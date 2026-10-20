@@ -219,6 +219,24 @@ exports.initiateTrade = async (req, res) => {
         // single atomic transaction to prevent race conditions where two requests
         // both pass the capacity check simultaneously.
         const tradeResult = await prisma.$transaction(async (tx) => {
+            // QUEUE-ADMISSION / TRADE-CREATION RE-CHECK UNDER LOCK
+            // (2026-10-20 final review): the ad was read OUTSIDE this
+            // transaction; a vendor may have deactivated/archived it since.
+            // Lock the Ad row (the same terminal lock archiveAd /
+            // deactivateAd / toggleAdStatus take) as the FIRST statement and
+            // re-read its current status: no WAITING queue entry and no
+            // trade may be created against an ad that is no longer ACTIVE
+            // (or is legacy-marked archived via archivedAt). This
+            // transaction never takes the TradeAccount lock, so the
+            // TradeAccount→Ad lock order cannot invert.
+            const lockedAd = await tx.$queryRaw`
+                SELECT "status", "archivedAt" FROM "Ad"
+                WHERE "id" = ${ad.id}
+                FOR UPDATE`;
+            if (!lockedAd[0] || lockedAd[0].status !== 'ACTIVE' || lockedAd[0].archivedAt) {
+                return { adInactive: true };
+            }
+
             // Count active trades INSIDE the transaction (prevents race condition)
             const activeTradeCount = await tx.trade.count({
                 where: {
@@ -287,6 +305,14 @@ exports.initiateTrade = async (req, res) => {
         });
 
         // ── Handle queue result (post-transaction side effects) ───────────────
+        // The ad went inactive (deactivated/archived) between the
+        // optimistic read and the locked re-check inside the transaction:
+        // refuse truthfully. Per §r42 the financial claim is RETAINED —
+        // the key stays consumed for this attempt.
+        if (tradeResult.adInactive) {
+            return res.status(400).json({ success: false, message: 'This advertisement is not active.' });
+        }
+
         if (tradeResult.queued) {
             io.to(`user_${userId}`).emit('queued', {
                 adId: ad.id,

@@ -397,17 +397,52 @@ exports.deactivateAd = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const { id } = req.params;
-        const ad = await prisma.ad.findUnique({ where: { id: parseInt(id) } });
-        if (!ad) return res.status(404).json({ message: 'Ad not found' });
-        if (ad.vendorId !== req.user.id) return res.status(403).json({ message: 'Unauthorized' });
+        const vendorId = req.user.id;
 
-        await prisma.ad.update({ where: { id: parseInt(id) }, data: { status: 'INACTIVE' } });
+        const fail = (status, message) => {
+            const e = new Error(message);
+            e.statusCode = status;
+            return e;
+        };
+
+        // STATUS-WRITER PROTOCOL (2026-10-20 final review): deactivate is a
+        // status writer and MUST follow the same lock order as toggleAdStatus
+        // and archiveAd — linked TradeAccount row FOR UPDATE first, then the
+        // Ad row FOR UPDATE — and re-read the ad under the lock before
+        // writing. ARCHIVED is TERMINAL: deactivation must never undo an
+        // archive (or a subsequent toggle could resurrect the ad). Legacy
+        // rows with archivedAt set but a stale status are treated as
+        // archived too — checking status alone is not sufficient.
+        await prisma.$transaction(async (tx) => {
+            const pre = await tx.ad.findUnique({ where: { id: parseInt(id) } });
+            if (!pre) throw fail(404, 'Ad not found');
+            if (pre.tradeAccountId) {
+                await tx.$queryRaw`
+                    SELECT "id" FROM "TradeAccount"
+                    WHERE "id" = ${pre.tradeAccountId}
+                    FOR UPDATE`;
+            }
+            await tx.$queryRaw`SELECT "id" FROM "Ad" WHERE "id" = ${parseInt(id)} FOR UPDATE`;
+
+            const ad = await tx.ad.findUnique({ where: { id: parseInt(id) } });
+            if (!ad) throw fail(404, 'Ad not found');
+            if (ad.vendorId !== vendorId) throw fail(403, 'Unauthorized');
+
+            if (ad.status === 'ARCHIVED' || ad.archivedAt) {
+                throw fail(400, 'This ad has been archived and can no longer be modified. Create a new ad instead.');
+            }
+
+            await tx.ad.update({ where: { id: parseInt(id) }, data: { status: 'INACTIVE' } });
+        });
 
         const io = req.app.get('socketio');
         if (io) io.emit('market_update');
 
         res.status(200).json({ success: true, message: 'Ad taken down successfully.' });
     } catch (error) {
+        if (error && error.statusCode) {
+            return res.status(error.statusCode).json({ success: false, message: error.message });
+        }
         res.status(500).json({ success: false, error: error.message });
     }
 };
@@ -616,6 +651,12 @@ exports.archiveAd = async (req, res) => {
             const ad = await tx.ad.findUnique({ where: { id: parseInt(id) } });
             if (!ad) throw fail(404, 'Ad not found.');
             if (ad.vendorId !== vendorId) throw fail(403, 'Unauthorized.');
+
+            // Already archived (explicit status OR legacy archivedAt
+            // marker): archiving is idempotent-refused, never re-stamped.
+            if (ad.status === 'ARCHIVED' || ad.archivedAt) {
+                throw fail(400, 'This ad has already been archived.');
+            }
 
             // Cannot archive an ACTIVE ad — must deactivate first
             if (ad.status === 'ACTIVE') {

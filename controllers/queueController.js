@@ -214,39 +214,75 @@ const initiateTradeWithQueue = async (req, res) => {
         });
 
         if (activeTrades >= ad.maxConcurrentTrades) {
-            const existingQueueEntry = await prisma.tradeQueue.findFirst({
-                where: {
-                    buyerId: String(userId),
-                    adId: String(adId),
-                    status: 'WAITING',
-                },
+            // QUEUE ADMISSION PROTOCOL (2026-10-20 final review): the
+            // optimistic ad.status read above is stale by the time we get
+            // here — a vendor may have deactivated and archived the ad
+            // between the read and this insert. Dedup + admission run in
+            // ONE transaction whose first statement takes the same Ad-row
+            // FOR UPDATE lock that archiveAd/deactivateAd/toggleAdStatus
+            // take, and the ad's CURRENT status is re-read under that
+            // lock: a WAITING entry can never be created for an ad that is
+            // no longer ACTIVE (or is legacy-marked archived via
+            // archivedAt). Admission never takes the TradeAccount lock, so
+            // the TradeAccount→Ad lock order cannot invert.
+            // TYPE FIX (found during the lock audit): TradeQueue.buyerId
+            // and adId are Int columns — the previous String(...) wrappers
+            // made every queue admission on this path throw a Prisma
+            // validation error (this path never succeeded).
+            const admission = await prisma.$transaction(async (tx) => {
+                const locked = await tx.$queryRaw`
+                    SELECT "status", "archivedAt" FROM "Ad"
+                    WHERE "id" = ${parseInt(adId)}
+                    FOR UPDATE`;
+                if (!locked[0] || locked[0].status !== 'ACTIVE' || locked[0].archivedAt) {
+                    return { refused: true };
+                }
+
+                const existingQueueEntry = await tx.tradeQueue.findFirst({
+                    where: {
+                        buyerId: userId,
+                        adId: parseInt(adId),
+                        status: 'WAITING',
+                    },
+                });
+
+                if (existingQueueEntry) {
+                    return { alreadyQueued: existingQueueEntry };
+                }
+
+                const queueEntry = await tx.tradeQueue.create({
+                    data: {
+                        buyerId: userId,
+                        adId: parseInt(adId),
+                        status: 'WAITING',
+                    },
+                });
+
+                const queuePosition = await tx.tradeQueue.count({
+                    where: {
+                        adId: parseInt(adId),
+                        status: 'WAITING',
+                        joinedAt: { lte: queueEntry.joinedAt },
+                    },
+                });
+
+                return { queueEntry, queuePosition };
             });
 
-            if (existingQueueEntry) {
+            if (admission.refused) {
+                return res.status(400).json({ success: false, message: 'This advertisement is not active.' });
+            }
+            if (admission.alreadyQueued) {
                 return res.status(200).json({
                     success: true,
                     queued: true,
                     message: 'You are already in the queue for this ad.',
-                    queuePosition: existingQueueEntry.id,
-                    joinedAt: existingQueueEntry.joinedAt,
+                    queuePosition: admission.alreadyQueued.id,
+                    joinedAt: admission.alreadyQueued.joinedAt,
                 });
             }
 
-            const queueEntry = await prisma.tradeQueue.create({
-                data: {
-                    buyerId: String(userId),
-                    adId: String(adId),
-                    status: 'WAITING',
-                },
-            });
-
-            const queuePosition = await prisma.tradeQueue.count({
-                where: {
-                    adId: String(adId),
-                    status: 'WAITING',
-                    joinedAt: { lte: queueEntry.joinedAt },
-                },
-            });
+            const { queueEntry, queuePosition } = admission;
 
             if (io) {
                 io.to(`user_${userId}`).emit('queue_joined', {

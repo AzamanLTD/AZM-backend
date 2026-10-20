@@ -29,6 +29,7 @@
 const { PrismaClient } = require('@prisma/client');
 const adController = require('../controllers/adController');
 const tradeAccountController = require('../controllers/tradeAccountController');
+const queueController = require('../controllers/queueController');
 
 const url = process.env.TEST_DATABASE_URL;
 const run = url ? describe : describe.skip;
@@ -529,6 +530,274 @@ run('Trade-account archive ↔ ad-create lifecycle (real PostgreSQL)', () => {
         // eslint-disable-next-line no-console
         console.log(
             `race outcomes over ${ITERATIONS} iterations: archive won ${outcomes.archiveWon}, ad-creation won ${outcomes.adWon}`,
+        );
+    });
+    // ═══════════════════════════════════════════════════════════════════════
+    // FINAL REVIEW (2026-10-20): ARCHIVED terminal across EVERY status
+    // writer + queue-admission mutual exclusion
+    // ═══════════════════════════════════════════════════════════════════════
+
+    const deactivateReq = toggleReq; // same shape: params.id + auth env
+
+    async function seedArchivedAd(linked) {
+        const { user, account } = await seedVendorAndAccount();
+        const res = makeRes();
+        await adController.createAd(createAdReq(user.id, linked ? account.id : null), res);
+        expect(res.statusCode).toBe(201);
+        const adId = res.body.ad.id;
+        seededAds.push(adId);
+        await prisma.ad.update({ where: { id: adId }, data: { status: 'OFFLINE' } });
+        const archRes = makeRes();
+        await adController.archiveAd(toggleReq(user.id, adId), archRes);
+        expect(archRes.statusCode).toBe(200);
+        const ad = await prisma.ad.findUnique({ where: { id: adId } });
+        expect(ad.status).toBe('ARCHIVED');
+        return { user, account, adId };
+    }
+
+    async function seedBuyer() {
+        seq = `${Date.now()}-${Math.floor(Math.random() * 1e9)}`;
+        const buyer = await prisma.user.create({
+            data: {
+                username: `user_taac-buyer-${seq}`,
+                email: `user_taac-buyer-${seq}@t.test`,
+                password: 'x',
+            },
+        });
+        seededUsers.push(buyer.id);
+        return buyer;
+    }
+
+    const joinQueueReq = (buyerId, adId) => ({
+        ...handlerEnv(buyerId),
+        params: {},
+        body: {
+            adId: String(adId),
+            amountCrypto: '50',
+            amountFiat: '50',
+            paymentMethod: 'Zelle',
+        },
+    });
+
+    const waitingEntriesOn = (adId) =>
+        prisma.tradeQueue.count({ where: { adId, status: 'WAITING' } });
+
+    test('terminal: ARCHIVED ad cannot be DEACTIVATED back to life (linked + unlinked)', async () => {
+        for (const linked of [true, false]) {
+            const { user, adId } = await seedArchivedAd(linked);
+            const res = makeRes();
+            await adController.deactivateAd(deactivateReq(user.id, adId), res);
+            expect(res.statusCode).toBe(400);
+            expect(res.body.message).toContain('archived');
+            const ad = await prisma.ad.findUnique({ where: { id: adId } });
+            expect(ad.status).toBe('ARCHIVED'); // terminal marker preserved
+        }
+    });
+
+    test('terminal: ARCHIVED unlinked ad cannot be TOGGLED back to life', async () => {
+        const { user, adId } = await seedArchivedAd(false);
+        const res = makeRes();
+        await adController.toggleAdStatus(toggleReq(user.id, adId), res);
+        expect(res.statusCode).toBe(400);
+        expect(res.body.message).toContain('Archived');
+        const ad = await prisma.ad.findUnique({ where: { id: adId } });
+        expect(ad.status).toBe('ARCHIVED');
+    });
+
+    test('race: archive vs deactivate — a committed archive is NEVER overwritten (linked + unlinked)', async () => {
+        const ITERATIONS = 12;
+        const BIASES = ['simultaneous', 'archive-first', 'deactivate-first'];
+        const outcomes = { archiveWon: 0, deactivateThenArchive: 0 };
+        const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+        for (let i = 0; i < ITERATIONS; i++) {
+            const bias = BIASES[i % BIASES.length];
+            const linked = i % 2 === 0;
+            const { user, adId } = await (async () => {
+                const { user, account } = await seedVendorAndAccount();
+                const res = makeRes();
+                await adController.createAd(createAdReq(user.id, linked ? account.id : null), res);
+                expect(res.statusCode).toBe(201);
+                const adId = res.body.ad.id;
+                seededAds.push(adId);
+                // Park the ad OFFLINE: both writers' valid pre-state.
+                await prisma.ad.update({ where: { id: adId }, data: { status: 'OFFLINE' } });
+                return { user, adId };
+            })();
+
+            const archiveRes = makeRes();
+            const deactRes = makeRes();
+            const runArchive = () => adController.archiveAd(toggleReq(user.id, adId), archiveRes);
+            const runDeact = () => adController.deactivateAd(deactivateReq(user.id, adId), deactRes);
+
+            await Promise.all([
+                bias === 'archive-first' ? delay(25).then(runDeact) : runDeact(),
+                bias === 'deactivate-first' ? delay(25).then(runArchive) : runArchive(),
+            ]);
+
+            // Committed-state invariant: the final status is ARCHIVED in
+            // EVERY possible interleaving — either archive won outright, or
+            // deactivate committed first (INACTIVE, which is legitimately
+            // archivable) and the archive then succeeded. A committed
+            // archive can never end up INACTIVE/OFFLINE.
+            const ad = await prisma.ad.findUnique({ where: { id: adId } });
+            expect(ad.status).toBe('ARCHIVED');
+            expect(ad.archivedAt).not.toBeNull();
+
+            if (deactRes.statusCode === 200) {
+                // Deactivate won the lock race: archive then re-read
+                // INACTIVE under the lock and legitimately archived it.
+                expect(archiveRes.statusCode).toBe(200);
+                outcomes.deactivateThenArchive++;
+            } else {
+                // Archive won outright: deactivate re-read ARCHIVED under
+                // the lock and was truthfully refused.
+                expect(archiveRes.statusCode).toBe(200);
+                expect(deactRes.statusCode).toBe(400);
+                expect(deactRes.body.message).toContain('archived');
+                outcomes.archiveWon++;
+            }
+        }
+        expect(outcomes.archiveWon + outcomes.deactivateThenArchive).toBe(ITERATIONS);
+        expect(outcomes.archiveWon).toBeGreaterThan(0);
+        expect(outcomes.deactivateThenArchive).toBeGreaterThan(0);
+        // eslint-disable-next-line no-console
+        console.log(
+            `archive-vs-deactivate race over ${ITERATIONS} iterations: archive outright ${outcomes.archiveWon}, deactivate-then-archive ${outcomes.deactivateThenArchive}`,
+        );
+    });
+
+    test('queue admission: a WAITING entry can never be created for a non-ACTIVE or archived ad', async () => {
+        const { user, account } = await seedVendorAndAccount();
+        const buyer = await seedBuyer();
+        const res = makeRes();
+        await adController.createAd(createAdReq(user.id, account.id), res);
+        const adId = res.body.ad.id;
+        seededAds.push(adId);
+        // Always-busy: every admission takes the queue path deterministically.
+        await prisma.ad.update({ where: { id: adId }, data: { maxConcurrentTrades: 0 } });
+
+        // OFFLINE ad → admission refused truthfully, no entry.
+        await prisma.ad.update({ where: { id: adId }, data: { status: 'OFFLINE' } });
+        let adm = makeRes();
+        await queueController.initiateTradeWithQueue(joinQueueReq(buyer.id, adId), adm);
+        expect(adm.statusCode).toBe(400);
+        expect(adm.body.message).toContain('not active');
+        expect(await waitingEntriesOn(adId)).toBe(0);
+
+        // LEGACY row: archivedAt set but status still ACTIVE → refused too.
+        await prisma.ad.update({ where: { id: adId }, data: { status: 'ACTIVE', archivedAt: new Date() } });
+        adm = makeRes();
+        await queueController.initiateTradeWithQueue(joinQueueReq(buyer.id, adId), adm);
+        expect(adm.statusCode).toBe(400);
+        expect(await waitingEntriesOn(adId)).toBe(0);
+
+        // Clean legacy marker; ACTIVE ad → admission succeeds (queue path
+        // works again after the Int/String type fix).
+        await prisma.ad.update({ where: { id: adId }, data: { archivedAt: null } });
+        adm = makeRes();
+        await queueController.initiateTradeWithQueue(joinQueueReq(buyer.id, adId), adm);
+        expect(adm.statusCode).toBe(200);
+        expect(adm.body.queued).toBe(true);
+        expect(await waitingEntriesOn(adId)).toBe(1);
+
+        // ARCHIVED terminal state → refused again.
+        await prisma.ad.update({ where: { id: adId }, data: { status: 'ARCHIVED', archivedAt: new Date() } });
+        adm = makeRes();
+        await queueController.initiateTradeWithQueue(joinQueueReq(buyer.id, adId), adm);
+        expect(adm.statusCode).toBe(400);
+        expect(await waitingEntriesOn(adId)).toBe(1); // unchanged — no new entry
+    });
+
+    test('queue admission: dedup preserved — the same buyer is not double-admitted', async () => {
+        const { user, account } = await seedVendorAndAccount();
+        const buyer = await seedBuyer();
+        const res = makeRes();
+        await adController.createAd(createAdReq(user.id, account.id), res);
+        const adId = res.body.ad.id;
+        seededAds.push(adId);
+        await prisma.ad.update({ where: { id: adId }, data: { maxConcurrentTrades: 0 } });
+
+        const first = makeRes();
+        await queueController.initiateTradeWithQueue(joinQueueReq(buyer.id, adId), first);
+        expect(first.statusCode).toBe(200);
+        expect(first.body.queued).toBe(true);
+
+        const second = makeRes();
+        await queueController.initiateTradeWithQueue(joinQueueReq(buyer.id, adId), second);
+        expect(second.statusCode).toBe(200);
+        expect(second.body.queued).toBe(true);
+        expect(second.body.message).toContain('already in the queue');
+        expect(await waitingEntriesOn(adId)).toBe(1); // exactly one entry
+    });
+
+    test('race: queue admission vs deactivate+archive — no WAITING entry survives against an ARCHIVED ad', async () => {
+        const ITERATIONS = 12;
+        const BIASES = ['simultaneous', 'admission-first', 'archive-first'];
+        const outcomes = { admissionWon: 0, deactivateWon: 0 };
+        const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+        for (let i = 0; i < ITERATIONS; i++) {
+            const bias = BIASES[i % BIASES.length];
+            const { user, account } = await seedVendorAndAccount();
+            const buyer = await seedBuyer();
+            const res = makeRes();
+            await adController.createAd(createAdReq(user.id, account.id), res);
+            const adId = res.body.ad.id;
+            seededAds.push(adId);
+            await prisma.ad.update({ where: { id: adId }, data: { maxConcurrentTrades: 0 } });
+
+            const admRes = makeRes();
+            const runAdmission = () =>
+                queueController.initiateTradeWithQueue(joinQueueReq(buyer.id, adId), admRes);
+            // Vendor side: deactivate then attempt archive (the ad ends
+            // up either OFFLINE-with-queue-entry or ARCHIVED-clean).
+            const vendRes = { deactivate: makeRes(), archive: makeRes() };
+            const runVendorPair = async () => {
+                await adController.deactivateAd(deactivateReq(user.id, adId), vendRes.deactivate);
+                await adController.archiveAd(toggleReq(user.id, adId), vendRes.archive);
+            };
+
+            await Promise.all([
+                bias === 'admission-first' ? delay(25).then(runVendorPair) : runVendorPair(),
+                bias === 'archive-first' ? delay(25).then(runAdmission) : runAdmission(),
+            ]);
+
+            const ad = await prisma.ad.findUnique({ where: { id: adId } });
+            const waiting = await waitingEntriesOn(adId);
+
+            if (admRes.statusCode === 200 && admRes.body.queued) {
+                // Admission committed while the ad was still ACTIVE: the
+                // entry exists, deactivate succeeded (INACTIVE does not
+                // touch queue entries), and the ARCHIVE was then REFUSED by
+                // the queue guard — an ARCHIVED ad never carries a WAITING
+                // entry. Both responses truthful.
+                outcomes.admissionWon++;
+                expect(ad.status).toBe('INACTIVE');
+                expect(waiting).toBe(1);
+                expect(vendRes.archive.statusCode).toBe(400);
+                expect(vendRes.archive.body.message).toContain('waiting');
+            } else {
+                // Deactivate won the ad lock: admission re-read OFFLINE
+                // under the lock and was refused — no entry, archive then
+                // completes cleanly.
+                outcomes.deactivateWon++;
+                expect(admRes.statusCode).toBe(400);
+                expect(admRes.body.message).toContain('not active');
+                expect(ad.status).toBe('ARCHIVED');
+                expect(waiting).toBe(0);
+                expect(vendRes.archive.statusCode).toBe(200);
+            }
+            // Global invariant either way: an ARCHIVED ad has NO WAITING
+            // queue entry created against it.
+            if (ad.status === 'ARCHIVED') expect(waiting).toBe(0);
+        }
+        expect(outcomes.admissionWon + outcomes.deactivateWon).toBe(ITERATIONS);
+        expect(outcomes.admissionWon).toBeGreaterThan(0);
+        expect(outcomes.deactivateWon).toBeGreaterThan(0);
+        // eslint-disable-next-line no-console
+        console.log(
+            `admission-vs-archive race over ${ITERATIONS} iterations: admission won ${outcomes.admissionWon}, deactivate+archive won ${outcomes.deactivateWon}`,
         );
     });
 });
