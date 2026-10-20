@@ -800,4 +800,169 @@ run('Trade-account archive ↔ ad-create lifecycle (real PostgreSQL)', () => {
             `admission-vs-archive race over ${ITERATIONS} iterations: admission won ${outcomes.admissionWon}, deactivate+archive won ${outcomes.deactivateWon}`,
         );
     });
+    // ═══════════════════════════════════════════════════════════════════════
+    // APPROVAL FOLLOW-UP (2026-10-20): legacy archivedAt marker in toggle +
+    // TradeQueue Int-type lifecycle
+    // ═══════════════════════════════════════════════════════════════════════
+
+    test('legacy marker: stale-status ad with archivedAt set cannot be toggled (account-linked)', async () => {
+        const { user, account } = await seedVendorAndAccount();
+        const createRes = makeRes();
+        await adController.createAd(createAdReq(user.id, account.id), createRes);
+        const adId = createRes.body.ad.id;
+        // Deactivate first (legitimate), then simulate a LEGACY inconsistent
+        // row: archivedAt stamped but the status never made it to ARCHIVED.
+        let res = makeRes();
+        await adController.toggleAdStatus(toggleReq(user.id, adId), res);
+        expect(res.statusCode).toBe(200);
+        const stampedAt = new Date();
+        await prisma.ad.update({ where: { id: adId }, data: { archivedAt: stampedAt } });
+
+        // The toggle (in EITHER direction) must be refused on the marker
+        // alone — status alone is not a sufficient archive marker.
+        res = makeRes();
+        await adController.toggleAdStatus(toggleReq(user.id, adId), res);
+        expect(res.statusCode).toBe(400);
+        expect(res.body.message).toContain('Archived');
+
+        // Committed state is UNTOUCHED — both status and marker intact.
+        const after = await prisma.ad.findUnique({ where: { id: adId } });
+        expect(after.status).toBe('OFFLINE');
+        expect(new Date(after.archivedAt).getTime()).toBe(stampedAt.getTime());
+    });
+
+    test('legacy marker: stale-status UNLINKED ad with archivedAt set cannot be toggled', async () => {
+        const { user } = await seedVendorAndAccount();
+        const createRes = makeRes();
+        await adController.createAd(createAdReq(user.id, null), createRes);
+        const adId = createRes.body.ad.id;
+        let res = makeRes();
+        await adController.toggleAdStatus(toggleReq(user.id, adId), res);
+        expect(res.statusCode).toBe(200); // ACTIVE → OFFLINE, legitimate
+        const stampedAt = new Date();
+        await prisma.ad.update({ where: { id: adId }, data: { archivedAt: stampedAt } });
+
+        res = makeRes();
+        await adController.toggleAdStatus(toggleReq(user.id, adId), res);
+        expect(res.statusCode).toBe(400);
+        expect(res.body.message).toContain('Archived');
+
+        const after = await prisma.ad.findUnique({ where: { id: adId } });
+        expect(after.status).toBe('OFFLINE');
+        expect(new Date(after.archivedAt).getTime()).toBe(stampedAt.getTime());
+
+        // Deactivation of a NON-archived ad still works (guard does not
+        // over-block): clear the marker, reactivate, deactivate again.
+        await prisma.ad.update({ where: { id: adId }, data: { archivedAt: null } });
+        res = makeRes();
+        await adController.toggleAdStatus(toggleReq(user.id, adId), res);
+        expect(res.statusCode).toBe(200);
+        expect(res.body.ad.status).toBe('ACTIVE');
+    });
+
+    test('queue lifecycle (Int columns end-to-end): admit → status → position → leave; foreign buyer refused', async () => {
+        const { user, account } = await seedVendorAndAccount();
+        const buyer = await seedBuyer();
+        const otherBuyer = await seedBuyer();
+
+        // Ad at zero capacity → every admission takes the queue path.
+        const createRes = makeRes();
+        await adController.createAd(createAdReq(user.id, account.id), createRes);
+        const adId = createRes.body.ad.id;
+        await prisma.ad.update({ where: { id: adId }, data: { maxConcurrentTrades: 0 } });
+
+        // ── Admission (Int buyerId/adId write path) ──
+        const admitRes = makeRes();
+        await queueController.initiateTradeWithQueue({
+            ...handlerEnv(buyer.id),
+            body: { adId: String(adId), amountCrypto: '50', amountFiat: '50', paymentMethod: 'Zelle' },
+        }, admitRes);
+        expect(admitRes.statusCode).toBe(200);
+        expect(admitRes.body.queued).toBe(true);
+        const queueId = admitRes.body.queueId;
+        expect(typeof queueId).toBe('string'); // UUID identity preserved
+
+        // ── Status read: numeric filters, real position ──
+        const statusRes = makeRes();
+        await queueController.getQueueStatus({
+            ...handlerEnv(buyer.id),
+            query: {},
+        }, statusRes);
+        expect(statusRes.statusCode).toBe(200);
+        const mine = statusRes.body.queue.find((e) => e.id === queueId);
+        expect(mine).toBeDefined();
+        expect(mine.position).toBe(1);
+
+        // Invalid adId query → truthful 400, not a Prisma 500.
+        const badRes = makeRes();
+        await queueController.getQueueStatus({
+            ...handlerEnv(buyer.id),
+            query: { adId: 'not-a-number' },
+        }, badRes);
+        expect(badRes.statusCode).toBe(400);
+
+        // ── Foreign buyer cannot leave someone else's entry ──
+        const foreignRes = makeRes();
+        await queueController.leaveQueue({
+            ...handlerEnv(otherBuyer.id),
+            params: { queueId },
+        }, foreignRes);
+        expect(foreignRes.statusCode).toBe(403);
+
+        // ── Owner leaves their own WAITING entry ──
+        const leaveRes = makeRes();
+        await queueController.leaveQueue({
+            ...handlerEnv(buyer.id),
+            params: { queueId },
+        }, leaveRes);
+        expect(leaveRes.statusCode).toBe(200);
+
+        // Entry is finalized; a second leave loses the conditional race.
+        const releaveRes = makeRes();
+        await queueController.leaveQueue({
+            ...handlerEnv(buyer.id),
+            params: { queueId },
+        }, releaveRes);
+        expect([400, 409]).toContain(releaveRes.statusCode);
+
+        // ── Post-leave state: no WAITING entries, counts consistent ──
+        const afterStatus = makeRes();
+        await queueController.getQueueStatus({
+            ...handlerEnv(buyer.id),
+            query: { adId: String(adId) },
+        }, afterStatus);
+        expect(afterStatus.statusCode).toBe(200);
+        expect(afterStatus.body.queue).toHaveLength(0);
+        const entry = await prisma.tradeQueue.findUnique({ where: { id: queueId } });
+        expect(entry.status).toBe('CANCELLED');
+        expect(entry.buyerId).toBe(buyer.id); // Int identity round-trips
+    });
+
+    test('queue admission E2E cannot create a WAITING entry against an archived ad', async () => {
+        const { user, account } = await seedVendorAndAccount();
+        const buyer = await seedBuyer();
+        const createRes = makeRes();
+        await adController.createAd(createAdReq(user.id, account.id), createRes);
+        const adId = createRes.body.ad.id;
+        await prisma.ad.update({ where: { id: adId }, data: { maxConcurrentTrades: 0 } });
+
+        // Deactivate + archive the ad first.
+        let res = makeRes();
+        await adController.toggleAdStatus(toggleReq(user.id, adId), res); // ACTIVE → OFFLINE
+        res = makeRes();
+        await adController.archiveAd(toggleReq(user.id, adId), res);
+        expect(res.statusCode).toBe(200);
+
+        // The optimistic pre-read would see a row; the locked re-check must
+        // refuse admission with a truthful 4xx and create NO entry.
+        const admitRes = makeRes();
+        await queueController.initiateTradeWithQueue({
+            ...handlerEnv(buyer.id),
+            body: { adId: String(adId), amountCrypto: '50', amountFiat: '50', paymentMethod: 'Zelle' },
+        }, admitRes);
+        expect(admitRes.statusCode).toBe(400);
+
+        const entries = await prisma.tradeQueue.count({ where: { adId, status: 'WAITING' } });
+        expect(entries).toBe(0);
+    });
 });

@@ -26,7 +26,7 @@ const _emitPositionUpdates = async (prisma, io, adId, excludeQueueId) => {
     try {
         const waitingEntries = await prisma.tradeQueue.findMany({
             where: {
-                adId: String(adId),
+                adId: parseInt(adId, 10), // Int column (2026-10-20 fix)
                 status: 'WAITING',
             },
             orderBy: { joinedAt: 'asc' },
@@ -67,7 +67,7 @@ const processNextInQueue = async (adId, { prisma, io } = {}) => {
     try {
         const nextInQueue = await prisma.tradeQueue.findFirst({
             where: {
-                adId: String(adId),
+                adId: parseInt(adId, 10), // Int column (2026-10-20 fix)
                 status: 'WAITING',
             },
             orderBy: { joinedAt: 'asc' },
@@ -318,8 +318,17 @@ const getQueueStatus = async (req, res) => {
     try {
         const { adId } = req.query;
 
-        const whereClause = { buyerId: String(userId), status: 'WAITING' };
-        if (adId) whereClause.adId = String(adId);
+        // (2026-10-20 fix) TradeQueue.buyerId/adId are Int columns — the
+        // previous String(...) filters threw PrismaClientValidationError and
+        // 500'd the whole status read. Validate inputs truthfully instead.
+        const whereClause = { buyerId: userId, status: 'WAITING' };
+        if (adId !== undefined && adId !== null && adId !== '') {
+            const parsedAdId = parseInt(adId, 10);
+            if (Number.isNaN(parsedAdId)) {
+                return res.status(400).json({ success: false, message: 'adId must be a valid ad id.' });
+            }
+            whereClause.adId = parsedAdId;
+        }
 
         const queueEntries = await prisma.tradeQueue.findMany({
             where: whereClause,
@@ -373,7 +382,10 @@ const leaveQueue = async (req, res) => {
         });
 
         if (!entry) return res.status(404).json({ success: false, message: 'Queue entry not found.' });
-        if (entry.buyerId !== String(userId)) return res.status(403).json({ success: false, message: 'Unauthorized.' });
+        // (2026-10-20 fix) entry.buyerId is a numeric Int column — the
+        // previous String(userId) comparison ALWAYS rejected the legitimate
+        // owner. Compare numerically.
+        if (Number(entry.buyerId) !== Number(userId)) return res.status(403).json({ success: false, message: 'Unauthorized.' });
         if (entry.status !== 'WAITING') return res.status(400).json({ success: false, message: 'Can only leave WAITING queue entries.' });
 
         // Phase H9 BUGFIX (2026-05-27): atomic conditional flip. Without

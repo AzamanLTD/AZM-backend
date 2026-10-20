@@ -547,7 +547,7 @@ exports.toggleAdStatus = async (req, res) => {
             if (ad.vendorId !== vendorId) throw fail(403, 'Unauthorized.');
 
             // ARCHIVED is terminal soft-archive — never resurrected here.
-            if (ad.status === 'ARCHIVED') {
+            if (ad.status === 'ARCHIVED' || ad.archivedAt) {
                 throw fail(400, 'Archived ads cannot be reactivated. Create a new ad instead.');
             }
 
