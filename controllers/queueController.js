@@ -175,6 +175,17 @@ const initiateTradeWithQueue = async (req, res) => {
         const { adId, amountCrypto, amountFiat, paymentMethod } = req.body;
         const userId = req.user.id;
 
+        // ── §r42 idempotency disposition ─────────────────────────────────
+        // The route now mounts the shared idempotency authority with the
+        // CANONICAL trade-initiation identity (routes/aiRoutes.js), so this
+        // handler owns a durable FinancialOperation claim exactly like
+        // tradeController.initiateTrade. Until the admission transaction
+        // below, every guard here is provably pre-economic: mark the claim
+        // releasable so a 4xx validation refusal does not poison the key.
+        // The flag is cleared before the admission transaction, and only
+        // the branches that provably committed NOTHING set it back.
+        res.locals.financialClaimRelease = true;
+
         const ad = await prisma.ad.findUnique({
             where: { id: parseInt(adId) },
             include: { vendor: true },
@@ -229,6 +240,10 @@ const initiateTradeWithQueue = async (req, res) => {
             // and adId are Int columns — the previous String(...) wrappers
             // made every queue admission on this path throw a Prisma
             // validation error (this path never succeeded).
+            // A queue-entry insert may commit from here on: a committed
+            // admission must RETAIN its durable identity (the auto-commit
+            // bookkeeping on the 200 stores the queued response for replay).
+            res.locals.financialClaimRelease = false;
             const admission = await prisma.$transaction(async (tx) => {
                 const locked = await tx.$queryRaw`
                     SELECT "status", "archivedAt", "maxConcurrentTrades" FROM "Ad"
@@ -291,14 +306,24 @@ const initiateTradeWithQueue = async (req, res) => {
             });
 
             if (admission.refused) {
+                // Provably pre-economic: the refusal came from the locked
+                // recheck at the transaction's first statement — nothing was
+                // written. Release the claim so the key stays reusable.
+                res.locals.financialClaimRelease = true;
                 return res.status(400).json({ success: false, message: 'This advertisement is not active.' });
             }
             if (admission.capacityFreed) {
                 // A slot freed between the optimistic count and the locked
-                // recheck: no WAITING entry was created. Hand the request to
-                // the canonical trade-initiation path — the same direct
-                // fall-through the not-busy optimistic branch uses, which
+                // recheck: no WAITING entry was created — the admission
+                // transaction committed nothing. Hand the request to the
+                // canonical trade-initiation path (the same direct
+                // fall-through the not-busy optimistic branch uses), which
                 // rechecks status and capacity inside its own transaction.
+                // initiateTrade re-manages this claim's disposition flags
+                // from its own pre-economic mark; the shared claim
+                // (res.locals.financialOperation) stays with this request,
+                // so a created trade commits under the SAME durable identity.
+                res.locals.financialClaimRelease = true;
                 const tradeController = require('./tradeController');
                 return tradeController.initiateTrade(req, res);
             }

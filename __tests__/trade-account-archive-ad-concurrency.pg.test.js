@@ -60,6 +60,11 @@ run('Trade-account archive ↔ ad-create lifecycle (real PostgreSQL)', () => {
         const res = {
             statusCode: null,
             body: null,
+            // The §r42 claim-disposition flags (res.locals.financialClaimRelease)
+            // are read by the idempotency MIDDLEWARE in production; the queue
+            // handler sets them unconditionally, so every mocked response needs
+            // a locals object.
+            locals: {},
             status(code) { this.statusCode = code; return this; },
             json(payload) { this.body = payload; return this; },
         };
