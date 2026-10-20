@@ -238,15 +238,53 @@ exports.initiateTrade = async (req, res) => {
             }
 
             // Count active trades INSIDE the transaction (prevents race condition)
+            //
+            // CAPACITY POLICY (2026-10-20 A2, audited against the real state
+            // machine): every UNFINALIZED trade consumes one
+            // maxConcurrentTrades slot from creation to a terminal state.
+            // V2 vendor-approval flow creates trades as PENDING (this file,
+            // trade.create below), and acceptTrade transitions
+            // PENDING → PENDING_PAYMENT. The previous filter omitted PENDING,
+            // which made vendor-pending requests invisible to the gate: a
+            // buyer could initiate unlimited PENDING trades past a busy ad
+            // and the vendor could accept them all into PENDING_PAYMENT —
+            // exceeding maxConcurrentTrades and bypassing the waiting queue.
+            // acceptTrade never re-checks capacity (it must not strand an
+            // accepted request), so INITIATION is the single capacity gate
+            // and it must count PENDING. PENDING_PAYMENT/PAID/DISPUTED keep
+            // counting; terminal states (CANCELLED/COMPLETED/EXPIRED) never do.
+            const ACTIVE_TRADE_STATUSES = ['PENDING', 'PENDING_PAYMENT', 'PAID', 'DISPUTED'];
             const activeTradeCount = await tx.trade.count({
                 where: {
                     vendorId,
-                    status: { in: ['PENDING_PAYMENT', 'PAID', 'DISPUTED'] }
+                    status: { in: ACTIVE_TRADE_STATUSES }
                 }
             });
 
             if (activeTradeCount >= ad.maxConcurrentTrades) {
                 // QUEUE PATH — return special marker
+                //
+                // A1 — ONE WAITING ENTRY PER (buyer, ad) INVARIANT.
+                // The canonical path previously created a queue row
+                // unconditionally, so a buyer already WAITING on this ad who
+                // re-initiated (fresh idempotency key, e.g. after a client
+                // retry storm or a second device) got a SECOND row: their
+                // queue position inflated and both rows later promoted the
+                // same buyer twice. Dedup runs HERE, inside the same
+                // transaction and under the same Ad-row FOR UPDATE lock that
+                // serializes every queue-entry insert on this ad (the queue
+                // route takes the identical lock), so the check-then-insert
+                // pair is race-free per ad across BOTH initiation paths.
+                const existingEntry = await tx.tradeQueue.findFirst({
+                    where: { buyerId: userId, adId: ad.id, status: 'WAITING' }
+                });
+                if (existingEntry) {
+                    const existingPosition = await tx.tradeQueue.count({
+                        where: { adId: ad.id, status: 'WAITING', joinedAt: { lte: existingEntry.joinedAt } }
+                    });
+                    return { alreadyQueued: true, queueEntry: existingEntry, queuePosition: existingPosition };
+                }
+
                 const queueEntry = await tx.tradeQueue.create({
                     data: { buyerId: userId, adId: ad.id, status: 'WAITING' }
                 });
@@ -303,6 +341,23 @@ exports.initiateTrade = async (req, res) => {
 
             return { queued: false, trade: newTrade };
         });
+
+        // A1 — already-WAITING on this ad via ANY path (queue route or a
+        // previous canonical admission that queued): converge on the queue
+        // route's already-queued contract. NO new row was created; the
+        // 200 is COMMITTED by the idempotency middleware (2xx bookkeeping)
+        // so a same-key retry replays byte-meaningfully — one entry, ever.
+        if (tradeResult.alreadyQueued) {
+            return res.status(200).json({
+                success: true,
+                queued: true,
+                alreadyQueued: true,
+                message: 'You are already in the queue for this ad.',
+                queuePosition: tradeResult.queuePosition,
+                queueId: tradeResult.queueEntry.id,
+                joinedAt: tradeResult.queueEntry.joinedAt
+            });
+        }
 
         // ── Handle queue result (post-transaction side effects) ───────────────
         // The ad went inactive (deactivated/archived) between the

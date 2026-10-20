@@ -195,32 +195,34 @@ const initiateTradeWithQueue = async (req, res) => {
         if (ad.vendorId === userId) return res.status(400).json({ success: false, message: 'You cannot trade with your own advertisement.' });
         if (ad.status !== 'ACTIVE') return res.status(400).json({ success: false, message: 'This advertisement is not active.' });
 
-        // Phase H11 BUGFIX (2026-05-27): the active-status filter MUST
-        // match the in-transaction check in `tradeController.initiateTrade`
-        // (line ~138) so the two paths agree on what counts as an
-        // "active trade" for cap purposes. Drift between the two filters
-        // could let a buyer pass the optimistic gate here only to bounce
-        // off the canonical check inside the trade-creation transaction
-        // — confusing UX and wasted round-trips.
+        // CAPACITY POLICY (2026-10-20 A2 — corrected state-machine audit):
+        // this optimistic gate MUST use the SAME active-status filter as
+        // the in-transaction checks in `tradeController.initiateTrade` and
+        // the locked recount below, so all three capacity checks express
+        // one explicit policy: every UNFINALIZED trade — PENDING,
+        // PENDING_PAYMENT, PAID, DISPUTED — consumes one
+        // maxConcurrentTrades slot from creation to a terminal state.
         //
-        // Canonical filter is `[PENDING_PAYMENT, PAID, DISPUTED]`. The
-        // previous version used `[PENDING, PENDING_PAYMENT, PAID]` which
-        // was wrong on two counts:
-        //   • `PENDING` is never persisted (Trade.status defaults to
-        //     PENDING_PAYMENT and no code path ever flips to PENDING).
-        //   • `DISPUTED` was missing — a vendor with an ongoing dispute
-        //     would be considered "free" here but blocked at the
-        //     in-transaction check, producing an inconsistent answer.
+        // The H11 note claimed "PENDING is never persisted" — that premise
+        // is FALSE for the V2 vendor-approval flow: `initiateTrade` creates
+        // trades with status 'PENDING' and `acceptTrade` transitions them
+        // PENDING → PENDING_PAYMENT. Under the old filter a vendor-pending
+        // request was invisible to the gate: unlimited initiations slipped
+        // past a busy ad, and accepting them all exceeded
+        // maxConcurrentTrades and bypassed the waiting queue. PENDING now
+        // counts everywhere (initiation is the single capacity gate —
+        // acceptTrade never re-checks capacity, so it must not strand an
+        // accepted request).
         //
-        // This is an OPTIMISTIC gate — `tradeController.initiateTrade`
-        // re-runs the same count atomically inside `$transaction`, so a
-        // race that slips a buyer past this gate will still queue them
-        // correctly at the canonical layer. No money loss; the fix is
-        // about consistent UX and avoiding wasted round-trips.
+        // This remains an OPTIMISTIC gate — the locked recount below and
+        // `tradeController.initiateTrade` re-run the same count under the
+        // Ad-row lock, so a race past this gate is still resolved
+        // truthfully at the canonical layer.
+        const ACTIVE_TRADE_STATUSES = ['PENDING', 'PENDING_PAYMENT', 'PAID', 'DISPUTED'];
         const activeTrades = await prisma.trade.count({
             where: {
                 vendorId: ad.vendorId,
-                status: { in: ['PENDING_PAYMENT', 'PAID', 'DISPUTED'] },
+                status: { in: ACTIVE_TRADE_STATUSES },
             },
         });
 
@@ -267,7 +269,9 @@ const initiateTradeWithQueue = async (req, res) => {
                 const activeNow = await tx.trade.count({
                     where: {
                         vendorId: ad.vendorId,
-                        status: { in: ['PENDING_PAYMENT', 'PAID', 'DISPUTED'] },
+                        // A2: same explicit capacity policy as the
+                        // optimistic gate and tradeController (PENDING counts).
+                        status: { in: ACTIVE_TRADE_STATUSES },
                     },
                 });
                 if (activeNow < locked[0].maxConcurrentTrades) {
@@ -328,11 +332,27 @@ const initiateTradeWithQueue = async (req, res) => {
                 return tradeController.initiateTrade(req, res);
             }
             if (admission.alreadyQueued) {
+                // A1: converge on the canonical path's already-queued
+                // contract. The pre-A1 shape returned queueEntry.id (a
+                // UUID) under the queuePosition name — the fresh-join
+                // response returns a true ordinal position, so the two
+                // responses disagreed on the same field. Both paths now
+                // return the same alreadyQueued envelope with the buyer's
+                // true ordinal position (WAITING rows joined no later).
+                const alreadyPosition = await prisma.tradeQueue.count({
+                    where: {
+                        adId: parseInt(adId),
+                        status: 'WAITING',
+                        joinedAt: { lte: admission.alreadyQueued.joinedAt },
+                    },
+                });
                 return res.status(200).json({
                     success: true,
                     queued: true,
+                    alreadyQueued: true,
                     message: 'You are already in the queue for this ad.',
-                    queuePosition: admission.alreadyQueued.id,
+                    queuePosition: alreadyPosition,
+                    queueId: admission.alreadyQueued.id,
                     joinedAt: admission.alreadyQueued.joinedAt,
                 });
             }
