@@ -128,18 +128,34 @@ describe('§4 trade-account route wiring (false-affordance fix)', () => {
 
 describe('§4 trade-account handler behavior (mocked Prisma, no DB)', () => {
     const controller = require(controllerPath);
+    const adController = require(path.resolve(__dirname, '..', 'controllers', 'adController.js'));
 
-    /** Fresh mock (req, res, prisma) triple; `delete` is a jest.fn so any
-     *  hard-delete call is caught by the explicit assertions below. */
+    /** Fresh mock (req, res, prisma, tx) triple; `delete` is a jest.fn so any
+     *  hard-delete call is caught by the explicit assertions below. The
+     *  transaction mock runs the callback with the same mock tx both the
+     *  archive and the ad-create paths use ($queryRaw + children). */
     const makeCtx = (id, userId, prismaOverrides = {}) => {
+        const tx = {
+            $queryRaw: jest.fn(),
+            tradeAccount: {
+                update: jest.fn(),
+                delete: jest.fn(), // must stay uncalled in EVERY case
+            },
+            ad: {
+                count: jest.fn(),
+                create: jest.fn(),
+            },
+        };
         const prisma = {
             globalSettings: { findUnique: jest.fn() },
+            user: { findUnique: jest.fn() },
             tradeAccount: {
                 findUnique: jest.fn(),
                 update: jest.fn(),
                 delete: jest.fn(), // must stay uncalled in EVERY case
             },
-            ad: { count: jest.fn() },
+            ad: { count: jest.fn(), create: jest.fn() },
+            $transaction: jest.fn(async (fn) => fn(tx)),
             ...prismaOverrides,
         };
         const req = {
@@ -153,7 +169,7 @@ describe('§4 trade-account handler behavior (mocked Prisma, no DB)', () => {
             status(code) { this.statusCode = code; return this; },
             json(payload) { this.body = payload; return this; },
         };
-        return { req, res, prisma };
+        return { req, res, prisma, tx };
     };
 
     describe('getSupportedMethods — client contract { success: true, methods }', () => {
@@ -181,53 +197,134 @@ describe('§4 trade-account handler behavior (mocked Prisma, no DB)', () => {
 
     describe('deleteTradeAccount — soft-archive contract', () => {
         test('E1. nonexistent account → 404; no archive update; no hard delete', async () => {
-            const { req, res, prisma } = makeCtx('acct-404', 'user-1');
-            prisma.tradeAccount.findUnique.mockResolvedValue(null);
+            const ctx = makeCtx('acct-404', 'user-1');
+            const { req, res, prisma, tx } = ctx;
+            tx.$queryRaw.mockResolvedValue([]);
             await controller.deleteTradeAccount(req, res);
             expect(res.statusCode).toBe(404);
             expect(res.body.success).toBe(false);
-            expect(prisma.tradeAccount.update).not.toHaveBeenCalled();
+            expect(tx.tradeAccount.update).not.toHaveBeenCalled();
             expect(prisma.tradeAccount.delete).not.toHaveBeenCalled();
+            expect(tx.tradeAccount.delete).not.toHaveBeenCalled();
         });
 
         test('E2. account owned by another user → 403; no archive update; no hard delete', async () => {
-            const { req, res, prisma } = makeCtx('acct-1', 'user-1');
-            prisma.tradeAccount.findUnique.mockResolvedValue({ id: 'acct-1', userId: 'user-2', archivedAt: null });
+            const ctx = makeCtx('acct-1', 'user-1');
+            const { req, res, prisma, tx } = ctx;
+            tx.$queryRaw.mockResolvedValue([{ id: 'acct-1', userId: 'user-2', archivedAt: null }]);
             await controller.deleteTradeAccount(req, res);
             expect(res.statusCode).toBe(403);
             expect(res.body.success).toBe(false);
-            expect(prisma.tradeAccount.update).not.toHaveBeenCalled();
+            expect(tx.tradeAccount.update).not.toHaveBeenCalled();
             expect(prisma.tradeAccount.delete).not.toHaveBeenCalled();
+            expect(tx.tradeAccount.delete).not.toHaveBeenCalled();
         });
 
         test('E3. already archived account → 400; no second archive; no hard delete', async () => {
-            const { req, res, prisma } = makeCtx('acct-1', 'user-1');
-            prisma.tradeAccount.findUnique.mockResolvedValue({
+            const ctx = makeCtx('acct-1', 'user-1');
+            const { req, res, prisma, tx } = ctx;
+            tx.$queryRaw.mockResolvedValue([{
                 id: 'acct-1', userId: 'user-1', archivedAt: new Date('2026-01-01T00:00:00Z'),
-            });
+            }]);
             await controller.deleteTradeAccount(req, res);
             expect(res.statusCode).toBe(400);
             expect(res.body.success).toBe(false);
-            expect(prisma.tradeAccount.update).not.toHaveBeenCalled();
+            expect(tx.tradeAccount.update).not.toHaveBeenCalled();
             expect(prisma.tradeAccount.delete).not.toHaveBeenCalled();
+            expect(tx.tradeAccount.delete).not.toHaveBeenCalled();
         });
 
         test('E4. account referenced by ACTIVE ads → 400 naming the count; no archive update; no hard delete', async () => {
-            const { req, res, prisma } = makeCtx('acct-1', 'user-1');
-            prisma.tradeAccount.findUnique.mockResolvedValue({ id: 'acct-1', userId: 'user-1', archivedAt: null });
-            prisma.ad.count.mockResolvedValue(2);
+            const ctx = makeCtx('acct-1', 'user-1');
+            const { req, res, prisma, tx } = ctx;
+            tx.$queryRaw.mockResolvedValue([{ id: 'acct-1', userId: 'user-1', archivedAt: null }]);
+            tx.ad.count.mockResolvedValue(2);
             await controller.deleteTradeAccount(req, res);
             expect(res.statusCode).toBe(400);
             expect(res.body.success).toBe(false);
             expect(res.body.message).toContain('2 active ad');
-            expect(prisma.tradeAccount.update).not.toHaveBeenCalled();
+            expect(tx.tradeAccount.update).not.toHaveBeenCalled();
             expect(prisma.tradeAccount.delete).not.toHaveBeenCalled();
+            expect(tx.tradeAccount.delete).not.toHaveBeenCalled();
+        });
+
+        test('E6. createAd rejects an ARCHIVED account server-side; no ad created; no hard delete', async () => {
+            const ctx = makeCtx('acct-1', 'user-1');
+            const { prisma, tx } = ctx;
+            prisma.user.findUnique.mockResolvedValue({ id: 'user-1', vendorUnallocatedBalance: 1000000 });
+            prisma.globalSettings.findUnique.mockResolvedValue(null);
+            // Account still owned by the caller and admin-approved — but archived.
+            tx.$queryRaw.mockResolvedValue([{
+                id: 'acct-1',
+                userId: 'user-1',
+                methodType: 'ZELLE',
+                adminVerificationStatus: 'APPROVED',
+                archivedAt: new Date('2026-01-01T00:00:00Z'),
+            }]);
+
+            const req = {
+                body: { type: 'SELL', crypto: 'USDC', minLimit: 10, maxLimit: 100, tradeAccountId: 'acct-1' },
+                user: { id: 'user-1' },
+                app: { get: (k) => (k === 'prisma' ? prisma : undefined) },
+            };
+            const res = {
+                statusCode: null, body: null,
+                status(code) { this.statusCode = code; return this; },
+                json(payload) { this.body = payload; return this; },
+            };
+            await adController.createAd(req, res);
+
+            expect(res.statusCode).toBe(400);
+            expect(res.body.success).toBe(false);
+            expect(res.body.message).toContain('archived');
+            expect(tx.ad.create).not.toHaveBeenCalled();
+            expect(prisma.ad.create).not.toHaveBeenCalled();
+            expect(prisma.tradeAccount.delete).not.toHaveBeenCalled();
+            expect(tx.tradeAccount.delete).not.toHaveBeenCalled();
+        });
+
+        test('E7. createAd happy path attaches an APPROVED live account inside the locked transaction', async () => {
+            const ctx = makeCtx('acct-1', 'user-1');
+            const { prisma, tx } = ctx;
+            prisma.user.findUnique.mockResolvedValue({ id: 'user-1', vendorUnallocatedBalance: 1000000 });
+            prisma.globalSettings.findUnique.mockResolvedValue(null);
+            tx.$queryRaw.mockResolvedValue([{
+                id: 'acct-1',
+                userId: 'user-1',
+                methodType: 'ZELLE',
+                adminVerificationStatus: 'APPROVED',
+                archivedAt: null,
+            }]);
+            tx.ad.create.mockResolvedValue({ id: 'ad-1', status: 'ACTIVE', tradeAccountId: 'acct-1' });
+
+            const req = {
+                body: { type: 'SELL', crypto: 'USDC', minLimit: 10, maxLimit: 100, tradeAccountId: 'acct-1' },
+                user: { id: 'user-1' },
+                app: { get: (k) => (k === 'prisma' ? prisma : undefined) },
+            };
+            const res = {
+                statusCode: null, body: null,
+                status(code) { this.statusCode = code; return this; },
+                json(payload) { this.body = payload; return this; },
+            };
+            await adController.createAd(req, res);
+
+            expect(res.statusCode).toBe(201);
+            expect(res.body.success).toBe(true);
+            expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+            expect(tx.ad.create).toHaveBeenCalledTimes(1);
+            const data = tx.ad.create.mock.calls[0][0].data;
+            expect(data.tradeAccountId).toBe('acct-1');
+            expect(data.paymentMethod).toBe('ZELLE'); // method comes from the LOCKED account read
+            expect(data.status).toBe('ACTIVE');
+            expect(tx.tradeAccount.delete).not.toHaveBeenCalled();
         });
 
         test('E5. success → soft archive: archivedAt timestamp + archiveReason USER_DELETED; 200; no hard delete', async () => {
-            const { req, res, prisma } = makeCtx('acct-1', 'user-1');
-            prisma.tradeAccount.findUnique.mockResolvedValue({ id: 'acct-1', userId: 'user-1', archivedAt: null });
-            prisma.ad.count.mockResolvedValue(0);
+            const ctx = makeCtx('acct-1', 'user-1');
+            const { req, res, prisma, tx } = ctx;
+            tx.$queryRaw.mockResolvedValue([{ id: 'acct-1', userId: 'user-1', archivedAt: null }]);
+            tx.ad.count.mockResolvedValue(0);
 
             const tBefore = Date.now();
             await controller.deleteTradeAccount(req, res);
@@ -236,8 +333,8 @@ describe('§4 trade-account handler behavior (mocked Prisma, no DB)', () => {
             expect(res.statusCode).toBe(200);
             expect(res.body.success).toBe(true);
 
-            expect(prisma.tradeAccount.update).toHaveBeenCalledTimes(1);
-            const call = prisma.tradeAccount.update.mock.calls[0][0];
+            expect(tx.tradeAccount.update).toHaveBeenCalledTimes(1);
+            const call = tx.tradeAccount.update.mock.calls[0][0];
             expect(call.where).toEqual({ id: 'acct-1' });
             expect(call.data.archiveReason).toBe('USER_DELETED');
             const ts = new Date(call.data.archivedAt).getTime();
@@ -247,6 +344,7 @@ describe('§4 trade-account handler behavior (mocked Prisma, no DB)', () => {
             // The durable statement of the safety contract: a hard delete
             // never happens on ANY path through this handler.
             expect(prisma.tradeAccount.delete).not.toHaveBeenCalled();
+            expect(tx.tradeAccount.delete).not.toHaveBeenCalled();
         });
     });
 });

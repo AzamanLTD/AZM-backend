@@ -35,46 +35,97 @@ exports.createAd = async (req, res) => {
         }
 
         // ── Phase F2: Validate tradeAccountId if provided ───────────────────
-        let linkedAccount = null;
-        if (tradeAccountId) {
-            linkedAccount = await prisma.tradeAccount.findUnique({
-                where: { id: tradeAccountId }
-            });
-            if (!linkedAccount) {
-                return res.status(400).json({ success: false, message: 'Trade account not found.' });
-            }
-            if (linkedAccount.userId !== vendorId) {
-                return res.status(403).json({ success: false, message: 'Trade account does not belong to you.' });
-            }
-            if (linkedAccount.adminVerificationStatus !== 'APPROVED') {
-                return res.status(400).json({ success: false, message: 'Trade account must be admin-approved before posting ads.' });
-            }
-        }
-
+        // ARCHIVED-ACCOUNT LIFECYCLE + ARCHIVE/AD-CREATE MUTUAL EXCLUSION
+        // (2026-10-20 review follow-up): an archived account may never be
+        // attached to a new ad — even one that still belongs to the caller
+        // and remains admin-approved. Validation previously read the
+        // account outside any transaction and never checked archivedAt, so
+        // a stale/direct request could create an ACTIVE ad against an
+        // archived account, and a concurrent archive could slip between
+        // the validation read and the ad insert.
+        //
+        // Protocol: when an account is attached, validation AND the ad
+        // insert run in ONE transaction that first takes a FOR UPDATE row
+        // lock on the TradeAccount row — the same lock
+        // tradeAccountController.deleteTradeAccount takes before archiving.
+        // Postgres serializes the pair on that lock: whichever commits
+        // first, the other re-reads the post-commit state (the archiver
+        // counts the new ACTIVE ad and refuses; the ad creator sees
+        // archivedAt and rejects). The lock is the FIRST statement in both
+        // transactions (identical single-row lock) — no lock-order
+        // inversion, no deadlock between the pair.
         // ── Phase F2: P2P ads use flat USDC pricing ─────────────────────────
         // No GHS oracle math. pricePerUSD is informational only (display rate).
         // The actual trade is amountCrypto USDC ↔ amountFiat USD (1:1 minus fee).
         let finalPrice = parseFloat(pricePerUSD || 1.0);
 
-        const formattedMethods = linkedAccount
-            ? linkedAccount.methodType
-            : (Array.isArray(paymentMethod) ? paymentMethod.join(', ') : (paymentMethod || 'Zelle'));
+        const fail = (status, message) => {
+            const e = new Error(message);
+            e.statusCode = status;
+            return e;
+        };
 
-        const newAd = await prisma.ad.create({
-            data: {
-                type:           type || 'SELL',
-                crypto:         crypto || 'USDC',
-                pricePerUSD:    finalPrice,
-                margin:         margin !== undefined ? parseFloat(margin) : null,
-                minLimit:       parseFloat(minLimit),
-                maxLimit:       parseFloat(maxLimit),
-                paymentMethod:  formattedMethods,
-                terms:          terms || null,
-                vendorId:       vendor.id,
-                status:         'ACTIVE',
-                tradeAccountId: linkedAccount?.id || null
-            }
-        });
+        let linkedAccount = null;
+        let newAd;
+        if (tradeAccountId) {
+            newAd = await prisma.$transaction(async (tx) => {
+                const locked = await tx.$queryRaw`
+                    SELECT "id", "userId", "methodType", "adminVerificationStatus", "archivedAt"
+                    FROM "TradeAccount"
+                    WHERE "id" = ${tradeAccountId}
+                    FOR UPDATE`;
+                const account = locked[0];
+
+                if (!account) throw fail(400, 'Trade account not found.');
+                if (account.userId !== vendorId) throw fail(403, 'Trade account does not belong to you.');
+                if (account.adminVerificationStatus !== 'APPROVED') {
+                    throw fail(400, 'Trade account must be admin-approved before posting ads.');
+                }
+                if (account.archivedAt) {
+                    throw fail(400, 'Trade account is archived and can no longer be attached to ads.');
+                }
+
+                linkedAccount = account;
+                return tx.ad.create({
+                    data: {
+                        type:           type || 'SELL',
+                        crypto:         crypto || 'USDC',
+                        pricePerUSD:    finalPrice,
+                        margin:         margin !== undefined ? parseFloat(margin) : null,
+                        minLimit:       parseFloat(minLimit),
+                        maxLimit:       parseFloat(maxLimit),
+                        paymentMethod:  account.methodType,
+                        terms:          terms || null,
+                        vendorId:       vendor.id,
+                        status:         'ACTIVE',
+                        tradeAccountId: account.id
+                    }
+                });
+            });
+        }
+
+        if (!newAd) {
+            // No linked account — the original non-account path, unchanged.
+            const formattedMethods = Array.isArray(paymentMethod)
+                ? paymentMethod.join(', ')
+                : (paymentMethod || 'Zelle');
+
+            newAd = await prisma.ad.create({
+                data: {
+                    type:           type || 'SELL',
+                    crypto:         crypto || 'USDC',
+                    pricePerUSD:    finalPrice,
+                    margin:         margin !== undefined ? parseFloat(margin) : null,
+                    minLimit:       parseFloat(minLimit),
+                    maxLimit:       parseFloat(maxLimit),
+                    paymentMethod:  formattedMethods,
+                    terms:          terms || null,
+                    vendorId:       vendor.id,
+                    status:         'ACTIVE',
+                    tradeAccountId: null
+                }
+            });
+        }
 
         const io = req.app.get('socketio');
         if (io) io.emit('market_update');
@@ -82,6 +133,12 @@ exports.createAd = async (req, res) => {
         res.status(201).json({ success: true, message: 'Ad posted successfully!', ad: newAd });
 
     } catch (error) {
+        // Validation failures thrown inside the account-attached transaction
+        // keep their intended status code and the { success, message } shape
+        // the existing account-validation errors already used.
+        if (error && error.statusCode) {
+            return res.status(error.statusCode).json({ success: false, message: error.message });
+        }
         logger.error('Create Ad Error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
