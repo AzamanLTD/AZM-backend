@@ -310,6 +310,18 @@ exports.initiateTrade = async (req, res) => {
         // refuse truthfully. Per §r42 the financial claim is RETAINED —
         // the key stays consumed for this attempt.
         if (tradeResult.adInactive) {
+            // PROVABLY PRE-ECONOMIC RELEASE (2026-10-20 review): the marker
+            // is produced ONLY by the transaction's FIRST statement — the
+            // locked ad-status recheck. When it returns, zero trades or
+            // queue entries have been written and zero economics ran; the
+            // transaction committed as a read-only no-op. §r42 requires the
+            // claim be RELEASED here, not retained — otherwise the key is
+            // permanently poisoned for a request that never proceeded.
+            // ONLY this exact branch marks releasable; every other 4xx
+            // after the transaction (and any thrown path) keeps RETAIN
+            // semantics, so a committed mutation can never release its own
+            // claim.
+            res.locals.financialClaimRelease = true;
             return res.status(400).json({ success: false, message: 'This advertisement is not active.' });
         }
 

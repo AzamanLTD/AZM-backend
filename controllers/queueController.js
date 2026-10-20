@@ -231,11 +231,32 @@ const initiateTradeWithQueue = async (req, res) => {
             // validation error (this path never succeeded).
             const admission = await prisma.$transaction(async (tx) => {
                 const locked = await tx.$queryRaw`
-                    SELECT "status", "archivedAt" FROM "Ad"
+                    SELECT "status", "archivedAt", "maxConcurrentTrades" FROM "Ad"
                     WHERE "id" = ${parseInt(adId)}
                     FOR UPDATE`;
                 if (!locked[0] || locked[0].status !== 'ACTIVE' || locked[0].archivedAt) {
                     return { refused: true };
+                }
+
+                // CAPACITY RECHECK UNDER THE LOCK (2026-10-20 review): the
+                // optimistic count above said the vendor was busy, but a
+                // slot may have freed (trade completed / cancelled) between
+                // that read and this lock. Re-run the CANONICAL active-trade
+                // filter inside the transaction: if a slot is now free, do
+                // NOT create a WAITING entry — the buyer proceeds through
+                // the canonical trade-initiation path (below, outside this
+                // transaction), which rechecks status and capacity under its
+                // own Ad-row lock and keeps its idempotency authority.
+                // canonical fall-through is the SAME direct handler call the
+                // not-busy optimistic path has always used.
+                const activeNow = await tx.trade.count({
+                    where: {
+                        vendorId: ad.vendorId,
+                        status: { in: ['PENDING_PAYMENT', 'PAID', 'DISPUTED'] },
+                    },
+                });
+                if (activeNow < locked[0].maxConcurrentTrades) {
+                    return { capacityFreed: true };
                 }
 
                 const existingQueueEntry = await tx.tradeQueue.findFirst({
@@ -271,6 +292,15 @@ const initiateTradeWithQueue = async (req, res) => {
 
             if (admission.refused) {
                 return res.status(400).json({ success: false, message: 'This advertisement is not active.' });
+            }
+            if (admission.capacityFreed) {
+                // A slot freed between the optimistic count and the locked
+                // recheck: no WAITING entry was created. Hand the request to
+                // the canonical trade-initiation path — the same direct
+                // fall-through the not-busy optimistic branch uses, which
+                // rechecks status and capacity inside its own transaction.
+                const tradeController = require('./tradeController');
+                return tradeController.initiateTrade(req, res);
             }
             if (admission.alreadyQueued) {
                 return res.status(200).json({
