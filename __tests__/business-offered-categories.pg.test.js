@@ -144,6 +144,132 @@ run('Business offered-categories contract (real PostgreSQL)', () => {
             'the failed update must not touch the stored offerings');
     });
 
+    // ─── 2b. Registration strictness (no silent filtering) ─────────────────
+
+    test('registration REJECTS an unknown category (never silently filtered)', async () => {
+        const user = await seedUser();
+        await expect(businessService.registerBusiness(db, {
+            userId: user.id,
+            businessName: 'OffCat Reject Biz',
+            category: 'HOSPITALITY',
+            offeredCategories: ['FOOD_BEVERAGE', 'NOT_A_CATEGORY'],
+        })).rejects.toThrow(/unknown category: NOT_A_CATEGORY/i);
+
+        const any = await db.businessProfile.findFirst({
+            where: { businessName: 'OffCat Reject Biz' } });
+        expect(any).toBeNull(); // rejected registration created NOTHING
+    });
+
+    test('registration REJECTS the primary category inside the offerings', async () => {
+        const user = await seedUser();
+        await expect(businessService.registerBusiness(db, {
+            userId: user.id,
+            businessName: 'OffCat Dup Biz',
+            category: 'HOSPITALITY',
+            offeredCategories: ['FOOD_BEVERAGE', 'HOSPITALITY'],
+        })).rejects.toThrow(/must not repeat the primary category/i);
+    });
+
+    // ─── 2c. Final-profile validation (key-order independence) ─────────────
+
+    test('PATCH rejects offerings repeating the NEW primary (category-first order)', async () => {
+        const user = await seedUser();
+        const biz = await seedBusiness(user, { offeredCategories: ['EDUCATION'] });
+        await expect(businessService.updateBusinessProfile(db, {
+            userId: user.id,
+            updates: {
+                category: 'FOOD_BEVERAGE',
+                offeredCategories: ['EDUCATION', 'FOOD_BEVERAGE'],
+            },
+        })).rejects.toThrow(/must not repeat the primary category/i);
+        const reread = await db.businessProfile.findUnique({ where: { id: biz.id } });
+        expect(reread.category).toBe('HOSPITALITY',
+            'the whole request must be rejected with zero mutation');
+        expect(reread.offeredCategories).toEqual(['EDUCATION']);
+    });
+
+    test('PATCH rejects offerings repeating the NEW primary (offerings-first order)', async () => {
+        const user = await seedUser();
+        const biz = await seedBusiness(user, { offeredCategories: ['EDUCATION'] });
+        await expect(businessService.updateBusinessProfile(db, {
+            userId: user.id,
+            updates: {
+                offeredCategories: ['EDUCATION', 'FOOD_BEVERAGE'],
+                category: 'FOOD_BEVERAGE',
+            },
+        })).rejects.toThrow(/must not repeat the primary category/i);
+        const reread = await db.businessProfile.findUnique({ where: { id: biz.id } });
+        expect(reread.category).toBe('HOSPITALITY');
+        expect(reread.offeredCategories).toEqual(['EDUCATION']);
+    });
+
+    test('PATCH accepts a combined category+offerings change that is consistent', async () => {
+        const user = await seedUser();
+        await seedBusiness(user, { offeredCategories: ['EDUCATION'] });
+        const updated = await businessService.updateBusinessProfile(db, {
+            userId: user.id,
+            updates: {
+                category: 'FOOD_BEVERAGE',
+                offeredCategories: ['ENTERTAINMENT', 'EDUCATION'],
+            },
+        });
+        expect(updated.category).toBe('FOOD_BEVERAGE');
+        expect(updated.offeredCategories).toEqual(['ENTERTAINMENT', 'EDUCATION']);
+    });
+
+    // ─── 2d. Overlay installer proofs (real PostgreSQL, disposable DB) ──────
+
+    const overlay = require('../infra/install-business-offered-categories-overlay');
+
+    test('installer adds the column to an existing table WITHOUT damaging rows', async () => {
+        const user = await seedUser();
+        const biz = await seedBusiness(user, { offeredCategories: ['EDUCATION'] });
+
+        // Absence proof: drop, then install.
+        await db.$executeRawUnsafe('ALTER TABLE "BusinessProfile" DROP COLUMN IF EXISTS "offeredCategories"');
+        const absent = await db.$queryRawUnsafe(
+            'SELECT 1 FROM information_schema.columns WHERE table_name = \'BusinessProfile\' AND column_name = \'offeredCategories\'');
+        expect(absent.length).toBe(0);
+
+        const r = await overlay.installBusinessOfferedCategoriesOverlay(db);
+        expect(r.ok).toBe(1);
+
+        const reread = await db.businessProfile.findUnique({ where: { id: biz.id } });
+        expect(reread).not.toBeNull(); // existing rows survive the overlay
+        expect(reread.businessName).toBe(biz.businessName);
+
+        const after = await db.$queryRawUnsafe(
+            'SELECT attnotnull, column_default FROM information_schema.columns c '
+          + 'JOIN pg_catalog.pg_attribute a ON a.attname = c.column_name '
+          + 'WHERE c.table_name = \'BusinessProfile\' AND c.column_name = \'offeredCategories\'');
+        expect(after.length).toBeGreaterThan(0);
+        expect(after[0].attnotnull).toBe(true);
+    });
+
+    test('installer is idempotent when the correctly shaped column exists', async () => {
+        // Column already exists from db push / previous install.
+        await seedBusiness(await seedUser());
+        const r = await overlay.installBusinessOfferedCategoriesOverlay(db);
+        expect(r.ok).toBe(1);
+        // A second install (true idempotence) must also succeed.
+        const r2 = await overlay.installBusinessOfferedCategoriesOverlay(db);
+        expect(r2.ok).toBe(1);
+    });
+
+    test('installer FAILS (fail-closed) when the column has an invalid shape', async () => {
+        // Corrupt the shape on purpose: wrong element type + nullable.
+        await db.$executeRawUnsafe('ALTER TABLE "BusinessProfile" DROP COLUMN IF EXISTS "offeredCategories"');
+        await db.$executeRawUnsafe(
+            'ALTER TABLE "BusinessProfile" ADD COLUMN IF NOT EXISTS "offeredCategories" TEXT');
+        await expect(overlay.installBusinessOfferedCategoriesOverlay(db))
+            .rejects.toThrow(/drift/i);
+
+        // Restore the correct shape for later tests.
+        await db.$executeRawUnsafe('ALTER TABLE "BusinessProfile" DROP COLUMN IF EXISTS "offeredCategories"');
+        const r = await overlay.installBusinessOfferedCategoriesOverlay(db);
+        expect(r.ok).toBe(1);
+    });
+
     test('non-array and >8 → 400 with zero mutation', async () => {
         const user = await seedUser();
         const biz = await seedBusiness(user);

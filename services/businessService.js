@@ -25,6 +25,37 @@ const UPDATABLE_FIELDS = new Set([
 // marketplace card renders a handful of icons; 8 is a hard, truthful cap.
 const MAX_OFFERED_CATEGORIES = 8;
 
+// WORKSTREAM D — STRICT contract for the additional-offerings list.
+//   • unknown categories are REJECTED (never silently filtered — this
+//     field is OUR contract and a silent drop would mask a client bug);
+//   • duplicate entries are deduped, first declaration order kept;
+//   • the empty list is a valid state (no additional offerings);
+//   • the PRIMARY category is never allowed inside the list: this field
+//     means ADDITIONAL offerings, not a second place to repeat the
+//     primary. The caller passes the FINAL intended primary category
+//     once known (final-profile validation, not key-order validation).
+function _validateOfferedCategories(value, primaryCategory) {
+    if (value === undefined || value === null) return [];
+    if (!Array.isArray(value)) {
+        throw new Error('offeredCategories must be an array of category names.');
+    }
+    if (value.length > MAX_OFFERED_CATEGORIES) {
+        throw new Error(`offeredCategories must contain at most ${MAX_OFFERED_CATEGORIES} categories.`);
+    }
+    const deduped = [];
+    for (const entry of value) {
+        if (!VALID_CATEGORIES.has(entry)) {
+            throw new Error(`offeredCategories contains an unknown category: ${entry}`);
+        }
+        if (!deduped.includes(entry)) deduped.push(entry);
+    }
+    if (primaryCategory && deduped.includes(primaryCategory)) {
+        throw new Error(
+            `offeredCategories must not repeat the primary category (${primaryCategory}); it lists only ADDITIONAL offerings.`);
+    }
+    return deduped;
+}
+
 // Ad appearance customization (2026-07-06): must be a 6-digit hex color
 // with leading '#', or null/empty string to clear the override and fall
 // back to the category-default tint.
@@ -83,11 +114,10 @@ const registerBusiness = async (prisma, {
 
     // 3. Create the BusinessProfile. No role flip — business ownership is
     //    determined solely by the existence of this record.
-    // WORKSTREAM D — explicitly declared additional offerings at
-    // registration (canonical enum, deduped; Zod already 400s unknowns).
-    const offered = Array.isArray(offeredCategories)
-        ? offeredCategories.filter((c) => VALID_CATEGORIES.has(c))
-        : [];
+    // WORKSTREAM D — STRICT: unknown categories REJECT the whole
+    // registration (never a silent drop); deduped; never repeats the
+    // effective primary category; [] is a valid no-offerings state.
+    const offered = _validateOfferedCategories(offeredCategories, cat);
     const businessProfile = await prisma.businessProfile.create({
         data: {
             userId,
@@ -253,20 +283,10 @@ const updateBusinessProfile = async (prisma, { userId, updates }) => {
             // Canonical-enum validated, deduped, capped. Unknown categories
             // 400 (this field is OUR contract — nothing silently dropped).
             // An empty array clears the offerings; that is a valid state.
-            if (!Array.isArray(value)) {
-                throw new Error('offeredCategories must be an array of category names.');
-            }
-            if (value.length > MAX_OFFERED_CATEGORIES) {
-                throw new Error(`offeredCategories must contain at most ${MAX_OFFERED_CATEGORIES} categories.`);
-            }
-            const deduped = [];
-            for (const entry of value) {
-                if (!VALID_CATEGORIES.has(entry)) {
-                    throw new Error(`offeredCategories contains an unknown category: ${entry}`);
-                }
-                if (!deduped.includes(entry)) deduped.push(entry);
-            }
-            data.offeredCategories = deduped;
+            // NOTE: the primary-duplicate rule is enforced AFTER the loop
+            // against the FINAL intended category, so it holds even when
+            // the same request also changes `category` (key-order-proof).
+            data.offeredCategories = _validateOfferedCategories(value);
             continue;
         }
         if (key === 'offerEscrowProtection') {
@@ -292,6 +312,19 @@ const updateBusinessProfile = async (prisma, { userId, updates }) => {
 
     if (Object.keys(data).length === 0) {
         throw new Error('No valid fields to update.');
+    }
+
+    // WORKSTREAM D — FINAL-PROFILE validation: the offered list must not
+    // repeat the FINAL primary category, even when the same request also
+    // changes `category`. This is deliberately AFTER the key loop so the
+    // result is independent of JSON key order (category-then-offerings or
+    // offerings-then-category must behave identically).
+    if (data.offeredCategories !== undefined) {
+        const finalCategory = data.category ?? profile.category;
+        if (data.offeredCategories.includes(finalCategory)) {
+            throw new Error(
+                `offeredCategories must not repeat the primary category (${finalCategory}); it lists only ADDITIONAL offerings.`);
+        }
     }
 
     // PRE-EXISTING DEFECT FIX (Workstream D, found by the first real-Postgres
