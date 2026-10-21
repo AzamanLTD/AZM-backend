@@ -27,12 +27,33 @@
 const { PrismaClient } = require('@prisma/client');
 const logger = require('../src/config/logger');
 
-// ADD COLUMN IF NOT EXISTS ... is the exact db-push render and is
-// idempotent; the validation below proves the resulting shape.
+// ADD COLUMN IF NOT EXISTS ... creates the intended shape when the
+// column is absent; the validation below proves the resulting shape.
 const ADD_COLUMN_SQL = `
   ALTER TABLE "BusinessProfile"
     ADD COLUMN IF NOT EXISTS "offeredCategories"
     "BusinessCategory"[] NOT NULL DEFAULT ARRAY[]::"BusinessCategory"[]`;
+
+// REALITY (found by CI run 39685609232): Prisma 'db push' renders scalar
+// LIST columns NULLABLE (it does so for every list field, e.g. amenities,
+// cuisineTypes), and 'ADD COLUMN IF NOT EXISTS' no-ops when db push
+// already created the column. So NOT NULL cannot be inherited from the
+// schema alone — the installer must ENFORCE it. Normalization is safe and
+// idempotent: NULL rows are backfilled to the empty array, the default is
+// re-asserted, then SET NOT NULL. Type drift stays FATAL (below).
+// NOTE: $executeRawUnsafe prepares ONE statement per call — keep the
+// three normalization steps as separate statements.
+const NULL_BACKFILL_SQL = `
+  UPDATE "BusinessProfile"
+     SET "offeredCategories" = ARRAY[]::"BusinessCategory"[]
+   WHERE "offeredCategories" IS NULL`;
+const SET_DEFAULT_SQL = `
+  ALTER TABLE "BusinessProfile"
+    ALTER COLUMN "offeredCategories"
+    SET DEFAULT ARRAY[]::"BusinessCategory"[]`;
+const SET_NOT_NULL_SQL = `
+  ALTER TABLE "BusinessProfile"
+    ALTER COLUMN "offeredCategories" SET NOT NULL`;
 
 // Schema-qualified pg_catalog proof of the intended shape. current_schema()
 // keeps the table_schema check honest under non-public search_path setups.
@@ -71,6 +92,9 @@ function defaultIsHonestEmptyArray(def) {
 
 async function installBusinessOfferedCategoriesOverlay(prisma) {
     await prisma.$executeRawUnsafe(ADD_COLUMN_SQL);
+    await prisma.$executeRawUnsafe(NULL_BACKFILL_SQL);
+    await prisma.$executeRawUnsafe(SET_DEFAULT_SQL);
+    await prisma.$executeRawUnsafe(SET_NOT_NULL_SQL);
 
     const rows = await prisma.$queryRawUnsafe(VALIDATE_SQL);
     if (rows.length !== 1) {
@@ -120,6 +144,11 @@ if (require.main === module) {
             + 'BusinessProfile.offeredCategories column installed '
             + '(idempotent, drift-guarded)'))
         .catch((error) => {
+            // CI runs with NODE_ENV=test which silences the logger — a
+            // fail-closed abort must ALWAYS be visible on stderr.
+            console.error(
+                '[business-offered-categories-overlay] failed: '
+                + error.message);
             logger.error(
                 '[business-offered-categories-overlay] failed: '
                 + error.message);

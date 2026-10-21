@@ -246,6 +246,40 @@ run('Business offered-categories contract (real PostgreSQL)', () => {
         expect(after[0].attnotnull).toBe(true);
     });
 
+    test('REGRESSION (CI run 39685609232): a db-push-rendered NULLABLE column with NULL rows is NORMALIZED to the NOT NULL contract', async () => {
+        // Prisma db push renders scalar LIST columns nullable (it does so
+        // for amenities/cuisineTypes too) and ADD COLUMN IF NOT EXISTS
+        // no-ops on an existing column, so the installer must ENFORCE
+        // NOT NULL itself. This is the exact CI shape that failed.
+        const biz = await seedBusiness(await seedUser());
+        await db.$executeRawUnsafe(
+            `ALTER TABLE "BusinessProfile" ALTER COLUMN "offeredCategories" DROP NOT NULL`);
+        await db.$executeRawUnsafe(
+            `UPDATE "BusinessProfile" SET "offeredCategories" = NULL WHERE id = '${biz.id}'`);
+        const before = await db.$queryRawUnsafe(
+            `SELECT attnotnull FROM pg_catalog.pg_attribute a
+             JOIN pg_catalog.pg_class cl ON cl.oid = a.attrelid
+             WHERE cl.relname = 'BusinessProfile'
+               AND a.attname = 'offeredCategories'`);
+        expect(before[0].attnotnull).toBe(false);
+
+        const r = await overlay.installBusinessOfferedCategoriesOverlay(db);
+        expect(r.ok).toBe(1);
+
+        // NOT NULL enforced, NULL row backfilled to the empty array...
+        const after = await db.$queryRawUnsafe(
+            `SELECT attnotnull FROM pg_catalog.pg_attribute a
+             JOIN pg_catalog.pg_class cl ON cl.oid = a.attrelid
+             WHERE cl.relname = 'BusinessProfile'
+               AND a.attname = 'offeredCategories'`);
+        expect(after[0].attnotnull).toBe(true);
+        const reread = await db.businessProfile.findUnique({ where: { id: biz.id } });
+        expect(reread.offeredCategories).toEqual([]);
+        // ...and a second install is still idempotent.
+        const r2 = await overlay.installBusinessOfferedCategoriesOverlay(db);
+        expect(r2.ok).toBe(1);
+    });
+
     test('installer is idempotent when the correctly shaped column exists', async () => {
         // Column already exists from db push / previous install.
         await seedBusiness(await seedUser());
