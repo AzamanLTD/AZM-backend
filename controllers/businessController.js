@@ -21,7 +21,8 @@ exports.registerBusiness = async (req, res) => {
         const userId = req.user.id;
         const {
             businessName, category, description, website,
-            phoneNumber, contactEmail, address, country, logoUrl, coverPhotoUrl
+            phoneNumber, contactEmail, address, country, logoUrl, coverPhotoUrl,
+            offeredCategories
         } = req.body;
 
         const cleanName = String(businessName || '').trim();
@@ -42,6 +43,7 @@ exports.registerBusiness = async (req, res) => {
             userId,
             businessName: cleanName,
             category: category || 'OTHER',
+            offeredCategories: Array.isArray(offeredCategories) ? offeredCategories : [],
             description, website, logoUrl, coverPhotoUrl,
             phoneNumber, contactEmail, address, country
         });

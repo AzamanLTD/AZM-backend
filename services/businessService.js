@@ -11,15 +11,19 @@
 const VALID_CATEGORIES = new Set([
     'FREELANCE_SERVICES', 'RETAIL', 'FOOD_BEVERAGE', 'TECHNOLOGY', 'REAL_ESTATE',
     'EDUCATION', 'HEALTH_WELLNESS', 'ENTERTAINMENT', 'LOGISTICS',
-    'FINANCIAL_SERVICES', 'OTHER'
+    'FINANCIAL_SERVICES', 'OTHER', 'HOSPITALITY' // Workstream D: Prisma-enum parity (see businessSchemas.js note)
 ]);
 
 // Fields a business owner may self-edit after registration.
 const UPDATABLE_FIELDS = new Set([
     'businessName', 'description', 'website', 'logoUrl', 'phoneNumber',
     'contactEmail', 'address', 'country', 'category', 'coverPhotoUrl',
-    'adAccentColor', 'offerEscrowProtection'
+    'adAccentColor', 'offerEscrowProtection', 'offeredCategories'
 ]);
+
+// WORKSTREAM D — maximum ADDITIONAL offerings a profile may declare. The
+// marketplace card renders a handful of icons; 8 is a hard, truthful cap.
+const MAX_OFFERED_CATEGORIES = 8;
 
 // Ad appearance customization (2026-07-06): must be a 6-digit hex color
 // with leading '#', or null/empty string to clear the override and fall
@@ -52,7 +56,7 @@ const _withEscrowProtectionCapability = (profile) => {
 // =============================================================================
 const registerBusiness = async (prisma, {
     userId, businessName, category, description, website, logoUrl, coverPhotoUrl,
-    phoneNumber, contactEmail, address, country
+    phoneNumber, contactEmail, address, country, offeredCategories
 }) => {
     if (!userId) throw new Error('userId is required.');
 
@@ -79,12 +83,18 @@ const registerBusiness = async (prisma, {
 
     // 3. Create the BusinessProfile. No role flip — business ownership is
     //    determined solely by the existence of this record.
+    // WORKSTREAM D — explicitly declared additional offerings at
+    // registration (canonical enum, deduped; Zod already 400s unknowns).
+    const offered = Array.isArray(offeredCategories)
+        ? offeredCategories.filter((c) => VALID_CATEGORIES.has(c))
+        : [];
     const businessProfile = await prisma.businessProfile.create({
         data: {
             userId,
             bizId,
             businessName: cleanName,
             category: cat,
+            offeredCategories: [...new Set(offered)],
             description: description ? String(description).slice(0, 500) : null,
             website: website ? String(website).slice(0, 255) : null,
             logoUrl: logoUrl || null,
@@ -239,6 +249,26 @@ const updateBusinessProfile = async (prisma, { userId, updates }) => {
             data.adAccentColor = value;
             continue;
         }
+        if (key === 'offeredCategories') {
+            // Canonical-enum validated, deduped, capped. Unknown categories
+            // 400 (this field is OUR contract — nothing silently dropped).
+            // An empty array clears the offerings; that is a valid state.
+            if (!Array.isArray(value)) {
+                throw new Error('offeredCategories must be an array of category names.');
+            }
+            if (value.length > MAX_OFFERED_CATEGORIES) {
+                throw new Error(`offeredCategories must contain at most ${MAX_OFFERED_CATEGORIES} categories.`);
+            }
+            const deduped = [];
+            for (const entry of value) {
+                if (!VALID_CATEGORIES.has(entry)) {
+                    throw new Error(`offeredCategories contains an unknown category: ${entry}`);
+                }
+                if (!deduped.includes(entry)) deduped.push(entry);
+            }
+            data.offeredCategories = deduped;
+            continue;
+        }
         if (key === 'offerEscrowProtection') {
             if (typeof value !== 'boolean') {
                 throw new Error('offerEscrowProtection must be a boolean.');
@@ -264,7 +294,12 @@ const updateBusinessProfile = async (prisma, { userId, updates }) => {
         throw new Error('No valid fields to update.');
     }
 
-    const updated = await prisma.businessProfile.update({ where: { userId }, data });
+    // PRE-EXISTING DEFECT FIX (Workstream D, found by the first real-Postgres
+    // proof of this path): `where: { userId }` was NEVER a valid Prisma unique
+    // selector (userId is indexed, not unique), so every real PATCH /profile
+    // call 500'd at client validation — the mock-prisma suites could not see
+    // it. The profile row is already resolved above; target its primary key.
+    const updated = await prisma.businessProfile.update({ where: { id: profile.id }, data });
     return _withEscrowProtectionCapability(updated);
 };
 

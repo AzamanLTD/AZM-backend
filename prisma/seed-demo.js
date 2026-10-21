@@ -93,6 +93,12 @@ async function main() {
             bizId: genBizId(),
             businessName: 'Royal Acacia Hotel',
             category: 'HOSPITALITY',
+            // WORKSTREAM D demo fixture — EXPLICIT multi-offering: the seed's
+            // own description declares "and restaurant", so the additional
+            // FOOD_BEVERAGE offering is grounded in the seeded record (never
+            // inferred). The other seeded businesses declare no additional
+            // offerings and correctly keep an empty list.
+            offeredCategories: ['FOOD_BEVERAGE'],
             description: 'A boutique hotel in the heart of Accra with 40 rooms, a pool, and restaurant.',
             website: 'https://demo.azm.azm/royal-acacia',
             phoneNumber: '+233500000001',
