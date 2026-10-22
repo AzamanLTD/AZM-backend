@@ -37,8 +37,26 @@ const prisma = new PrismaClient();
         await prisma.$connect();
         logger.info('Prisma connected successfully');
     } catch (error) {
-        logger.error({ err: error }, 'Database connection failed');
-        process.exit(1);
+        // Production/dev keep fail-fast semantics: a server that cannot reach
+        // its database at boot must not limp up half-initialized. Under the
+        // TEST battery, however, this module is required transitively by
+        // suites inside a single --runInBand jest process. There, an eager
+        // process.exit(1) on a TRANSIENT connect failure (e.g. the gate's
+        // cumulative Prisma handles momentarily exhausting
+        // max_connections — postgres "sorry, too many clients already")
+        // kills the shared worker and wedges the WHOLE battery with the
+        // failing suite still reported PASS (observed in the 2026-10-22
+        // gate run: FATAL in the postgres log at the exact second the
+        // jest log went silent). In test mode we log loudly and continue:
+        // Prisma reconnects lazily on the next query, so a genuinely down
+        // database still fails the suite honestly — only the process-level
+        // collateral is removed.
+        if (process.env.NODE_ENV === 'test') {
+            logger.error({ err: error }, 'Database connection failed (test mode: continuing without exit)');
+        } else {
+            logger.error({ err: error }, 'Database connection failed');
+            process.exit(1);
+        }
     }
 })();
 

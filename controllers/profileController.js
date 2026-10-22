@@ -1,4 +1,5 @@
 const logger = require('../src/config/logger');
+const { buildBalanceValuation } = require('../src/services/balanceValuationService');
 // controllers/profileController.js
 // =============================================================================
 // AZAMAN V4 — PROFILE CONTROLLER
@@ -265,13 +266,38 @@ exports.getBalance = async (req, res) => {
             return res.status(404).json({ success: false, message: 'User not found.' });
         }
 
+        // FX-balance workstream — the authoritative balance VALUATION
+        // contract (additive: every legacy field above is untouched). The
+        // valuation is a READ-ONLY model: it can never mutate balances, and
+        // an FX revaluation only changes the DISPLAY value of the available
+        // USDC component. Full contract:
+        // docs/native-ghs-fx-audit.md §Valuation contract.
+        let valuation = null;
+        let valuationError = null;
+        try {
+            valuation = await buildBalanceValuation({ prisma, userId });
+        } catch (valuationErr) {
+            // Honest degradation: the legacy balance fields remain
+            // authoritative and available; a valuation failure is never
+            // hidden as a fabricated zero/complete valuation.
+            valuationError = valuationErr.message;
+            logger.warn({ err: valuationErr }, '[profile.getBalance] valuation unavailable (legacy fields still returned)');
+        }
+
         return res.status(200).json({
             success: true,
             data: {
                 ...user,
                 totalBalance: user.availableBalance + user.vendorUnallocatedBalance,
                 currency: 'USDC',
-                lastUpdated: new Date().toISOString()
+                lastUpdated: new Date().toISOString(),
+                // Additive valuation block. `available` when null-free;
+                // `valuationError` names the honest reason otherwise.
+                valuation,
+                valuationStatus: valuation
+                    ? valuation.valuationStatus
+                    : 'VALUATION_UNAVAILABLE',
+                ...(valuationError ? { valuationError } : {})
             }
         });
 

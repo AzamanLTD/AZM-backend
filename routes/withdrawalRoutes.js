@@ -2,6 +2,9 @@ const logger = require('../src/config/logger');
 const express = require('express');
 const router = express.Router();
 const withdrawalController = require('../controllers/withdrawalController');
+
+// FX-balance workstream — fresh-canonical-rate transaction gate (§Gate scope)
+const { requireFreshFxRate } = require('../middleware/fxTransactionGateMiddleware');
 const authMiddleware = require('../middleware/authMiddleware');
 const { validate } = require('../middleware/validate');
 const { fiatWithdrawalSchema, cryptoWithdrawalSchema } = require('../services/validation/financialSchemas');
@@ -27,11 +30,21 @@ const protect = authMiddleware.protect;
 // res-silent (outcomes live in the Withdrawal / CustodyExecution /
 // reconciliation state machines). This is the same disposition contract the
 // r42 review approved for the in-transaction-wired convert route.
+// FX-balance workstream — server-side transaction gate. The fiat payout
+// path is FX-dependent (USDC debit ⇄ GHS payout via Moolre at the canonical
+// rate): with no FRESH canonical rate it is refused 503 here, BEFORE the
+// idempotency claim and before any controller money movement. A saved/demo
+// fallback rate is display-only and never opens this gate.
 router.post('/fiat',
     protect, require2FA(),
+    requireFreshFxRate(),
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
     validate(fiatWithdrawalSchema),
     withdrawalController.fiatWithdrawal);
+// /crypto is deliberately NOT FX-gated: the on-chain payout is USDC-native
+// (the only external feed it reads is the MATIC/USDC gas oracle) and the
+// shared contract keeps USDC-native actions enabled. See
+// docs/native-ghs-fx-audit.md §Gate scope.
 router.post('/crypto',
     protect, require2FA(),
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
