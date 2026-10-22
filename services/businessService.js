@@ -314,17 +314,23 @@ const updateBusinessProfile = async (prisma, { userId, updates }) => {
         throw new Error('No valid fields to update.');
     }
 
-    // WORKSTREAM D — FINAL-PROFILE validation: the offered list must not
-    // repeat the FINAL primary category, even when the same request also
-    // changes `category`. This is deliberately AFTER the key loop so the
-    // result is independent of JSON key order (category-then-offerings or
-    // offerings-then-category must behave identically).
-    if (data.offeredCategories !== undefined) {
-        const finalCategory = data.category ?? profile.category;
-        if (data.offeredCategories.includes(finalCategory)) {
-            throw new Error(
-                `offeredCategories must not repeat the primary category (${finalCategory}); it lists only ADDITIONAL offerings.`);
-        }
+    // WORKSTREAM D — FINAL-PROFILE validation: the FINAL offered list must
+    // not repeat the FINAL primary category — checked on EVERY PATCH, not
+    // only when this request happens to submit offerings. A PATCH that
+    // changes ONLY the primary category to a value already sitting in the
+    // stored offerings must be rejected too, otherwise the update would
+    // silently produce a profile whose own category is listed as an
+    // "additional" offering. Deliberately AFTER the key loop so the check
+    // is independent of JSON key order (category-then-offerings and
+    // offerings-then-category behave identically). Omission preserves the
+    // existing list; explicit null already resolved to [] above.
+    const finalCategory = data.category ?? profile.category;
+    const finalOfferings = data.offeredCategories !== undefined
+        ? data.offeredCategories
+        : (profile.offeredCategories || []);
+    if (finalOfferings.includes(finalCategory)) {
+        throw new Error(
+            `offeredCategories must not repeat the primary category (${finalCategory}); it lists only ADDITIONAL offerings.`);
     }
 
     // PRE-EXISTING DEFECT FIX (Workstream D, found by the first real-Postgres

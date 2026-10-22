@@ -255,6 +255,41 @@ run('Business offered-categories contract (real PostgreSQL)', () => {
         expect(updated.offeredCategories).toEqual(['ENTERTAINMENT', 'EDUCATION']);
     });
 
+    // ─── 2c-bis. Final-profile invariant on category-ONLY PATCH ────────────
+
+    test('PATCH that changes ONLY the primary category to a value already in '
+        + 'the STORED offerings is rejected with zero mutation', async () => {
+        const user = await seedUser();
+        const biz = await seedBusiness(user, { offeredCategories: ['FOOD_BEVERAGE'] });
+
+        // offerings OMITTED from the request entirely — the stored list is
+        // the final list, so the new primary would repeat an "additional" offering.
+        await expect(businessService.updateBusinessProfile(db, {
+            userId: user.id,
+            updates: { category: 'FOOD_BEVERAGE' },
+        })).rejects.toThrow(/must not repeat the primary category \(FOOD_BEVERAGE\)/i);
+
+        const reread = await db.businessProfile.findUnique({ where: { id: biz.id } });
+        expect(reread.category).toBe('HOSPITALITY',
+            'the rejected PATCH must leave the primary category untouched');
+        expect(reread.offeredCategories).toEqual(['FOOD_BEVERAGE'],
+            'the rejected PATCH must leave the stored offerings untouched');
+    });
+
+    test('category-ONLY PATCH to a NON-colliding category succeeds and PRESERVES '
+        + 'the stored offerings (omission never clears)', async () => {
+        const user = await seedUser();
+        await seedBusiness(user, { offeredCategories: ['FOOD_BEVERAGE'] });
+
+        const updated = await businessService.updateBusinessProfile(db, {
+            userId: user.id,
+            updates: { category: 'TECHNOLOGY' },
+        });
+        expect(updated.category).toBe('TECHNOLOGY');
+        expect(updated.offeredCategories).toEqual(['FOOD_BEVERAGE'],
+            'an omitted offerings field preserves the stored list');
+    });
+
     // ─── 2d. Overlay installer proofs (real PostgreSQL, disposable DB) ──────
 
     const overlay = require('../infra/install-business-offered-categories-overlay');
