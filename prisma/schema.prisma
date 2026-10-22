@@ -2760,6 +2760,13 @@ model BusinessProfile {
   bizId           String           @unique // BIZ-XXXXXXXXX (9 digits after prefix)
   moolrePaymentId String?          @unique // *203*<id># USSD payment ID for businesses (Moolre on-ramp, 2026-06-23)
   // Marketplace hierarchy additions (2026-06-24)
+  // WORKSTREAM D (2026-10-21) — the business's ADDITIONAL declared offerings,
+  // a subset of the canonical BusinessCategory enum. The PRIMARY category
+  // stays in the separate `category` column; this list only ever carries
+  // explicitly declared offerings (never inferred from amenities, cuisine
+  // types or description words). Backward compatible: existing records keep
+  // an empty list, which is a VALID state (no additional offerings).
+  offeredCategories BusinessCategory[] @default([])
   subcategory     String? // wire value from BusinessSubcategory (e.g. "RESTAURANT_FINE_DINING")
   priceRange      Int? // 1=₵  2=₵₵  3=₵₵₵  4=₵₵₵₵
   amenities       String[] // ["WIFI","PARKING","AC","POOL"] — profile-level amenities

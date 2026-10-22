@@ -31,7 +31,10 @@ const { z } = require('zod');
 const BUSINESS_CATEGORIES = [
   'FREELANCE_SERVICES', 'RETAIL', 'FOOD_BEVERAGE', 'TECHNOLOGY', 'REAL_ESTATE',
   'EDUCATION', 'HEALTH_WELLNESS', 'ENTERTAINMENT', 'LOGISTICS',
-  'FINANCIAL_SERVICES', 'OTHER',
+  'FINANCIAL_SERVICES', 'OTHER', 'HOSPITALITY', // Workstream D: restores parity
+  // with the Prisma BusinessCategory enum — HOSPITALITY was added to the
+  // enum in the 2026-06-24 marketplace-hierarchy work but these validation
+  // lists were never updated, so hotel registration/category-change 400'd.
 ];
 
 // businessName: trimmed, 2–100 chars (controller 25-27 + service 43-44).
@@ -49,11 +52,26 @@ const description = z.string().max(500, 'description must be max 500 chars.').op
 // to string; .optional() keeps them non-required exactly as today.
 const freeString = z.string().optional();
 
+// WORKSTREAM D — additional declared offerings. Canonical enum values only;
+// unknown entries must 400 (this is OUR new field, so unlike the legacy
+// category passthrough we validate strictly). Max 8 keeps the marketplace
+// card honest (it renders at most a handful of offering icons). An empty
+// array is valid — "no additional offerings" is a real state. null is
+// accepted and resolves to [] at the service/controller boundary (same
+// as omission); every other malformed shape (string, number, object,
+// array of unknowns) still 400s here.
+const offeredCategories = z
+  .array(z.enum(BUSINESS_CATEGORIES))
+  .max(8, 'offeredCategories must contain at most 8 categories.')
+  .nullable()
+  .optional();
+
 // POST /api/business/register -------------------------------------------------
 // category enum-restricted: register DOES 400 on an unknown category today.
 const businessRegisterSchema = z.object({
   businessName,
   category: z.enum(BUSINESS_CATEGORIES).optional(),
+  offeredCategories,
   description,
   website: freeString,
   logoUrl: freeString,
@@ -70,6 +88,7 @@ const businessRegisterSchema = z.object({
 const businessUpdateSchema = z.object({
   businessName: businessName.optional(),
   category: freeString,
+  offeredCategories,
   description,
   website: freeString,
   logoUrl: freeString,

@@ -49,7 +49,12 @@ paths are:
   5. wallet-address overlay
   6. **Marketplace Discovery overlay (PR #349)**
   7. azamanId backfill
-  8. treasury lookup — the susu-foundation seed and id-number encryption
+  8. **Business offered-categories overlay (PR #366)** — adds
+     `BusinessProfile.offeredCategories` (`"BusinessCategory"[] NOT NULL
+     DEFAULT ARRAY[]::"BusinessCategory"[]`, the exact `db push` shape) if
+     absent and fail-closed validates the shape via pg_catalog
+     (enum-array element type, NOT NULL, empty-array default).
+  9. treasury lookup — the susu-foundation seed and id-number encryption
      run ONLY when the treasury row is missing or a forced release is
      requested; otherwise autoRelease skips both and finishes early.
   Separately, AFTER `autoRelease()` completes, `bootTreasury()` runs the
@@ -62,6 +67,10 @@ Two consequences of that split:
 - An installer added ONLY to the release chain (e.g. a future
   `npm run release` addition) does NOT automatically provision the
   production database, because the release chain itself never runs.
+  (The offered-categories installer of PR #366 is wired into BOTH paths:
+  `npm run release` runs `infra/install-business-offered-categories-overlay.js`
+  standalone, and `infra/autoRelease.js` calls its exported
+  `installBusinessOfferedCategoriesOverlay(prisma)` at every boot.)
 - The boot-time path is NOT equivalent to the full release chain: it is a
   SMALLER subset. In particular `infra/autoRelease.js` includes the
   Marketplace Discovery installer but does NOT run

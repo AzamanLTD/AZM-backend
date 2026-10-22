@@ -1257,6 +1257,45 @@ hardware wallet.
 
 ---
 
+## Business profile — `/business` (registration & offered categories)
+
+### `POST /business/register` (auth)
+
+Creates the caller's `BusinessProfile` (idempotent: returns the existing
+profile with `alreadyRegistered: true` if one exists — no role flip).
+
+`offeredCategories` — **additional declared offerings** (Workstream D,
+2026-10-21):
+
+- **Type**: array of `BusinessCategory` enum names (the canonical enum —
+  no invented taxonomy). **Constraints**: deduplicated (first declaration
+  order kept), at most **8** entries.
+- **Semantics**: ADDITIONAL offerings only — the entry must never repeat
+  the profile's primary `category`, which stays in its own column and is
+  the single authority for the primary classification.
+- **Error behavior (400, whole request rejected, zero mutation)**:
+  - non-array body → `offeredCategories must be an array of category names.`
+  - unknown category value → `offeredCategories contains an unknown category: <value>` — invalid input is NEVER silently filtered out
+  - more than 8 entries → `offeredCategories must contain at most 8 categories.`
+  - primary-category duplicate → `offeredCategories must not repeat the primary category (<category>); it lists only ADDITIONAL offerings.`
+- **Backward compatibility**: omitted / `null` → empty list, which is a
+  VALID state (no additional offerings). Existing rows keep `[]`.
+
+### `PATCH /business/profile` (auth, owner-only)
+
+Accepts `offeredCategories` under the same constraints. Validation is
+based on the **final intended profile**, not JSON key order: a request
+that changes `category` AND `offeredCategories` together is validated
+against the final primary category, so repeating the newly-chosen primary
+category in the offerings list is rejected identically in either key
+order. An explicit `[]` clears the offerings — a valid state.
+
+Provisioning: the `BusinessProfile.offeredCategories` column
+(`"BusinessCategory"[] NOT NULL DEFAULT ARRAY[]::"BusinessCategory"[]`)
+is provisioned by `infra/install-business-offered-categories-overlay.js`
+via `npm run release` and via the boot-time `infra/autoRelease.js` chain
+(the real path on the Render Free plan), fail-closed on shape drift.
+
 ## Real-time events (Socket.io)
 
 ### Rooms

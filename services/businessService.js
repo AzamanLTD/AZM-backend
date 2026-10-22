@@ -11,15 +11,62 @@
 const VALID_CATEGORIES = new Set([
     'FREELANCE_SERVICES', 'RETAIL', 'FOOD_BEVERAGE', 'TECHNOLOGY', 'REAL_ESTATE',
     'EDUCATION', 'HEALTH_WELLNESS', 'ENTERTAINMENT', 'LOGISTICS',
-    'FINANCIAL_SERVICES', 'OTHER'
+    'FINANCIAL_SERVICES', 'OTHER', 'HOSPITALITY' // Workstream D: Prisma-enum parity (see businessSchemas.js note)
 ]);
 
 // Fields a business owner may self-edit after registration.
 const UPDATABLE_FIELDS = new Set([
     'businessName', 'description', 'website', 'logoUrl', 'phoneNumber',
     'contactEmail', 'address', 'country', 'category', 'coverPhotoUrl',
-    'adAccentColor', 'offerEscrowProtection'
+    'adAccentColor', 'offerEscrowProtection', 'offeredCategories'
 ]);
+
+// WORKSTREAM D — maximum ADDITIONAL offerings a profile may declare. The
+// marketplace card renders a handful of icons; 8 is a hard, truthful cap.
+const MAX_OFFERED_CATEGORIES = 8;
+
+// WORKSTREAM D — STRICT contract for the additional-offerings list.
+//   • unknown categories are REJECTED (never silently filtered — this
+//     field is OUR contract and a silent drop would mask a client bug);
+//   • duplicate entries are deduped, first declaration order kept;
+//   • the empty list is a valid state (no additional offerings);
+//   • the PRIMARY category is never allowed inside the list: this field
+//     means ADDITIONAL offerings, not a second place to repeat the
+// Typed validation error for the register/update paths. Controllers use
+// `err.statusCode` / `err.name` to map these DELIBERATELY to HTTP 400 — a
+// plain message-regex classifier silently misses new validation messages
+// (exactly how the primary/offering overlap error leaked out as a 500).
+class ProfileValidationError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'ProfileValidationError';
+        this.statusCode = 400;
+    }
+}
+
+//     primary. The caller passes the FINAL intended primary category
+//     once known (final-profile validation, not key-order validation).
+function _validateOfferedCategories(value, primaryCategory) {
+    if (value === undefined || value === null) return [];
+    if (!Array.isArray(value)) {
+        throw new ProfileValidationError('offeredCategories must be an array of category names.');
+    }
+    if (value.length > MAX_OFFERED_CATEGORIES) {
+        throw new ProfileValidationError(`offeredCategories must contain at most ${MAX_OFFERED_CATEGORIES} categories.`);
+    }
+    const deduped = [];
+    for (const entry of value) {
+        if (!VALID_CATEGORIES.has(entry)) {
+            throw new ProfileValidationError(`offeredCategories contains an unknown category: ${entry}`);
+        }
+        if (!deduped.includes(entry)) deduped.push(entry);
+    }
+    if (primaryCategory && deduped.includes(primaryCategory)) {
+        throw new ProfileValidationError(
+            `offeredCategories must not repeat the primary category (${primaryCategory}); it lists only ADDITIONAL offerings.`);
+    }
+    return deduped;
+}
 
 // Ad appearance customization (2026-07-06): must be a 6-digit hex color
 // with leading '#', or null/empty string to clear the override and fall
@@ -52,7 +99,7 @@ const _withEscrowProtectionCapability = (profile) => {
 // =============================================================================
 const registerBusiness = async (prisma, {
     userId, businessName, category, description, website, logoUrl, coverPhotoUrl,
-    phoneNumber, contactEmail, address, country
+    phoneNumber, contactEmail, address, country, offeredCategories
 }) => {
     if (!userId) throw new Error('userId is required.');
 
@@ -64,7 +111,7 @@ const registerBusiness = async (prisma, {
 
     const cleanName = String(businessName || '').trim();
     if (cleanName.length < 2 || cleanName.length > 100) {
-        throw new Error('businessName must be 2–100 chars.');
+        throw new ProfileValidationError('businessName must be 2–100 chars.');
     }
     const cat = category && VALID_CATEGORIES.has(category) ? category : 'OTHER';
 
@@ -79,12 +126,17 @@ const registerBusiness = async (prisma, {
 
     // 3. Create the BusinessProfile. No role flip — business ownership is
     //    determined solely by the existence of this record.
+    // WORKSTREAM D — STRICT: unknown categories REJECT the whole
+    // registration (never a silent drop); deduped; never repeats the
+    // effective primary category; [] is a valid no-offerings state.
+    const offered = _validateOfferedCategories(offeredCategories, cat);
     const businessProfile = await prisma.businessProfile.create({
         data: {
             userId,
             bizId,
             businessName: cleanName,
             category: cat,
+            offeredCategories: [...new Set(offered)],
             description: description ? String(description).slice(0, 500) : null,
             website: website ? String(website).slice(0, 255) : null,
             logoUrl: logoUrl || null,
@@ -210,65 +262,120 @@ const getSubcategories = async (prisma, { parentWire } = {}) => {
 // 4. UPDATE BUSINESS PROFILE — owner-only, whitelisted fields.
 // =============================================================================
 const updateBusinessProfile = async (prisma, { userId, updates }) => {
-    const profile = await prisma.businessProfile.findFirst({ where: { userId } });
-    if (!profile) throw new Error('No business profile found for this user.');
+    // CONCURRENCY CONTRACT (review pass on 46d0b5d): two concurrent PATCHes
+    // can each read the OLD row, each pass the final-profile validation,
+    // and each commit its own column — leaving the stored profile with
+    // its primary category repeated in the offerings. The read, the
+    // validation and the write now run inside ONE transaction with the
+    // profile row locked FOR UPDATE: the second concurrent PATCH blocks
+    // on the row lock and, when it wakes up, re-reads the freshly
+    // committed state and validates against THAT. Whichever order the
+    // two requests serialize in, the invariant holds on every commit.
+    return prisma.$transaction(async (tx) => {
+        const locked = await tx.$queryRaw`
+            SELECT id FROM "BusinessProfile"
+            WHERE "userId" = ${userId}
+            LIMIT 1
+            FOR UPDATE`;
+        if (!locked || locked.length === 0) {
+            throw new ProfileValidationError('No business profile found for this user.');
+        }
+        const profile = await tx.businessProfile.findUnique({ where: { id: locked[0].id } });
+        if (!profile) throw new ProfileValidationError('No business profile found for this user.');
 
-    const data = {};
-    for (const [key, value] of Object.entries(updates || {})) {
-        if (!UPDATABLE_FIELDS.has(key)) continue;
-        if (key === 'category') {
-            if (VALID_CATEGORIES.has(value)) data.category = value;
-            continue;
-        }
-        if (key === 'businessName') {
-            const clean = String(value || '').trim();
-            if (clean.length < 2 || clean.length > 100) {
-                throw new Error('businessName must be 2–100 chars.');
-            }
-            data.businessName = clean;
-            continue;
-        }
-        if (key === 'adAccentColor') {
-            if (value === null || value === '') {
-                data.adAccentColor = null; // explicit clear -> revert to category tint
+        const data = {};
+        for (const [key, value] of Object.entries(updates || {})) {
+            if (!UPDATABLE_FIELDS.has(key)) continue;
+            if (key === 'category') {
+                if (VALID_CATEGORIES.has(value)) data.category = value;
                 continue;
             }
-            if (!HEX_COLOR_RE.test(value)) {
-                throw new Error('adAccentColor must be a 6-digit hex color like "#FFAA00".');
-            }
-            data.adAccentColor = value;
-            continue;
-        }
-        if (key === 'offerEscrowProtection') {
-            if (typeof value !== 'boolean') {
-                throw new Error('offerEscrowProtection must be a boolean.');
-            }
-            const existingMeta = profile.businessMeta && typeof profile.businessMeta === 'object'
-                ? profile.businessMeta
-                : {};
-            data.businessMeta = {
-                ...existingMeta,
-                escrowProtection: {
-                    ...(existingMeta.escrowProtection && typeof existingMeta.escrowProtection === 'object'
-                        ? existingMeta.escrowProtection
-                        : {}),
-                    enabled: value
+            if (key === 'businessName') {
+                const clean = String(value || '').trim();
+                if (clean.length < 2 || clean.length > 100) {
+                    throw new ProfileValidationError('businessName must be 2–100 chars.');
                 }
-            };
-            continue;
+                data.businessName = clean;
+                continue;
+            }
+            if (key === 'adAccentColor') {
+                if (value === null || value === '') {
+                    data.adAccentColor = null; // explicit clear -> revert to category tint
+                    continue;
+                }
+                if (!HEX_COLOR_RE.test(value)) {
+                    throw new ProfileValidationError('adAccentColor must be a 6-digit hex color like "#FFAA00".');
+                }
+                data.adAccentColor = value;
+                continue;
+            }
+            if (key === 'offeredCategories') {
+                // Canonical-enum validated, deduped, capped. Unknown categories
+                // 400 (this field is OUR contract — nothing silently dropped).
+                // An empty array clears the offerings; that is a valid state.
+                // NOTE: the primary-duplicate rule is enforced AFTER the loop
+                // against the FINAL intended category, so it holds even when
+                // the same request also changes `category` (key-order-proof).
+                data.offeredCategories = _validateOfferedCategories(value);
+                continue;
+            }
+            if (key === 'offerEscrowProtection') {
+                if (typeof value !== 'boolean') {
+                    throw new ProfileValidationError('offerEscrowProtection must be a boolean.');
+                }
+                const existingMeta = profile.businessMeta && typeof profile.businessMeta === 'object'
+                    ? profile.businessMeta
+                    : {};
+                data.businessMeta = {
+                    ...existingMeta,
+                    escrowProtection: {
+                        ...(existingMeta.escrowProtection && typeof existingMeta.escrowProtection === 'object'
+                            ? existingMeta.escrowProtection
+                            : {}),
+                        enabled: value
+                    }
+                };
+                continue;
+            }
+            data[key] = value;
         }
-        data[key] = value;
-    }
 
-    if (Object.keys(data).length === 0) {
-        throw new Error('No valid fields to update.');
-    }
+        if (Object.keys(data).length === 0) {
+            throw new ProfileValidationError('No valid fields to update.');
+        }
 
-    const updated = await prisma.businessProfile.update({ where: { userId }, data });
-    return _withEscrowProtectionCapability(updated);
+        // WORKSTREAM D — FINAL-PROFILE validation: the FINAL offered list must
+        // not repeat the FINAL primary category — checked on EVERY PATCH, not
+        // only when this request happens to submit offerings. A PATCH that
+        // changes ONLY the primary category to a value already sitting in the
+        // stored offerings must be rejected too, otherwise the update would
+        // silently produce a profile whose own category is listed as an
+        // "additional" offering. Deliberately AFTER the key loop so the check
+        // is independent of JSON key order (category-then-offerings and
+        // offerings-then-category behave identically). Omission preserves the
+        // existing list; explicit null already resolved to [] above.
+        const finalCategory = data.category ?? profile.category;
+        const finalOfferings = data.offeredCategories !== undefined
+            ? data.offeredCategories
+            : (profile.offeredCategories || []);
+        if (finalOfferings.includes(finalCategory)) {
+            throw new ProfileValidationError(
+                `offeredCategories must not repeat the primary category (${finalCategory}); it lists only ADDITIONAL offerings.`);
+        }
+
+        // PRE-EXISTING DEFECT FIX (Workstream D, found by the first real-Postgres
+        // proof of this path): `where: { userId }` was NEVER a valid Prisma unique
+        // selector (userId is indexed, not unique), so every real PATCH /profile
+        // call 500'd at client validation — the mock-prisma suites could not see
+        // it. The profile row is already resolved above; target its primary key.
+
+        const updated = await tx.businessProfile.update({ where: { id: profile.id }, data });
+        return _withEscrowProtectionCapability(updated);
+    });
 };
 
 module.exports = {
+    ProfileValidationError,
     registerBusiness,
     getBusinessProfile,
     searchBusinesses,

@@ -21,7 +21,8 @@ exports.registerBusiness = async (req, res) => {
         const userId = req.user.id;
         const {
             businessName, category, description, website,
-            phoneNumber, contactEmail, address, country, logoUrl, coverPhotoUrl
+            phoneNumber, contactEmail, address, country, logoUrl, coverPhotoUrl,
+            offeredCategories
         } = req.body;
 
         const cleanName = String(businessName || '').trim();
@@ -42,6 +43,7 @@ exports.registerBusiness = async (req, res) => {
             userId,
             businessName: cleanName,
             category: category || 'OTHER',
+            offeredCategories: Array.isArray(offeredCategories) ? offeredCategories : [],
             description, website, logoUrl, coverPhotoUrl,
             phoneNumber, contactEmail, address, country
         });
@@ -53,7 +55,12 @@ exports.registerBusiness = async (req, res) => {
         });
     } catch (err) {
         logger.error({ err: err }, '[registerBusiness] error');
-        return res.status(500).json({ success: false, message: err.message });
+        // Typed validation failures (e.g. the primary category repeated in
+        // offeredCategories, a cross-field rule the Zod edge schema cannot
+        // express) are client errors: 400, nothing created. Anything else
+        // is a genuine unexpected failure and stays 500.
+        const isTypedValidation = err && (err.statusCode === 400 || err.name === 'ProfileValidationError');
+        return res.status(isTypedValidation ? 400 : 500).json({ success: false, message: err.message });
     }
 };
 
@@ -130,7 +137,18 @@ exports.updateBusinessProfile = async (req, res) => {
         return res.status(200).json({ success: true, businessProfile });
     } catch (err) {
         logger.error({ err: err }, '[updateBusinessProfile] error');
-        const code = /no business profile|no valid fields|must be/i.test(err.message) ? 400 : 500;
+        // Deliberate validation mapping: the service throws typed
+        // ProfileValidationErrors (statusCode 400) for every invalid PATCH,
+        // including the primary/offering overlap introduced with the
+        // serialized concurrency fix — a message-regex alone missed it and
+        // a valid-but-conflicting request surfaced as HTTP 500. The legacy
+        // regex stays only for backwards compatibility with errors that
+        // reach this handler as plain Error objects; anything else is a
+        // genuine unexpected failure and remains 500.
+        const isTypedValidation = err && (err.statusCode === 400 || err.name === 'ProfileValidationError');
+        const code = isTypedValidation
+            || /no business profile|no valid fields|must be/i.test(err.message)
+            ? 400 : 500;
         return res.status(code).json({ success: false, message: err.message });
     }
 };

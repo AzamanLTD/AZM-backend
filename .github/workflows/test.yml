@@ -145,6 +145,11 @@ jobs:
         # taxonomy mapping table + backfill (§4 D-2), discovery indexes
         # (§3.3). Mirrors the release chain (npm run release).
         run: node infra/install-marketplace-discovery-overlay.js
+      - name: Install business offered-categories overlay
+        # Workstream D (PR #366): BusinessProfile.offeredCategories enum
+        # array column. Mirrors the release chain (npm run release); after
+        # db push the ADD COLUMN IF NOT EXISTS no-ops.
+        run: node infra/install-business-offered-categories-overlay.js
 
       - name: Install inventory restock authority
         run: node infra/install-inventory-restock-overlay.js
