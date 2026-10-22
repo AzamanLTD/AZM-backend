@@ -26,7 +26,7 @@ const _emitPositionUpdates = async (prisma, io, adId, excludeQueueId) => {
     try {
         const waitingEntries = await prisma.tradeQueue.findMany({
             where: {
-                adId: String(adId),
+                adId: parseInt(adId, 10), // Int column (2026-10-20 fix)
                 status: 'WAITING',
             },
             orderBy: { joinedAt: 'asc' },
@@ -67,7 +67,7 @@ const processNextInQueue = async (adId, { prisma, io } = {}) => {
     try {
         const nextInQueue = await prisma.tradeQueue.findFirst({
             where: {
-                adId: String(adId),
+                adId: parseInt(adId, 10), // Int column (2026-10-20 fix)
                 status: 'WAITING',
             },
             orderBy: { joinedAt: 'asc' },
@@ -175,6 +175,17 @@ const initiateTradeWithQueue = async (req, res) => {
         const { adId, amountCrypto, amountFiat, paymentMethod } = req.body;
         const userId = req.user.id;
 
+        // ── §r42 idempotency disposition ─────────────────────────────────
+        // The route now mounts the shared idempotency authority with the
+        // CANONICAL trade-initiation identity (routes/aiRoutes.js), so this
+        // handler owns a durable FinancialOperation claim exactly like
+        // tradeController.initiateTrade. Until the admission transaction
+        // below, every guard here is provably pre-economic: mark the claim
+        // releasable so a 4xx validation refusal does not poison the key.
+        // The flag is cleared before the admission transaction, and only
+        // the branches that provably committed NOTHING set it back.
+        res.locals.financialClaimRelease = true;
+
         const ad = await prisma.ad.findUnique({
             where: { id: parseInt(adId) },
             include: { vendor: true },
@@ -184,69 +195,169 @@ const initiateTradeWithQueue = async (req, res) => {
         if (ad.vendorId === userId) return res.status(400).json({ success: false, message: 'You cannot trade with your own advertisement.' });
         if (ad.status !== 'ACTIVE') return res.status(400).json({ success: false, message: 'This advertisement is not active.' });
 
-        // Phase H11 BUGFIX (2026-05-27): the active-status filter MUST
-        // match the in-transaction check in `tradeController.initiateTrade`
-        // (line ~138) so the two paths agree on what counts as an
-        // "active trade" for cap purposes. Drift between the two filters
-        // could let a buyer pass the optimistic gate here only to bounce
-        // off the canonical check inside the trade-creation transaction
-        // — confusing UX and wasted round-trips.
+        // CAPACITY POLICY (2026-10-20 A2 — corrected state-machine audit):
+        // this optimistic gate MUST use the SAME active-status filter as
+        // the in-transaction checks in `tradeController.initiateTrade` and
+        // the locked recount below, so all three capacity checks express
+        // one explicit policy: every UNFINALIZED trade — PENDING,
+        // PENDING_PAYMENT, PAID, DISPUTED — consumes one
+        // maxConcurrentTrades slot from creation to a terminal state.
         //
-        // Canonical filter is `[PENDING_PAYMENT, PAID, DISPUTED]`. The
-        // previous version used `[PENDING, PENDING_PAYMENT, PAID]` which
-        // was wrong on two counts:
-        //   • `PENDING` is never persisted (Trade.status defaults to
-        //     PENDING_PAYMENT and no code path ever flips to PENDING).
-        //   • `DISPUTED` was missing — a vendor with an ongoing dispute
-        //     would be considered "free" here but blocked at the
-        //     in-transaction check, producing an inconsistent answer.
+        // The H11 note claimed "PENDING is never persisted" — that premise
+        // is FALSE for the V2 vendor-approval flow: `initiateTrade` creates
+        // trades with status 'PENDING' and `acceptTrade` transitions them
+        // PENDING → PENDING_PAYMENT. Under the old filter a vendor-pending
+        // request was invisible to the gate: unlimited initiations slipped
+        // past a busy ad, and accepting them all exceeded
+        // maxConcurrentTrades and bypassed the waiting queue. PENDING now
+        // counts everywhere (initiation is the single capacity gate —
+        // acceptTrade never re-checks capacity, so it must not strand an
+        // accepted request).
         //
-        // This is an OPTIMISTIC gate — `tradeController.initiateTrade`
-        // re-runs the same count atomically inside `$transaction`, so a
-        // race that slips a buyer past this gate will still queue them
-        // correctly at the canonical layer. No money loss; the fix is
-        // about consistent UX and avoiding wasted round-trips.
+        // This remains an OPTIMISTIC gate — the locked recount below and
+        // `tradeController.initiateTrade` re-run the same count under the
+        // Ad-row lock, so a race past this gate is still resolved
+        // truthfully at the canonical layer.
+        const ACTIVE_TRADE_STATUSES = ['PENDING', 'PENDING_PAYMENT', 'PAID', 'DISPUTED'];
         const activeTrades = await prisma.trade.count({
             where: {
                 vendorId: ad.vendorId,
-                status: { in: ['PENDING_PAYMENT', 'PAID', 'DISPUTED'] },
+                status: { in: ACTIVE_TRADE_STATUSES },
             },
         });
 
         if (activeTrades >= ad.maxConcurrentTrades) {
-            const existingQueueEntry = await prisma.tradeQueue.findFirst({
-                where: {
-                    buyerId: String(userId),
-                    adId: String(adId),
-                    status: 'WAITING',
-                },
+            // QUEUE ADMISSION PROTOCOL (2026-10-20 final review): the
+            // optimistic ad.status read above is stale by the time we get
+            // here — a vendor may have deactivated and archived the ad
+            // between the read and this insert. Dedup + admission run in
+            // ONE transaction whose first statement takes the same Ad-row
+            // FOR UPDATE lock that archiveAd/deactivateAd/toggleAdStatus
+            // take, and the ad's CURRENT status is re-read under that
+            // lock: a WAITING entry can never be created for an ad that is
+            // no longer ACTIVE (or is legacy-marked archived via
+            // archivedAt). Admission never takes the TradeAccount lock, so
+            // the TradeAccount→Ad lock order cannot invert.
+            // TYPE FIX (found during the lock audit): TradeQueue.buyerId
+            // and adId are Int columns — the previous String(...) wrappers
+            // made every queue admission on this path throw a Prisma
+            // validation error (this path never succeeded).
+            // A queue-entry insert may commit from here on: a committed
+            // admission must RETAIN its durable identity (the auto-commit
+            // bookkeeping on the 200 stores the queued response for replay).
+            res.locals.financialClaimRelease = false;
+            const admission = await prisma.$transaction(async (tx) => {
+                const locked = await tx.$queryRaw`
+                    SELECT "status", "archivedAt", "maxConcurrentTrades" FROM "Ad"
+                    WHERE "id" = ${parseInt(adId)}
+                    FOR UPDATE`;
+                if (!locked[0] || locked[0].status !== 'ACTIVE' || locked[0].archivedAt) {
+                    return { refused: true };
+                }
+
+                // CAPACITY RECHECK UNDER THE LOCK (2026-10-20 review): the
+                // optimistic count above said the vendor was busy, but a
+                // slot may have freed (trade completed / cancelled) between
+                // that read and this lock. Re-run the CANONICAL active-trade
+                // filter inside the transaction: if a slot is now free, do
+                // NOT create a WAITING entry — the buyer proceeds through
+                // the canonical trade-initiation path (below, outside this
+                // transaction), which rechecks status and capacity under its
+                // own Ad-row lock and keeps its idempotency authority.
+                // canonical fall-through is the SAME direct handler call the
+                // not-busy optimistic path has always used.
+                const activeNow = await tx.trade.count({
+                    where: {
+                        vendorId: ad.vendorId,
+                        // A2: same explicit capacity policy as the
+                        // optimistic gate and tradeController (PENDING counts).
+                        status: { in: ACTIVE_TRADE_STATUSES },
+                    },
+                });
+                if (activeNow < locked[0].maxConcurrentTrades) {
+                    return { capacityFreed: true };
+                }
+
+                const existingQueueEntry = await tx.tradeQueue.findFirst({
+                    where: {
+                        buyerId: userId,
+                        adId: parseInt(adId),
+                        status: 'WAITING',
+                    },
+                });
+
+                if (existingQueueEntry) {
+                    return { alreadyQueued: existingQueueEntry };
+                }
+
+                const queueEntry = await tx.tradeQueue.create({
+                    data: {
+                        buyerId: userId,
+                        adId: parseInt(adId),
+                        status: 'WAITING',
+                    },
+                });
+
+                const queuePosition = await tx.tradeQueue.count({
+                    where: {
+                        adId: parseInt(adId),
+                        status: 'WAITING',
+                        joinedAt: { lte: queueEntry.joinedAt },
+                    },
+                });
+
+                return { queueEntry, queuePosition };
             });
 
-            if (existingQueueEntry) {
+            if (admission.refused) {
+                // Provably pre-economic: the refusal came from the locked
+                // recheck at the transaction's first statement — nothing was
+                // written. Release the claim so the key stays reusable.
+                res.locals.financialClaimRelease = true;
+                return res.status(400).json({ success: false, message: 'This advertisement is not active.' });
+            }
+            if (admission.capacityFreed) {
+                // A slot freed between the optimistic count and the locked
+                // recheck: no WAITING entry was created — the admission
+                // transaction committed nothing. Hand the request to the
+                // canonical trade-initiation path (the same direct
+                // fall-through the not-busy optimistic branch uses), which
+                // rechecks status and capacity inside its own transaction.
+                // initiateTrade re-manages this claim's disposition flags
+                // from its own pre-economic mark; the shared claim
+                // (res.locals.financialOperation) stays with this request,
+                // so a created trade commits under the SAME durable identity.
+                res.locals.financialClaimRelease = true;
+                const tradeController = require('./tradeController');
+                return tradeController.initiateTrade(req, res);
+            }
+            if (admission.alreadyQueued) {
+                // A1: converge on the canonical path's already-queued
+                // contract. The pre-A1 shape returned queueEntry.id (a
+                // UUID) under the queuePosition name — the fresh-join
+                // response returns a true ordinal position, so the two
+                // responses disagreed on the same field. Both paths now
+                // return the same alreadyQueued envelope with the buyer's
+                // true ordinal position (WAITING rows joined no later).
+                const alreadyPosition = await prisma.tradeQueue.count({
+                    where: {
+                        adId: parseInt(adId),
+                        status: 'WAITING',
+                        joinedAt: { lte: admission.alreadyQueued.joinedAt },
+                    },
+                });
                 return res.status(200).json({
                     success: true,
                     queued: true,
+                    alreadyQueued: true,
                     message: 'You are already in the queue for this ad.',
-                    queuePosition: existingQueueEntry.id,
-                    joinedAt: existingQueueEntry.joinedAt,
+                    queuePosition: alreadyPosition,
+                    queueId: admission.alreadyQueued.id,
+                    joinedAt: admission.alreadyQueued.joinedAt,
                 });
             }
 
-            const queueEntry = await prisma.tradeQueue.create({
-                data: {
-                    buyerId: String(userId),
-                    adId: String(adId),
-                    status: 'WAITING',
-                },
-            });
-
-            const queuePosition = await prisma.tradeQueue.count({
-                where: {
-                    adId: String(adId),
-                    status: 'WAITING',
-                    joinedAt: { lte: queueEntry.joinedAt },
-                },
-            });
+            const { queueEntry, queuePosition } = admission;
 
             if (io) {
                 io.to(`user_${userId}`).emit('queue_joined', {
@@ -282,8 +393,17 @@ const getQueueStatus = async (req, res) => {
     try {
         const { adId } = req.query;
 
-        const whereClause = { buyerId: String(userId), status: 'WAITING' };
-        if (adId) whereClause.adId = String(adId);
+        // (2026-10-20 fix) TradeQueue.buyerId/adId are Int columns — the
+        // previous String(...) filters threw PrismaClientValidationError and
+        // 500'd the whole status read. Validate inputs truthfully instead.
+        const whereClause = { buyerId: userId, status: 'WAITING' };
+        if (adId !== undefined && adId !== null && adId !== '') {
+            const parsedAdId = parseInt(adId, 10);
+            if (Number.isNaN(parsedAdId)) {
+                return res.status(400).json({ success: false, message: 'adId must be a valid ad id.' });
+            }
+            whereClause.adId = parsedAdId;
+        }
 
         const queueEntries = await prisma.tradeQueue.findMany({
             where: whereClause,
@@ -337,7 +457,10 @@ const leaveQueue = async (req, res) => {
         });
 
         if (!entry) return res.status(404).json({ success: false, message: 'Queue entry not found.' });
-        if (entry.buyerId !== String(userId)) return res.status(403).json({ success: false, message: 'Unauthorized.' });
+        // (2026-10-20 fix) entry.buyerId is a numeric Int column — the
+        // previous String(userId) comparison ALWAYS rejected the legitimate
+        // owner. Compare numerically.
+        if (Number(entry.buyerId) !== Number(userId)) return res.status(403).json({ success: false, message: 'Unauthorized.' });
         if (entry.status !== 'WAITING') return res.status(400).json({ success: false, message: 'Can only leave WAITING queue entries.' });
 
         // Phase H9 BUGFIX (2026-05-27): atomic conditional flip. Without

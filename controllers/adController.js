@@ -35,46 +35,97 @@ exports.createAd = async (req, res) => {
         }
 
         // ── Phase F2: Validate tradeAccountId if provided ───────────────────
-        let linkedAccount = null;
-        if (tradeAccountId) {
-            linkedAccount = await prisma.tradeAccount.findUnique({
-                where: { id: tradeAccountId }
-            });
-            if (!linkedAccount) {
-                return res.status(400).json({ success: false, message: 'Trade account not found.' });
-            }
-            if (linkedAccount.userId !== vendorId) {
-                return res.status(403).json({ success: false, message: 'Trade account does not belong to you.' });
-            }
-            if (linkedAccount.adminVerificationStatus !== 'APPROVED') {
-                return res.status(400).json({ success: false, message: 'Trade account must be admin-approved before posting ads.' });
-            }
-        }
-
+        // ARCHIVED-ACCOUNT LIFECYCLE + ARCHIVE/AD-CREATE MUTUAL EXCLUSION
+        // (2026-10-20 review follow-up): an archived account may never be
+        // attached to a new ad — even one that still belongs to the caller
+        // and remains admin-approved. Validation previously read the
+        // account outside any transaction and never checked archivedAt, so
+        // a stale/direct request could create an ACTIVE ad against an
+        // archived account, and a concurrent archive could slip between
+        // the validation read and the ad insert.
+        //
+        // Protocol: when an account is attached, validation AND the ad
+        // insert run in ONE transaction that first takes a FOR UPDATE row
+        // lock on the TradeAccount row — the same lock
+        // tradeAccountController.deleteTradeAccount takes before archiving.
+        // Postgres serializes the pair on that lock: whichever commits
+        // first, the other re-reads the post-commit state (the archiver
+        // counts the new ACTIVE ad and refuses; the ad creator sees
+        // archivedAt and rejects). The lock is the FIRST statement in both
+        // transactions (identical single-row lock) — no lock-order
+        // inversion, no deadlock between the pair.
         // ── Phase F2: P2P ads use flat USDC pricing ─────────────────────────
         // No GHS oracle math. pricePerUSD is informational only (display rate).
         // The actual trade is amountCrypto USDC ↔ amountFiat USD (1:1 minus fee).
         let finalPrice = parseFloat(pricePerUSD || 1.0);
 
-        const formattedMethods = linkedAccount
-            ? linkedAccount.methodType
-            : (Array.isArray(paymentMethod) ? paymentMethod.join(', ') : (paymentMethod || 'Zelle'));
+        const fail = (status, message) => {
+            const e = new Error(message);
+            e.statusCode = status;
+            return e;
+        };
 
-        const newAd = await prisma.ad.create({
-            data: {
-                type:           type || 'SELL',
-                crypto:         crypto || 'USDC',
-                pricePerUSD:    finalPrice,
-                margin:         margin !== undefined ? parseFloat(margin) : null,
-                minLimit:       parseFloat(minLimit),
-                maxLimit:       parseFloat(maxLimit),
-                paymentMethod:  formattedMethods,
-                terms:          terms || null,
-                vendorId:       vendor.id,
-                status:         'ACTIVE',
-                tradeAccountId: linkedAccount?.id || null
-            }
-        });
+        let linkedAccount = null;
+        let newAd;
+        if (tradeAccountId) {
+            newAd = await prisma.$transaction(async (tx) => {
+                const locked = await tx.$queryRaw`
+                    SELECT "id", "userId", "methodType", "adminVerificationStatus", "archivedAt"
+                    FROM "TradeAccount"
+                    WHERE "id" = ${tradeAccountId}
+                    FOR UPDATE`;
+                const account = locked[0];
+
+                if (!account) throw fail(400, 'Trade account not found.');
+                if (account.userId !== vendorId) throw fail(403, 'Trade account does not belong to you.');
+                if (account.adminVerificationStatus !== 'APPROVED') {
+                    throw fail(400, 'Trade account must be admin-approved before posting ads.');
+                }
+                if (account.archivedAt) {
+                    throw fail(400, 'Trade account is archived and can no longer be attached to ads.');
+                }
+
+                linkedAccount = account;
+                return tx.ad.create({
+                    data: {
+                        type:           type || 'SELL',
+                        crypto:         crypto || 'USDC',
+                        pricePerUSD:    finalPrice,
+                        margin:         margin !== undefined ? parseFloat(margin) : null,
+                        minLimit:       parseFloat(minLimit),
+                        maxLimit:       parseFloat(maxLimit),
+                        paymentMethod:  account.methodType,
+                        terms:          terms || null,
+                        vendorId:       vendor.id,
+                        status:         'ACTIVE',
+                        tradeAccountId: account.id
+                    }
+                });
+            });
+        }
+
+        if (!newAd) {
+            // No linked account — the original non-account path, unchanged.
+            const formattedMethods = Array.isArray(paymentMethod)
+                ? paymentMethod.join(', ')
+                : (paymentMethod || 'Zelle');
+
+            newAd = await prisma.ad.create({
+                data: {
+                    type:           type || 'SELL',
+                    crypto:         crypto || 'USDC',
+                    pricePerUSD:    finalPrice,
+                    margin:         margin !== undefined ? parseFloat(margin) : null,
+                    minLimit:       parseFloat(minLimit),
+                    maxLimit:       parseFloat(maxLimit),
+                    paymentMethod:  formattedMethods,
+                    terms:          terms || null,
+                    vendorId:       vendor.id,
+                    status:         'ACTIVE',
+                    tradeAccountId: null
+                }
+            });
+        }
 
         const io = req.app.get('socketio');
         if (io) io.emit('market_update');
@@ -82,6 +133,12 @@ exports.createAd = async (req, res) => {
         res.status(201).json({ success: true, message: 'Ad posted successfully!', ad: newAd });
 
     } catch (error) {
+        // Validation failures thrown inside the account-attached transaction
+        // keep their intended status code and the { success, message } shape
+        // the existing account-validation errors already used.
+        if (error && error.statusCode) {
+            return res.status(error.statusCode).json({ success: false, message: error.message });
+        }
         logger.error('Create Ad Error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
@@ -340,17 +397,52 @@ exports.deactivateAd = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const { id } = req.params;
-        const ad = await prisma.ad.findUnique({ where: { id: parseInt(id) } });
-        if (!ad) return res.status(404).json({ message: 'Ad not found' });
-        if (ad.vendorId !== req.user.id) return res.status(403).json({ message: 'Unauthorized' });
+        const vendorId = req.user.id;
 
-        await prisma.ad.update({ where: { id: parseInt(id) }, data: { status: 'INACTIVE' } });
+        const fail = (status, message) => {
+            const e = new Error(message);
+            e.statusCode = status;
+            return e;
+        };
+
+        // STATUS-WRITER PROTOCOL (2026-10-20 final review): deactivate is a
+        // status writer and MUST follow the same lock order as toggleAdStatus
+        // and archiveAd — linked TradeAccount row FOR UPDATE first, then the
+        // Ad row FOR UPDATE — and re-read the ad under the lock before
+        // writing. ARCHIVED is TERMINAL: deactivation must never undo an
+        // archive (or a subsequent toggle could resurrect the ad). Legacy
+        // rows with archivedAt set but a stale status are treated as
+        // archived too — checking status alone is not sufficient.
+        await prisma.$transaction(async (tx) => {
+            const pre = await tx.ad.findUnique({ where: { id: parseInt(id) } });
+            if (!pre) throw fail(404, 'Ad not found');
+            if (pre.tradeAccountId) {
+                await tx.$queryRaw`
+                    SELECT "id" FROM "TradeAccount"
+                    WHERE "id" = ${pre.tradeAccountId}
+                    FOR UPDATE`;
+            }
+            await tx.$queryRaw`SELECT "id" FROM "Ad" WHERE "id" = ${parseInt(id)} FOR UPDATE`;
+
+            const ad = await tx.ad.findUnique({ where: { id: parseInt(id) } });
+            if (!ad) throw fail(404, 'Ad not found');
+            if (ad.vendorId !== vendorId) throw fail(403, 'Unauthorized');
+
+            if (ad.status === 'ARCHIVED' || ad.archivedAt) {
+                throw fail(400, 'This ad has been archived and can no longer be modified. Create a new ad instead.');
+            }
+
+            await tx.ad.update({ where: { id: parseInt(id) }, data: { status: 'INACTIVE' } });
+        });
 
         const io = req.app.get('socketio');
         if (io) io.emit('market_update');
 
         res.status(200).json({ success: true, message: 'Ad taken down successfully.' });
     } catch (error) {
+        if (error && error.statusCode) {
+            return res.status(error.statusCode).json({ success: false, message: error.message });
+        }
         res.status(500).json({ success: false, error: error.message });
     }
 };
@@ -389,27 +481,105 @@ exports.getMyAds = async (req, res) => {
 };
 
 // 5. TOGGLE AD STATUS
+// =============================================================================
+// ACTIVATION ↔ ACCOUNT-ARCHIVAL MUTUAL EXCLUSION (2026-10-20 review
+// follow-up). The previous unconditional `status === 'ACTIVE' ? 'OFFLINE'
+// : 'ACTIVE'` flip had two defects:
+//   (a) an OFFLINE ad linked to a trade account could be reactivated AFTER
+//       that account was archived — the exact lifecycle gap createAd was
+//       fixed for, reopened through this path; and it raced account
+//       archival the same way createAd did.
+//   (b) an ARCHIVED ad — a TERMINAL soft-archive state (see archiveAd) —
+//       could be resurrected to ACTIVE through this path.
+//
+// Protocol (identical to createAd / deleteTradeAccount / archiveAd):
+// validation and the status write run inside ONE transaction; when the ad
+// is linked to a trade account, the transaction takes the same
+// SELECT ... FOR UPDATE row lock on the TradeAccount row FIRST, then the
+// Ad row lock (one consistent TradeAccount→Ad order across all ad-status
+// writers), so
+// activation and archival serialize on that lock: whichever commits first,
+// the other re-reads post-commit state — the reactivator sees archivedAt
+// and refuses; the archiver counts the newly re-ACTIVE ad and refuses.
+// Deactivation (ACTIVE→OFFLINE) remains always allowed: it only ever
+// reduces the archiver's active-ad count and can never violate the
+// invariant. The pre-read of the ad (to learn its immutable
+// tradeAccountId) is only used to select the lock set; ALL validation and
+// the write are re-done inside the transaction.
+// =============================================================================
 exports.toggleAdStatus = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const { id }     = req.params;
         const vendorId   = req.user.id;
-        const ad         = await prisma.ad.findUnique({ where: { id: parseInt(id) } });
 
-        if (!ad) return res.status(404).json({ success: false, message: 'Ad not found.' });
-        if (ad.vendorId !== vendorId) return res.status(403).json({ success: false, message: 'Unauthorized.' });
+        const fail = (status, message) => {
+            const e = new Error(message);
+            e.statusCode = status;
+            return e;
+        };
 
-        const newStatus  = ad.status === 'ACTIVE' ? 'OFFLINE' : 'ACTIVE';
-        const updatedAd  = await prisma.ad.update({
-            where: { id: parseInt(id) },
-            data:  { status: newStatus }
+        const updatedAd = await prisma.$transaction(async (tx) => {
+            const pre = await tx.ad.findUnique({ where: { id: parseInt(id) } });
+            if (!pre) throw fail(404, 'Ad not found.');
+
+            if (pre.tradeAccountId) {
+                await tx.$queryRaw`
+                    SELECT "id"
+                    FROM "TradeAccount"
+                    WHERE "id" = ${pre.tradeAccountId}
+                    FOR UPDATE`;
+            }
+            // Ad-row lock (final review 2026-10-20): the same lock
+            // archiveAd takes AFTER its TradeAccount lock — one consistent
+            // TradeAccount→Ad order across every ad-status writer, so
+            // toggle-vs-archive serializes even for account-unlinked ads
+            // and no lock-order inversion is possible.
+            await tx.$queryRaw`
+                SELECT "id"
+                FROM "Ad"
+                WHERE "id" = ${parseInt(id)}
+                FOR UPDATE`;
+
+            // Re-read and validate the ad's CURRENT state under the lock.
+            const ad = await tx.ad.findUnique({ where: { id: parseInt(id) } });
+            if (!ad) throw fail(404, 'Ad not found.');
+            if (ad.vendorId !== vendorId) throw fail(403, 'Unauthorized.');
+
+            // ARCHIVED is terminal soft-archive — never resurrected here.
+            if (ad.status === 'ARCHIVED' || ad.archivedAt) {
+                throw fail(400, 'Archived ads cannot be reactivated. Create a new ad instead.');
+            }
+
+            const newStatus = ad.status === 'ACTIVE' ? 'OFFLINE' : 'ACTIVE';
+
+            // Reactivation (→ACTIVE) of an account-linked ad requires the
+            // linked account to still exist and be unarchived. The row lock
+            // above makes this check race-free against deleteTradeAccount.
+            if (newStatus === 'ACTIVE' && ad.tradeAccountId) {
+                const acct = await tx.tradeAccount.findUnique({
+                    where: { id: ad.tradeAccountId },
+                    select: { archivedAt: true },
+                });
+                if (!acct || acct.archivedAt) {
+                    throw fail(400, 'Trade account is archived and can no longer be attached to ads.');
+                }
+            }
+
+            return tx.ad.update({
+                where: { id: parseInt(id) },
+                data:  { status: newStatus }
+            });
         });
 
         const io = req.app.get('socketio');
         if (io) io.emit('market_update');
 
-        res.status(200).json({ success: true, message: `Ad is now ${newStatus}.`, ad: updatedAd });
+        res.status(200).json({ success: true, message: `Ad is now ${updatedAd.status}.`, ad: updatedAd });
     } catch (error) {
+        if (error && error.statusCode) {
+            return res.status(error.statusCode).json({ success: false, message: error.message });
+        }
         logger.error('Toggle Ad Error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
@@ -424,7 +594,9 @@ exports.toggleAdStatus = async (req, res) => {
 //
 // Rules:
 //   - Only INACTIVE or OFFLINE ads can be archived (not ACTIVE).
-//   - No in-progress trades may reference the ad (status IN_PROGRESS / ESCROW).
+//   - QUEUE POLICY: no WAITING TradeQueue buyers on the ad (the Trade model
+//     has no adId, so the old "no in-progress trades on this ad" rule is
+//     unenforceable in the current schema — see the in-handler note).
 //   - Once archived, the ad is hidden from getMyAds and the marketplace.
 //   - Admin can still view archived ads via the war room.
 // =============================================================================
@@ -434,39 +606,94 @@ exports.archiveAd = async (req, res) => {
         const { id } = req.params;
         const vendorId = req.user.id;
 
-        const ad = await prisma.ad.findUnique({ where: { id: parseInt(id) } });
-        if (!ad) return res.status(404).json({ success: false, message: 'Ad not found.' });
-        if (ad.vendorId !== vendorId) return res.status(403).json({ success: false, message: 'Unauthorized.' });
+        const fail = (status, message) => {
+            const e = new Error(message);
+            e.statusCode = status;
+            return e;
+        };
 
-        // Cannot archive an ACTIVE ad — must deactivate first
-        if (ad.status === 'ACTIVE') {
-            return res.status(400).json({
-                success: false,
-                message: 'Cannot archive an active ad. Deactivate it first.'
-            });
-        }
+        // TOGGLE ↔ ARCHIVE MUTUAL EXCLUSION (2026-10-20 final review).
+        // archiveAd used to be a non-transactional read/check/update, so a
+        // concurrent toggleAdStatus could validate an OFFLINE ad and then
+        // overwrite the committed ARCHIVED status with ACTIVE, defeating the
+        // terminal contract. Both ad-status writers (toggleAdStatus and
+        // archiveAd) now run inside ONE transaction with a CONSISTENT lock
+        // order:
+        //   1. TradeAccount row FOR UPDATE (only when the ad is
+        //      account-linked) — the same lock createAd and
+        //      deleteTradeAccount take FIRST, so no lock-order inversion
+        //      is introduced into the existing account protocol;
+        //   2. Ad row FOR UPDATE — serializes toggle-vs-archive even for
+        //      account-unlinked ads.
+        // The ad's status is then RE-READ under the lock before the write,
+        // so ARCHIVED is terminal under concurrent as well as sequential
+        // requests: whichever writer commits first, the other re-reads the
+        // post-commit status and refuses (ARCHIVED → toggle 400; ACTIVE →
+        // archive 400).
+        const archivedAd = await prisma.$transaction(async (tx) => {
+            const pre = await tx.ad.findUnique({ where: { id: parseInt(id) } });
+            if (!pre) throw fail(404, 'Ad not found.');
 
-        // Check for in-progress trades referencing this ad
-        const activeTrades = await prisma.trade.count({
-            where: {
-                adId: parseInt(id),
-                status: { in: ['PENDING', 'IN_PROGRESS', 'ESCROW', 'DISPUTED'] }
+            if (pre.tradeAccountId) {
+                await tx.$queryRaw`
+                    SELECT "id"
+                    FROM "TradeAccount"
+                    WHERE "id" = ${pre.tradeAccountId}
+                    FOR UPDATE`;
             }
-        });
-        if (activeTrades > 0) {
-            return res.status(400).json({
-                success: false,
-                message: `Cannot archive: ${activeTrades} trade(s) still in progress on this ad.`
-            });
-        }
+            await tx.$queryRaw`
+                SELECT "id"
+                FROM "Ad"
+                WHERE "id" = ${parseInt(id)}
+                FOR UPDATE`;
 
-        // Soft-delete: set status to ARCHIVED with timestamp
-        const archivedAd = await prisma.ad.update({
-            where: { id: parseInt(id) },
-            data: {
-                status: 'ARCHIVED',
-                archivedAt: new Date()
+            // Re-read the ad's CURRENT state under the locks.
+            const ad = await tx.ad.findUnique({ where: { id: parseInt(id) } });
+            if (!ad) throw fail(404, 'Ad not found.');
+            if (ad.vendorId !== vendorId) throw fail(403, 'Unauthorized.');
+
+            // Already archived (explicit status OR legacy archivedAt
+            // marker): archiving is idempotent-refused, never re-stamped.
+            if (ad.status === 'ARCHIVED' || ad.archivedAt) {
+                throw fail(400, 'This ad has already been archived.');
             }
+
+            // Cannot archive an ACTIVE ad — must deactivate first
+            if (ad.status === 'ACTIVE') {
+                throw fail(400, 'Cannot archive an active ad. Deactivate it first.');
+            }
+
+            // QUEUE POLICY (named honestly 2026-10-20 final review): this
+            // guard is the ad's overflow-QUEUE policy — a vendor cannot
+            // archive an ad while buyers are WAITING in its TradeQueue.
+            // It is NOT the historical "no in-progress trades on this ad"
+            // policy: the Trade model has NO adId column (the original
+            // prisma.trade.count({ where: { adId } }) always threw
+            // PrismaClientValidationError and 500'd this endpoint), so
+            // ad-to-trade association does not exist in the schema and
+            // that older policy is UNENFORCEABLE today. Implementing it
+            // requires adding Trade.adId (schema migration, write at
+            // trade-initiation, backfill) — tracked as a separate,
+            // explicitly-scoped change; do NOT treat this queue count as
+            // proof that no in-progress trades exist.
+            const waitingQueueEntries = await tx.tradeQueue.count({
+                where: {
+                    adId: parseInt(id),
+                    status: 'WAITING'
+                }
+            });
+            if (waitingQueueEntries > 0) {
+                throw fail(400, `Cannot archive: ${waitingQueueEntries} buyer(s) are still waiting in this ad's trade queue.`);
+            }
+
+            // Soft-delete: set status to ARCHIVED with timestamp
+            return tx.ad.update({
+                where: { id: parseInt(id) },
+                data: {
+                    status: 'ARCHIVED',
+                    archivedAt: new Date()
+                }
+            });
         });
 
         const io = req.app.get('socketio');
@@ -478,6 +705,9 @@ exports.archiveAd = async (req, res) => {
             ad: archivedAd
         });
     } catch (error) {
+        if (error && error.statusCode) {
+            return res.status(error.statusCode).json({ success: false, message: error.message });
+        }
         logger.error('Archive Ad Error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
