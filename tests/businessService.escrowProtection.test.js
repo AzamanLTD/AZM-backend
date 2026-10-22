@@ -40,9 +40,15 @@ describe('businessService escrow protection capability', () => {
     const prisma = {
       businessProfile: {
         findFirst: jest.fn().mockResolvedValue(profile),
+        findUnique: jest.fn().mockResolvedValue(profile),
         update,
       },
     };
+    // updateBusinessProfile serializes under a row lock inside ONE
+    // transaction; the mock runs the callback with the mock itself and
+    // answers the FOR UPDATE row-lock probe with the profile's id.
+    prisma.$transaction = async (fn) => fn(prisma);
+    prisma.$queryRaw = jest.fn().mockResolvedValue([{ id: profile.id }]);
 
     const result = await businessService.updateBusinessProfile(prisma, {
       userId: profile.userId,
@@ -80,9 +86,15 @@ describe('businessService escrow protection capability', () => {
     const prisma = {
       businessProfile: {
         findFirst: jest.fn().mockResolvedValue(profile),
+        findUnique: jest.fn().mockResolvedValue(profile),
         update,
       },
     };
+    // updateBusinessProfile serializes under a row lock inside ONE
+    // transaction; the mock runs the callback with the mock itself and
+    // answers the FOR UPDATE row-lock probe with the profile's id.
+    prisma.$transaction = async (fn) => fn(prisma);
+    prisma.$queryRaw = jest.fn().mockResolvedValue([{ id: profile.id }]);
 
     const result = await businessService.updateBusinessProfile(prisma, {
       userId: profile.userId,

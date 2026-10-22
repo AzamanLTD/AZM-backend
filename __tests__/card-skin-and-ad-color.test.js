@@ -156,8 +156,8 @@ describe('AzmSpendService — card skins', () => {
 
 // ── businessService — adAccentColor validation ───────────────────────────────
 function makeFakeBusinessPrisma(initialProfile) {
-    let profile = { ...initialProfile };
-    return {
+    let profile = { id: 'biz-1', ...initialProfile };
+    const prisma = {
         businessProfile: {
             findUnique: async () => ({ ...profile }),
             findFirst: async () => ({ ...profile }),
@@ -168,6 +168,12 @@ function makeFakeBusinessPrisma(initialProfile) {
         },
         _debug: { getProfile: () => profile }
     };
+    // updateBusinessProfile serializes under a row lock inside ONE
+    // transaction; the fake answers the FOR UPDATE probe and runs the
+    // transaction callback against itself.
+    prisma.$transaction = async (fn) => fn(prisma);
+    prisma.$queryRaw = async () => [{ id: profile.id }];
+    return prisma;
 }
 
 describe('businessService.updateBusinessProfile — adAccentColor', () => {

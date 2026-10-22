@@ -290,6 +290,112 @@ run('Business offered-categories contract (real PostgreSQL)', () => {
             'an omitted offerings field preserves the stored list');
     });
 
+    // ─── 2c-ter. CONCURRENCY: the cross-field invariant survives concurrent
+    // PATCHes (deterministic, real PostgreSQL) ─────────────────────────────
+    //
+    // The single-request validation is not enough by itself: read → validate
+    // → write as separate operations lets two concurrent PATCHes each pass
+    // against the OLD row (A: category-only, B: offerings-only) and both
+    // commit, storing the primary inside its own offerings. updateBusinessProfile
+    // now reads, validates and writes inside ONE transaction under a row
+    // FOR UPDATE lock, so the second request wakes up on the FIRST's committed
+    // state and revalidates against THAT.
+
+    test('two conflicting PATCHes raced under a barrier: at most one succeeds '
+        + 'and the stored invariant always holds', async () => {
+        const user = await seedUser();
+        await seedBusiness(user, { offeredCategories: [] });
+
+        // Barrier: count transactions as they OPEN, and do not let the test
+        // proceed until BOTH requests are inside their transactions — i.e.
+        // genuinely in flight at the same time, not merely a Promise.all of
+        // two sequential-looking calls.
+        let opened = 0;
+        let releaseBarrier;
+        const barrier = new Promise((res) => { releaseBarrier = res; });
+        // NOTE: a bare delegating wrapper, NOT Object.create(db) — the
+        // Prisma client is proxied internally and assigning $transaction on
+        // a prototype child ALSO overwrites the real client's $transaction
+        // (infinite recursion). updateBusinessProfile only calls
+        // prisma.$transaction, so { $transaction } is the full surface.
+        const instrumented = {
+            $transaction: (fn, opts) => {
+                opened += 1;
+                if (opened === 2) releaseBarrier();
+                return db.$transaction(fn, opts);
+            }
+        };
+
+        const requestA = businessService.updateBusinessProfile(instrumented, {
+            userId: user.id,
+            updates: { category: 'FOOD_BEVERAGE' },
+        });
+        const requestB = businessService.updateBusinessProfile(instrumented, {
+            userId: user.id,
+            updates: { offeredCategories: ['FOOD_BEVERAGE'] },
+        });
+
+        await barrier; // both transactions are open before either resolves
+        const [resA, resB] = await Promise.allSettled([requestA, requestB]);
+
+        const fulfilled = [resA, resB].filter((r) => r.status === 'fulfilled');
+        expect(fulfilled).toHaveLength(1,
+            'the row lock must serialize the pair: exactly one of the two '
+            + 'conflicting PATCHes may commit');
+
+        // Whichever won, the COMMITTED state cannot repeat the primary.
+        const row = await db.businessProfile.findFirst({ where: { userId: user.id } });
+        expect(row.offeredCategories).not.toContain(row.category,
+            'the stored profile must never list its primary as an additional offering');
+        if (resA.status === 'fulfilled') {
+            expect(row.category).toBe('FOOD_BEVERAGE');
+            expect(row.offeredCategories).toEqual([]);
+        } else {
+            expect(row.category).toBe('HOSPITALITY');
+            expect(row.offeredCategories).toEqual(['FOOD_BEVERAGE']);
+            expect(resB.reason.message).toMatch(/must not repeat the primary category/i);
+        }
+        if (resA.status === 'rejected') {
+            expect(resA.reason.message).toMatch(/must not repeat the primary category/i);
+        }
+    });
+
+    test('an offerings-only PATCH blocked behind a committed category-only PATCH '
+        + 'revalidates against the COMMITTED row (forced interleaving)', async () => {
+        const user = await seedUser();
+        const biz = await seedBusiness(user, { offeredCategories: [] });
+
+        // Deterministic interleave: this transaction takes the row lock,
+        // SETS the category, and commits — while the service request below
+        // is already parked on the same lock. When it wakes up it must see
+        // the committed FOOD_BEVERAGE primary and reject.
+        const lockTaken = new Promise((res) => setTimeout(res, 0));
+        let lockHeld;
+        const held = new Promise((res) => { lockHeld = res; });
+        const committingTx = db.$transaction(async (tx) => {
+            await tx.$queryRaw`SELECT id FROM "BusinessProfile" WHERE "userId" = ${user.id} LIMIT 1 FOR UPDATE`;
+            lockHeld();
+            await new Promise((r) => setTimeout(r, 400)); // hold the lock
+            await tx.businessProfile.update({ where: { id: biz.id }, data: { category: 'FOOD_BEVERAGE' } });
+        });
+        await held; // row lock is held before the request below starts
+        await lockTaken;
+
+        const blocked = businessService.updateBusinessProfile(db, {
+            userId: user.id,
+            updates: { offeredCategories: ['FOOD_BEVERAGE'] },
+        });
+
+        await expect(blocked).rejects.toThrow(
+            /must not repeat the primary category \(FOOD_BEVERAGE\)/i);
+        await committingTx; // ensure the committing transaction finished cleanly
+
+        const row = await db.businessProfile.findUnique({ where: { id: biz.id } });
+        expect(row.category).toBe('FOOD_BEVERAGE');
+        expect(row.offeredCategories).toEqual([],
+            'the rejected PATCH must not have written anything');
+    });
+
     // ─── 2d. Overlay installer proofs (real PostgreSQL, disposable DB) ──────
 
     const overlay = require('../infra/install-business-offered-categories-overlay');
