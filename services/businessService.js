@@ -32,25 +32,37 @@ const MAX_OFFERED_CATEGORIES = 8;
 //   • the empty list is a valid state (no additional offerings);
 //   • the PRIMARY category is never allowed inside the list: this field
 //     means ADDITIONAL offerings, not a second place to repeat the
+// Typed validation error for the register/update paths. Controllers use
+// `err.statusCode` / `err.name` to map these DELIBERATELY to HTTP 400 — a
+// plain message-regex classifier silently misses new validation messages
+// (exactly how the primary/offering overlap error leaked out as a 500).
+class ProfileValidationError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'ProfileValidationError';
+        this.statusCode = 400;
+    }
+}
+
 //     primary. The caller passes the FINAL intended primary category
 //     once known (final-profile validation, not key-order validation).
 function _validateOfferedCategories(value, primaryCategory) {
     if (value === undefined || value === null) return [];
     if (!Array.isArray(value)) {
-        throw new Error('offeredCategories must be an array of category names.');
+        throw new ProfileValidationError('offeredCategories must be an array of category names.');
     }
     if (value.length > MAX_OFFERED_CATEGORIES) {
-        throw new Error(`offeredCategories must contain at most ${MAX_OFFERED_CATEGORIES} categories.`);
+        throw new ProfileValidationError(`offeredCategories must contain at most ${MAX_OFFERED_CATEGORIES} categories.`);
     }
     const deduped = [];
     for (const entry of value) {
         if (!VALID_CATEGORIES.has(entry)) {
-            throw new Error(`offeredCategories contains an unknown category: ${entry}`);
+            throw new ProfileValidationError(`offeredCategories contains an unknown category: ${entry}`);
         }
         if (!deduped.includes(entry)) deduped.push(entry);
     }
     if (primaryCategory && deduped.includes(primaryCategory)) {
-        throw new Error(
+        throw new ProfileValidationError(
             `offeredCategories must not repeat the primary category (${primaryCategory}); it lists only ADDITIONAL offerings.`);
     }
     return deduped;
@@ -266,10 +278,10 @@ const updateBusinessProfile = async (prisma, { userId, updates }) => {
             LIMIT 1
             FOR UPDATE`;
         if (!locked || locked.length === 0) {
-            throw new Error('No business profile found for this user.');
+            throw new ProfileValidationError('No business profile found for this user.');
         }
         const profile = await tx.businessProfile.findUnique({ where: { id: locked[0].id } });
-        if (!profile) throw new Error('No business profile found for this user.');
+        if (!profile) throw new ProfileValidationError('No business profile found for this user.');
 
         const data = {};
         for (const [key, value] of Object.entries(updates || {})) {
@@ -281,7 +293,7 @@ const updateBusinessProfile = async (prisma, { userId, updates }) => {
             if (key === 'businessName') {
                 const clean = String(value || '').trim();
                 if (clean.length < 2 || clean.length > 100) {
-                    throw new Error('businessName must be 2–100 chars.');
+                    throw new ProfileValidationError('businessName must be 2–100 chars.');
                 }
                 data.businessName = clean;
                 continue;
@@ -292,7 +304,7 @@ const updateBusinessProfile = async (prisma, { userId, updates }) => {
                     continue;
                 }
                 if (!HEX_COLOR_RE.test(value)) {
-                    throw new Error('adAccentColor must be a 6-digit hex color like "#FFAA00".');
+                    throw new ProfileValidationError('adAccentColor must be a 6-digit hex color like "#FFAA00".');
                 }
                 data.adAccentColor = value;
                 continue;
@@ -309,7 +321,7 @@ const updateBusinessProfile = async (prisma, { userId, updates }) => {
             }
             if (key === 'offerEscrowProtection') {
                 if (typeof value !== 'boolean') {
-                    throw new Error('offerEscrowProtection must be a boolean.');
+                    throw new ProfileValidationError('offerEscrowProtection must be a boolean.');
                 }
                 const existingMeta = profile.businessMeta && typeof profile.businessMeta === 'object'
                     ? profile.businessMeta
@@ -329,7 +341,7 @@ const updateBusinessProfile = async (prisma, { userId, updates }) => {
         }
 
         if (Object.keys(data).length === 0) {
-            throw new Error('No valid fields to update.');
+            throw new ProfileValidationError('No valid fields to update.');
         }
 
         // WORKSTREAM D — FINAL-PROFILE validation: the FINAL offered list must
@@ -347,7 +359,7 @@ const updateBusinessProfile = async (prisma, { userId, updates }) => {
             ? data.offeredCategories
             : (profile.offeredCategories || []);
         if (finalOfferings.includes(finalCategory)) {
-            throw new Error(
+            throw new ProfileValidationError(
                 `offeredCategories must not repeat the primary category (${finalCategory}); it lists only ADDITIONAL offerings.`);
         }
 
@@ -363,6 +375,7 @@ const updateBusinessProfile = async (prisma, { userId, updates }) => {
 };
 
 module.exports = {
+    ProfileValidationError,
     registerBusiness,
     getBusinessProfile,
     searchBusinesses,

@@ -301,30 +301,43 @@ run('Business offered-categories contract (real PostgreSQL)', () => {
     // FOR UPDATE lock, so the second request wakes up on the FIRST's committed
     // state and revalidates against THAT.
 
-    test('two conflicting PATCHes raced under a barrier: at most one succeeds '
-        + 'and the stored invariant always holds', async () => {
+    test('two conflicting PATCHes raced together: both transactions are '
+        + 'provably OPEN before either proceeds, and exactly one may commit', async () => {
         const user = await seedUser();
         await seedBusiness(user, { offeredCategories: [] });
 
-        // Barrier: count transactions as they OPEN, and do not let the test
-        // proceed until BOTH requests are inside their transactions — i.e.
-        // genuinely in flight at the same time, not merely a Promise.all of
-        // two sequential-looking calls.
+        // Deterministic coordination INSIDE the interactive transactions:
+        // each service call is wrapped so the barrier is released only when
+        // the REAL transaction callback starts executing. Both service
+        // callbacks then wait until BOTH transactions are open, so the two
+        // FOR UPDATE lock attempts run against each other — this proves the
+        // interleaving instead of assuming it from Promise.all timing.
         let opened = 0;
         let releaseBarrier;
         const barrier = new Promise((res) => { releaseBarrier = res; });
-        // NOTE: a bare delegating wrapper, NOT Object.create(db) — the
-        // Prisma client is proxied internally and assigning $transaction on
-        // a prototype child ALSO overwrites the real client's $transaction
-        // (infinite recursion). updateBusinessProfile only calls
-        // prisma.$transaction, so { $transaction } is the full surface.
-        const instrumented = {
-            $transaction: (fn, opts) => {
-                opened += 1;
-                if (opened === 2) releaseBarrier();
-                return db.$transaction(fn, opts);
+        // Full delegating wrapper: $transaction is intercepted for the
+        // barrier; EVERYTHING ELSE passes through to the real client, so
+        // against a pre-fix implementation (no transaction layer) the two
+        // requests still execute the plain read-validate-write path and the
+        // test fails on the RACE (two commits / broken invariant), not on a
+        // missing wrapper surface. NOTE: NOT Object.create(db) — the Prisma
+        // client is proxied internally and assigning $transaction on a
+        // prototype child ALSO overwrites the real client's $transaction
+        // (infinite recursion). A Proxy with per-get binding avoids both.
+        const instrumented = new Proxy({}, {
+            get: (_target, prop) => {
+                if (prop === '$transaction') {
+                    return (fn, opts) => db.$transaction(async (tx) => {
+                        opened += 1;
+                        if (opened === 2) releaseBarrier();
+                        await barrier; // both transaction callbacks open, released together
+                        return fn(tx);
+                    }, opts);
+                }
+                const value = Reflect.get(db, prop);
+                return typeof value === 'function' ? value.bind(db) : value;
             }
-        };
+        });
 
         const requestA = businessService.updateBusinessProfile(instrumented, {
             userId: user.id,
@@ -335,22 +348,32 @@ run('Business offered-categories contract (real PostgreSQL)', () => {
             updates: { offeredCategories: ['FOOD_BEVERAGE'] },
         });
 
-        await barrier; // both transactions are open before either resolves
+        // Both transactions are provably open before either callback
+        // proceeds. Without the serialization fix there is no $transaction
+        // layer at all: the barrier can never release, both requests race
+        // the read-validate-write sequence unserialized, and the assertions
+        // below then fail on the RACE itself (two commits / invariant broken).
+        const raced = await Promise.race([
+            barrier.then(() => true),
+            new Promise((res) => setTimeout(() => res(false), 2000)),
+        ]);
         const [resA, resB] = await Promise.allSettled([requestA, requestB]);
 
         const fulfilled = [resA, resB].filter((r) => r.status === 'fulfilled');
         expect(fulfilled).toHaveLength(1,
             'the row lock must serialize the pair: exactly one of the two '
-            + 'conflicting PATCHes may commit');
+            + 'conflicting PATCHes may commit (pre-fix: both win the race)');
 
         // Whichever won, the COMMITTED state cannot repeat the primary.
         const row = await db.businessProfile.findFirst({ where: { userId: user.id } });
         expect(row.offeredCategories).not.toContain(row.category,
             'the stored profile must never list its primary as an additional offering');
         if (resA.status === 'fulfilled') {
+            expect(raced).toBe(true);
             expect(row.category).toBe('FOOD_BEVERAGE');
             expect(row.offeredCategories).toEqual([]);
         } else {
+            expect(raced).toBe(true);
             expect(row.category).toBe('HOSPITALITY');
             expect(row.offeredCategories).toEqual(['FOOD_BEVERAGE']);
             expect(resB.reason.message).toMatch(/must not repeat the primary category/i);
@@ -360,35 +383,57 @@ run('Business offered-categories contract (real PostgreSQL)', () => {
         }
     });
 
-    test('an offerings-only PATCH blocked behind a committed category-only PATCH '
-        + 'revalidates against the COMMITTED row (forced interleaving)', async () => {
+    test('a PATCH parked on a held row lock is PROVEN waiting (pg_locks '
+        + 'evidence), then revalidates against the COMMITTED row', async () => {
         const user = await seedUser();
         const biz = await seedBusiness(user, { offeredCategories: [] });
 
-        // Deterministic interleave: this transaction takes the row lock,
-        // SETS the category, and commits — while the service request below
-        // is already parked on the same lock. When it wakes up it must see
-        // the committed FOOD_BEVERAGE primary and reject.
-        const lockTaken = new Promise((res) => setTimeout(res, 0));
+        // Deterministic interleave with OBSERVED lock-wait evidence, no
+        // fixed sleeps: the holder transaction takes the row lock and
+        // publishes its own transaction id; the service PATCH below is then
+        // proven BLOCKED on that exact lock via pg_locks (a NOT-granted
+        // transactionid wait pointing at the holder) BEFORE the holder
+        // commits. Pre-fix there is no lock to wait on: no wait is ever
+        // observed AND the parked PATCH sails through with a bad commit —
+        // so the failure mode is the race, not a missing test surface.
+        let holderXid;
         let lockHeld;
+        let holderReleased;
         const held = new Promise((res) => { lockHeld = res; });
         const committingTx = db.$transaction(async (tx) => {
             await tx.$queryRaw`SELECT id FROM "BusinessProfile" WHERE "userId" = ${user.id} LIMIT 1 FOR UPDATE`;
+            const [xidRow] = await tx.$queryRaw`SELECT txid_current()::text AS xid`;
+            holderXid = xidRow.xid;
             lockHeld();
-            await new Promise((r) => setTimeout(r, 400)); // hold the lock
+            await new Promise((r) => { holderReleased = r; }); // wait for proof, not a timer
             await tx.businessProfile.update({ where: { id: biz.id }, data: { category: 'FOOD_BEVERAGE' } });
         });
-        await held; // row lock is held before the request below starts
-        await lockTaken;
+        await held;
 
         const blocked = businessService.updateBusinessProfile(db, {
             userId: user.id,
             updates: { offeredCategories: ['FOOD_BEVERAGE'] },
         });
 
+        // Poll for POSITIVE evidence that the service transaction is
+        // waiting on the holder's transaction id (row-lock wait).
+        let waiting = false;
+        for (let i = 0; i < 100 && !waiting; i += 1) {
+            const [row] = await db.$queryRaw`
+                SELECT count(*)::int AS n FROM pg_locks
+                WHERE locktype = 'transactionid' AND granted = false
+                  AND transactionid::text = ${holderXid}`;
+            waiting = row.n >= 1;
+            if (!waiting) await new Promise((r) => setTimeout(r, 50));
+        }
+        expect(waiting).toBe(true,
+            'the parked PATCH must be OBSERVED waiting on the holder row lock '
+            + '(pg_locks transactionid wait) before the holder commits');
+
+        holderReleased(); // release the holder so it commits the category change
         await expect(blocked).rejects.toThrow(
             /must not repeat the primary category \(FOOD_BEVERAGE\)/i);
-        await committingTx; // ensure the committing transaction finished cleanly
+        await committingTx; // holder finished cleanly
 
         const row = await db.businessProfile.findUnique({ where: { id: biz.id } });
         expect(row.category).toBe('FOOD_BEVERAGE');
@@ -532,5 +577,91 @@ run('Business offered-categories contract (real PostgreSQL)', () => {
         expect(typeof mine.offeredCategories).toBe('object');
         // Legacy rows without the field are untouched and still parse.
         expect(rows.every((r) => Array.isArray(r.offeredCategories))).toBe(true);
+    });
+
+    // ─── 4. Controller/route-level error contract (real PostgreSQL) ────────
+    //
+    // The service rejections above are only half the contract: the HTTP
+    // layer must classify them correctly. The invariant error message
+    // contains none of the legacy classifier's keywords, so before the
+    // typed-error mapping a valid-but-conflicting PATCH reached the API
+    // client as HTTP 500. These tests pin the full route behavior:
+    // duplicate-primary PATCHes return 400 with ZERO mutation, while
+    // genuine unexpected failures stay 500.
+
+    const buildBusinessApp = () => {
+        const request = require('supertest');
+        const express = require('express');
+        const jwt = require('jsonwebtoken');
+        const businessRoutes = require('../routes/businessRoutes');
+        const app = express();
+        app.use(express.json());
+        app.set('prisma', db);
+        app.use('/api/business', businessRoutes);
+        const signToken = (userId) => jwt.sign({ id: userId }, process.env.JWT_SECRET, { expiresIn: '1h' });
+        return { app, request, signToken };
+    };
+
+    test('route: duplicate-primary PATCH (offerings containing the new primary) '
+        + 'returns 400 — NOT 500 — with zero mutation', async () => {
+        const { app, request, signToken } = buildBusinessApp();
+        const user = await seedUser();
+        await seedBusiness(user, { offeredCategories: [] });
+
+        const res = await request(app)
+            .patch('/api/business/profile')
+            .set('Authorization', `Bearer ${signToken(user.id)}`)
+            .send({ category: 'FOOD_BEVERAGE', offeredCategories: ['FOOD_BEVERAGE'] });
+
+        expect(res.status).toBe(400,
+            'a valid-but-conflicting PATCH is a client error, not an internal one');
+        expect(res.body.success).toBe(false);
+        expect(res.body.message).toMatch(/must not repeat the primary category/i);
+
+        // Zero mutation through the whole route stack.
+        const row = await db.businessProfile.findFirst({ where: { userId: user.id } });
+        expect(row.category).toBe('HOSPITALITY');
+        expect(row.offeredCategories).toEqual([]);
+    });
+
+    test('route: duplicate-primary PATCH (primary colliding with STORED '
+        + 'offerings) returns 400 with zero mutation', async () => {
+        const { app, request, signToken } = buildBusinessApp();
+        const user = await seedUser();
+        await seedBusiness(user, { offeredCategories: ['FOOD_BEVERAGE'] });
+
+        const res = await request(app)
+            .patch('/api/business/profile')
+            .set('Authorization', `Bearer ${signToken(user.id)}`)
+            .send({ category: 'FOOD_BEVERAGE' });
+
+        expect(res.status).toBe(400);
+        expect(res.body.message).toMatch(/must not repeat the primary category/i);
+        const row = await db.businessProfile.findFirst({ where: { userId: user.id } });
+        expect(row.category).toBe('HOSPITALITY');
+        expect(row.offeredCategories).toEqual(['FOOD_BEVERAGE']);
+    });
+
+    test('controller: a genuine unexpected failure remains HTTP 500', async () => {
+        const ctrl = require('../controllers/businessController');
+        const res = {
+            status: (code) => {
+                res._code = code;
+                return res;
+            },
+            json: (body) => { res._body = body; }
+        };
+        // An infrastructure-level failure the service cannot classify as
+        // validation — must surface as 500, never swallowed into a 400.
+        const brokenPrisma = {
+            $transaction: () => Promise.reject(new Error('connection terminated'))
+        };
+        await ctrl.updateBusinessProfile(
+            { app: { get: () => brokenPrisma }, user: { id: 'does-not-matter' }, body: { businessName: 'OffCat Biz Renamed' } },
+            res
+        );
+        expect(res._code).toBe(500);
+        expect(res._body.success).toBe(false);
+        expect(res._body.message).toBe('connection terminated');
     });
 });
