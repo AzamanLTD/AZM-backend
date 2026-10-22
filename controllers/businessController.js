@@ -55,7 +55,12 @@ exports.registerBusiness = async (req, res) => {
         });
     } catch (err) {
         logger.error({ err: err }, '[registerBusiness] error');
-        return res.status(500).json({ success: false, message: err.message });
+        // Typed validation failures (e.g. the primary category repeated in
+        // offeredCategories, a cross-field rule the Zod edge schema cannot
+        // express) are client errors: 400, nothing created. Anything else
+        // is a genuine unexpected failure and stays 500.
+        const isTypedValidation = err && (err.statusCode === 400 || err.name === 'ProfileValidationError');
+        return res.status(isTypedValidation ? 400 : 500).json({ success: false, message: err.message });
     }
 };
 

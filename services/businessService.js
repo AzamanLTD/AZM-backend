@@ -111,7 +111,7 @@ const registerBusiness = async (prisma, {
 
     const cleanName = String(businessName || '').trim();
     if (cleanName.length < 2 || cleanName.length > 100) {
-        throw new Error('businessName must be 2–100 chars.');
+        throw new ProfileValidationError('businessName must be 2–100 chars.');
     }
     const cat = category && VALID_CATEGORIES.has(category) ? category : 'OTHER';
 

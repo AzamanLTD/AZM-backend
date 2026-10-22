@@ -642,6 +642,47 @@ run('Business offered-categories contract (real PostgreSQL)', () => {
         expect(row.offeredCategories).toEqual(['FOOD_BEVERAGE']);
     });
 
+    test('route: POST /register with the primary repeated in offeredCategories '
+        + 'returns 400 and creates NO BusinessProfile', async () => {
+        const { app, request, signToken } = buildBusinessApp();
+        const user = await seedUser();
+
+        const res = await request(app)
+            .post('/api/business/register')
+            .set('Authorization', `Bearer ${signToken(user.id)}`)
+            .send({
+                businessName: 'OffCat Biz Dup',
+                category: 'HOSPITALITY',
+                offeredCategories: ['FOOD_BEVERAGE', 'HOSPITALITY'],
+            });
+
+        expect(res.status).toBe(400,
+            'a duplicate-primary registration is a client error, not an internal one');
+        expect(res.body.success).toBe(false);
+        expect(res.body.message).toMatch(/must not repeat the primary category/i);
+
+        const created = await db.businessProfile.findMany({ where: { userId: user.id } });
+        expect(created).toHaveLength(0);
+    });
+
+    test('controller: registration infrastructure failure remains HTTP 500', async () => {
+        const ctrl = require('../controllers/businessController');
+        const res = {
+            status: (code) => { res._code = code; return res; },
+            json: (body) => { res._body = body; }
+        };
+        const rejectAll = () => Promise.reject(new Error('connection terminated'));
+        const brokenPrisma = {
+            businessProfile: { findFirst: rejectAll, create: rejectAll, update: rejectAll }
+        };
+        await ctrl.registerBusiness(
+            { app: { get: () => brokenPrisma }, user: { id: 'x' }, body: { businessName: 'OffCat Biz Ok', category: 'RETAIL' } },
+            res
+        );
+        expect(res._code).toBe(500);
+        expect(res._body.message).toBe('connection terminated');
+    });
+
     test('controller: a genuine unexpected failure remains HTTP 500', async () => {
         const ctrl = require('../controllers/businessController');
         const res = {
