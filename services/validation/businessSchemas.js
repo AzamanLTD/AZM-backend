@@ -56,10 +56,14 @@ const freeString = z.string().optional();
 // unknown entries must 400 (this is OUR new field, so unlike the legacy
 // category passthrough we validate strictly). Max 8 keeps the marketplace
 // card honest (it renders at most a handful of offering icons). An empty
-// array is valid — "no additional offerings" is a real state.
+// array is valid — "no additional offerings" is a real state. null is
+// accepted and resolves to [] at the service/controller boundary (same
+// as omission); every other malformed shape (string, number, object,
+// array of unknowns) still 400s here.
 const offeredCategories = z
   .array(z.enum(BUSINESS_CATEGORIES))
   .max(8, 'offeredCategories must contain at most 8 categories.')
+  .nullable()
   .optional();
 
 // POST /api/business/register -------------------------------------------------

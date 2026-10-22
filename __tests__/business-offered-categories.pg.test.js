@@ -86,6 +86,44 @@ run('Business offered-categories contract (real PostgreSQL)', () => {
         expect(bad.error.issues[0].message).toMatch(/Invalid option|Invalid enum value/i);
     });
 
+    test('register/update schemas: null offerings RESOLVE to [] (not a 400) '
+        + 'while every other malformed shape still rejects', () => {
+        const regNull = businessRegisterSchema.safeParse({
+            businessName: 'TT',
+            offeredCategories: null,
+        });
+        expect(regNull.success).toBe(true,
+            'null must pass the schema and resolve to [] downstream '
+            + '(controller ternary on register, service on update)');
+
+        const updNull = businessUpdateSchema.safeParse({ offeredCategories: null });
+        expect(updNull.success).toBe(true);
+
+        // The strict rejections stay strict — only null/omission resolve.
+        for (const bad of ['RETAIL', 42, { 0: 'RETAIL' }, ['NOT_A_CATEGORY']]) {
+            expect(businessUpdateSchema.safeParse({ offeredCategories: bad }).success)
+                .toBe(false);
+        }
+    });
+
+    test('service: register with null -> []; PATCH with null -> clears to []', async () => {
+        const user = await seedUser();
+        const { businessProfile } = await businessService.registerBusiness(db, {
+            userId: user.id,
+            businessName: 'OffCat Null Biz',
+            category: 'HOSPITALITY',
+            offeredCategories: null,
+        });
+        expect(businessProfile.offeredCategories).toEqual([]);
+
+        await seedBusiness(user, { offeredCategories: ['FOOD_BEVERAGE'] });
+        const updated = await businessService.updateBusinessProfile(db, {
+            userId: user.id,
+            updates: { offeredCategories: null },
+        });
+        expect(updated.offeredCategories).toEqual([]);
+    });
+
     test('update schema: >8 offerings 400s; empty array accepted', () => {
         const tooMany = businessUpdateSchema.safeParse({
             offeredCategories: [

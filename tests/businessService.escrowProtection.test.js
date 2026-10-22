@@ -49,8 +49,11 @@ describe('businessService escrow protection capability', () => {
       updates: { offerEscrowProtection: true },
     });
 
+    // The service resolves the profile via findFirst (userId is INDEXED,
+    // not unique — `where: { userId }` is not a valid Prisma update
+    // selector) and targets the resolved row's primary key instead.
     expect(update).toHaveBeenCalledWith({
-      where: { userId: profile.userId },
+      where: { id: profile.id },
       data: {
         businessMeta: {
           storefront: { theme: 'dark' },
