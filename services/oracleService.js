@@ -582,11 +582,17 @@ class OracleService {
             // snapshot is a separate display concept and is never transaction
             // authorization.
             try {
+                // Provenance is the SAME literal the canonical write
+                // stamps (liveRateSource: 'KOTANI_PAY'). Post-#353 this
+                // sync path is Kotani-only: no FALLBACK_FX observation can
+                // reach it, so the snapshot provenance is identical to the
+                // canonical one by construction — never a separate or
+                // client-supplied value.
                 const result = await saveValidatedRateSnapshot({
                     prisma: this.prisma,
                     pair: FX_SAVED_RATE_PAIR,
                     rate: usdcToGhsRate,
-                    source: rateSource,
+                    source: 'KOTANI_PAY',
                     observedAt: observationTimestamp,
                     validation: {
                         validationStatus: 'CANONICAL',
