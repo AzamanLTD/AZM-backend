@@ -207,9 +207,30 @@ describe('Kotani-only transaction-rate authority (unit proofs)', () => {
         // P0 review rejects that: a canonical USDC/GHS transaction rate may
         // come ONLY from the documented v3 field data.value (string). Any
         // other shape is UNPARSEABLE — never guessed, never derived.
-        // Documented shape parses.
+        // Documented shape parses — data.value as a STRING only.
         expect(OracleService.extractKotaniRate({ success: true, data: { value: '15.53' } })).toBe(15.53);
-        expect(OracleService.extractKotaniRate({ success: true, data: { value: 12.75 } })).toBe(12.75);
+        // Strict-schema review (2026-10-23): a JSON NUMBER is an
+        // envelope-shape violation, not an observation — the documented
+        // contract says data.value is a string. Never coerce.
+        expect(OracleService.extractKotaniRate({ success: true, data: { value: 12.75 } })).toBeNull();
+        expect(OracleService.extractKotaniRate({ success: true, data: { value: 0.999 } })).toBeNull();
+        // JavaScript coercion is the reason this is load-bearing:
+        // Number(true) === 1 — a boolean "rate" would parse to 1.
+        expect(OracleService.extractKotaniRate({ success: true, data: { value: true } })).toBeNull();
+        expect(OracleService.extractKotaniRate({ success: true, data: { value: null } })).toBeNull();
+        // Non-decimal strings are rejected: exponent, separator, sign,
+        // whitespace-padding is tolerated but inner shape is not.
+        expect(OracleService.extractKotaniRate({ success: true, data: { value: '1.553e1' } })).toBeNull();
+        expect(OracleService.extractKotaniRate({ success: true, data: { value: '15,53' } })).toBeNull();
+        expect(OracleService.extractKotaniRate({ success: true, data: { value: '+15.53' } })).toBeNull();
+        expect(OracleService.extractKotaniRate({ success: true, data: { value: '-15.53' } })).toBeNull();
+        expect(OracleService.extractKotaniRate({ success: true, data: { value: '  15.53  ' } })).toBe(15.53);
+        // The success declaration must be EXPLICIT true — an absent or
+        // nullish success never parses (strict parser, shared by oracle
+        // and gateway, defense-in-depth behind the fetch-path gate).
+        expect(OracleService.extractKotaniRate({ data: { value: '15.53' } })).toBeNull();
+        expect(OracleService.extractKotaniRate({ success: null, data: { value: '15.53' } })).toBeNull();
+        expect(OracleService.extractKotaniRate({ success: 1, data: { value: '15.53' } })).toBeNull();
         // Legacy/unexpected fields are NO LONGER accepted at any depth.
         expect(OracleService.extractKotaniRate({ rate: '12.34' })).toBeNull();
         expect(OracleService.extractKotaniRate({ exchangeRate: 13.21 })).toBeNull();
@@ -291,6 +312,12 @@ describe('Kotani-only transaction-rate authority (unit proofs)', () => {
         // A response with no pair echo at all is an unvalidated observation.
         expect(OracleService.kotaniPairMatches({ data: { value: '15.53' } }, 'USDC', 'GHS')).toBe(false);
         expect(OracleService.kotaniPairMatches({}, 'USDC', 'GHS')).toBe(false);
+        // Strict-schema review (2026-10-23): the pair must be echoed at the
+        // DOCUMENTED location data.from/data.to. A root-level from/to echo
+        // is an undocumented shape — the removed legacy fallback used to
+        // accept it; it must fail closed now.
+        expect(OracleService.kotaniPairMatches({ success: true, from: 'USDC', to: 'GHS', data: { value: '15.53' } }, 'USDC', 'GHS')).toBe(false);
+        expect(OracleService.kotaniPairMatches({ success: true, data: { from: 'USDC' }, to: 'GHS', data: { value: '15.53' } }, 'USDC', 'GHS')).toBe(false);
     });
 
     test('A2-c. the fetch request uses the documented fiat payout code (to=GHS, POST body)', async () => {
@@ -401,6 +428,56 @@ describe('Kotani-only transaction-rate authority (unit proofs)', () => {
         await new OracleService(prisma).fetchAndUpdateRates();
 
         expect(prisma.globalSettings.upsert).not.toHaveBeenCalled(); // no canonical write
+    });
+
+    test('P0-f. a JSON-NUMBER data.value is an envelope-shape violation — no canonical write (strict-schema 2026-10-23)', async () => {
+        axios.post.mockResolvedValue({ data: {
+            success: true, message: 'Available exchange rate.',
+            data: { from: 'USDC', to: 'GHS', value: 12.75 }, // value as a JSON number, not a string
+        } });
+        axios.get.mockImplementation((url) => {
+            if (url.includes('coingecko')) return COINGECKO_OK();
+            throw new Error(`unexpected GET ${url}`);
+        });
+
+        const prisma = mockPrisma();
+        await new OracleService(prisma).fetchAndUpdateRates();
+
+        expect(prisma.globalSettings.upsert).not.toHaveBeenCalled();
+    });
+
+    test('P0-g. a root-level pair echo is an undocumented shape — no canonical write (strict-schema 2026-10-23)', async () => {
+        axios.post.mockResolvedValue({ data: {
+            success: true,
+            from: 'USDC', to: 'GHS', // pair at the ROOT, not in data — the removed legacy fallback
+            data: { value: '12.75' },
+        } });
+        axios.get.mockImplementation((url) => {
+            if (url.includes('coingecko')) return COINGECKO_OK();
+            throw new Error(`unexpected GET ${url}`);
+        });
+
+        const prisma = mockPrisma();
+        await new OracleService(prisma).fetchAndUpdateRates();
+
+        expect(prisma.globalSettings.upsert).not.toHaveBeenCalled();
+    });
+
+    test('P0-h. a blank or malformed data.value string never parses — no canonical write', async () => {
+        for (const value of ['', '   ', '1.5e1', '15,53', '-1']) {
+            axios.post.mockResolvedValue({ data: {
+                success: true, data: { from: 'USDC', to: 'GHS', value },
+            } });
+            axios.get.mockImplementation((url) => {
+                if (url.includes('coingecko')) return COINGECKO_OK();
+                throw new Error(`unexpected GET ${url}`);
+            });
+
+            const prisma = mockPrisma();
+            await new OracleService(prisma).fetchAndUpdateRates();
+
+            expect(prisma.globalSettings.upsert).not.toHaveBeenCalled();
+        }
     });
 
     test('A2-d. a foreign-pair echo fails closed with a distinct, greppable error — no canonical write', async () => {
@@ -529,6 +606,20 @@ describe('Kotani-only transaction-rate authority (unit proofs)', () => {
         expect(await new GatewayService(mockPrisma()).fetchOfframpRates()).toBeNull();
 
         axios.post.mockResolvedValue({ data: { success: false, message: 'Invalid API Key', data: {} } });
+        expect(await new GatewayService(mockPrisma()).fetchOfframpRates()).toBeNull();
+
+        // Strict-schema review (2026-10-23): the LIVE gateway path must
+        // require an EXPLICIT success:true. The old `=== false` check let a
+        // response with NO success field through whenever the pair and
+        // value happened to look right — an undocumented envelope could
+        // become a tradable OTC quote.
+        axios.post.mockResolvedValue({ data: { from: 'USDC', to: 'GHS', value: '12.90' } }); // success MISSING
+        expect(await new GatewayService(mockPrisma()).fetchOfframpRates()).toBeNull();
+        axios.post.mockResolvedValue({ data: { success: null, from: 'USDC', to: 'GHS', value: '12.90' } });
+        expect(await new GatewayService(mockPrisma()).fetchOfframpRates()).toBeNull();
+        // A numeric data.value is an envelope-shape violation here too —
+        // the gateway shares the oracle's strict parser.
+        axios.post.mockResolvedValue({ data: { success: true, data: { from: 'USDC', to: 'GHS', value: 12.90 } } });
         expect(await new GatewayService(mockPrisma()).fetchOfframpRates()).toBeNull();
         delete process.env.KOTANI_API_KEY;
     });

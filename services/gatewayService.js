@@ -107,13 +107,24 @@ class GatewayService {
                         timeout: 10000,
                     }
                 );
-                if (data?.success === false) {
-                    throw new Error(`Kotani returned success:false (${data?.message ?? 'no message'})`);
+                // Strict-schema review (2026-10-23): the documented v3
+                // contract declares success:true on a usable response —
+                // an ABSENT or non-true declaration (undefined, null,
+                // "1", anything else) is a contract violation and must
+                // FAIL CLOSED, exactly like the oracle path. The earlier
+                // `=== false` check silently accepted a response whose
+                // success field was missing entirely.
+                if (data?.success !== true) {
+                    throw new Error(
+                        `[KOTANI_GATEWAY_SUCCESS_DECLARATION] Kotani offramp rates did not explicitly declare success:true `
+                        + `(success=${JSON.stringify(data?.success ?? null)}, message=${JSON.stringify(data?.message ?? null)}) `
+                        + '— failing closed, no MOCK fallback.'
+                    );
                 }
                 if (!kotaniPairMatches(data, SUPPORTED_CRYPTO, SUPPORTED_FIAT_CURRENCY)) {
                     throw new Error(
                         `Kotani pair mismatch: requested ${SUPPORTED_CRYPTO}->${SUPPORTED_FIAT_CURRENCY}, `
-                        + `echoed ${JSON.stringify(data?.data?.from ?? data?.from ?? null)}->${JSON.stringify(data?.data?.to ?? data?.to ?? null)}`
+                        + `echoed ${JSON.stringify(data?.data?.from ?? null)}->${JSON.stringify(data?.data?.to ?? null)}`
                     );
                 }
                 // The documented offramp envelope carries ONE rate

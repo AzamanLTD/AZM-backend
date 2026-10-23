@@ -56,8 +56,21 @@ const extractKotaniRate = (payload) => {
     // foreign or mislabeled number could be laundered into the canonical
     // slot. When data.value is absent or malformed the observation is
     // UNPARSEABLE — fail closed, never guess.
-    if (payload?.success === false) return null;
-    return asFinitePositive(payload?.data?.value);
+    //
+    // Strict-schema review (2026-10-23): the success declaration must be an
+    // EXPLICIT true (not merely "not false"), and data.value must be a
+    // STRING per the documented v3 contract — a JSON number, boolean or null
+    // is an envelope-shape violation, not an observation. JavaScript
+    // coercion makes this load-bearing: Number(true) === 1 and
+    // Number('15.53') === 15.53, so asFinitePositive silently "parsed"
+    // numbers and even true. Only a trimmed, positive, finite decimal
+    // string is accepted (no exponent, no separators, no sign).
+    if (payload?.success !== true) return null;
+    const raw = payload?.data?.value;
+    if (typeof raw !== 'string') return null;
+    const trimmed = raw.trim();
+    if (!/^\d+(?:\.\d+)?$/.test(trimmed)) return null;
+    return asFinitePositive(trimmed);
 };
 
 // EXACT pair validation (lead review 2026-10-17): the provider contract
@@ -83,8 +96,13 @@ const sameCurrencyCode = (requested, echoed) => {
 // semantics: a response with NO echoed pair, or a mismatched one, must
 // never be trusted as the requested rate.
 const kotaniPairMatches = (payload, expectedFrom, expectedTo) => {
-    const echoedFrom = payload?.data?.from ?? payload?.from;
-    const echoedTo = payload?.data?.to ?? payload?.to;
+    // Strict-schema review (2026-10-23): the documented v3 envelope echoes
+    // the pair ONLY at data.from/data.to. The earlier root-level from/to
+    // fallback accepted an undocumented shape; a strict envelope must not
+    // be lenient about WHERE validation fields live, or a foreign shape can
+    // satisfy the pair check while smuggling an unvalidated rate.
+    const echoedFrom = payload?.data?.from;
+    const echoedTo = payload?.data?.to;
     if (!sameCurrencyCode(expectedFrom, echoedFrom)) return false;
     if (!sameCurrencyCode(expectedTo, echoedTo)) return false;
     return true;
@@ -363,8 +381,8 @@ class OracleService {
             );
         }
         if (!kotaniPairMatches(response.data, from, to)) {
-            const echoedFrom = response.data?.data?.from ?? response.data?.from;
-            const echoedTo = response.data?.data?.to ?? response.data?.to;
+            const echoedFrom = response.data?.data?.from;
+            const echoedTo = response.data?.data?.to;
             throw new Error(
                 `[KOTANI_RATE_PAIR_MISMATCH] requested ${from}->${to} but Kotani echoed `
                 + `${JSON.stringify(echoedFrom ?? null)}->${JSON.stringify(echoedTo ?? null)} `
