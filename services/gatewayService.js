@@ -33,6 +33,30 @@ const crypto = require('crypto');
 const { extractKotaniRate, kotaniPairMatches } = require('./oracleService');
 
 // ─── Constants ──────────────────────────────────────────────────────────────
+// ─── PRODUCTION-HOST POLICY BOUNDARY (review follow-up 2026-10-19) ───────────
+//
+// OracleService's KOTANI_VERIFIED_PRODUCTION_HOSTS allowlist is INTENTIONALLY
+// scoped to RATE OBSERVATIONS only: it governs which host may feed the
+// canonical USDC/GHS transaction rate (globalSettings.liveRetailRate).
+//
+// This service is the PAYOUT EXECUTION path (real money movement: USDC → GHS
+// mobile-money). It does NOT consult that allowlist. A verified rate host is
+// therefore NOT proof that payout execution is safely armed — rate authority
+// and payout authority are SEPARATE authorizations:
+//
+//   • Rate observation arming: host allowlist + explicit operator commit
+//     (services/oracleService.js).
+//   • Payout execution arming: KOTANI_PROVIDER=LIVE + KOTANI_API_KEY set.
+//     The default base URL (https://api.kotanipay.com) is used when
+//     KOTANI_API_BASE_URL is unset. The operator who sets those env vars is
+//     asserting, on their own authority, that the payout host/credentials
+//     are the ones Kotani issued for production payouts.
+//
+// When Kotani onboarding confirms the production payout hostname, the same
+// allowlist discipline SHOULD be extended here (require the payout host on a
+// verified-host list before LIVE payout calls); until that confirmation the
+// boundary is documented rather than invented. This comment is the contract:
+// do not read the rate-observation gate as covering this path.
 const PROVIDER_NAME            = 'KOTANI_PAY';
 const DEFAULT_BASE_URL         = 'https://api.kotanipay.com';
 const RATE_ENDPOINT            = '/api/v3/rate/offramp';
@@ -60,7 +84,14 @@ class GatewayService {
         if (this.providerMode === 'MOCK') {
             logger.info('[GatewayService] Running in MOCK mode (set KOTANI_API_KEY + KOTANI_PROVIDER=LIVE for live calls).');
         } else {
-            logger.info(`[GatewayService] Running in LIVE mode → ${this.baseUrl}`);
+            // Loud by design: LIVE mode here means PAYOUT EXECUTION is armed.
+            // NOT covered by the rate-observation host allowlist — see the
+            // PRODUCTION-HOST POLICY BOUNDARY comment above.
+            logger.warn(
+                `[GatewayService] Running in LIVE mode → ${this.baseUrl} — PAYOUT EXECUTION ARMED. `
+                + 'Payout arming is a separate authorization from the rate-observation host allowlist '
+                + '(KOTANI_VERIFIED_PRODUCTION_HOSTS does NOT gate this path).'
+            );
         }
     }
 
