@@ -114,6 +114,8 @@ The codebase itself states the boundary (`controllers/tradeController.js`): *"P2
 
 Any future FX-dependent route MUST mount the gate; the test suite pins the currently-gated routes.
 
+**Known gap (superseded policy, tracked separately).** This table reflects the PR's shipped scope: FX-dependence scoping. The established product policy is stricter — every NEW USDC-enabled transaction authorization (P2P, internal transfer, crypto withdrawal, conversion, merchant checkout/dine-in/reservations/chat accept) must be refused while the canonical rate is missing, invalid, or stale, even when the transaction itself computes no GHS conversion. That universal-gate workstream is prepared as a separate focused PR on top of this one; until it merges, the ungated rows above are NOT compliant with the product policy and must not be described as complete.
+
 ---
 
 ## 5. Oracle API — additive `savedRate` block (`GET /api/oracle/rates`)
@@ -123,6 +125,8 @@ The canonical response (current rate, source, freshness fields) is byte-identica
 ## 6. Balance API — additive `valuation` block (`GET /api/users/balance`)
 
 Legacy fields (`availableBalance`, `totalBalance`, `currency:'USDC'`, ...) untouched and still authoritative. Added: `valuation` (the full contract in §3), `valuationStatus`, and — on a valuation failure only — `valuationError`. Honest degradation: the legacy balance fields remain available; a valuation failure is never hidden as a fabricated zero/complete valuation.
+
+**Legacy `totalBalance` defect (found by the route-level contract test, fixed here).** The legacy controller computed `user.availableBalance + user.vendorUnallocatedBalance` on two Prisma `Decimal` values. JS coerces objects via `valueOf`, and decimal.js returns a plain string there, so `+` STRING-CONCATENATED: a user with `100` available and `300` unallocated received `"100300"`; a user with `100` available and `0` unallocated received `"1000"`. Fixed to true Decimal addition (`.plus()`), serialized consistently with every other Decimal money field in the envelope. Same fix applied to the two other occurrences in `profileController.js` (dashboard `totalBalance`, hologram `balances.total`). This is the one legacy response value corrected by this PR: it was arithmetically wrong, not a semantics change.
 
 ## 7. Demo gating (every demo artifact)
 
@@ -144,6 +148,7 @@ Legacy fields (`availableBalance`, `totalBalance`, `currency:'USDC'`, ...) untou
 - `__tests__/native-ghs-wallet.test.js` — balanced double entry (custody vs liability); projection equals ledger; CAS overdraft refusal (no ledger residue); idempotency-key duplicate refusal; exact-decimal arithmetic; reconciliation residual zero.
 - `__tests__/balance-valuation.test.js` — every valuationStatus branch; locked buckets in native units; AZM excluded; gate closed on SAVED/DEMO/UNAVAILABLE; `PARTIAL_FX_UNAVAILABLE` honesty (no fabricated totals).
 - `__tests__/fx-transaction-gate.test.js` — 503 fail-closed on stale/unavailable; fresh passes; MoMo-conditional scoping on `/api/wallet/withdraw`; gate ordered before the idempotency claim.
+- `__tests__/balance-route-contract.test.js` — ROUTE-LEVEL pin of the real route (`GET /api/users/balance`), envelope, `{exact, value}` money serialization, equivalent-vs-held distinction, every rate/valuation status variant over HTTP, saved/demo fallback never opening the transaction gate, the honest 404, the `VALUATION_UNAVAILABLE` degradation envelope, and the corrected `totalBalance` arithmetic.
 
 ## 10. Why it is safe to merge
 

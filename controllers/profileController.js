@@ -123,7 +123,7 @@ exports.getProfile = async (req, res) => {
                 ...user,
                 rating,
                 totalReviews,
-                totalBalance: user.availableBalance + user.vendorUnallocatedBalance,
+                totalBalance: user.availableBalance.plus(user.vendorUnallocatedBalance),
                 unreadNotifications: user._count.notifications,
                 totalFriends: user._count.sentFriendRequests + user._count.receivedFriendRequests,
                 memberSince: user.createdAt,
@@ -288,7 +288,7 @@ exports.getBalance = async (req, res) => {
             success: true,
             data: {
                 ...user,
-                totalBalance: user.availableBalance + user.vendorUnallocatedBalance,
+                totalBalance: user.availableBalance.plus(user.vendorUnallocatedBalance),
                 currency: 'USDC',
                 lastUpdated: new Date().toISOString(),
                 // Additive valuation block. `available` when null-free;
@@ -557,7 +557,7 @@ exports.getDashboard = async (req, res) => {
                     available: user.availableBalance,
                     vendorUnallocated: user.vendorUnallocatedBalance,
                     escrowLocked: user.escrowLockedBalance,
-                    total: user.availableBalance + user.vendorUnallocatedBalance,
+                    total: user.availableBalance.plus(user.vendorUnallocatedBalance),
                     currency: 'USDC'
                 },
 
