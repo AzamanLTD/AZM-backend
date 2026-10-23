@@ -3,7 +3,10 @@
 // AZAMAN V2 — KOTANI PAY V3 GATEWAY SERVICE  (Phase B)
 //
 // Mirrors the Kotani Pay V3 API surface for two flows:
-//   1. Off-ramp rate quote   — GET  /api/v3/rate/offramp
+//   1. Off-ramp rate quote   — POST /api/v3/rate/offramp (documented v3
+//      contract: JSON body {from, to, cryptoAmount}; the rate is returned
+//      as data.value — a GET with query params is NOT the v3 surface and
+//      previously made every LIVE call fail into a silent MOCK fallback)
 //   2. Mobile-money payout   — POST /api/v3/payouts/mobile-money
 //   3. Payout status poll    — GET  /api/v3/payouts/{reference}/status
 //
@@ -23,8 +26,37 @@
 const logger = require('../src/config/logger');
 const axios  = require('axios');
 const crypto = require('crypto');
+// Single source of parsing truth for the SAME documented endpoint
+// (POST /api/v3/rate/offramp): the oracle's extractor + pair
+// validation. The gateway must never parse this payload shape
+// independently.
+const { extractKotaniRate, kotaniPairMatches } = require('./oracleService');
 
 // ─── Constants ──────────────────────────────────────────────────────────────
+// ─── PRODUCTION-HOST POLICY BOUNDARY (review follow-up 2026-10-19) ───────────
+//
+// OracleService's KOTANI_VERIFIED_PRODUCTION_HOSTS allowlist is INTENTIONALLY
+// scoped to RATE OBSERVATIONS only: it governs which host may feed the
+// canonical USDC/GHS transaction rate (globalSettings.liveRetailRate).
+//
+// This service is the PAYOUT EXECUTION path (real money movement: USDC → GHS
+// mobile-money). It does NOT consult that allowlist. A verified rate host is
+// therefore NOT proof that payout execution is safely armed — rate authority
+// and payout authority are SEPARATE authorizations:
+//
+//   • Rate observation arming: host allowlist + explicit operator commit
+//     (services/oracleService.js).
+//   • Payout execution arming: KOTANI_PROVIDER=LIVE + KOTANI_API_KEY set.
+//     The default base URL (https://api.kotanipay.com) is used when
+//     KOTANI_API_BASE_URL is unset. The operator who sets those env vars is
+//     asserting, on their own authority, that the payout host/credentials
+//     are the ones Kotani issued for production payouts.
+//
+// When Kotani onboarding confirms the production payout hostname, the same
+// allowlist discipline SHOULD be extended here (require the payout host on a
+// verified-host list before LIVE payout calls); until that confirmation the
+// boundary is documented rather than invented. This comment is the contract:
+// do not read the rate-observation gate as covering this path.
 const PROVIDER_NAME            = 'KOTANI_PAY';
 const DEFAULT_BASE_URL         = 'https://api.kotanipay.com';
 const RATE_ENDPOINT            = '/api/v3/rate/offramp';
@@ -52,7 +84,14 @@ class GatewayService {
         if (this.providerMode === 'MOCK') {
             logger.info('[GatewayService] Running in MOCK mode (set KOTANI_API_KEY + KOTANI_PROVIDER=LIVE for live calls).');
         } else {
-            logger.info(`[GatewayService] Running in LIVE mode → ${this.baseUrl}`);
+            // Loud by design: LIVE mode here means PAYOUT EXECUTION is armed.
+            // NOT covered by the rate-observation host allowlist — see the
+            // PRODUCTION-HOST POLICY BOUNDARY comment above.
+            logger.warn(
+                `[GatewayService] Running in LIVE mode → ${this.baseUrl} — PAYOUT EXECUTION ARMED. `
+                + 'Payout arming is a separate authorization from the rate-observation host allowlist '
+                + '(KOTANI_VERIFIED_PRODUCTION_HOSTS does NOT gate this path).'
+            );
         }
     }
 
@@ -74,29 +113,71 @@ class GatewayService {
      */
     async fetchOfframpRates() {
         if (this.providerMode === 'LIVE') {
+            // 2026-10-17 (A3) — the LIVE path previously issued a GET with
+            // query params (the v3 rate endpoint is POST with a JSON body)
+            // and read data.rate/data.corporateRate — fields the documented
+            // v3 envelope never carries — so EVERY LIVE call failed and
+            // silently fell back to MOCK rates while the logs claimed LIVE.
+            // It also failed OPEN for the war-room OTC quote: the admin
+            // corporate buy traded at a fabricated rate whenever Kotani
+            // hiccuped. The path now makes the documented call, validates
+            // the response exactly like the oracle (success + echoed pair
+            // + usable rate), and FAILS CLOSED on any failure — null, not
+            // a MOCK rate. MOCK is an explicit provider configuration
+            // (KOTANI_PROVIDER unset), never a fallback state.
             try {
-                const { data } = await axios.get(`${this.baseUrl}${RATE_ENDPOINT}`, {
-                    params:  { from: SUPPORTED_CRYPTO, to: SUPPORTED_FIAT_CURRENCY },
-                    headers: this._authHeaders(),
-                    timeout: 10000
-                });
-                const retail    = parseFloat(data.rate ?? data.retailRate);
-                const corporate = parseFloat(data.corporateRate ?? data.otcRate ?? retail);
-                if (!Number.isFinite(retail) || !Number.isFinite(corporate) || retail <= 0) {
-                    throw new Error('Kotani returned a non-numeric rate.');
+                const { data } = await axios.post(
+                    `${this.baseUrl}${RATE_ENDPOINT}`,
+                    {
+                        from:         SUPPORTED_CRYPTO,
+                        to:           SUPPORTED_FIAT_CURRENCY,
+                        cryptoAmount: 1,
+                    },
+                    {
+                        headers: this._authHeaders(),
+                        timeout: 10000,
+                    }
+                );
+                // Strict-schema review (2026-10-23): the documented v3
+                // contract declares success:true on a usable response —
+                // an ABSENT or non-true declaration (undefined, null,
+                // "1", anything else) is a contract violation and must
+                // FAIL CLOSED, exactly like the oracle path. The earlier
+                // `=== false` check silently accepted a response whose
+                // success field was missing entirely.
+                if (data?.success !== true) {
+                    throw new Error(
+                        `[KOTANI_GATEWAY_SUCCESS_DECLARATION] Kotani offramp rates did not explicitly declare success:true `
+                        + `(success=${JSON.stringify(data?.success ?? null)}, message=${JSON.stringify(data?.message ?? null)}) `
+                        + '— failing closed, no MOCK fallback.'
+                    );
+                }
+                if (!kotaniPairMatches(data, SUPPORTED_CRYPTO, SUPPORTED_FIAT_CURRENCY)) {
+                    throw new Error(
+                        `Kotani pair mismatch: requested ${SUPPORTED_CRYPTO}->${SUPPORTED_FIAT_CURRENCY}, `
+                        + `echoed ${JSON.stringify(data?.data?.from ?? null)}->${JSON.stringify(data?.data?.to ?? null)}`
+                    );
+                }
+                // The documented offramp envelope carries ONE rate
+                // (data.value). There is no separate corporate/OTC feed in
+                // the v3 surface, so LIVE corporate === retail (spread 0)
+                // — the truthful answer, not a fabricated discount.
+                const retail = extractKotaniRate(data);
+                if (!retail) {
+                    throw new Error('Kotani rate response did not contain a usable rate (data.value).');
                 }
                 return {
                     provider:      PROVIDER_NAME,
                     currency:      SUPPORTED_FIAT_CURRENCY,
                     retailRate:    retail,
-                    corporateRate: corporate,
-                    spread:        Math.max(0, parseFloat((retail - corporate).toFixed(6))),
-                    validUntil:    data.validUntil || new Date(Date.now() + 5 * 60_000).toISOString(),
+                    corporateRate: retail,
+                    spread:        0,
+                    validUntil:    new Date(Date.now() + 5 * 60_000).toISOString(),
                     source:        'LIVE'
                 };
             } catch (err) {
-                logger.error({ err: err }, '[GatewayService.fetchOfframpRates] LIVE call failed → falling back to MOCK');
-                // Fall through — never let a transient gateway outage break the platform.
+                logger.error({ err: err }, '[GatewayService.fetchOfframpRates] LIVE call failed → FAILING CLOSED (no MOCK fallback)');
+                return null; // fail closed — the caller (war-room OTC quote) 503s
             }
         }
         return this._mockOfframpRates();
@@ -196,63 +277,35 @@ class GatewayService {
     }
 
     /**
-     * Fetch rates and persist them to GlobalSettings (singleton id=1).
-     * Driven on a 5-minute interval by .startRateSync().
+     * ECHO-ONLY rate sync — persists the corporate (admin OTC) rate into
+     * GlobalSettings (singleton id=1). Driven on a 5-minute interval by
+     * .startRateSync().
      *
-     * Provenance contract (issue #271 / PR 271B):
-     *   LIVE Kotani response → a genuine EXTERNAL observation: may stamp
-     *     lastRateSync + lastExternalSync (same timestamp) and liveRateSource.
-     *   MOCK (default mode, or LIVE falling back to MOCK after a failure) →
-     *     NOT an external observation: it is an echo of cached values. It must
-     *     never rewrite liveRetailRate / liveUsdToGhs / liveRateSource and
-     *     never refresh lastRateSync / lastExternalSync. Only lastEchoAt is
-     *     stamped (plus liveCorporateRate, derived from the canonical current
-     *     retail snapshot rather than the echoed headline rate, so the
-     *     oracle's USDC adjustment can no longer be erased by this loop).
+     * Provenance contract (issue #271 / PR 271B; Kotani-only authority,
+     * 2026-10-16 wave; A3 hardening 2026-10-17):
+     *   The ORACLE is the single canonical writer of the transaction-rate
+     *   fields (liveRetailRate / liveUsdToGhs / liveRateSource =
+     *   'KOTANI_PAY' / lastRateSync / lastExternalSync). This loop is
+     *   RETIRED as a rate source: previously a successful LIVE fetch here
+     *   stamped ALL of those canonical fields a SECOND time from its own
+     *   (previously broken GET-based) call — a competing writer that
+     *   could disagree with the oracle's validated observation. It now
+     *   only EVER writes the corporate rate and lastEchoAt, in every
+     *   provider mode: liveCorporateRate is derived from the canonical
+     *   current retail snapshot (liveRetailRate), never from an
+     *   independent fetch, so the oracle's USDC adjustment can no longer
+     *   be erased and no second writer exists.
+     *
+     * liveRetailRate, liveUsdToGhs, liveRateSource, lastRateSync and
+     * lastExternalSync are NEVER touched by this method.
      */
     async syncRatesToGlobalSettings() {
         try {
-            const rates = await this.fetchOfframpRates();
-
-            if (rates.source === 'LIVE') {
-                // Genuine external Kotani observation — one timestamp for
-                // both freshness fields (issue #271 contract).
-                const observationTimestamp = new Date();
-                await this.prisma.globalSettings.upsert({
-                    where: { id: 1 },
-                    update: {
-                        liveRetailRate:    rates.retailRate,
-                        liveCorporateRate: rates.corporateRate,
-                        liveRateSource:    rates.source,
-                        lastRateSync:      observationTimestamp,
-                        lastExternalSync: observationTimestamp,
-                        // Keep liveUsdToGhs in sync so legacy code paths
-                        // (oracle, p2p.completeTrade margin math) keep
-                        // returning the same Hologram value.
-                        liveUsdToGhs:      rates.retailRate
-                    },
-                    create: {
-                        id: 1,
-                        liveRetailRate:    rates.retailRate,
-                        liveCorporateRate: rates.corporateRate,
-                        liveRateSource:    rates.source,
-                        lastRateSync:      observationTimestamp,
-                        lastExternalSync: observationTimestamp,
-                        liveUsdToGhs:      rates.retailRate
-                    }
-                });
-                logger.info(
-                    `[GatewayService] Rate sync ✓ retail=${rates.retailRate} ` +
-                    `corporate=${rates.corporateRate} source=${rates.source}`
-                );
-                return rates;
-            }
-
-            // MOCK echo — cached-value copy, NOT an external observation.
-            // Derive the corporate rate from the canonical current retail
-            // snapshot (liveRetailRate), never from the echoed
-            // liveUsdToGhs → liveRetailRate overwrite that previously erased
-            // the oracle's USDC adjustment every 5 minutes.
+            // Cached-value copy, NOT an external observation. Derive the
+            // corporate rate from the canonical current retail snapshot
+            // (liveRetailRate), never from the echoed liveUsdToGhs →
+            // liveRetailRate overwrite that previously erased the oracle's
+            // USDC adjustment every 5 minutes.
             const settings   = await this.prisma.globalSettings.findUnique({ where: { id: 1 } });
             const retailRate = Number(settings?.liveRetailRate ?? 12.5);
             const corporate  = parseFloat((retailRate * (1 - MOCK_CORPORATE_DISCOUNT)).toFixed(6));
@@ -271,9 +324,17 @@ class GatewayService {
             });
             logger.info(
                 `[GatewayService] Rate echo ✓ (cached retail preserved: ${retailRate}) ` +
-                `corporate=${corporate} source=MOCK`
+                `corporate=${corporate} (echo-only: canonical fields untouched)`
             );
-            return rates;
+            return {
+                provider:      PROVIDER_NAME,
+                currency:      SUPPORTED_FIAT_CURRENCY,
+                retailRate,   // the canonical snapshot, for display only
+                corporateRate: corporate,
+                spread:        Math.max(0, parseFloat((retailRate - corporate).toFixed(6))),
+                validUntil:    echoAt.toISOString(),
+                source:        'ECHO'
+            };
         } catch (err) {
             logger.error({ err: err }, '[GatewayService] Rate sync failed');
             return null;
@@ -318,7 +379,13 @@ class GatewayService {
         // hasn't run yet, fall back to the schema default (12.50). The
         // corporate rate is a realistic OTC discount below retail.
         const settings    = await this.prisma.globalSettings.findUnique({ where: { id: 1 } });
-        const retailRate  = settings?.liveUsdToGhs ?? 12.5;
+        // B fix (lead review 2026-10-17): anchor to the canonical
+        // liveRetailRate snapshot (the oracle no longer writes
+        // liveUsdToGhs); legacy field kept only as the admin-override
+        // fallback.
+        const retailRate  = (Number(settings?.liveRetailRate) > 0)
+            ? Number(settings.liveRetailRate)
+            : Number(settings?.liveUsdToGhs ?? 12.5);
         const corporate   = parseFloat((retailRate * (1 - MOCK_CORPORATE_DISCOUNT)).toFixed(6));
         return {
             provider:      PROVIDER_NAME,

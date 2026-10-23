@@ -105,7 +105,11 @@ describeOrSkip('Rate provenance truthfulness (real PostgreSQL) — issue #271 / 
             }
             return Promise.reject(new Error(`unexpected GET ${url}`));
         });
-        axios.post.mockImplementation(() => Promise.resolve({ data: { rate: externalRate } }));
+        // Documented v3 envelope (success + echoed pair + string value).
+        axios.post.mockImplementation(() => Promise.resolve({ data: {
+            success: true,
+            data: { from: 'USDC', to: 'GHS', value: String(externalRate) },
+        } }));
         process.env.KOTANI_PROVIDER = 'LIVE';
         process.env.KOTANI_API_TOKEN = 'test-token';
         const OracleService = require('../services/oracleService');
@@ -138,9 +142,20 @@ describeOrSkip('Rate provenance truthfulness (real PostgreSQL) — issue #271 / 
         axios.post.mockReset();
         process.env.KOTANI_PROVIDER = 'LIVE';
         process.env.KOTANI_API_KEY = 'test-key';
-        axios.get.mockImplementation(() => {
+        // The LIVE rate fetch is the documented POST /api/v3/rate/offramp
+        // (a GET with query params was never the v3 surface).
+        axios.post.mockImplementation((url, body) => {
+            if (!url.includes('/api/v3/rate/offramp')) {
+                return Promise.reject(new Error(`unexpected POST ${url}`));
+            }
+            expect(body).toEqual({ from: 'USDC', to: 'GHS', cryptoAmount: 1 });
             if (!succeed) return Promise.reject(new Error('kotani LIVE outage'));
-            return Promise.resolve({ data: { rate: '12.90', corporateRate: '12.70' } });
+            return Promise.resolve({
+                data: {
+                    success: true,
+                    data: { from: 'USDC', to: 'GHS', value: '12.90' },
+                },
+            });
         });
         const GatewayService = require('../services/gatewayService');
         return new GatewayService(prisma);
@@ -213,39 +228,52 @@ describeOrSkip('Rate provenance truthfulness (real PostgreSQL) — issue #271 / 
 
     // ---- D. Gateway LIVE -----------------------------------------------------
 
-    test('D1. gateway LIVE success is an external observation and stamps both freshness fields', async () => {
-        await seedSettings({ liveRetailRate: 13.42, lastEchoAt: null });
+    // ---- D. Gateway LIVE (A3 hardening, 2026-10-17) --------------------------
+    //
+    // The gateway is RETIRED as a rate source: its sync loop is ECHO-ONLY
+    // in every provider mode and the oracle is the single canonical writer.
+    // Its LIVE fetch exists solely for the war-room OTC quote and must be
+    // the documented POST call — and must FAIL CLOSED (null, never a MOCK
+    // fallback rate) so the admin quote 503s instead of trading at a
+    // fabricated rate.
 
-        const before = Date.now();
-        await makeGatewayLive({ succeed: true }).syncRatesToGlobalSettings();
-        const after = Date.now();
-
-        const row = await getSettings();
-        expect(Number(row.liveRetailRate)).toBe(12.90);
-        expect(Number(row.liveCorporateRate)).toBe(12.70);
-        expect(Number(row.liveUsdToGhs)).toBe(12.90);
-        expect(row.liveRateSource).toBe('LIVE');
-        expect(row.lastRateSync.getTime()).toBe(row.lastExternalSync.getTime());
-        expect(row.lastExternalSync.getTime()).toBeGreaterThanOrEqual(before - 5);
-        expect(row.lastExternalSync.getTime()).toBeLessThanOrEqual(after + 5);
-    });
-
-    test('D2. gateway LIVE failure falling back to MOCK must NOT stamp freshness', async () => {
+    test('D1. gateway LIVE sync is ECHO-ONLY — canonical fields untouched, single writer remains the oracle', async () => {
         const prior = await seedSettings({
             liveRetailRate: 13.42,
             liveRateSource: 'KOTANI_PAY',
+            lastRateSync: new Date('2026-09-17T10:00:00.000Z'),
+            lastExternalSync: new Date('2026-09-17T10:00:00.000Z'),
             lastEchoAt: null,
         });
 
-        const rates = await makeGatewayLive({ succeed: false }).syncRatesToGlobalSettings();
-        expect(rates.source).toBe('MOCK'); // fetchOfframpRates fell back to MOCK
+        const rates = await makeGatewayLive({ succeed: true }).syncRatesToGlobalSettings();
 
         const row = await getSettings();
-        expect(Number(row.liveRetailRate)).toBe(13.42);           // untouched
-        expect(row.liveRateSource).toBe('KOTANI_PAY');            // untouched
+        expect(Number(row.liveRetailRate)).toBe(13.42);  // NOT overwritten
+        expect(row.liveRateSource).toBe('KOTANI_PAY');    // NOT overwritten
+        expect(Number(row.liveCorporateRate)).toBeCloseTo(13.42 * 0.985, 6); // derived from the canonical retail
+        expect(row.lastEchoAt).not.toBeNull();            // echo recorded
+        expect(row.lastEchoAt.getTime()).toBeGreaterThan(prior.lastRateSync.getTime());
+        // Freshness is NEVER stamped by the gateway — identical timestamps.
         expect(row.lastRateSync.getTime()).toBe(prior.lastRateSync.getTime());
         expect(row.lastExternalSync.getTime()).toBe(prior.lastExternalSync.getTime());
-        expect(row.lastEchoAt).not.toBeNull();                    // echo recorded, freshness not
+        expect(rates.source).toBe('ECHO');                // the sync declares itself an echo
+        // The sync performs NO external rate fetch at all.
+        expect(axios.post).not.toHaveBeenCalled();
+    });
+
+    test('D2. gateway LIVE fetch uses the documented POST + v3 envelope, and FAILS CLOSED (no MOCK fallback)', async () => {
+        // Success: the documented contract, with pair echo + data.value.
+        const ok = await makeGatewayLive({ succeed: true }).fetchOfframpRates();
+        expect(ok.source).toBe('LIVE');
+        expect(ok.retailRate).toBe(12.90);
+        expect(ok.corporateRate).toBe(12.90); // one rate in the v3 surface — no fabricated corporate spread
+        expect(ok.spread).toBe(0);
+
+        // Failure: null (fail closed) — never a silent MOCK rate for the
+        // admin OTC quote.
+        const failed = await makeGatewayLive({ succeed: false }).fetchOfframpRates();
+        expect(failed).toBeNull();
     });
 
     // ---- E. Admin override ---------------------------------------------------
@@ -276,6 +304,65 @@ describeOrSkip('Rate provenance truthfulness (real PostgreSQL) — issue #271 / 
         expect(log).not.toBeNull();
         expect(log.changes.liveUsdToGhs).toEqual({ old: 13.10, new: 14.50 });
         expect(log.changes.lastAdminSetAt).toBeDefined();
+    });
+
+    // ---- E2. §1 provider-owned canonical fields (review follow-up 2026-10-18) ----
+
+    test('E2-a. admin settings CANNOT mutate liveRetailRate — the field is provider-owned', async () => {
+        const prior = await seedSettings({ liveRetailRate: 13.42, liveRateSource: 'KOTANI_PAY', lastAdminSetAt: null });
+        const { updateSettings } = require('../controllers/adminSettingsController');
+
+        const res = mockRequest({ liveRetailRate: 99.99 });
+        const out = mockResponse();
+        await updateSettings(res, out);
+
+        expect(out.statusCode).toBe(400);
+        expect(out.payload.success).toBe(false);
+        expect(out.payload.message).toContain('provider-owned');
+
+        // The canonical row is byte-identical — no mutation, no freshness move.
+        const row = await getSettings();
+        expect(Number(row.liveRetailRate)).toBe(13.42);
+        expect(row.liveRateSource).toBe('KOTANI_PAY');
+        expect(row.lastExternalSync ? row.lastExternalSync.getTime() : null)
+            .toBe(prior.lastExternalSync ? prior.lastExternalSync.getTime() : null);
+        expect(row.lastAdminSetAt).toBeNull();
+    });
+
+    test('E2-b. admin settings CANNOT spoof liveRateSource=KOTANI_PAY — a manual value can never be relabeled as a provider observation', async () => {
+        const prior = await seedSettings({ liveRetailRate: 13.42, liveRateSource: 'AZM_ADMIN_OVERRIDE', lastAdminSetAt: null });
+        const { updateSettings } = require('../controllers/adminSettingsController');
+
+        // The spoof shape: a rate PLUS a provider label in one request.
+        const res = mockRequest({ liveRetailRate: 99.99, liveRateSource: 'KOTANI_PAY' });
+        const out = mockResponse();
+        await updateSettings(res, out);
+
+        expect(out.statusCode).toBe(400);
+        const row = await getSettings();
+        expect(Number(row.liveRetailRate)).toBe(13.42);
+        expect(row.liveRateSource).toBe('AZM_ADMIN_OVERRIDE');
+
+        // The label alone is also refused.
+        const res2 = mockRequest({ liveRateSource: 'KOTANI_PAY' });
+        const out2 = mockResponse();
+        await updateSettings(res2, out2);
+        expect(out2.statusCode).toBe(400);
+        const row2 = await getSettings();
+        expect(row2.liveRateSource).toBe('AZM_ADMIN_OVERRIDE');
+        expect(row2.lastExternalSync ? row2.lastExternalSync.getTime() : null)
+            .toBe(prior.lastExternalSync ? prior.lastExternalSync.getTime() : null);
+    });
+
+    test('E2-c. the legacy liveUsdToGhs override still works and stamps manual provenance (operator capability preserved)', async () => {
+        const { updateSettings } = require('../controllers/adminSettingsController');
+        const res = mockRequest({ liveUsdToGhs: 14.20 });
+        const out = mockResponse();
+        await updateSettings(res, out);
+        expect(out.statusCode).toBe(200);
+        const row = await getSettings();
+        expect(Number(row.liveUsdToGhs)).toBe(14.20);
+        expect(row.lastAdminSetAt).not.toBeNull();
     });
 
     // ---- F. Mixed writer sequence ---------------------------------------------

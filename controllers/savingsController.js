@@ -1072,9 +1072,13 @@ exports.getOverview = async (req, res) => {
         const bestStreak = Math.max(0, ...goals.map(g => g.longestStreak));
         const currentBestStreak = Math.max(0, ...activeGoals.map(g => g.streakCount));
 
-        // Get live rate for USD display
+        // Get live rate for USDC display (B fix, lead review 2026-10-17):
+        // prefer the canonical liveRetailRate; the legacy liveUsdToGhs is
+        // only the admin-override fallback.
         const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
-        const liveRate = settings ? settings.liveUsdToGhs : 15.0;
+        const liveRate = (Number(settings?.liveRetailRate) > 0)
+            ? Number(settings.liveRetailRate)
+            : (settings ? Number(settings.liveUsdToGhs) : 15.0);
         const totalSavedUsdc = parseFloat((totalSavedGhs / liveRate).toFixed(4));
 
         // Upcoming due dates (next 7 days)

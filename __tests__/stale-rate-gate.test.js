@@ -290,10 +290,65 @@ describeOrSkip('271C fail-closed stale-rate gate (real PostgreSQL)', () => {
         test('canonical retail rate wins over the legacy headline rate (same resolution as the ungated reader)', async () => {
             await seedSettings({ lastExternalSync: at(60), liveRetailRate: 13.42, liveUsdToGhs: 13.10 });
             expect((await getFreshServerRateGhsPerUsdc({ prisma, now: NOW })).rateGhsPerUsdc).toBe(13.42);
+        });
 
-            // Legacy fallback when the retail field is missing.
+        // §1 (review follow-up 2026-10-18): the legacy liveUsdToGhs is a
+        // USD/GHS compatibility DISPLAY field. A missing/invalid canonical
+        // USDC/GHS rate must NEVER be papered over with the USD field — the
+        // gate fails closed even when a fresh observation timestamp exists.
+        test('a missing/invalid canonical retail rate NEVER falls back to the legacy USD/GHS field (§1)', async () => {
             await seedSettings({ lastExternalSync: at(60), liveRetailRate: 0, liveUsdToGhs: 13.10 });
-            expect((await getFreshServerRateGhsPerUsdc({ prisma, now: NOW })).rateGhsPerUsdc).toBe(13.10);
+            await expect(getFreshServerRateGhsPerUsdc({ prisma, now: NOW }))
+                .rejects.toMatchObject({ code: 'RATE_UNAVAILABLE' });
+            // (liveRetailRate is a non-nullable Decimal in the schema, so
+            // the zero/invalid value is the representable unusable-rate case.)
+        });
+
+        // §1 case 1: a recent old Kotani timestamp must NOT authorize a rate
+        // that was manually changed AFTER the observation. lastAdminSetAt
+        // newer than lastExternalSync -> RATE_UNTRUSTED (typed 503).
+        test('a recent-but-manually-superseded observation cannot produce a quote (§1 case 1)', async () => {
+            // Fresh Kotani observation 60s ago, then a manual mutation 30s ago.
+            await seedSettings({
+                lastExternalSync: at(60),
+                lastAdminSetAt: at(30),
+                liveRetailRate: 99.99,
+                liveRateSource: 'KOTANI_PAY',
+            });
+            await expect(getFreshServerRateGhsPerUsdc({ prisma, now: NOW }))
+                .rejects.toMatchObject({ code: 'RATE_UNTRUSTED', statusCode: 503 });
+        });
+
+        // §1: a fresh observation timestamp with a NON-provider source label
+        // (e.g. an override labeled MOCK/FALLBACK/AZM_ADMIN_OVERRIDE) is not
+        // Kotani provenance — no quote.
+        test('a fresh timestamp with a non-Kotani source label fails closed (§1 provenance)', async () => {
+            // (liveRateSource is a non-nullable String in the schema, so the
+            // default 'MOCK' row state is the not-KOTANI_PAY baseline case.)
+            for (const label of ['AZM_ADMIN_OVERRIDE', 'MOCK', 'FALLBACK_FX', 'LEGACY']) {
+                await seedSettings({
+                    lastExternalSync: at(60),
+                    liveRetailRate: 13.42,
+                    liveRateSource: label,
+                    lastAdminSetAt: null,
+                });
+                await expect(getFreshServerRateGhsPerUsdc({ prisma, now: NOW }))
+                    .rejects.toMatchObject({ code: 'RATE_UNAVAILABLE', statusCode: 503 });
+            }
+        });
+
+        // §1: an admin-set timestamp OLDER than the observation does not
+        // invalidate the (newer) genuine Kotani observation.
+        test('an older manual change does not invalidate a newer genuine observation', async () => {
+            await seedSettings({
+                lastExternalSync: at(30),
+                lastAdminSetAt: at(60),
+                liveRetailRate: 13.42,
+                liveRateSource: 'KOTANI_PAY',
+            });
+            const rate = await getFreshServerRateGhsPerUsdc({ prisma, now: NOW });
+            expect(rate.rateGhsPerUsdc).toBe(13.42);
+            expect(rate.rateSource).toBe('KOTANI_PAY');
         });
     });
 

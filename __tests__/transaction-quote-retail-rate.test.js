@@ -51,13 +51,21 @@ describe('transaction quote canonical FX source (gated reader)', () => {
         expect(result.externalAgeSeconds).toBeCloseTo(600, 0);
     });
 
-    test('falls back to legacy USD/GHS only when retail rate is unavailable', async () => {
-        const result = await getFreshServerRateGhsPerUsdc({
-            prisma: prismaWith(settings({ liveRetailRate: null, liveRateSource: 'LEGACY' })),
+    // §1 (review follow-up 2026-10-18): the legacy liveUsdToGhs is a USD/GHS
+    // display field — NEVER a USDC/GHS transaction-rate fallback. A missing
+    // canonical retail rate fails closed even with a fresh observation.
+    test('a missing canonical retail rate NEVER falls back to legacy USD/GHS (§1)', async () => {
+        await expect(getFreshServerRateGhsPerUsdc({
+            prisma: prismaWith(settings({ liveRetailRate: null })),
             now: NOW,
-        });
-        expect(result.rateGhsPerUsdc).toBe(13.25);
-        expect(result.rateSource).toBe('LEGACY');
+        })).rejects.toMatchObject({ code: 'RATE_UNAVAILABLE' });
+    });
+
+    test('a non-Kotani source label fails closed even with a fresh observation (§1 provenance)', async () => {
+        await expect(getFreshServerRateGhsPerUsdc({
+            prisma: prismaWith(settings({ liveRateSource: 'LEGACY' })),
+            now: NOW,
+        })).rejects.toMatchObject({ code: 'RATE_UNAVAILABLE' });
     });
 
     test('NULL lastExternalSync fails closed (RATE_UNAVAILABLE)', async () => {
