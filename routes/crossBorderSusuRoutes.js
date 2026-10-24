@@ -8,7 +8,7 @@ const cb = require('../controllers/crossBorderSusuController');
 const protect = authMiddleware.protect;
 
 router.post('/',                protect, cb.createCrossBorderSusu);
-router.post('/contribute', requireFreshFxRate(),     protect, idempotency(), cb.contributeLocalCurrency);
+router.post('/contribute', protect, requireFreshFxRate(), idempotency(), cb.contributeLocalCurrency);
 router.post('/payout',         protect, idempotency(), cb.payoutLocalCurrency);
 router.get('/:susuGroupId',    protect, cb.getCrossBorderDetails);
 

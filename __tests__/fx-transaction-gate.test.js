@@ -208,25 +208,31 @@ describe('FX transaction gate middleware (real PostgreSQL)', () => {
         expect(res.status).toHaveBeenCalledWith(503);
     });
 
-    // ── D. `when` predicate scoping ─────────────────────────────────────
+    // ── D. NO conditional bypass (universal scope) ──────────────────────
 
-    test('the `when` predicate lets FX-independent requests pass without a fresh rate', async () => {
+    test('the retired `when` predicate cannot soften the gate — no bypass exists', async () => {
         await setGlobal('12.5', null); // gate CLOSED
-        const gate = requireFreshFxRate({
-            when: (req) => /^\d+$/.test(String(req.body?.destination || '')),
-        });
 
-        // FX-dependent request: refused
+        // The factory takes NO options: a leftover conditional-style call
+        // site requireFreshFxRate({ when: ... }) is inert — the gate still
+        // runs unconditionally.
+        const gate = requireFreshFxRate({
+            when: () => true, // a stale call site trying to opt out
+        });
+        expect(requireFreshFxRate.length).toBe(0); // signature has no params
+
+        // "FX-independent-looking" request (crypto destination): still refused
         const refusedRes = buildRes();
         const refusedNext = jest.fn();
-        await gate(buildReq({ destination: '02445566778899' }), refusedRes, refusedNext);
+        await gate(buildReq({ destination: '0x742d35Cc6634C0532925a3b844Bc454e44384444' }), refusedRes, refusedNext);
         expect(refusedNext).not.toHaveBeenCalled();
+        expect(refusedRes.status).toHaveBeenCalledWith(503);
 
-        // FX-independent request (crypto destination): passes
-        const passedRes = buildRes();
-        const passedNext = jest.fn();
-        await gate(buildReq({ destination: '0x742d35Cc6634C0532925a3b844Bc454e44384444' }), passedRes, passedNext);
-        expect(passedNext).toHaveBeenCalled();
+        // And the middleware source ships no conditional bypass at all.
+        const src = require('fs').readFileSync(
+            require('path').resolve(__dirname, '../middleware/fxTransactionGateMiddleware.js'), 'utf8');
+        expect(src).not.toMatch(/function requireFreshFxRate\(\{ when \}/);
+        expect(src).not.toMatch(/!when\(req\)/);
     });
 
     // ── E/F. real route wiring pinned ───────────────────────────────────

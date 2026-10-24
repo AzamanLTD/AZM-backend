@@ -21,7 +21,7 @@ router.get('/ticket/:ticketId', protect, ctrl.getEscrowForTicket);
 // IN_PROGRESS claim after a 4xx is durable proof of rollback — the key is
 // safely releasable (releaseOn4xx). 5xx stays RETAIN (default): a post-
 // commit failure must never re-arm a funded escrow.
-router.post('/fund', requireFreshFxRate(), protectActive, require2FA(), idempotency({ releaseOn4xx: true }), validate(fundEscrowSchema), ctrl.fundEscrow);
+router.post('/fund', protectActive, require2FA(), requireFreshFxRate(), idempotency({ releaseOn4xx: true }), validate(fundEscrowSchema), ctrl.fundEscrow);
 router.post('/satisfy', protectActive, idempotency(), ctrl.markSatisfied);
 router.post('/dispute', protectActive, idempotency(), validate(raiseDisputeSchema), ctrl.raiseDispute);
 router.post('/update-terms', protect, ctrl.updateTerms);

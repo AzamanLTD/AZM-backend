@@ -27,10 +27,10 @@ router.get('/goals/:id', protect, savingsController.getGoal);
 router.post('/goals', protectActive, savingsController.createGoal);
 
 // Deposit into a savings goal (write — ban guarded)
-router.post('/goals/:id/deposit', requireFreshFxRate(), protectActive, idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), savingsController.deposit);
+router.post('/goals/:id/deposit', protectActive, requireFreshFxRate(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), savingsController.deposit);
 
 // Withdraw from a savings goal (write — ban guarded)
-router.post('/goals/:id/withdraw', requireFreshFxRate(), protectActive, require2FA(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), savingsController.withdraw);
+router.post('/goals/:id/withdraw', protectActive, require2FA(), requireFreshFxRate(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), savingsController.withdraw);
 
 // Pause a savings goal
 router.put('/goals/:id/pause', protectActive, savingsController.pauseGoal);

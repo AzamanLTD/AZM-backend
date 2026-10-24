@@ -88,12 +88,12 @@ Honesty rules (proven by tests):
 
 ## 4. Transaction gate — `middleware/fxTransactionGateMiddleware.js`
 
-`requireFreshFxRate({ when })`:
+`requireFreshFxRate()` — UNIVERSAL, no options, no conditional bypass:
 
 - Delegates to the ONE canonical freshness authority (271C): `getFreshServerRateGhsPerUsdc` — fail-closed on NULL/future/stale `lastExternalSync` or unusable rate value, recomputed AT REQUEST TIME.
 - Refuses 503 with `success=false`, stable `code` (`RATE_STALE`/`RATE_UNAVAILABLE`), `retryable=true`, `usdcTransactionGate:'CLOSED'`, and the honest `savedRateIsDisplayOnly:true` hint. No client retry storm can turn a stale oracle green.
-- Mounted BEFORE `idempotency` and before any controller: a refused request never claims an idempotency key, never moves money, never dispatches to a provider. Controllers' own internal gates re-validate inside the financial transaction for defense in depth.
-- The gate is mounted UNCONDITIONALLY on every new USDC-enabled transaction authorization (see §4.1) — USDC-native destinations do NOT stay enabled on a stale oracle, because the balance being spent against cannot be honestly valued. The `when` predicate now exists only to exempt a route from the gate, and no authorization route uses it.
+- Mount ORDERING contract (pinned by tests): authentication / ban guard / required 2FA run BEFORE the gate; the gate runs BEFORE `idempotency` and before any controller. An unauthenticated request gets the auth verdict (401) and never learns the gate's state; a refused request never claims an idempotency key, never moves money, never dispatches to a provider. Controllers' own internal gates re-validate inside the financial transaction for defense in depth.
+- The gate is mounted UNCONDITIONALLY on every new USDC-enabled transaction authorization (see §4.1) — USDC-native destinations do NOT stay enabled on a stale oracle, because the balance being spent against cannot be honestly valued. The retired `when` predicate NO LONGER EXISTS in the middleware: there is no lambda a call site can pass to soften the gate. Any future exception must be a reviewed, documented, TESTED exception in this inventory — not a runtime flag.
 
 ### 4.1 Gate scope — UNIVERSAL (every new USDC-enabled transaction authorization)
 
@@ -106,7 +106,7 @@ Honesty rules (proven by tests):
 | `POST /api/wallet/internal-transfer` | **YES** |
 | P2P trades `/initiate`, `/accept`; p2p ping `/accept` | **YES** |
 | Savings goals `deposit`, `withdraw` | **YES** (plus the controllers' own internal gates — defense in depth) |
-| Vault `/deposit`; shared-vault `/deposit` | **YES** |
+| Vault `/deposit`; vault `/break` (early release: returns remaining funds, applies penalty, posts a ledger release); shared-vault `/deposit` | **YES** |
 | `POST /api/escrow/fund` | **YES** |
 | Chat money `accept-money` | **YES** |
 | Storefront `checkout`, `order` | **YES** |
@@ -119,9 +119,15 @@ Honesty rules (proven by tests):
 | Deposit quotes (fiat initiate/moolre/otp) | Already gated internally (`quoteFiatDepositController.js:127` maps `RateUnavailableError` → 503) |
 | **SmartRoute scheduled executors** (WITHDRAW_MOMO, INTERNAL_TRANSFER, VAULT_DEPOSIT) | **YES — fail-closed at the executor seam** before any reservation/debit/ledger/provider intent; rate-classified failure, next occurrence retries. The MoMo crash-RESUME path is intentionally NOT re-gated (a prior authorization converges at its originally reserved amount). |
 
-**Intentionally NOT gated — settlement protection.** Lifecycle/settlement routes (trades decline, escrow satisfy/cancel, refunds, expiries, reconciliation convergence) finalize or reverse ALREADY-AUTHORIZED operations. A rate refusal can never block settlement. `requireFreshFxRate()` is mounted only on authorization entry points.
+**Intentionally NOT gated — settlement protection.** Lifecycle/settlement routes (trades decline, escrow satisfy/cancel, refunds, expiries, reconciliation convergence) finalize or reverse ALREADY-AUTHORIZED operations. A rate refusal can never block settlement. `requireFreshFxRate()` is mounted only on authorization entry points. Documented exceptions:
 
-Any future NEW USDC-enabled transaction authorization MUST mount the gate; `__tests__/universal-usdc-transaction-gate.test.js` pins every currently-gated mount (stale → 503 CLOSED), the idempotency non-claim, the saved-rate display-only rule, and the executor fail-closed/resume behavior.
+| Route | Classification | Integrity requirement |
+|---|---|---|
+| `DELETE /api/shared-vaults/:id` (owner cancels, refunds all contributors) | **Reversal of already-authorized deposits** — deliberately available during an FX outage (users must be able to exit a shared vault when the oracle is down). NOT a new authorization, so NOT gated. | The cancellation/refund must be SINGLE-WINNER: a second cancel request must never re-refund. Guarded `status → CANCELLED` transition + refunds inside one transaction (tracked in the financial-integrity follow-up PR). |
+| `POST /api/cross-border-susu/payout` | **NOT covered by this gate.** It converts the base-currency payout into the recipient's chosen target currency at payout-time rates via the multi-currency `FxRate` table — a NEW FX conversion at execution time, not settlement of a persisted USDC/GHS quote. The USDC/GHS canonical gate does not authorize this pair. | Single-winner `status → PAID_OUT` transition atomic with the wallet credit (no replay double-credit), and payout-pair rate honesty (no demo fallback, freshness-checked observation). Tracked as a high-priority financial-integrity issue in the follow-up PR — NOT silently classified as safe settlement. |
+| `POST /api/wallet/deposit/initialize` | **NOT a live provider payment path.** It generates a deposit reference and returns payment instructions without creating a durable provider operation or dispatching a Moolre request. Classified as instructions/reference generation, not a functioning deposit authorization. | Do not present this route as a covered live financial route; a real provider integration remains open work. |
+
+Any future NEW USDC-enabled transaction authorization MUST mount the gate; `__tests__/universal-usdc-transaction-gate.test.js` pins every currently-gated mount (stale → 503 CLOSED), the idempotency non-claim, the saved-rate display-only rule, the auth-before-gate ordering (401 never 503 for unauthenticated callers), the per-mount stack order (auth/ban/2FA → gate → idempotency), and the executor fail-closed/resume behavior.
 
 ---
 

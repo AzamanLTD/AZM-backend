@@ -12,7 +12,7 @@ const { requireFreshFxRate } = require('../middleware/fxTransactionGateMiddlewar
 
 router.get('/', protect, ctrl.getSettings);
 router.put('/', protect, ctrl.updateSettings);
-router.post('/process', requireFreshFxRate(), protect, ctrl.processRoundUp);
+router.post('/process', protect, requireFreshFxRate(), ctrl.processRoundUp);
 router.get('/history', protect, ctrl.getHistory);
 
 module.exports = router;

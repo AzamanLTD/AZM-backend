@@ -20,10 +20,13 @@ const { require2FA } = require('../middleware/require2FA');
 router.get('/',                  protect,        ctrl.list);
 router.post('/',                 protectActive,  ctrl.create);
 router.get('/:id',               protect,        ctrl.getDetail);
-router.post('/:id/deposit', requireFreshFxRate(),      protectActive,  idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), ctrl.deposit);
+router.post('/:id/deposit', protectActive, requireFreshFxRate(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), ctrl.deposit);
 router.post('/:id/auto-rule',    protectActive,  ctrl.setAutoRule);
 router.delete('/:id/auto-rule',  protectActive,  ctrl.disableAutoRule);
-router.post('/:id/break',        protectActive,  require2FA(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), ctrl.breakEarly);
+// Early break is a NEW USDC-enabled transaction authorization (returns the
+// remaining funds, applies the penalty, posts a ledger release) — universally
+// gated, after auth/2FA, before idempotency.
+router.post('/:id/break',        protectActive,  require2FA(), requireFreshFxRate(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), ctrl.breakEarly);
 router.get('/:id/receipt',       protect,        ctrl.getReceipt);
 router.get('/:id/deposits',      protect,        ctrl.listDeposits);
 

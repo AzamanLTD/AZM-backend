@@ -23,6 +23,11 @@
 //   6. SETTLEMENT PROTECTION: lifecycle/settlement routes (trades decline,
 //      escrow satisfy/cancel) are NOT gated — a stale rate never blocks the
 //      settlement of an already-authorized operation.
+//   1b. ORDERING — authentication precedes the gate: an unauthenticated
+//      request on ANY gated route gets the auth response (401), never the
+//      gate's 503 — it cannot learn the gate's state.
+//   1c. ORDERING — stack pin: on every gated mount, auth/ban/2FA layers run
+//      before the gate, and the gate runs before the idempotency layer.
 //   7. Smart Route executors fail closed on a stale/missing rate BEFORE any
 //      reservation, debit, ledger posting or provider intent (WITHDRAW_MOMO,
 //      INTERNAL_TRANSFER, VAULT_DEPOSIT); the run FAILED with a
@@ -39,21 +44,28 @@ if (!hasDb) console.warn('[universal-usdc-transaction-gate.test] TEST_DATABASE_U
 var mockAuthUserId = null;
 
 jest.mock('../middleware/authMiddleware', () => ({
-    protect: (req, _res, next) => {
+    // Named so the stack-order pin can identify auth layers by signature.
+    protect: function protectGuard(req, res, next) {
+        if (mockAuthUserId === null) {
+            return res.status(401).json({ success: false, message: 'Not authenticated.' });
+        }
         req.user = { id: mockAuthUserId, role: 'USER' };
         next();
     },
-    adminOnly: (_req, _res, next) => next(),
+    adminOnly: function adminOnlyGuard(_req, _res, next) { next(); },
 }));
 jest.mock('../middleware/banGuardMiddleware', () => ({
-    protectActive: (req, _res, next) => {
+    protectActive: function protectActiveGuard(req, res, next) {
+        if (mockAuthUserId === null) {
+            return res.status(401).json({ success: false, message: 'Not authenticated.' });
+        }
         req.user = req.user || { id: mockAuthUserId, role: 'USER' };
         next();
     },
 }));
 jest.mock('../middleware/require2FA', () => ({
     // The real require2FA is a FACTORY returning express middleware.
-    require2FA: () => (_req, _res, next) => next(),
+    require2FA: () => function require2FAGuard(_req, _res, next) { next(); },
 }));
 
 const express = require('express');
@@ -97,6 +109,7 @@ const GATED_ROUTES = [
     ['POST', '/api/savings/goals/1/deposit'],
     ['POST', '/api/savings/goals/1/withdraw'],
     ['POST', '/api/vaults/1/deposit'],
+    ['POST', '/api/vaults/1/break'],
     ['POST', '/api/shared-vaults/1/deposit'],
     ['POST', '/api/escrow/fund'],
     ['POST', '/api/conversations/1/messages/1/accept-money'],
@@ -224,6 +237,81 @@ describe('Universal USDC transaction gate — route-level pin (real PostgreSQL)'
         expect(res.status).toBe(503);
         expect(res.body.code).toBe('RATE_UNAVAILABLE');
         expect(res.body.usdcTransactionGate).toBe('CLOSED');
+    });
+
+    test('1b: ORDERING — an unauthenticated request gets 401 on every gated route (never the 503 gate verdict)', async () => {
+        await setStaleRate(); // gate CLOSED
+        const prevUser = mockAuthUserId;
+        mockAuthUserId = null; // auth middleware now rejects
+        try {
+            for (const [method, path] of GATED_ROUTES) {
+                const res = await request(app).post(path).send({});
+                // Authentication precedes the gate: the caller learns the
+                // auth verdict, never the FX-gate state.
+                expect(res.status).toBe(401);
+                expect(res.body && res.body.code).toBeUndefined();
+            }
+        } finally {
+            mockAuthUserId = prevUser;
+        }
+    });
+
+    test('1c: ORDERING — stack pin: auth/ban/2FA before the gate, gate before idempotency, on every gated mount', async () => {
+        const ROUTER_BY_PREFIX = [
+            ['/api/trades', require('../routes/tradeRoutes')],
+            ['/api/p2p', require('../routes/p2pRoutes')],
+            ['/api/wallet', require('../routes/walletRoutes')],
+            ['/api/withdraw', require('../routes/withdrawalRoutes')],
+            ['/api/savings', require('../routes/savingsRoutes')],
+            ['/api/vaults', require('../routes/vaultRoutes')],
+            ['/api/shared-vaults', require('../routes/sharedVaultRoutes')],
+            ['/api/escrow', require('../routes/escrowRoutes')],
+            ['/api/conversations', require('../routes/conversationRoutes')],
+            ['/api/storefront', require('../routes/storefrontRoutes')],
+            ['/api/dine-in', require('../routes/dineInRoutes')],
+            ['/api/cross-border-susu', require('../routes/crossBorderSusuRoutes')],
+            ['/api/order-book', require('../routes/orderBookRoutes')],
+            ['/api/round-up', require('../routes/roundUpRoutes')],
+            ['/api/azm-convert', require('../routes/azmConversionRoutes')],
+            ['/api/smart-routes', require('../routes/smartRouteRoutes')],
+        ];
+        const pathMatches = (pattern, concrete) => {
+            const ps = pattern.split('/').filter(Boolean);
+            const cs = concrete.split('/').filter(Boolean);
+            if (ps.length !== cs.length) return false;
+            return ps.every((seg, i) => (seg.startsWith(':') ? !!cs[i] : seg === cs[i]));
+        };
+        const sig = (h) => String(h);
+        const isGuard = (l) => /protectGuard|protectActiveGuard|require2FAGuard/.test(sig(l.handle));
+        const isGate = (l) => sig(l.handle).includes('freshFxRate') || sig(l.handle).includes('usdcTransactionGate');
+        const isIdempotency = (l) => /Idempotency-Key|idempotency/i.test(sig(l.handle));
+
+        const mountsChecked = [];
+        for (const [prefix, router] of ROUTER_BY_PREFIX) {
+            for (const layer of router.stack) {
+                if (!layer.route || !layer.route.methods || !layer.route.methods.post) continue;
+                for (const [method, path] of GATED_ROUTES) {
+                    if (method !== 'POST' || !path.startsWith(prefix + '/')) continue;
+                    const remainder = path.slice(prefix.length);
+                    if (!pathMatches(layer.route.path, remainder)) continue;
+                    const stack = layer.route.stack;
+                    const gateIdx = stack.findIndex(isGate);
+                    expect(gateIdx).toBeGreaterThanOrEqual(0); // the gate IS mounted
+                    const guardIdxs = stack.map((l, i) => (isGuard(l) ? i : -1)).filter((i) => i >= 0);
+                    for (const gi of guardIdxs) {
+                        expect(gi).toBeLessThan(gateIdx); // auth/ban/2FA first
+                    }
+                    const idemIdx = stack.findIndex(isIdempotency);
+                    if (idemIdx >= 0) {
+                        expect(gateIdx).toBeLessThan(idemIdx); // then idempotency
+                    }
+                    mountsChecked.push(prefix + layer.route.path);
+                    break; // first matching GATED_ROUTES entry per route
+                }
+            }
+        }
+        // Every GATED_ROUTES entry was found in a real router stack.
+        expect(new Set(mountsChecked).size).toBe(GATED_ROUTES.length);
     });
 
     test('4: fresh rate → the gate PASSES: controllers answer with their own validation, never the gate refusal', async () => {
