@@ -252,7 +252,7 @@ describe('FX transaction gate middleware (real PostgreSQL)', () => {
         expect(gateIdx).toBeLessThan(idemIdx);
     });
 
-    test('walletRoutes gates only MoMo payout destinations on POST /withdraw', async () => {
+    test('walletRoutes gates POST /withdraw UNCONDITIONALLY (universal scope — all destinations)', async () => {
         const walletRoutes = require('../routes/walletRoutes');
         const route = walletRoutes.stack
             .map((l) => l.route)
@@ -264,27 +264,16 @@ describe('FX transaction gate middleware (real PostgreSQL)', () => {
             return sig.includes('freshFxRate') || sig.includes('usdcTransactionGate');
         });
         expect(hasGate).toBe(true);
-        // The gate middleware is the conditional instance (with a `when`
-        // predicate). Crypto/Binance payouts on this route stay enabled by
-        // the predicate — covered by the MoMo predicate unit proof below.
-    });
-
-    test('the MoMo predicate mirrors the controller: numeric non-Binance destinations gate, others pass', async () => {
-        // Re-evaluate the exact predicate logic shipped on the route.
+        // UNIVERSAL scope (supersedes the earlier conditional MoMo-only
+        // scoping): crypto/Binance/TRC20 destinations are NEW USDC-enabled
+        // transaction authorizations too, so they are refused identically
+        // while the canonical rate observation is stale/missing. The retired
+        // isMomoPayoutDestination predicate must NOT ship on the route file.
         const src = require('fs').readFileSync(
             require('path').resolve(__dirname, '../routes/walletRoutes.js'), 'utf8');
-        const match = src.match(/function isMomoPayoutDestination\(req\) \{[\s\S]*?\n\}/);
-        expect(match).toBeDefined(); // the predicate exists verbatim on the route file
-        const fn = eval(`(${match[0]})`);
-        // MoMo phone (numeric, > 12 digits): gated
-        expect(fn({ body: { destination: '233551234567890' } })).toBe(true);
-        // Binance Pay ID (numeric, 8-12 digits): NOT gated
-        expect(fn({ body: { destination: '0244556677' } })).toBe(false);
-        // ERC20/TRC20 destinations: NOT gated
-        expect(fn({ body: { destination: '0x742d35Cc6634C0532925a3b844Bc454e44384444' } })).toBe(false);
-        expect(fn({ body: { destination: 'TQn9Y2khEsLJW1ChVGFMS7d3oQremEb9m' } })).toBe(false);
-        // Non-string / absent destination: NOT gated (controller validation rejects it)
-        expect(fn({ body: {} })).toBe(false);
-        expect(fn({ body: { destination: null } })).toBe(false);
+        expect(src).not.toMatch(/function isMomoPayoutDestination/);
+        // The per-destination fail-closed behavior is pinned end-to-end in
+        // __tests__/universal-usdc-transaction-gate.test.js (all gated routes
+        // refuse 503 on a stale observation, before the controller).
     });
 });
