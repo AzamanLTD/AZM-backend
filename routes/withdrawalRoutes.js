@@ -45,7 +45,7 @@ router.post('/fiat',
 // (the only external feed it reads is the MATIC/USDC gas oracle) and the
 // shared contract keeps USDC-native actions enabled. See
 // docs/native-ghs-fx-audit.md §Gate scope.
-router.post('/crypto',
+router.post('/crypto', requireFreshFxRate(),
     protect, require2FA(),
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
     validate(cryptoWithdrawalSchema),

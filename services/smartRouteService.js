@@ -525,6 +525,13 @@ class SmartRouteService {
         } catch (err) {
             // The guarded executor claims fail closed on concurrent spend:
             // classify honestly instead of blanket FAILED_OTHER.
+            // Universal USDC transaction gate: a rate-classified refusal
+            // blocked the execution BEFORE any money moved — the run FAILED
+            // with the honest rate reason and the next occurrence retries at
+            // the recovered rate (same contract as the savings executor).
+            if (err?.code === 'RATE_STALE' || err?.code === 'RATE_UNAVAILABLE') {
+                return await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_OTHER', `Smart Route execution blocked — ${err.message}`);
+            }
             if (err?.code === 'INSUFFICIENT_BALANCE') {
                 await this._notifyInsufficient(route, new Prisma.Decimal(0), amount).catch(() => {});
                 return await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_INSUFFICIENT', 'Balance changed before execution');
@@ -565,6 +572,29 @@ class SmartRouteService {
      * it; a run whose dispatch outcome is unprovable parks in
      * AWAITING_RECONCILIATION instead of guessing.
      */
+
+    // ── Universal USDC transaction gate (2026-10-24) ─────────────────────
+    // Policy: every NEW USDC-enabled transaction authorization is refused
+    // while the canonical rate is missing/invalid/stale — including route
+    // executions that compute no GHS conversion (transfers, vault moves).
+    // Scheduled/manual executions are NEW authorizations, one per occurrence;
+    // they are NOT settlement of a prior authorization (the run retries at
+    // the next occurrence once the rate recovers). The ONE exception is the
+    // CRASH-RESUME path in _executeMomo: a reservation that already exists
+    // is a prior authorization converging to settlement — it resumes on the
+    // ORIGINALLY reserved GHS amount and is never re-gated.
+    async _assertFreshRateForNewExecution() {
+        try {
+            await getFreshServerRateGhsPerUsdc({ prisma: this.prisma });
+        } catch (rateErr) {
+            const err = new Error(
+                `stale/unavailable rate (${rateErr.code || 'RATE_UNAVAILABLE'}): ${rateErr.message}`
+            );
+            err.code = rateErr.code || 'RATE_UNAVAILABLE';
+            throw err;
+        }
+    }
+
     async _executeMomo(run, route, occurrenceBased, occurrenceBase) {
         // r19 P0: amount and destination from the run's immutable snapshot.
         const amount = new Prisma.Decimal(run.amountUsdc);
@@ -669,6 +699,15 @@ class SmartRouteService {
                 return await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'AWAITING_RECONCILIATION', 'recovered reservation has no withdrawal mirror — parked');
             }
         } else {
+            // Universal USDC transaction gate: a NEW MoMo payout reservation
+            // is a new USDC-enabled transaction authorization — fail closed
+            // on a stale/unavailable canonical rate BEFORE any reservation,
+            // lease-driven provider intent or debit (the run retries at the
+            // next occurrence). Mirrors the manual /api/withdraw/fiat route's
+            // middleware gate, which this scheduled path previously bypassed:
+            // it resolved raw settings.liveRetailRate with NO freshness
+            // validation (the savings executor was hardened; this leg was not).
+            await this._assertFreshRateForNewExecution();
             result = await financeService.processFiatWithdrawal(
                 this.prisma,
                 route.userId,
@@ -1281,6 +1320,12 @@ class SmartRouteService {
         const amount = new Prisma.Decimal(run.amountUsdc);
         const recipientId = run.destFriendUserId || route.destFriendUserId;
 
+        // Universal USDC transaction gate: a scheduled peer transfer is a NEW
+        // USDC-enabled authorization (it debits availableBalance) — fail
+        // closed on a stale/unavailable rate before the transaction opens,
+        // matching the manual /api/wallet/internal-transfer route's gate.
+        await this._assertFreshRateForNewExecution();
+
         await this.prisma.$transaction(async (tx) => {
             // ── FINAL AUTHORIZATION RE-PROOF (smart-route final-authorization
             // race): the SENDER's live ban predicate and the route's live
@@ -1504,6 +1549,12 @@ class SmartRouteService {
         // r19 P0: amount and vault from the run's immutable snapshot.
         const amount = new Prisma.Decimal(run.amountUsdc);
         const vaultId = run.destVaultId || route.destVaultId;
+
+        // Universal USDC transaction gate: a scheduled vault deposit is a
+        // NEW USDC-enabled authorization (it debits availableBalance) — fail
+        // closed on a stale/unavailable rate before any guarded claim,
+        // matching the manual /api/vaults/:id/deposit route's gate.
+        await this._assertFreshRateForNewExecution();
 
         // Vault deposits commit through vaultService's own transaction (a
         // guarded ACTIVE claim + guarded user debit inside it). The run's

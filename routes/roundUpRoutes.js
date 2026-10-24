@@ -8,10 +8,11 @@ const express = require('express');
 const router = express.Router();
 const ctrl = require('../controllers/roundUpController');
 const { protect } = require('../middleware/authMiddleware');
+const { requireFreshFxRate } = require('../middleware/fxTransactionGateMiddleware');
 
 router.get('/', protect, ctrl.getSettings);
 router.put('/', protect, ctrl.updateSettings);
-router.post('/process', protect, ctrl.processRoundUp);
+router.post('/process', requireFreshFxRate(), protect, ctrl.processRoundUp);
 router.get('/history', protect, ctrl.getHistory);
 
 module.exports = router;
