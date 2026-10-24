@@ -41,12 +41,13 @@ router.post('/fiat',
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
     validate(fiatWithdrawalSchema),
     withdrawalController.fiatWithdrawal);
-// /crypto is deliberately NOT FX-gated: the on-chain payout is USDC-native
-// (the only external feed it reads is the MATIC/USDC gas oracle) and the
-// shared contract keeps USDC-native actions enabled. See
-// docs/native-ghs-fx-audit.md §Gate scope.
+// /crypto is universally gated like every other USDC-enabled transaction
+// authorization (universal scope — see docs/native-ghs-fx-audit.md §4.1):
+// the balance being spent against cannot be honestly valued on a stale
+// oracle, even when the payout destination itself is on-chain USDC.
 router.post('/crypto',
     protect, require2FA(),
+    requireFreshFxRate(),
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
     validate(cryptoWithdrawalSchema),
     withdrawalController.cryptoWithdrawal);

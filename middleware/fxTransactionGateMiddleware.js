@@ -23,25 +23,34 @@
 //     dispatches to a provider. The controllers' own gates re-validate
 //     inside the financial transaction for defense in depth.
 //
-// Scope discipline: mount ONLY on USDC-enabled transaction routes. Read
-// models (balance/valuation/oracle), auth, native-GHS-only paths and
-// provider WEBHOOKS (settlement completions of already-started operations)
-// are deliberately not gated — see docs/native-ghs-fx-audit.md for the full
-// route inventory and documented exceptions.
+// Ordering contract (enforced by the mounted route stacks and pinned by
+// tests): authentication / ban guard / required 2FA run BEFORE this gate;
+// this gate runs BEFORE idempotency and before any controller. An
+// unauthenticated request must never learn the gate's state, and a refused
+// request never claims an idempotency key.
+//
+// Scope discipline: mount ONLY on NEW USDC-enabled transaction
+// authorizations. Read models (balance/valuation/oracle), auth,
+// settlement/lifecycle routes (decline, satisfy, cancel, refund, expiry —
+// completions/reversals of ALREADY-AUTHORIZED operations) and provider
+// WEBHOOKS are deliberately not gated: a rate refusal can never block
+// settlement — see docs/native-ghs-fx-audit.md §4.1 for the full route
+// inventory and documented exceptions.
 
 const { getFreshServerRateGhsPerUsdc } = require('../src/services/transactionQuoteService');
 
-// `when` (optional): a predicate (req) => boolean evaluated BEFORE the
-// gate. Use it to scope the gate to the request's genuine FX dependence
-// (e.g. only the MoMo/GHS payout destinations of /api/wallet/withdraw) —
-// USDC-native paths on the same route stay enabled, per the shared
-// contract's "actions that do not depend on USDC/FX stay enabled" rule.
-function requireFreshFxRate({ when } = {}) {
+// UNIVERSAL SCOPE — no conditional bypass. The earlier `when` predicate
+// (conditional FX-dependence scoping) is RETIRED: a stale/missing canonical
+// rate makes the whole combined wallet valuation unpriceable at
+// authorization time, so EVERY new USDC-enabled transaction authorization on
+// a gated route is refused — including flows whose own math computes no GHS
+// conversion. There is deliberately no way for a call site to soften this
+// middleware; if a future route needs a scoped exception it must be a
+// reviewed, documented, TESTED exception (see the settlement-protection
+// inventory in docs/native-ghs-fx-audit.md §4.1), not a lambda.
+function requireFreshFxRate() {
     return async (req, res, next) => {
         try {
-            if (typeof when === 'function' && !when(req)) {
-                return next(); // this request's money path is FX-independent
-            }
             const prisma = req.app.get('prisma');
             if (!prisma) {
                 // Fail closed on infrastructure ambiguity — a missing

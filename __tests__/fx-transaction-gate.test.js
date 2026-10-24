@@ -208,25 +208,31 @@ describe('FX transaction gate middleware (real PostgreSQL)', () => {
         expect(res.status).toHaveBeenCalledWith(503);
     });
 
-    // ── D. `when` predicate scoping ─────────────────────────────────────
+    // ── D. NO conditional bypass (universal scope) ──────────────────────
 
-    test('the `when` predicate lets FX-independent requests pass without a fresh rate', async () => {
+    test('the retired `when` predicate cannot soften the gate — no bypass exists', async () => {
         await setGlobal('12.5', null); // gate CLOSED
-        const gate = requireFreshFxRate({
-            when: (req) => /^\d+$/.test(String(req.body?.destination || '')),
-        });
 
-        // FX-dependent request: refused
+        // The factory takes NO options: a leftover conditional-style call
+        // site requireFreshFxRate({ when: ... }) is inert — the gate still
+        // runs unconditionally.
+        const gate = requireFreshFxRate({
+            when: () => true, // a stale call site trying to opt out
+        });
+        expect(requireFreshFxRate.length).toBe(0); // signature has no params
+
+        // "FX-independent-looking" request (crypto destination): still refused
         const refusedRes = buildRes();
         const refusedNext = jest.fn();
-        await gate(buildReq({ destination: '02445566778899' }), refusedRes, refusedNext);
+        await gate(buildReq({ destination: '0x742d35Cc6634C0532925a3b844Bc454e44384444' }), refusedRes, refusedNext);
         expect(refusedNext).not.toHaveBeenCalled();
+        expect(refusedRes.status).toHaveBeenCalledWith(503);
 
-        // FX-independent request (crypto destination): passes
-        const passedRes = buildRes();
-        const passedNext = jest.fn();
-        await gate(buildReq({ destination: '0x742d35Cc6634C0532925a3b844Bc454e44384444' }), passedRes, passedNext);
-        expect(passedNext).toHaveBeenCalled();
+        // And the middleware source ships no conditional bypass at all.
+        const src = require('fs').readFileSync(
+            require('path').resolve(__dirname, '../middleware/fxTransactionGateMiddleware.js'), 'utf8');
+        expect(src).not.toMatch(/function requireFreshFxRate\(\{ when \}/);
+        expect(src).not.toMatch(/!when\(req\)/);
     });
 
     // ── E/F. real route wiring pinned ───────────────────────────────────
@@ -252,7 +258,7 @@ describe('FX transaction gate middleware (real PostgreSQL)', () => {
         expect(gateIdx).toBeLessThan(idemIdx);
     });
 
-    test('walletRoutes gates only MoMo payout destinations on POST /withdraw', async () => {
+    test('walletRoutes gates POST /withdraw UNCONDITIONALLY (universal scope — all destinations)', async () => {
         const walletRoutes = require('../routes/walletRoutes');
         const route = walletRoutes.stack
             .map((l) => l.route)
@@ -264,27 +270,16 @@ describe('FX transaction gate middleware (real PostgreSQL)', () => {
             return sig.includes('freshFxRate') || sig.includes('usdcTransactionGate');
         });
         expect(hasGate).toBe(true);
-        // The gate middleware is the conditional instance (with a `when`
-        // predicate). Crypto/Binance payouts on this route stay enabled by
-        // the predicate — covered by the MoMo predicate unit proof below.
-    });
-
-    test('the MoMo predicate mirrors the controller: numeric non-Binance destinations gate, others pass', async () => {
-        // Re-evaluate the exact predicate logic shipped on the route.
+        // UNIVERSAL scope (supersedes the earlier conditional MoMo-only
+        // scoping): crypto/Binance/TRC20 destinations are NEW USDC-enabled
+        // transaction authorizations too, so they are refused identically
+        // while the canonical rate observation is stale/missing. The retired
+        // isMomoPayoutDestination predicate must NOT ship on the route file.
         const src = require('fs').readFileSync(
             require('path').resolve(__dirname, '../routes/walletRoutes.js'), 'utf8');
-        const match = src.match(/function isMomoPayoutDestination\(req\) \{[\s\S]*?\n\}/);
-        expect(match).toBeDefined(); // the predicate exists verbatim on the route file
-        const fn = eval(`(${match[0]})`);
-        // MoMo phone (numeric, > 12 digits): gated
-        expect(fn({ body: { destination: '233551234567890' } })).toBe(true);
-        // Binance Pay ID (numeric, 8-12 digits): NOT gated
-        expect(fn({ body: { destination: '0244556677' } })).toBe(false);
-        // ERC20/TRC20 destinations: NOT gated
-        expect(fn({ body: { destination: '0x742d35Cc6634C0532925a3b844Bc454e44384444' } })).toBe(false);
-        expect(fn({ body: { destination: 'TQn9Y2khEsLJW1ChVGFMS7d3oQremEb9m' } })).toBe(false);
-        // Non-string / absent destination: NOT gated (controller validation rejects it)
-        expect(fn({ body: {} })).toBe(false);
-        expect(fn({ body: { destination: null } })).toBe(false);
+        expect(src).not.toMatch(/function isMomoPayoutDestination/);
+        // The per-destination fail-closed behavior is pinned end-to-end in
+        // __tests__/universal-usdc-transaction-gate.test.js (all gated routes
+        // refuse 503 on a stale observation, before the controller).
     });
 });

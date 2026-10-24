@@ -23,18 +23,6 @@ const { protectActive }        = require('../middleware/banGuardMiddleware');
 // dispatch makes exactly these requests FX-dependent.
 const { requireFreshFxRate } = require('../middleware/fxTransactionGateMiddleware');
 
-function isMomoPayoutDestination(req) {
-    const raw = req?.body?.destination;
-    if (typeof raw !== 'string') return false;
-    const cleanDest = raw.trim();
-    const isNumeric = /^\d+$/.test(cleanDest);
-    if (!isNumeric) return false; // TRC20/BEP20/crypto paths: FX-independent
-    // 8-12 digits resolves to BINANCE_PAY in the controller's if/else order
-    // (FX-independent). Anything else numeric is the MoMo/GHS payout path
-    // (or an invalid payout the controller will reject) — fail CLOSED and
-    // demand a fresh canonical rate for it.
-    return !(cleanDest.length >= 8 && cleanDest.length <= 12);
-}
 
 // Withdrawals — r42 WAVE-2: the claim commits INSIDE the withdrawal
 // reservation transaction (see walletController.requestWithdrawal) with the
@@ -42,15 +30,15 @@ function isMomoPayoutDestination(req) {
 // request path (payout workers own dispatch), so the response is honest
 // post-commit; 4xx/5xx responses prove the reservation rolled back and
 // release the claim for retry (same disposition contract as /api/withdraw/*).
-// FX-balance workstream — conditional transaction gate. The route serves
-// BOTH USDC-native crypto destinations (FX-independent, stays enabled) and
-// MoMo/GHS phone payouts (FX-dependent). The predicate mirrors the
-// controller's MoMO detection (numeric destination >= 9 digits): only
-// those requests demand a FRESH canonical rate, and are refused 503 BEFORE
-// the idempotency claim. A saved/demo fallback rate never opens the gate.
+// FX-balance workstream — universal transaction gate (supersedes the
+// earlier conditional MoMo-only scope). Crypto wallet dispatches and
+// MoMo/GHS payouts are BOTH new USDC-enabled transaction authorizations —
+// every destination now demands a FRESH canonical rate and is refused 503
+// BEFORE the idempotency claim. A saved/demo fallback rate never opens
+// the gate. (The former isMomoPayoutDestination predicate is retired.)
 router.post('/withdraw',
     protectActive, require2FA(),
-    requireFreshFxRate({ when: isMomoPayoutDestination }),
+    requireFreshFxRate(),
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
     walletController.requestWithdrawal);
 
@@ -119,7 +107,8 @@ router.get('/pool-withdrawal-preview', protect, async (req, res) => {
 
 // POST /api/wallet/internal-transfer
 // Body: { direction: 'TO_POOL' | 'FROM_POOL', amount: number }
-router.post('/internal-transfer', protectActive, require2FA(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), async (req, res) => {
+router.post('/internal-transfer', protectActive, require2FA(), requireFreshFxRate(),
+    idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), async (req, res) => {
     const prisma = req.app.get('prisma');
     const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
 

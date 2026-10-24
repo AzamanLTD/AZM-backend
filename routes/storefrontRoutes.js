@@ -9,6 +9,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const { requireFreshFxRate } = require('../middleware/fxTransactionGateMiddleware');
 const router = require('express').Router();
 const { protect } = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
@@ -503,7 +504,7 @@ router.post('/me/media', protect, protectActive, requirePermission('storefront.m
 // Accepts an array of items [{ productId, quantity, notes }] and creates a single
 // BusinessOrder with multiple BusinessOrderItem rows. Falls back to single-item
 // behavior if only one item is provided.
-router.post('/:businessProfileId/checkout', protect, protectActive, wrap(async (req, res) => {
+router.post('/:businessProfileId/checkout', protect, protectActive, requireFreshFxRate(), wrap(async (req, res) => {
   const prisma = req.app.get('prisma');
   const { businessProfileId } = req.params;
   const userId = req.user.id;
@@ -767,7 +768,7 @@ router.post('/:businessProfileId/checkout', protect, protectActive, wrap(async (
 
 // POST /api/storefront/:businessProfileId/order — customer places an order from the storefront
 // Requires authentication. Creates a BusinessOrder with status AWAITING_PAYMENT.
-router.post('/:businessProfileId/order', protect, protectActive, wrap(async (req, res) => {
+router.post('/:businessProfileId/order', protect, protectActive, requireFreshFxRate(), wrap(async (req, res) => {
   const prisma = req.app.get('prisma');
   const { businessProfileId } = req.params;
   const userId = req.user.id;

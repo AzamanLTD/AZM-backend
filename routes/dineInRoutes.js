@@ -1,4 +1,5 @@
 const express = require('express');
+const { requireFreshFxRate } = require('../middleware/fxTransactionGateMiddleware');
 const router = express.Router();
 const { protect } = require('../middleware/authMiddleware');
 const ctrl = require('../controllers/dineInController');
@@ -28,6 +29,6 @@ router.get('/guests/search',          protect, kybGate, dineInManage, ctrl.searc
 // merely by reaching the same URL.
 router.post('/tabs/:tabId/customer-items', protect, ctrl.addCustomerItem);
 router.get('/tabs/:tabId',                 protect, ctrl.getTab);
-router.post('/tabs/:tabId/pay',            protect, require2FA(), ctrl.confirmAndPay);
+router.post('/tabs/:tabId/pay',            protect, require2FA(), requireFreshFxRate(), ctrl.confirmAndPay);
 
 module.exports = router;
