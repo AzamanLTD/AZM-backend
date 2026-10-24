@@ -93,28 +93,35 @@ Honesty rules (proven by tests):
 - Delegates to the ONE canonical freshness authority (271C): `getFreshServerRateGhsPerUsdc` — fail-closed on NULL/future/stale `lastExternalSync` or unusable rate value, recomputed AT REQUEST TIME.
 - Refuses 503 with `success=false`, stable `code` (`RATE_STALE`/`RATE_UNAVAILABLE`), `retryable=true`, `usdcTransactionGate:'CLOSED'`, and the honest `savedRateIsDisplayOnly:true` hint. No client retry storm can turn a stale oracle green.
 - Mounted BEFORE `idempotency` and before any controller: a refused request never claims an idempotency key, never moves money, never dispatches to a provider. Controllers' own internal gates re-validate inside the financial transaction for defense in depth.
-- `when` predicate scopes the gate to a request's GENUINE FX dependence — USDC-native paths stay enabled, per the shared contract.
+- The gate is mounted UNCONDITIONALLY on every new USDC-enabled transaction authorization (see §4.1) — USDC-native destinations do NOT stay enabled on a stale oracle, because the balance being spent against cannot be honestly valued. The `when` predicate now exists only to exempt a route from the gate, and no authorization route uses it.
 
-### 4.1 Gate scope (evidence-based route inventory)
+### 4.1 Gate scope — UNIVERSAL (every new USDC-enabled transaction authorization)
 
-The codebase itself states the boundary (`controllers/tradeController.js`): *"P2P trades use flat USDC fee, no GHS oracle math. The oracle rate (liveUsdToGhs) is ONLY for the internal MoMo deposit/withdrawal rail."* Verified by grep audit of every transaction route:
+**Superseded scope.** The earlier conditional scoping (`when: isMomoPayoutDestination`, FX-dependence-only rows) is RETIRED. The universal policy is now shipped: a stale/missing canonical rate makes the whole combined wallet valuation unpriceable at authorization time, so EVERY new USDC-enabled transaction authorization — including flows whose own math computes no GHS conversion (USDC-to-USDC transfers, escrow funding, vault/savings deposits, on-chain crypto dispatch, checkout, dine-in pay, chat money-accept, order-book orders, round-up processing, AZM→USDC conversion, manual smart-route execution) — is refused while the canonical observation is missing, invalid, or stale. Reference behavior (Wise/Revolut): money movement is disabled entirely when the FX feed is down.
 
-| Route | FX-dependent? | Gated? |
-|---|---|---|
-| `POST /api/withdraw/fiat` | YES — USDC debit vs GHS payout via Moolre at the canonical rate | **YES — unconditional** |
-| `POST /api/wallet/withdraw` (MoMo phone destination) | YES — GHS payout path | **YES — conditional** (`when: isMomoPayoutDestination`, mirroring the controller's payoutMethod detection; Binance IDs (8-12 digits), TRC20/BEP20 destinations stay enabled) |
-| `POST /api/wallet/withdraw` (crypto/Binance destination) | NO — USDC-native | No (stays enabled) |
-| `POST /api/withdraw/crypto` | NO — on-chain USDC; only external feed is the MATIC/USDC gas oracle | No (stays enabled) |
-| Deposit quotes (`/api/deposit/fiat/initiate`, moolre, otp) | YES | Already gated internally (verified: `quoteFiatDepositController.js:127` maps `RateUnavailableError` to 503) |
-| Savings deposits | YES | Already gated internally (verified: `savingsController.js` at 3 sites) |
-| P2P trades (`/initiate`, `/accept`) | NO — USDC escrow, flat USDC fee (code comment above) | No |
-| Wallet `/internal-transfer` | NO — USDC-to-USDC vendor-pool movement | No |
-| AZM-to-USDC conversion | NO — internal platform rate (profit-pool health), not the external FX feed | No |
-| Storefront checkout/order, dine-in pay, reservations, chat money-accept | NO — all USDC-native amounts (no GHS rate reads in any of those code paths — grep-verified) | No |
+| Route family | Gated? |
+|---|---|
+| `POST /api/withdraw/fiat`, `POST /api/withdraw/crypto` | **YES — unconditional** |
+| `POST /api/wallet/withdraw` (ALL destinations — MoMo phone AND crypto/Binance/TRC20) | **YES — unconditional** (the conditional `isMomoPayoutDestination` predicate is retired) |
+| `POST /api/wallet/internal-transfer` | **YES** |
+| P2P trades `/initiate`, `/accept`; p2p ping `/accept` | **YES** |
+| Savings goals `deposit`, `withdraw` | **YES** (plus the controllers' own internal gates — defense in depth) |
+| Vault `/deposit`; shared-vault `/deposit` | **YES** |
+| `POST /api/escrow/fund` | **YES** |
+| Chat money `accept-money` | **YES** |
+| Storefront `checkout`, `order` | **YES** |
+| Dine-in `tabs/:tabId/pay` | **YES** |
+| Cross-border susu `contribute` | **YES** |
+| Order-book `POST /orders` | **YES** |
+| Round-up `process` | **YES** |
+| AZM→USDC conversion | **YES** |
+| Smart-route `run-now` (manual execution) | **YES** |
+| Deposit quotes (fiat initiate/moolre/otp) | Already gated internally (`quoteFiatDepositController.js:127` maps `RateUnavailableError` → 503) |
+| **SmartRoute scheduled executors** (WITHDRAW_MOMO, INTERNAL_TRANSFER, VAULT_DEPOSIT) | **YES — fail-closed at the executor seam** before any reservation/debit/ledger/provider intent; rate-classified failure, next occurrence retries. The MoMo crash-RESUME path is intentionally NOT re-gated (a prior authorization converges at its originally reserved amount). |
 
-Any future FX-dependent route MUST mount the gate; the test suite pins the currently-gated routes.
+**Intentionally NOT gated — settlement protection.** Lifecycle/settlement routes (trades decline, escrow satisfy/cancel, refunds, expiries, reconciliation convergence) finalize or reverse ALREADY-AUTHORIZED operations. A rate refusal can never block settlement. `requireFreshFxRate()` is mounted only on authorization entry points.
 
-**Known gap (superseded policy, tracked separately).** This table reflects the PR's shipped scope: FX-dependence scoping. The established product policy is stricter — every NEW USDC-enabled transaction authorization (P2P, internal transfer, crypto withdrawal, conversion, merchant checkout/dine-in/reservations/chat accept) must be refused while the canonical rate is missing, invalid, or stale, even when the transaction itself computes no GHS conversion. That universal-gate workstream is prepared as a separate focused PR on top of this one; until it merges, the ungated rows above are NOT compliant with the product policy and must not be described as complete.
+Any future NEW USDC-enabled transaction authorization MUST mount the gate; `__tests__/universal-usdc-transaction-gate.test.js` pins every currently-gated mount (stale → 503 CLOSED), the idempotency non-claim, the saved-rate display-only rule, and the executor fail-closed/resume behavior.
 
 ---
 
