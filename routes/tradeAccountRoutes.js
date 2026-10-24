@@ -93,4 +93,15 @@ router.post('/', protect, tradeAccountController.addTradeAccount);
 router.get('/', protect, tradeAccountController.getTradeAccounts);
 router.get('/approved', protect, tradeAccountController.getApprovedTradeAccounts);
 
+// ── §4 false-affordance fix (review follow-up 2026-10-18, reconstructed 2026-10-20) ──
+// Both handlers existed on tradeAccountController all along but were never
+// registered, so the Flutter app's GET /supported-methods discovery and
+// DELETE (soft-archive) calls 404'd. Wiring is purely additive; controller
+// bodies are unchanged. deleteTradeAccount is a SOFT archive (archivedAt +
+// archiveReason 'USER_DELETED') — trade-account records are never
+// hard-deleted, preserving admin audit visibility.
+// ORDER: '/supported-methods' must stay ABOVE the '/:id' parametric route.
+router.get('/supported-methods', protect, tradeAccountController.getSupportedMethods);
+router.delete('/:id', protect, tradeAccountController.deleteTradeAccount);
+
 module.exports = router;

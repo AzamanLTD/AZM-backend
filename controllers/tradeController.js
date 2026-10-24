@@ -219,16 +219,72 @@ exports.initiateTrade = async (req, res) => {
         // single atomic transaction to prevent race conditions where two requests
         // both pass the capacity check simultaneously.
         const tradeResult = await prisma.$transaction(async (tx) => {
+            // QUEUE-ADMISSION / TRADE-CREATION RE-CHECK UNDER LOCK
+            // (2026-10-20 final review): the ad was read OUTSIDE this
+            // transaction; a vendor may have deactivated/archived it since.
+            // Lock the Ad row (the same terminal lock archiveAd /
+            // deactivateAd / toggleAdStatus take) as the FIRST statement and
+            // re-read its current status: no WAITING queue entry and no
+            // trade may be created against an ad that is no longer ACTIVE
+            // (or is legacy-marked archived via archivedAt). This
+            // transaction never takes the TradeAccount lock, so the
+            // TradeAccount→Ad lock order cannot invert.
+            const lockedAd = await tx.$queryRaw`
+                SELECT "status", "archivedAt" FROM "Ad"
+                WHERE "id" = ${ad.id}
+                FOR UPDATE`;
+            if (!lockedAd[0] || lockedAd[0].status !== 'ACTIVE' || lockedAd[0].archivedAt) {
+                return { adInactive: true };
+            }
+
             // Count active trades INSIDE the transaction (prevents race condition)
+            //
+            // CAPACITY POLICY (2026-10-20 A2, audited against the real state
+            // machine): every UNFINALIZED trade consumes one
+            // maxConcurrentTrades slot from creation to a terminal state.
+            // V2 vendor-approval flow creates trades as PENDING (this file,
+            // trade.create below), and acceptTrade transitions
+            // PENDING → PENDING_PAYMENT. The previous filter omitted PENDING,
+            // which made vendor-pending requests invisible to the gate: a
+            // buyer could initiate unlimited PENDING trades past a busy ad
+            // and the vendor could accept them all into PENDING_PAYMENT —
+            // exceeding maxConcurrentTrades and bypassing the waiting queue.
+            // acceptTrade never re-checks capacity (it must not strand an
+            // accepted request), so INITIATION is the single capacity gate
+            // and it must count PENDING. PENDING_PAYMENT/PAID/DISPUTED keep
+            // counting; terminal states (CANCELLED/COMPLETED/EXPIRED) never do.
+            const ACTIVE_TRADE_STATUSES = ['PENDING', 'PENDING_PAYMENT', 'PAID', 'DISPUTED'];
             const activeTradeCount = await tx.trade.count({
                 where: {
                     vendorId,
-                    status: { in: ['PENDING_PAYMENT', 'PAID', 'DISPUTED'] }
+                    status: { in: ACTIVE_TRADE_STATUSES }
                 }
             });
 
             if (activeTradeCount >= ad.maxConcurrentTrades) {
                 // QUEUE PATH — return special marker
+                //
+                // A1 — ONE WAITING ENTRY PER (buyer, ad) INVARIANT.
+                // The canonical path previously created a queue row
+                // unconditionally, so a buyer already WAITING on this ad who
+                // re-initiated (fresh idempotency key, e.g. after a client
+                // retry storm or a second device) got a SECOND row: their
+                // queue position inflated and both rows later promoted the
+                // same buyer twice. Dedup runs HERE, inside the same
+                // transaction and under the same Ad-row FOR UPDATE lock that
+                // serializes every queue-entry insert on this ad (the queue
+                // route takes the identical lock), so the check-then-insert
+                // pair is race-free per ad across BOTH initiation paths.
+                const existingEntry = await tx.tradeQueue.findFirst({
+                    where: { buyerId: userId, adId: ad.id, status: 'WAITING' }
+                });
+                if (existingEntry) {
+                    const existingPosition = await tx.tradeQueue.count({
+                        where: { adId: ad.id, status: 'WAITING', joinedAt: { lte: existingEntry.joinedAt } }
+                    });
+                    return { alreadyQueued: true, queueEntry: existingEntry, queuePosition: existingPosition };
+                }
+
                 const queueEntry = await tx.tradeQueue.create({
                     data: { buyerId: userId, adId: ad.id, status: 'WAITING' }
                 });
@@ -286,7 +342,44 @@ exports.initiateTrade = async (req, res) => {
             return { queued: false, trade: newTrade };
         });
 
+        // A1 — already-WAITING on this ad via ANY path (queue route or a
+        // previous canonical admission that queued): converge on the queue
+        // route's already-queued contract. NO new row was created; the
+        // 200 is COMMITTED by the idempotency middleware (2xx bookkeeping)
+        // so a same-key retry replays byte-meaningfully — one entry, ever.
+        if (tradeResult.alreadyQueued) {
+            return res.status(200).json({
+                success: true,
+                queued: true,
+                alreadyQueued: true,
+                message: 'You are already in the queue for this ad.',
+                queuePosition: tradeResult.queuePosition,
+                queueId: tradeResult.queueEntry.id,
+                joinedAt: tradeResult.queueEntry.joinedAt
+            });
+        }
+
         // ── Handle queue result (post-transaction side effects) ───────────────
+        // The ad went inactive (deactivated/archived) between the
+        // optimistic read and the locked re-check inside the transaction:
+        // refuse truthfully. Per §r42 the financial claim is RETAINED —
+        // the key stays consumed for this attempt.
+        if (tradeResult.adInactive) {
+            // PROVABLY PRE-ECONOMIC RELEASE (2026-10-20 review): the marker
+            // is produced ONLY by the transaction's FIRST statement — the
+            // locked ad-status recheck. When it returns, zero trades or
+            // queue entries have been written and zero economics ran; the
+            // transaction committed as a read-only no-op. §r42 requires the
+            // claim be RELEASED here, not retained — otherwise the key is
+            // permanently poisoned for a request that never proceeded.
+            // ONLY this exact branch marks releasable; every other 4xx
+            // after the transaction (and any thrown path) keeps RETAIN
+            // semantics, so a committed mutation can never release its own
+            // claim.
+            res.locals.financialClaimRelease = true;
+            return res.status(400).json({ success: false, message: 'This advertisement is not active.' });
+        }
+
         if (tradeResult.queued) {
             io.to(`user_${userId}`).emit('queued', {
                 adId: ad.id,

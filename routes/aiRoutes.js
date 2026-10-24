@@ -4,12 +4,34 @@ const router = express.Router();
 const aiController = require('../controllers/aiController');
 const queueController = require('../controllers/queueController');
 const { protect, adminOnly } = require('../middleware/authMiddleware');
+const { protectActive } = require('../middleware/banGuardMiddleware');
+const { require2FA } = require('../middleware/require2FA');
+const { idempotency } = require('../middleware/idempotency');
 
 router.get('/capabilities', protect, adminOnly, aiController.getAiCapabilities);
 
 router.post('/cfo/analyze', protect, adminOnly, aiController.triggerCfoAnalysis);
 
-router.post('/queue/initiate', protect, queueController.initiateTradeWithQueue);
+// ── Queue-initiated trades share the canonical trade-initiation authority ──
+// (2026-10-20 route-level review): this handler falls through to
+// tradeController.initiateTrade whenever capacity is available or frees up
+// under the admission lock — a direct controller call that does NOT execute
+// the canonical route's middleware stack. It previously mounted with protect
+// alone, so the queue entry point could reach trade creation without the
+// active-user/ban guard, the 2FA step-up, or the durable idempotency claim
+// (a response-disposition flag without a claim is not idempotency).
+//
+// The mount now runs the SAME guards as POST /api/trades/initiate, and —
+// critically — the idempotency authority carries the EXPLICIT canonical
+// identity 'POST /api/trades/initiate': one logical trade = one durable
+// FinancialOperation claim no matter which entry path served it. A key
+// used against this route and the canonical route cannot create two
+// independent operations. The fingerprint (params + body) still guards the
+// claim, so key reuse with a materially different body fails closed. Same
+// required-key semantics as the canonical route: no key → deterministic
+// 400 before any claim or mutation. The /api/admin/ai alias mount of this
+// router shares the same explicit identity by construction.
+router.post('/queue/initiate', protectActive, require2FA(), idempotency({ identity: 'POST /api/trades/initiate' }), queueController.initiateTradeWithQueue);
 router.get('/queue/status', protect, queueController.getQueueStatus);
 router.put('/queue/:queueId/leave', protect, queueController.leaveQueue);
 

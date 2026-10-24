@@ -191,39 +191,60 @@ exports.deleteTradeAccount = async (req, res) => {
         const { id } = req.params;
         const userId = req.user.id;
 
-        const account = await prisma.tradeAccount.findUnique({ where: { id } });
-        if (!account) return res.status(404).json({ success: false, message: 'Account not found.' });
-        if (account.userId !== userId) return res.status(403).json({ success: false, message: 'Unauthorized.' });
+        // ARCHIVE/AD-CREATE MUTUAL EXCLUSION (2026-10-20 review follow-up):
+        // the archive check-then-update used to run outside any transaction,
+        // so a concurrent createAd could attach a new ACTIVE ad to the
+        // account between the active-ad count and the archive write. Both
+        // this handler and createAd now run inside ONE transaction that
+        // first takes a FOR UPDATE row lock on the same TradeAccount row.
+        // Postgres serializes the two on that lock: whichever commits first,
+        // the other re-reads the post-commit state — the archiver counts
+        // the newly created ACTIVE ad and refuses; the ad creator sees
+        // archivedAt set and rejects. The lock is always the FIRST
+        // statement of both transactions (identical single-row lock), so
+        // there is no lock-order inversion and no deadlock between the pair.
+        const outcome = await prisma.$transaction(async (tx) => {
+            const locked = await tx.$queryRaw`
+                SELECT "id", "userId", "archivedAt"
+                FROM "TradeAccount"
+                WHERE "id" = ${id}
+                FOR UPDATE`;
+            const account = locked[0];
 
-        // Already archived
-        if (account.archivedAt) {
-            return res.status(400).json({ success: false, message: 'Account is already archived.' });
-        }
+            if (!account) return { status: 404, message: 'Account not found.' };
+            if (account.userId !== userId) return { status: 403, message: 'Unauthorized.' };
 
-        // Check if any active ads reference this account
-        const activeAds = await prisma.ad.count({
-            where: { tradeAccountId: id, status: 'ACTIVE' }
-        });
-        if (activeAds > 0) {
-            return res.status(400).json({
-                success: false,
-                message: `Cannot remove: ${activeAds} active ad(s) reference this account. Deactivate them first.`
-            });
-        }
-
-        // Phase Q2: Soft-delete — set archive timestamp, never hard-delete
-        await prisma.tradeAccount.update({
-            where: { id },
-            data: {
-                archivedAt: new Date(),
-                archiveReason: 'USER_DELETED'
+            // Already archived
+            if (account.archivedAt) {
+                return { status: 400, message: 'Account is already archived.' };
             }
+
+            // Check if any active ads reference this account (inside the
+            // same lock that createAd's ad creation holds — no in-flight
+            // ACTIVE ad can slip between this count and the archive write).
+            const activeAds = await tx.ad.count({
+                where: { tradeAccountId: id, status: 'ACTIVE' }
+            });
+            if (activeAds > 0) {
+                return { status: 400, message: `Cannot remove: ${activeAds} active ad(s) reference this account. Deactivate them first.` };
+            }
+
+            // Phase Q2: Soft-delete — set archive timestamp, never hard-delete
+            await tx.tradeAccount.update({
+                where: { id },
+                data: {
+                    archivedAt: new Date(),
+                    archiveReason: 'USER_DELETED'
+                }
+            });
+
+            return { status: 200, message: 'Trade account removed. It has been archived for security purposes.' };
         });
 
-        res.status(200).json({
-            success: true,
-            message: 'Trade account removed. It has been archived for security purposes.'
-        });
+        if (outcome.status === 200) {
+            return res.status(200).json({ success: true, message: outcome.message });
+        }
+        return res.status(outcome.status).json({ success: false, message: outcome.message });
     } catch (error) {
         logger.error("Delete Trade Account Error:", error);
         res.status(500).json({ success: false, message: error.message });
