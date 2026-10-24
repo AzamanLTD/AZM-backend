@@ -15,6 +15,7 @@
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 const logger = require('../src/config/logger');
+const ledger = require('../services/ledgerService');
 
 // ── Create ──────────────────────────────────────────────────────────────────
 async function create(req, res) {
@@ -218,49 +219,88 @@ async function deposit(req, res) {
     const membership = vault.members.find(m => m.userId === userId);
     if (!membership) return res.status(403).json({ success: false, message: 'Not a member of this vault.' });
 
-    // Check wallet balance
-    const wallet = await prisma.wallet.findUnique({ where: { userId } });
-    if (!wallet || parseFloat(wallet.balanceUsdc) < amount) {
-      return res.status(400).json({ success: false, message: 'Insufficient wallet balance.' });
-    }
+    // Money authority repair: this flow previously referenced a
+    // `prisma.wallet` model that DOES NOT EXIST in the current schema (the
+    // unified-ledger migration moved spendable USDC onto User.availableBalance
+    // — the same authority every other money path uses). The deposit now
+    // debits User.availableBalance with a CONDITIONAL (single-winner) update:
+    // two concurrent deposits can never spend the same stale balance twice.
+    const operation = res.locals?.financialOperation || null;
+    const idemKey = operation
+        ? `fo_${operation.id}`
+        : `srv_sharedvault_${userId}_${id}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
-    // Atomic: debit wallet + credit vault + credit membership
-    const [updatedWallet, updatedVault, updatedMember] = await prisma.$transaction([
-      prisma.wallet.update({
-        where: { userId },
-        data: { balanceUsdc: { decrement: amount } },
-      }),
-      prisma.sharedVault.update({
-        where: { id },
-        data: { currentAmountUsdc: { increment: amount } },
-      }),
-      prisma.sharedVaultMember.update({
-        where: { id: membership.id },
-        data: { contributedUsdc: { increment: amount } },
-      }),
-    ]);
+    let data;
+    await prisma.$transaction(async (tx) => {
+        // Single-winner conditional debit — the DB nonneg CHECK is a
+        // secondary invariant, never the guard.
+        const debit = await tx.user.updateMany({
+            where: { id: userId, availableBalance: { gte: amount } },
+            data: {
+                availableBalance: { decrement: amount },
+                escrowLockedBalance: { increment: amount },
+            },
+        });
+        if (debit.count !== 1) {
+            const err = new Error('Insufficient balance.');
+            err.code = 'INSUFFICIENT_FUNDS';
+            throw err;
+        }
 
-    // Check if vault target reached
-    const newTotal = parseFloat(updatedVault.currentAmountUsdc);
-    if (newTotal >= parseFloat(updatedVault.targetAmountUsdc) && vault.status === 'ACTIVE') {
-      await prisma.sharedVault.update({
-        where: { id },
-        data: { status: 'COMPLETED', completedAt: new Date() },
-      });
-      // TODO: Send celebration notification to all members
-    }
+        const [updatedVault, updatedMember] = await Promise.all([
+            tx.sharedVault.update({
+                where: { id },
+                data: { currentAmountUsdc: { increment: amount } },
+            }),
+            tx.sharedVaultMember.update({
+                where: { id: membership.id },
+                data: { contributedUsdc: { increment: amount } },
+            }),
+        ]);
+
+        // Target reached → guarded completion transition (single-winner:
+        // a concurrent second deposit cannot double-flip COMPLETED).
+        const newTotal = parseFloat(updatedVault.currentAmountUsdc);
+        if (newTotal >= parseFloat(updatedVault.targetAmountUsdc) && vault.status === 'ACTIVE') {
+            await tx.sharedVault.updateMany({
+                where: { id, status: 'ACTIVE' },
+                data: { status: 'COMPLETED', completedAt: new Date() },
+            });
+        }
+
+        // §P.4 AUTHORITATIVE LEDGER — same transaction, idempotent on the
+        // durable operation key:
+        //   D user:{userId}:liability        — spendable liability down
+        //   C escrow:shared-vault-{id}:locked — vault restriction up
+        await ledger.post(tx, {
+            idempotencyKey: `ledger:shared-vault:deposit:${idemKey}`,
+            entryType: 'SHARED_VAULT_DEPOSIT',
+            description: 'Shared vault deposit — spendable balance locked into vault restriction',
+            userId,
+            relatedEntity: 'sharedVault',
+            relatedEntityId: id,
+            lines: [
+                { account: `user:${userId}:liability`, debit: amount.toFixed(8) },
+                { account: `escrow:shared-vault-${id}:locked`, credit: amount.toFixed(8) },
+            ],
+        });
+
+        data = {
+            newVaultTotal: parseFloat(updatedVault.currentAmountUsdc),
+            myContribution: parseFloat(updatedMember.contributedUsdc),
+        };
+    });
 
     logger.info({ vaultId: id, userId, amount }, '[sharedVault] Deposit');
     return res.status(200).json({
       success: true,
       message: 'Deposit successful.',
-      data: {
-        newVaultTotal: parseFloat(updatedVault.currentAmountUsdc),
-        myContribution: parseFloat(updatedMember.contributedUsdc),
-        walletBalance: parseFloat(updatedWallet.balanceUsdc),
-      },
+      data,
     });
   } catch (err) {
+    if (err?.code === 'INSUFFICIENT_FUNDS') {
+      return res.status(400).json({ success: false, message: err.message });
+    }
     logger.error({ err: err.message, vaultId: id, userId }, '[sharedVault] Deposit failed');
     return res.status(500).json({ success: false, message: 'Deposit failed.' });
   }
@@ -332,20 +372,54 @@ async function cancel(req, res) {
       return res.status(403).json({ success: false, message: 'Only the owner can cancel.' });
     }
 
-    // Refund all contributors to their wallets
-    await prisma.$transaction([
-      ...vault.members.map(m =>
-        prisma.wallet.update({
-          where: { userId: m.userId },
-          data: { balanceUsdc: { increment: parseFloat(m.contributedUsdc) } },
-        })
-      ),
-      prisma.sharedVault.update({
-        where: { id },
+    // Cancellation is a REVERSAL of already-authorized deposits: it stays
+    // available during an FX outage (documented settlement-protection
+    // exception — see docs/native-ghs-fx-audit.md §4.1). Its integrity
+    // requirement is SINGLE-WINNER: the CANCELLED transition flips FIRST,
+    // inside the same interactive transaction as the refunds. Only the
+    // request that wins the transition refunds; a replayed or concurrent
+    // cancel finds zero updated rows and is refused 409 — contributors can
+    // never be refunded twice for one vault.
+    let cancelled = false;
+    await prisma.$transaction(async (tx) => {
+      const transition = await tx.sharedVault.updateMany({
+        where: { id, status: { not: 'CANCELLED' } },
         data: { status: 'CANCELLED', cancelledAt: new Date() },
-      }),
-    ]);
+      });
+      if (transition.count !== 1) return; // already cancelled — no refunds
 
+      // Refund each contributor to the REAL money authority
+      // (User.availableBalance) and release the matching escrow
+      // restriction, with the §P.4 ledger reversal of the deposit legs.
+      for (const m of vault.members) {
+        const contributed = parseFloat(m.contributedUsdc);
+        if (!(contributed > 0)) continue;
+        await tx.user.update({
+          where: { id: m.userId },
+          data: {
+            availableBalance: { increment: contributed },
+            escrowLockedBalance: { decrement: contributed },
+          },
+        });
+        await ledger.post(tx, {
+          idempotencyKey: `ledger:shared-vault:refund:${id}:${m.userId}`,
+          entryType: 'SHARED_VAULT_REFUND',
+          description: 'Shared vault cancelled — vault restriction released back to spendable balance',
+          userId: m.userId,
+          relatedEntity: 'sharedVault',
+          relatedEntityId: id,
+          lines: [
+            { account: `escrow:shared-vault-${id}:locked`, debit: contributed.toFixed(8) },
+            { account: `user:${m.userId}:liability`, credit: contributed.toFixed(8) },
+          ],
+        });
+      }
+      cancelled = true;
+    });
+
+    if (!cancelled) {
+      return res.status(409).json({ success: false, code: 'VAULT_ALREADY_CANCELLED', message: 'This shared vault has already been cancelled.' });
+    }
     return res.status(200).json({ success: true, message: 'Vault cancelled. Funds returned to contributors.' });
   } catch (err) {
     logger.error({ err: err.message, vaultId: id }, '[sharedVault] Cancel failed');
