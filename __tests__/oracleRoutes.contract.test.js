@@ -48,6 +48,12 @@ describe('oracle routes canonical contract', () => {
         isFresh: false,
         rateFreshnessMaxAgeSeconds: 1800,
         refreshIntervalSeconds: 600,
+        // FX-balance workstream (GHS wallet + saved-rate): the canonical
+        // oracle payload now also publishes the caller's banked FX rate
+        // snapshot (fxDisplayPolicy), so clients can render the saved rate
+        // alongside the live one. The mocked prisma context has no
+        // fxSavedRate rows, so the honest value here is null.
+        savedRate: null,
       },
     });
   });

@@ -17,13 +17,42 @@ const { idempotency } = require('../middleware/idempotency');
 const { require2FA } = require('../middleware/require2FA');
 const { protectActive }        = require('../middleware/banGuardMiddleware');
 
+// FX-balance workstream — MoMo/GHS payout detection for the conditional
+// FX gate on /withdraw. Mirrors walletController's payoutMethod detection
+// (numeric destination, >= 9 digits → MOMO): the USDC⇄GHS conversion at
+// dispatch makes exactly these requests FX-dependent.
+const { requireFreshFxRate } = require('../middleware/fxTransactionGateMiddleware');
+
+function isMomoPayoutDestination(req) {
+    const raw = req?.body?.destination;
+    if (typeof raw !== 'string') return false;
+    const cleanDest = raw.trim();
+    const isNumeric = /^\d+$/.test(cleanDest);
+    if (!isNumeric) return false; // TRC20/BEP20/crypto paths: FX-independent
+    // 8-12 digits resolves to BINANCE_PAY in the controller's if/else order
+    // (FX-independent). Anything else numeric is the MoMo/GHS payout path
+    // (or an invalid payout the controller will reject) — fail CLOSED and
+    // demand a fresh canonical rate for it.
+    return !(cleanDest.length >= 8 && cleanDest.length <= 12);
+}
+
 // Withdrawals — r42 WAVE-2: the claim commits INSIDE the withdrawal
 // reservation transaction (see walletController.requestWithdrawal) with the
 // deterministic created-ticket response. There is NO provider I/O in the
 // request path (payout workers own dispatch), so the response is honest
 // post-commit; 4xx/5xx responses prove the reservation rolled back and
 // release the claim for retry (same disposition contract as /api/withdraw/*).
-router.post('/withdraw',       protectActive, require2FA(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), walletController.requestWithdrawal);
+// FX-balance workstream — conditional transaction gate. The route serves
+// BOTH USDC-native crypto destinations (FX-independent, stays enabled) and
+// MoMo/GHS phone payouts (FX-dependent). The predicate mirrors the
+// controller's MoMO detection (numeric destination >= 9 digits): only
+// those requests demand a FRESH canonical rate, and are refused 503 BEFORE
+// the idempotency claim. A saved/demo fallback rate never opens the gate.
+router.post('/withdraw',
+    protectActive, require2FA(),
+    requireFreshFxRate({ when: isMomoPayoutDestination }),
+    idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
+    walletController.requestWithdrawal);
 
 // Read-only history (banned users still need to see their own history)
 router.get('/history',         protect,       walletController.getWithdrawalHistory);

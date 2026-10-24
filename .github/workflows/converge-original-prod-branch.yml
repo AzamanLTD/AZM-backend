@@ -239,6 +239,7 @@ jobs:
           node infra/install-payout-reconciliation-infra.js
           node infra/install-fiat-liquidity-overlay.js
           node infra/install-model-b-settlement-overlay.js
+          node infra/install-ghs-wallet-overlay.js
           node infra/install-r16-execution-identity-overlay.js
           node infra/install-r19-smartroute-execution-snapshot-overlay.js
           node infra/install-r42-idempotency-overlay.js
