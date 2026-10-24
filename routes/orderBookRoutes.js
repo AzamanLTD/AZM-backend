@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const authMiddleware = require('../middleware/authMiddleware');
+const { requireFreshFxRate } = require('../middleware/fxTransactionGateMiddleware');
 const { idempotency } = require('../middleware/idempotency');
 const obController = require('../controllers/orderBookController');
 
@@ -10,7 +11,7 @@ const protect = authMiddleware.protect;
 // IN_PROGRESS claim after a 4xx is durable proof of rollback — the key is
 // safely releasable (releaseOn4xx). 5xx stays RETAIN (default): a post-
 // commit failure must never re-arm a placed order.
-router.post('/orders',       protect, idempotency({ releaseOn4xx: true }), obController.placeOrder);
+router.post('/orders', protect, requireFreshFxRate(), idempotency({ releaseOn4xx: true }), obController.placeOrder);
 router.get('/',              protect, obController.getOrderBook);
 router.get('/orders/my',     protect, obController.getMyOrders);
 router.get('/trades',        protect, obController.getTradeHistory);

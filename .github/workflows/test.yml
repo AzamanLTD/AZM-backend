@@ -116,6 +116,12 @@ jobs:
       - name: Install Model B settlement overlay
         run: node infra/install-model-b-settlement-overlay.js
 
+      - name: Install GHS wallet + FX saved-rate overlay
+        # FX-balance workstream: nativeGhsBalance CHECK floor, FxSavedRate
+        # guards, and (on the disposable CI test DB) the explicit demo rate
+        # seed used by the display-fallback contract tests.
+        run: node infra/install-ghs-wallet-overlay.js
+
       # PR #292 follow-up: the release chain (npm run release) executes the
       # business-os overlay in production (it is the schema authority for
       # Business OS DDL, including the ProfitSource EWA_FEE enum value that
@@ -186,7 +192,18 @@ jobs:
           CONTAINER=$(docker ps --filter "ancestor=postgres:16" --format "{{ .ID }}" | head -1)
           docker exec "$CONTAINER" psql -U postgres -d azm_test \
             -c "ALTER SYSTEM SET synchronous_commit = off" \
-            -c "SELECT pg_reload_conf();"
+            -c "SELECT pg_reload_conf();" \
+            -c "ALTER DATABASE azm_test SET idle_session_timeout = '90s'"
+        # idle_session_timeout (PG14+, no restart needed): the serial jest
+        # battery accumulates leaked Prisma handles across suites — once the
+        # leaks pass ~max_connections (100), postgres starts refusing NEW
+        # connections ("sorry, too many clients already"), which turns a
+        # healthy gate into false mid-run failures. Reaping sessions that
+        # have been idle >90s keeps the budget clear; active suites and
+        # in-flight transactions are untouched (testTimeout is 30s, far
+        # below the reap window, and open $transaction blocks are governed
+        # by a different timeout we are not setting). Observed on the
+        # 2026-10-22 gate: 62 leaked idles after ~115 suites.
 
       - name: Run tests
         # DB-backed suites share one disposable database and truncate between

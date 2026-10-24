@@ -17,13 +17,30 @@ const { idempotency } = require('../middleware/idempotency');
 const { require2FA } = require('../middleware/require2FA');
 const { protectActive }        = require('../middleware/banGuardMiddleware');
 
+// FX-balance workstream — MoMo/GHS payout detection for the conditional
+// FX gate on /withdraw. Mirrors walletController's payoutMethod detection
+// (numeric destination, >= 9 digits → MOMO): the USDC⇄GHS conversion at
+// dispatch makes exactly these requests FX-dependent.
+const { requireFreshFxRate } = require('../middleware/fxTransactionGateMiddleware');
+
+
 // Withdrawals — r42 WAVE-2: the claim commits INSIDE the withdrawal
 // reservation transaction (see walletController.requestWithdrawal) with the
 // deterministic created-ticket response. There is NO provider I/O in the
 // request path (payout workers own dispatch), so the response is honest
 // post-commit; 4xx/5xx responses prove the reservation rolled back and
 // release the claim for retry (same disposition contract as /api/withdraw/*).
-router.post('/withdraw',       protectActive, require2FA(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), walletController.requestWithdrawal);
+// FX-balance workstream — universal transaction gate (supersedes the
+// earlier conditional MoMo-only scope). Crypto wallet dispatches and
+// MoMo/GHS payouts are BOTH new USDC-enabled transaction authorizations —
+// every destination now demands a FRESH canonical rate and is refused 503
+// BEFORE the idempotency claim. A saved/demo fallback rate never opens
+// the gate. (The former isMomoPayoutDestination predicate is retired.)
+router.post('/withdraw',
+    protectActive, require2FA(),
+    requireFreshFxRate(),
+    idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
+    walletController.requestWithdrawal);
 
 // Read-only history (banned users still need to see their own history)
 router.get('/history',         protect,       walletController.getWithdrawalHistory);
@@ -90,7 +107,8 @@ router.get('/pool-withdrawal-preview', protect, async (req, res) => {
 
 // POST /api/wallet/internal-transfer
 // Body: { direction: 'TO_POOL' | 'FROM_POOL', amount: number }
-router.post('/internal-transfer', protectActive, require2FA(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), async (req, res) => {
+router.post('/internal-transfer', protectActive, require2FA(), requireFreshFxRate(),
+    idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), async (req, res) => {
     const prisma = req.app.get('prisma');
     const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
 

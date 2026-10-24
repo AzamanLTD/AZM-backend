@@ -13,6 +13,7 @@ const router              = express.Router();
 const tradeController     = require('../controllers/tradeController');
 const { protect, adminOnly } = require('../middleware/authMiddleware');
 const { protectActive }   = require('../middleware/banGuardMiddleware');
+const { requireFreshFxRate } = require('../middleware/fxTransactionGateMiddleware');
 const { idempotency }       = require('../middleware/idempotency');
 const { require2FA }    = require('../middleware/require2FA');
 const upload              = require('../middleware/uploadMiddleware');
@@ -46,10 +47,12 @@ router.get('/:id',     protect, getTradeDetails);
 // controller's explicit pre-economics guards mark the claim releasable
 // (res.locals.financialClaimRelease), and those provably run before the
 // economic transaction.
-router.post('/initiate', protectActive, require2FA(), idempotency(), initiateTrade);
+router.post('/initiate', protectActive, require2FA(), requireFreshFxRate(),
+    idempotency(), initiateTrade);
 
 // ── Vendor approval actions ──────────────────────────────────────────────────
-router.post('/accept',  protectActive, idempotency(), acceptTrade);
+router.post('/accept',  protectActive, requireFreshFxRate(),
+    idempotency(), acceptTrade);
 router.post('/decline', protectActive, declineTrade);
 
 // ── Time extension ───────────────────────────────────────────────────────────

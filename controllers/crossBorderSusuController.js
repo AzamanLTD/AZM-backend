@@ -18,10 +18,50 @@
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 const logger = require('../src/config/logger');
-const { getFxRate, SUPPORTED_CURRENCIES } = require('./multiCurrencyController');
+const { SUPPORTED_CURRENCIES } = require('./multiCurrencyController');
 
 const CROSS_BORDER_FEE = 0.005; // 0.5% fee on cross-border conversions
 const MAX_COUNTRIES_PER_GROUP = 5;
+
+// Authorization-grade rate authority for cross-border money movement.
+//
+// `getFxRate` (multiCurrencyController) is a DISPLAY/utility lookup: it
+// silently falls back to hardcoded BASE_RATES when the FxRate table row is
+// missing — a fabricated demo rate. That is never acceptable for money
+// movement. Money paths here must read the persisted FxRate observation
+// and fail closed when it is missing, non-positive or stale, mirroring the
+// canonical 271C freshness discipline (default 30-minute observation age).
+const RATE_OBSERVATION_MAX_AGE_MS = 30 * 60 * 1000;
+
+async function getFreshCrossBorderRate(from, to) {
+  const row = await prisma.fxRate.findUnique({
+    where: { fromCurrency_toCurrency: { fromCurrency: from, toCurrency: to } },
+  });
+  if (!row) {
+    const err = new Error('FX rate unavailable.');
+    err.code = 'RATE_UNAVAILABLE';
+    throw err;
+  }
+  const rate = parseFloat(row.rate.toString());
+  if (!Number.isFinite(rate) || rate <= 0) {
+    const err = new Error('FX rate unavailable.');
+    err.code = 'RATE_UNAVAILABLE';
+    throw err;
+  }
+  const ageMs = Date.now() - row.fetchedAt.getTime();
+  if (ageMs > RATE_OBSERVATION_MAX_AGE_MS) {
+    const err = new Error('FX rate stale.');
+    err.code = 'RATE_STALE';
+    throw err;
+  }
+  // Future observations beyond a small clock-skew allowance are untrustworthy.
+  if (ageMs < -60 * 1000) {
+    const err = new Error('FX rate stale.');
+    err.code = 'RATE_STALE';
+    throw err;
+  }
+  return { rate, observedAt: row.fetchedAt };
+}
 
 // ── Create cross-border Susu group ──────────────────────────────────────────
 async function createCrossBorderSusu(req, res) {
@@ -116,32 +156,43 @@ async function contributeLocalCurrency(req, res) {
       return res.status(400).json({ success: false, message: 'Not a cross-border Susu group.' });
     }
 
-    // Get FX rate from local → base
-    const fxRate = await getFxRate(localCurr, config.baseCurrency);
-    if (!fxRate) {
-      return res.status(503).json({ success: false, message: 'FX rate unavailable.' });
+    // Get FX rate from local → base (authorization-grade: no demo
+    // fallback, freshness-checked observation — see getFreshCrossBorderRate)
+    let freshRate;
+    try {
+      freshRate = await getFreshCrossBorderRate(localCurr, config.baseCurrency);
+    } catch (err) {
+      return res.status(503).json({ success: false, code: err.code || 'RATE_UNAVAILABLE', message: err.message || 'FX rate unavailable.', retryable: true });
     }
+    const fxRate = freshRate.rate;
 
     // Apply cross-border fee
     const effectiveRate = fxRate * (1 - CROSS_BORDER_FEE);
     const baseAmount = parseFloat(localAmount) * effectiveRate;
 
-    // Check user has sufficient local currency wallet balance
+    // Resolve the wallet for the 404 verdict; the balance CHECK happens
+    // inside the transaction as a conditional debit so two concurrent
+    // contributions can never spend the same stale balance twice.
     const wallet = await prisma.currencyWallet.findUnique({
       where: { userId_currency: { userId, currency: localCurr } },
     });
-
-    if (!wallet || parseFloat(wallet.balance.toString()) < parseFloat(localAmount)) {
-      return res.status(400).json({ success: false, message: `Insufficient ${localCurr} balance.` });
+    if (!wallet) {
+      return res.status(404).json({ success: false, message: `${localCurr} wallet not found.` });
     }
 
     // Record the contribution with FX metadata
     const result = await prisma.$transaction(async (tx) => {
-      // Debit local wallet
-      await tx.currencyWallet.update({
-        where: { id: wallet.id },
+      // Debit local wallet — SINGLE-WINNER conditional update: a wallet
+      // whose live balance is below the amount is not debited at all.
+      const debited = await tx.currencyWallet.updateMany({
+        where: { id: wallet.id, balance: { gte: parseFloat(localAmount) } },
         data: { balance: { decrement: parseFloat(localAmount) } },
       });
+      if (debited.count !== 1) {
+        const err = new Error(`Insufficient ${localCurr} balance.`);
+        err.code = 'INSUFFICIENT_BALANCE';
+        throw err;
+      }
 
       // Create contribution record with FX snapshot
       const contribution = await tx.susuContribution.create({
@@ -184,6 +235,9 @@ async function contributeLocalCurrency(req, res) {
       },
     });
   } catch (err) {
+    if (err?.code === 'INSUFFICIENT_BALANCE') {
+      return res.status(400).json({ success: false, message: err.message });
+    }
     logger.error({ err }, '[crossBorderSusu] contribute error');
     return res.status(500).json({ success: false, message: 'Contribution failed.' });
   }
@@ -217,37 +271,57 @@ async function payoutLocalCurrency(req, res) {
       return res.status(400).json({ success: false, message: 'Not a cross-border Susu.' });
     }
 
-    // Convert payout from base → target currency
+    // Convert payout from base → target currency. The payout leg is a NEW
+    // FX conversion authorized at payout time (the target currency and the
+    // conversion rate are chosen NOW — there is no persisted pre-authorized
+    // quote for this leg). It therefore requires a fresh, persisted,
+    // non-demo observation of the payout pair: the display utility
+    // getFxRate (with its hardcoded BASE_RATES fallback) is never used for
+    // money movement.
     const basePayout = parseFloat(cycle.payoutAmount.toString());
-    const fxRate = await getFxRate(config.baseCurrency, targetCurr);
-    if (!fxRate) {
-      return res.status(503).json({ success: false, message: 'FX rate unavailable.' });
+    let freshRate;
+    try {
+      freshRate = await getFreshCrossBorderRate(config.baseCurrency, targetCurr);
+    } catch (err) {
+      return res.status(503).json({ success: false, code: err.code || 'RATE_UNAVAILABLE', message: err.message || 'FX rate unavailable.', retryable: true });
     }
+    const fxRate = freshRate.rate;
 
     // No fee on payout (fee was collected at contribution time)
     const targetAmount = basePayout * fxRate;
 
-    // Credit recipient's target currency wallet
-    let wallet = await prisma.currencyWallet.findUnique({
+    // Resolve the target wallet for the 404 verdict; the wallet is created
+    // inside the transaction.
+    const wallet = await prisma.currencyWallet.findUnique({
       where: { userId_currency: { userId, currency: targetCurr } },
     });
 
     const result = await prisma.$transaction(async (tx) => {
-      if (!wallet) {
-        wallet = await tx.currencyWallet.create({
+      // SINGLE-WINNER payout transition, FIRST inside the transaction and
+      // ATOMIC with the credit: only a request that flips a not-yet-paid
+      // cycle to PAID_OUT proceeds. A replayed or concurrent request finds
+      // zero updated rows and is refused BEFORE any wallet credit — the
+      // same cycle can never be paid out twice.
+      const transition = await tx.susuCycle.updateMany({
+        where: { id: cycleId, status: { not: 'PAID_OUT' } },
+        data: { status: 'PAID_OUT', paidOutAt: new Date() },
+      });
+      if (transition.count !== 1) {
+        const err = new Error('This cycle has already been paid out.');
+        err.code = 'PAYOUT_ALREADY_COMPLETED';
+        throw err;
+      }
+
+      let targetWallet = wallet;
+      if (!targetWallet) {
+        targetWallet = await tx.currencyWallet.create({
           data: { userId, currency: targetCurr, balance: 0 },
         });
       }
 
       await tx.currencyWallet.update({
-        where: { id: wallet.id },
+        where: { id: targetWallet.id },
         data: { balance: { increment: targetAmount } },
-      });
-
-      // Mark cycle as paid out
-      await tx.susuCycle.update({
-        where: { id: cycleId },
-        data: { status: 'PAID_OUT', paidOutAt: new Date() },
       });
 
       // Record payout FX snapshot
@@ -265,6 +339,7 @@ async function payoutLocalCurrency(req, res) {
         },
       });
 
+
       return { targetAmount };
     });
 
@@ -280,6 +355,9 @@ async function payoutLocalCurrency(req, res) {
       },
     });
   } catch (err) {
+    if (err?.code === 'PAYOUT_ALREADY_COMPLETED') {
+      return res.status(409).json({ success: false, code: 'PAYOUT_ALREADY_COMPLETED', message: err.message });
+    }
     logger.error({ err }, '[crossBorderSusu] payout error');
     return res.status(500).json({ success: false, message: 'Payout failed.' });
   }
