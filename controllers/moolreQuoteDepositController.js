@@ -636,3 +636,78 @@ exports.webhook = async (req, res) => {
     return res.status(409).json({ success: false, message: err.message });
   }
 };
+
+// =============================================================================
+// BACKEND F — TRANSACTION CONTINUATION (session-interruption recovery)
+// =============================================================================
+// GET-ONLY re-observation of an in-flight fiat deposit. The deposit rails
+// historically exposed only mutations (initiate/OTP) and provider webhooks;
+// after a session interruption the client could only infer an in-flight
+// deposit from the broad history list. This endpoint is the single,
+// idempotent, ownership-checked way to re-observe ONE deposit by its
+// transaction id: status, settlement outcome, and the persisted
+// continuation payload (payment instructions metadata) — sufficient to
+// finish or abandon the flow with no dead ends.
+//
+// Contract rules:
+//   - READ-ONLY: never mutates the transaction, quote, balances or provider.
+//   - Ownership: the transaction must belong to the caller (404 otherwise,
+//     indistinguishable from absence — no existence leak).
+//   - Honest statuses: PENDING / COMPLETED / FAILED exactly as the ledger
+//     records them; no invented intermediate states.
+//   - The payload is ONLY what was persisted at initiation (metadata) —
+//     re-observation never regenerates quotes, references or rates.
+// =============================================================================
+
+function maskMsisdn(msisdn) {
+  if (!msisdn || typeof msisdn !== 'string') return null;
+  if (msisdn.length <= 4) return '****';
+  return msisdn.slice(0, 3) + '****' + msisdn.slice(-3);
+}
+
+exports.getDepositStatus = async (req, res) => {
+  const prisma = req.app.get('prisma');
+  const { transactionId } = req.params;
+  try {
+    const txn = await prisma.transactionHistory.findFirst({
+      where: {
+        id: transactionId,
+        userId: req.user.id,          // ownership — never another user's row
+        type: 'DEPOSIT_FIAT',
+      },
+    });
+    if (!txn) {
+      return res.status(404).json({ success: false, message: 'Not found.' });
+    }
+
+    const md = (txn.metadata && typeof txn.metadata === 'object') ? txn.metadata : {};
+
+    return res.json({
+      success: true,
+      transaction: {
+        id: txn.id,
+        type: txn.type,
+        status: txn.status,                 // PENDING | COMPLETED | FAILED (| FROZEN_DISPUTE — honest, unchanged enum)
+        amountUsdc: txn.amountUsdc,
+        createdAt: txn.createdAt,
+        settledAt: txn.status === 'COMPLETED' ? txn.createdAt : null,
+      },
+      // Continuation payload — ONLY persisted initiation data, sufficient
+      // for the client to finish (or safely abandon) the interrupted flow.
+      continuation: {
+        provider: md.provider ?? null,
+        network: md.network ?? null,
+        amountGhs: md.amountGhs ?? null,
+        amountGhsExact: md.amountGhsExact ?? null,
+        quoteId: md.quoteId ?? null,
+        quoteExpiresAt: md.quoteExpiresAt ?? null,
+        rateAtInitiation: md.rateAtInitiation ?? null,
+        payerPhoneMasked: maskMsisdn(md.payerPhone ?? txn.payerMsisdn ?? null),
+        providerRef: txn.providerRef ?? null,
+      },
+    });
+  } catch (err) {
+    req.app.get('logger')?.error?.({ err }, 'getDepositStatus error');
+    return res.status(500).json({ success: false, message: 'Internal error.' });
+  }
+};

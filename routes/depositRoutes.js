@@ -38,4 +38,8 @@ router.post('/fiat/initiate/moolre/otp', protectActive, quoteFiatDepositControll
 router.post('/fiat/webhook/moolre', quoteMoolreDepositController.webhook);
 router.post('/validate-name', protectActive, depositController.validateMomoName);
 
+// Backend F — transaction continuation: idempotent, read-only
+// re-observation of ONE in-flight fiat deposit after session interruption.
+router.get('/fiat/status/:transactionId', protectActive, quoteMoolreDepositController.getDepositStatus);
+
 module.exports = router;
