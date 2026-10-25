@@ -981,6 +981,7 @@ model User {
   storyViews          StoryView[]             @relation("StoryViewer")
   storyReactions      StoryReaction[]         @relation("StoryReactor")
   followingBusinesses BusinessFollower[]      @relation("BusinessFollower")
+  savedBusinesses    BusinessBookmark[]       @relation("BusinessBookmark")
   dineInTabs          DineInTab[]             @relation("DineInTabCustomer")
   dineInTabItems      DineInTabItem[]         @relation("DineInTabStaff")
   trustScore          CustomerTrustScore?
@@ -2859,6 +2860,7 @@ model BusinessProfile {
   loyaltyPrograms            LoyaltyProgram[]
   transitTrips               TransitTrip[]
   followers                  BusinessFollower[]
+  customerBookmarks          BusinessBookmark[]
   adPosts                    BusinessAdPost[]
   taxPresets                 BusinessTaxPreset[]
   dineInTabs                 DineInTab[]
@@ -4767,6 +4769,26 @@ model BusinessFollower {
 
   businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
   customer        User            @relation("BusinessFollower", fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@unique([businessProfileId, customerId])
+  @@index([customerId])
+  @@index([businessProfileId])
+}
+
+// Marketplace personalisation (Backend A): a user-scoped business
+// bookmark ("saved business"). Distinct from BusinessFollower by design:
+// following drives the story/ad feed; bookmarking is a private, personal
+// collection. Owner-scoped: every route resolves customerId from the
+// authenticated user, and the @@unique pair makes repeated save/unsave
+// requests idempotent at the database level.
+model BusinessBookmark {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  customerId        Int
+  createdAt         DateTime @default(now())
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  customer        User            @relation("BusinessBookmark", fields: [customerId], references: [id], onDelete: Cascade)
 
   @@unique([businessProfileId, customerId])
   @@index([customerId])
