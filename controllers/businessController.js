@@ -10,6 +10,7 @@
 
 const logger = require('../src/config/logger');
 const businessService = require('../services/businessService');
+const { attachStoryState } = require('../services/marketplace/businessStoryStateService');
 const storefrontRenderService = require('../services/storefrontRenderService');
 
 // =============================================================================
@@ -109,6 +110,12 @@ exports.searchBusinesses = async (req, res) => {
         const hasMore = rows.length > take;
         const businesses = hasMore ? rows.slice(0, take) : rows;
         const nextCursor = hasMore ? businesses[businesses.length - 1].id : null;
+
+        // Backend B: authoritative active/unseen story state for the ring —
+        // attached only from the Story/StoryView authorities (additive
+        // `storyState` block; anonymous viewers get hasUnseenStory: null).
+        const viewerId = req.user ? req.user.id : null;
+        await attachStoryState(prisma, businesses, viewerId);
 
         return res.status(200).json({ success: true, businesses, hasMore, nextCursor });
     } catch (err) {
