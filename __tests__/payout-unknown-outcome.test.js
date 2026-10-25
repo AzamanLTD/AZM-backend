@@ -229,6 +229,18 @@ describeOrSkip('payout provider unknown-outcome (real PostgreSQL)', () => {
 
         expect(await withdrawalStatus(withdrawal.id)).toBe('NEEDS_MANUAL_REVIEW');
         expect(summary.flagged).toBe(1);
-        expect(notify).toHaveBeenCalledWith(expect.objectContaining({ type: 'WITHDRAWAL_REVIEW' }));
+        // Canonical WITHDRAWAL_STATUS action (same shape as adminController
+        // approve/reject). The previous assertion pinned a top-level `type`
+        // field that sendNotification never accepted, on a call that used
+        // `message` instead of `body` — so no record could ever persist.
+        expect(notify).toHaveBeenCalledWith(expect.objectContaining({
+            userId: withdrawal.userId,
+            category: 'GENERAL',
+            actionPayload: expect.objectContaining({
+                action: 'WITHDRAWAL_STATUS',
+                withdrawalId: String(withdrawal.id),
+                status: 'NEEDS_MANUAL_REVIEW'
+            })
+        }));
     });
 });
