@@ -369,6 +369,9 @@ class NotificationService {
         const { page = 1, limit = 20, unreadOnly = false, cursor = null, category = null } = opts;
 
         const where = { userId: parsedUserId };
+        // Backend E: dismissed notifications are hidden from the owner's
+        // list in ALL modes (the event record itself is preserved).
+        where.isDismissed = false;
         if (unreadOnly) where.isRead = false;
         if (category) where.category = String(category).toUpperCase();
 
@@ -429,7 +432,30 @@ class NotificationService {
 
     async getUnreadCount(userId) {
         return this.prisma.notification.count({
-            where: { userId: parseInt(userId, 10), isRead: false }
+            where: { userId: parseInt(userId, 10), isRead: false, isDismissed: false }
+        });
+    }
+
+    // =========================================================================
+    // BACKEND E — OWNER-SCOPED SOFT DISMISSAL
+    // =========================================================================
+    // Hides a notification from the owner's list and unread count WITHOUT
+    // deleting it: financial/security/dispute event records and their
+    // audit trails keep their Notification rows. Idempotent by the flag;
+    // converges safely with concurrent markAsRead (independent columns).
+    async dismissNotification(notificationId, userId) {
+        const parsedUserId = parseInt(userId, 10);
+        const notification = await this.prisma.notification.findUnique({
+            where: { id: notificationId }
+        });
+        if (!notification) throw new Error('Notification not found');
+        if (notification.userId !== parsedUserId) throw new Error('Not authorized');
+
+        // Idempotent: re-dismissing an already-dismissed row only refreshes
+        // dismissedAt; read state is never touched by dismissal.
+        return this.prisma.notification.update({
+            where: { id: notificationId },
+            data:  { isDismissed: true, dismissedAt: new Date() }
         });
     }
 

@@ -22,6 +22,8 @@ router.get('/', protect, notifLimiter, notificationController.getNotifications);
 router.get('/unread-count', protect, notificationController.getUnreadCount);
 router.patch('/:id/read', protect, notifLimiter, notificationController.markAsRead);
 router.patch('/read-all', protect, notifLimiter, notificationController.markAllAsRead);
+// Backend E: owner-scoped soft dismissal (idempotent; record preserved).
+router.delete('/:id', protect, notifLimiter, notificationController.dismissNotification);
 
 router.post('/trigger/trade-started', protect, adminOnly, notificationController.sendTradeStarted);
 router.post('/trigger/dispute-updated', protect, adminOnly, notificationController.sendDisputeUpdated);
