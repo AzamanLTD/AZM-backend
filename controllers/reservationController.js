@@ -435,16 +435,27 @@ exports.counterProposeReservation = async (req, res) => {
             }
         });
 
-        // Notify the customer
+        // Notify the customer. The Notification model has no `type`/`metadata`
+        // columns and `MARKETPLACE` is not a NotificationCategory value — the
+        // previous create payload could never validate against the real schema
+        // (PrismaClientValidationError AFTER the reservation update had already
+        // committed, so the customer saw a 500 on a request that actually
+        // succeeded and the business side got nothing). The event type rides
+        // inside actionPayload (the model's Json column) and the category uses
+        // a real enum value, matching the transit-reminder remediation (#270).
         await req.prisma.notification.create({
             data: {
                 userId: reservation.customerId,
-                type: 'COUNTER_PROPOSAL',
-                category: 'MARKETPLACE',
+                category: 'GENERAL',
                 title: `${reservation.businessProfile.businessName} proposed an alternative time`,
                 body: message || `The business has proposed ${new Date(proposedStartDatetime).toLocaleString()}. Tap to review.`,
-                metadata: { reservationId, proposedStartDatetime, proposedEndDatetime },
-                isRead: false,
+                actionPayload: {
+                    action: 'COUNTER_PROPOSAL',
+                    type: 'COUNTER_PROPOSAL',
+                    reservationId: reservationId,
+                    proposedStartDatetime: proposedStartDatetime,
+                    proposedEndDatetime: proposedEndDatetime || null,
+                },
             }
         });
 
@@ -495,18 +506,29 @@ exports.acceptCounterProposal = async (req, res) => {
             }
         });
 
-        // Notify the business
-        await req.prisma.notification.create({
-            data: {
-                userId: (await req.prisma.businessProfile.findUnique({ where: { id: reservation.businessProfileId }, select: { userId: true } })).userId,
-                type: 'COUNTER_PROPOSAL',
-                category: 'MARKETPLACE',
-                title: 'Counter-proposal accepted',
-                body: 'The customer accepted your proposed alternative time.',
-                metadata: { reservationId },
-                isRead: false,
-            }
+        // Notify the business (same schema-valid shape as the counter-propose
+        // notification above — the old payload used nonexistent `type`/`metadata`
+        // columns and the invalid `MARKETPLACE` category, so the notification
+        // could never persist and the handler 500'd after the update committed).
+        const counterBizOwner = await req.prisma.businessProfile.findUnique({
+            where: { id: reservation.businessProfileId },
+            select: { userId: true }
         });
+        if (counterBizOwner) {
+            await req.prisma.notification.create({
+                data: {
+                    userId: counterBizOwner.userId,
+                    category: 'GENERAL',
+                    title: 'Counter-proposal accepted',
+                    body: 'The customer accepted your proposed alternative time.',
+                    actionPayload: {
+                        action: 'COUNTER_PROPOSAL_ACCEPTED',
+                        type: 'COUNTER_PROPOSAL_ACCEPTED',
+                        reservationId: reservationId,
+                    },
+                }
+            });
+        }
 
         res.json({ success: true, reservation: updated });
     } catch (err) {

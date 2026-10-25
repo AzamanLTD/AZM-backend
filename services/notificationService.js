@@ -438,7 +438,10 @@ class NotificationService {
     // =========================================================================
 
     _normalizeCategory(category) {
-        const valid = ['GENERAL', 'SECURITY_ACCOUNT', 'VENDOR_PRIORITY', 'ADMIN_SYSTEM', 'MONEY', 'SOCIAL', 'CHAT', 'SYSTEM', 'VAULT', 'SUSU', 'SMART_ROUTE', 'AUCTION'];
+        // Must mirror the Prisma NotificationCategory enum exactly. STOREFRONT was
+        // previously missing here, so a legitimate enum category was silently
+        // downgraded to GENERAL at the persistence boundary.
+        const valid = ['GENERAL', 'SECURITY_ACCOUNT', 'VENDOR_PRIORITY', 'ADMIN_SYSTEM', 'MONEY', 'SOCIAL', 'CHAT', 'SYSTEM', 'VAULT', 'SUSU', 'SMART_ROUTE', 'AUCTION', 'STOREFRONT'];
         return valid.includes(category) ? category : 'GENERAL';
     }
 }

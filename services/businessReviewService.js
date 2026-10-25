@@ -106,15 +106,25 @@ const createReview = async (prisma, {
           select: { userId: true, businessName: true }
       });
       if (business) {
+          // The Notification model has no `type`/`metadata` columns and
+          // `MARKETPLACE` is not a NotificationCategory value — the previous
+          // create could never validate, and the silent catch meant the
+          // business NEVER received a review notification. The event type
+          // rides inside actionPayload (the model's Json column) and the
+          // category uses a real enum value (transit-reminder precedent #270).
           await prisma.notification.create({
               data: {
                   userId: business.userId,
-                  type: 'REVIEW_RECEIVED',
-                  category: 'MARKETPLACE',
+                  category: 'GENERAL',
                   title: 'New review',
                   body: `${r}★ review from a customer.`,
-                  metadata: { reviewId: transactionResult.id, businessProfileId, rating: r },
-                  isRead: false,
+                  actionPayload: {
+                      action: 'REVIEW_RECEIVED',
+                      type: 'REVIEW_RECEIVED',
+                      reviewId: transactionResult.id,
+                      businessProfileId: businessProfileId,
+                      rating: r,
+                  },
               }
           });
       }

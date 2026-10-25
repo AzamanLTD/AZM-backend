@@ -774,12 +774,24 @@ class PayoutBatchWorker {
             }
 
             if (this.notificationService) {
+                // The service signature takes `body`, not `message` — the old
+                // call passed `message`, leaving `body` undefined, so the
+                // Notification create ALWAYS failed (required column) and the
+                // `.catch(() => {})` swallowed the error: the user was never
+                // told their withdrawal went to manual review. The canonical
+                // WITHDRAWAL_STATUS action/keys (see adminController) carry the
+                // event; `type` rides inside actionPayload.
                 await this.notificationService.sendNotification({
                     userId: withdrawal.userId,
                     title: 'Withdrawal Under Review',
-                    message: 'Your withdrawal is being reviewed by our team. This usually takes less than 24 hours.',
-                    type: 'WITHDRAWAL_REVIEW',
-                    category: 'GENERAL'
+                    body: 'Your withdrawal is being reviewed by our team. This usually takes less than 24 hours.',
+                    category: 'GENERAL',
+                    actionPayload: {
+                        action: 'WITHDRAWAL_STATUS',
+                        type: 'WITHDRAWAL_REVIEW',
+                        withdrawalId: String(withdrawal.id),
+                        status: 'NEEDS_MANUAL_REVIEW'
+                    }
                 }).catch(() => {});
             }
 
