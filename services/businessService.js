@@ -173,7 +173,7 @@ const getBusinessProfile = async (prisma, { bizId, userId }) => {
 // =============================================================================
 // 3. SEARCH BUSINESSES — name / bizId / description, optional filters.
 // =============================================================================
-const searchBusinesses = async (prisma, { query, category, verified, limit, cursor, subcategory, priceRange, minRating, sort }) => {
+const searchBusinesses = async (prisma, { query, category, verified, limit, cursor, subcategory, priceRange, minRating, sort, viewerId }) => {
     const take = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 50);
 
     // Names that must never appear in the public marketplace feed (test/seed accounts).
@@ -239,6 +239,23 @@ const searchBusinesses = async (prisma, { query, category, verified, limit, curs
         }
         for (const row of rows) {
             row.minProductPrice = priceMap[row.id] ?? null;
+        }
+    }
+
+    // Backend D — RANKING EFFECT: for an authenticated viewer, businesses
+    // they suppressed with "Show less like this" are DEMOTED to the end of
+    // the page (one batched query; relative order preserved in both
+    // groups). Demotion only: the business is never removed, hidden or
+    // altered — hard eligibility/suspension filters above still apply, and
+    // the caller can still open the profile or follow/bookmark it freely.
+    if (viewerId != null && rows.length > 0) {
+        const RecommendationFeedbackService = require('./marketplace/recommendationFeedbackService');
+        const svc = new RecommendationFeedbackService(prisma);
+        const suppressed = await svc.getSuppressedIds(viewerId, rows.map(r => r.id));
+        if (suppressed.size > 0) {
+            const demoted = svc.demoteSuppressed(rows, suppressed);
+            rows.length = 0;
+            rows.push(...demoted);
         }
     }
 

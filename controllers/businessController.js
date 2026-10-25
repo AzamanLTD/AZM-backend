@@ -103,7 +103,11 @@ exports.searchBusinesses = async (req, res) => {
             subcategory: subcategory || null,
             priceRange: priceRange || null,
             minRating: minRating || null,
-            sort: sort || null
+            sort: sort || null,
+            // Backend D: per-viewer "Show less" demotion. Null for
+            // anonymous callers; the search route resolves the viewer via
+            // optionalAuth when #371 lands.
+            viewerId: req.user ? req.user.id : null
         });
 
         const hasMore = rows.length > take;

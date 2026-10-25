@@ -209,6 +209,19 @@ async function autoRelease(prisma, opts = {}) {
       log(`offered-categories overlay failed (non-fatal): ${e.message}`);
     }
 
+    // MARKETPLACE PERSONALISATION (Backend D) — per-user recommendation
+    // feedback ("Show less like this"). Same convention: idempotent,
+    // additive, fail-closed on drift; part of the boot-time path.
+    try {
+      const { installBusinessRecommendationFeedbackOverlay } = require('./install-business-recommendation-feedback-overlay');
+      const r = await installBusinessRecommendationFeedbackOverlay(prisma);
+      releaseStatus.businessRecommendationFeedbackOverlay = r;
+      log(`business-recommendation-feedback overlay: ${r.ok} ok, ${r.failed} failed`);
+    } catch (e) {
+      releaseStatus.businessRecommendationFeedbackOverlay = { error: e.message };
+      log(`business-recommendation-feedback overlay failed (non-fatal): ${e.message}`);
+    }
+
     releaseStatus.finishedAt = new Date().toISOString();
     log('Release step finished.');
     return releaseStatus;
