@@ -64,7 +64,18 @@ Read model consumed by `/api/users/balance` (additive `valuation` block; legacy 
     availableGhsValue       = nativeGhsAvailable + (availableUsdc * displayRateGhsPerUsdc)
     availableUsdcEquivalent = availableGhsValue / displayRateGhsPerUsdc
 
-Response fields (every Decimal financial quantity serialized as BOTH exact string `*Exact` and a JS number projection for presentation):
+Wire shape — money objects (pinned by `__tests__/balance-route-contract.test.js`): every Decimal financial quantity serializes as an object `{ exact, value }` where `exact` is the authoritative exact-decimal string (8 dp, the contract for any financial arithmetic) and `value` is a JS number kept for presentation convenience only. There are no bare `*Exact` sibling fields on the wire and no aliases — the tested shape below is the contract:
+
+```json
+"nativeGhsAvailable": { "exact": "50.00000000", "value": 50 }
+```
+
+Four DISTINCT quantities — never conflated:
+
+1. **Actual native GHS** (`nativeGhsAvailable`) — REAL GHS owed to the customer, from the native-GHS ledger. Never derived from USDC or a display rate.
+2. **Actual USDC held** (`availableUsdc`) — REAL liquid USDC in the ledger.
+3. **GHS display valuation** (`availableGhsValue`) — the combined value expressed in GHS at the display rate. A display number, not a holding.
+4. **USDC equivalent** (`usdcEquivalent`) — the DISPLAY valuation of the combined GHS value expressed in USDC. NOT the quantity of USDC held (`≠ availableUsdc`); `null` when no eligible rate exists (never fabricated).
 
 | Field | Meaning |
 |---|---|
@@ -78,6 +89,8 @@ Response fields (every Decimal financial quantity serialized as BOTH exact strin
 | `usdcTransactionGateOpen` | `true` ONLY when `rateStatus === CURRENT`. The honest mirror of the same server-side authority the transaction routes enforce; the frontend disables nothing by itself. |
 | `locked` | `escrowUsdc`, `disputesUsdc`, `vaultsUsdc` (vault status ACTIVE/COMPLETED), `committedSusuUsdc` (PAID contributions in COLLECTING/COLLECTING_GRACE cycles), `savingsGhs` (ACTIVE/PAUSED goals), `vendorUnallocatedUsdc`. Each in its NATIVE unit — never summed across currencies. |
 | `nonCash.azmPoints` | Loyalty points — excluded from every monetary total. |
+
+Null and rate-status semantics (proven by tests): `availableGhsValue`/`usdcEquivalent` are `null` exactly when they cannot be valued — never zero-fabricated. `currentRate` is `null` whenever the fresh canonical observation is missing/unusable; `savedRate` is `null` unless an eligible saved snapshot exists. A saved/demo rate ALWAYS renders as `rateStatus: SAVED_FALLBACK|DEMO_FALLBACK` (display-only) and never as `CURRENT`.
 
 Honesty rules (proven by tests):
 
