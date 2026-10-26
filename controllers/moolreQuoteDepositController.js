@@ -690,7 +690,11 @@ exports.getDepositStatus = async (req, res) => {
         status: txn.status,                 // PENDING | COMPLETED | FAILED (| FROZEN_DISPUTE — honest, unchanged enum)
         amountUsdc: txn.amountUsdc,
         createdAt: txn.createdAt,
-        settledAt: txn.status === 'COMPLETED' ? txn.createdAt : null,
+        // settledAt: null until a real settlement timestamp is persisted at
+        // the provider-reconciliation/settlement transition. Initiation time
+        // (createdAt) is NOT settlement time and must never be relabelled
+        // as such (schema has no settledAt field at this head).
+        settledAt: null,
       },
       // Continuation payload — ONLY persisted initiation data, sufficient
       // for the client to finish (or safely abandon) the interrupted flow.

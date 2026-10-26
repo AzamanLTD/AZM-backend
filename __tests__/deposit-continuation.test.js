@@ -5,7 +5,9 @@
 //
 // Required cases:
 //   - pending deposit is fully re-observable after "session interruption"
-//   - completed deposit settles honestly (COMPLETED, settledAt set)
+//   - completed deposit reports the honest settlement contract: status
+//     COMPLETED with settledAt null (no persisted settlement timestamp exists
+//     at this head — initiation time is never relabelled as settlement time)
 //   - ownership: another user's transaction -> 404 (no existence leak)
 //   - unknown id -> honest 404; unauthenticated -> 401
 //   - READ-ONLY: repeated calls never mutate the row (status, metadata,
@@ -144,7 +146,13 @@ describeOrSkip('Deposit continuation (Backend F)', () => {
         const res = await asAlice(request(app).get(url(tCompleted.id)));
         expect(res.statusCode).toBe(200);
         expect(res.body.transaction.status).toBe('COMPLETED');
-        expect(res.body.transaction.settledAt).not.toBeNull();
+        // settledAt is null even for COMPLETED: the schema has no persisted
+        // settlement timestamp. createdAt (initiation) must never be
+        // relabelled as settlement time. Pinned here so the contract is
+        // explicit: null until a real settlement time is recorded at the
+        // provider-reconciliation transition.
+        expect(res.body.transaction.settledAt).toBeNull();
+        expect(res.body.transaction.createdAt).toBeTruthy(); // initiation time, separately reported
     });
 
     test('ownership: another user transaction and unknown ids -> 404', async () => {
