@@ -113,7 +113,8 @@ class BookmarkService {
                 include: {
                     businessProfile: {
                         select: {
-                            id: true, businessName: true, logoUrl: true,
+                            id: true, bizId: true, businessName: true,
+                            logoUrl: true,
                             category: true, isVerified: true,
                             averageRating: true,
                         },
@@ -129,6 +130,11 @@ class BookmarkService {
             total,
             bookmarks: rows.map(r => ({
                 businessProfileId: r.businessProfile.id,
+                // bizId: the PUBLIC deep-link identifier the app's business
+                // profile route consumes. Both ids ship: businessProfileId
+                // stays the canonical key for writes/checks/deletes; bizId
+                // is additive read-side convenience for navigation only.
+                bizId: r.businessProfile.bizId,
                 businessName: r.businessProfile.businessName,
                 logoUrl: r.businessProfile.logoUrl,
                 category: r.businessProfile.category,

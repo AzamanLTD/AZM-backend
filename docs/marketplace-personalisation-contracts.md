@@ -70,6 +70,7 @@ new save from a repeat.
   "bookmarks": [
     {
       "businessProfileId": "uuid",
+      "bizId": "string",
       "businessName": "string",
       "logoUrl": "string|null",
       "category": "BusinessCategory",
@@ -83,6 +84,12 @@ new save from a repeat.
 Newest saved first (`savedAt` DESC). `limit` default 50, capped at 100;
 `offset` for pagination; `total` is the caller's full count before
 pagination. The list contains ONLY the caller's bookmarks.
+
+`bizId` is the public deep-link identifier for the app's business profile
+route (`GET /api/business/:bizId`). Both identifiers ship on every row:
+`businessProfileId` remains the CANONICAL key for bookmark writes, checks
+and deletes — never substitute one for the other. `bizId` is a read-side
+navigation convenience only and is never accepted as a write key.
 
 ### Referential integrity
 

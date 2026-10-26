@@ -69,6 +69,9 @@ describeOrSkip('Business bookmark API (integration)', () => {
         app.use('/api', require('../middleware/responseHelpers'));
         app.use('/api', require('../src/middleware/prismaInjector'));
         app.use('/api/bookmarks', require('../routes/bookmarkRoutes'));
+        // Public business profile route — mounted for the deep-link contract
+        // test (GET /api/business/:bizId must resolve the bookmarked row).
+        app.use('/api/business', require('../routes/businessRoutes'));
 
         // Real users with real bcrypt hashes; access tokens minted by the
         // repo's own canonical signer (authTokenService), so protect's
@@ -325,6 +328,51 @@ describeOrSkip('Business bookmark API (integration)', () => {
         expect(first).toHaveProperty('category');
         expect(first).toHaveProperty('isVerified');
         expect(first).toHaveProperty('savedAt');
+    });
+
+    test('deep-link contract: list returns BOTH ids and bizId opens the correct public profile route', async () => {
+        await request(app)
+            .post('/api/bookmarks')
+            .set('Authorization', `Bearer ${aliceToken}`)
+            .send({ businessProfileId: bizB.id });
+
+        const list = await request(app)
+            .get('/api/bookmarks')
+            .set('Authorization', `Bearer ${aliceToken}`)
+            .expect(200);
+
+        // Every row ships BOTH identifiers, accurately paired.
+        for (const b of list.body.bookmarks) {
+            expect(typeof b.businessProfileId).toBe('string');
+            expect(typeof b.bizId).toBe('string');
+            expect(b.bizId).toMatch(/^BIZ-/);
+        }
+        const rowB = list.body.bookmarks.find(b => b.businessProfileId === bizB.id);
+        expect(rowB).toBeTruthy();
+        expect(rowB.bizId).toBe(bizB.bizId);
+
+        // The public deep link resolves the SAME profile the canonical id
+        // refers to — the bookmark card can navigate straight from the row.
+        const profile = await request(app)
+            .get(`/api/business/${rowB.bizId}`)
+            .expect(200);
+        expect(profile.body.business.id).toBe(bizB.id);
+        expect(profile.body.business.businessName).toBe(bizB.businessName);
+
+        // Account isolation is unchanged by the new field: bob never sees it.
+        const bobList = await request(app)
+            .get('/api/bookmarks')
+            .set('Authorization', `Bearer ${bobToken}`);
+        expect(bobList.body.bookmarks.find(b => b.bizId === bizB.bizId)).toBeFalsy();
+
+        // Ordering and pagination unchanged (newest first, limit respected).
+        const paged = await request(app)
+            .get('/api/bookmarks?limit=1')
+            .set('Authorization', `Bearer ${aliceToken}`)
+            .expect(200);
+        expect(paged.body.bookmarks.length).toBe(1);
+        expect(paged.body.bookmarks[0].businessProfileId)
+            .toBe(list.body.bookmarks[0].businessProfileId);
     });
 
     test('list pagination is real (limit/offset)', async () => {
