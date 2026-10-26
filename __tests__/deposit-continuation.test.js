@@ -5,9 +5,9 @@
 //
 // Required cases:
 //   - pending deposit is fully re-observable after "session interruption"
-//   - completed deposit reports the honest settlement contract: status
-//     COMPLETED with settledAt null (no persisted settlement timestamp exists
-//     at this head — initiation time is never relabelled as settlement time)
+//   - completed deposit reports the authoritative persisted settlement
+//     stamp (metadata.settledAt), and a COMPLETED row without one honestly
+//     reports settledAt: null — never initiation time fabricated as settlement
 //   - ownership: another user's transaction -> 404 (no existence leak)
 //   - unknown id -> honest 404; unauthenticated -> 401
 //   - READ-ONLY: repeated calls never mutate the row (status, metadata,
@@ -31,7 +31,8 @@ describeOrSkip('Deposit continuation (Backend F)', () => {
 
     let app, request;
     let aliceToken, bobToken, aliceId;
-    let tPending, tCompleted, tInternal;
+    let tPending, tCompleted, tCompletedLegacy, tInternal;
+    let settledStamp; // authoritative metadata.settledAt seeded in beforeAll
 
     beforeAll(async () => {
         process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -93,7 +94,15 @@ describeOrSkip('Deposit continuation (Backend F)', () => {
             return t;
         }
         tPending = await seedDeposit(aliceId, 'PENDING');
-        tCompleted = await seedDeposit(aliceId, 'COMPLETED');
+        // Completed WITH the authoritative settlement stamp, exactly as the
+        // real settlement transition persists it (metadata.settledAt,
+        // deliberately different from createdAt so fabrication is detectable).
+        settledStamp = new Date(Date.now() - 30 * 1000).toISOString();
+        tCompleted = await seedDeposit(aliceId, 'COMPLETED', { settledAt: settledStamp });
+        // Completed but WITHOUT a persisted settlement stamp (a row settled
+        // before the stamp existed, or any non-deposit settle path): the
+        // honest answer is null, never initiation time dressed as settlement.
+        tCompletedLegacy = await seedDeposit(aliceId, 'COMPLETED');
         tInternal = await prisma.transactionHistory.create({
             data: {
                 userId: aliceId, type: 'INTERNAL_TRANSFER',
@@ -142,17 +151,22 @@ describeOrSkip('Deposit continuation (Backend F)', () => {
         expect(JSON.stringify(res.body)).not.toContain('233201234567');
     });
 
-    test('completed deposit reports honest settlement state', async () => {
+    test('completed deposit reports the AUTHORITATIVE persisted settlement timestamp', async () => {
         const res = await asAlice(request(app).get(url(tCompleted.id)));
         expect(res.statusCode).toBe(200);
         expect(res.body.transaction.status).toBe('COMPLETED');
-        // settledAt is null even for COMPLETED: the schema has no persisted
-        // settlement timestamp. createdAt (initiation) must never be
-        // relabelled as settlement time. Pinned here so the contract is
-        // explicit: null until a real settlement time is recorded at the
-        // provider-reconciliation transition.
+        // The persisted provider-reconciliation stamp, verbatim — and
+        // provably NOT the initiation time.
+        expect(res.body.transaction.settledAt).toBe(settledStamp);
+        expect(new Date(res.body.transaction.settledAt).getTime())
+            .not.toBe(tCompleted.createdAt.getTime());
+    });
+
+    test('completed deposit WITHOUT a persisted settlement stamp honestly reports settledAt: null (never fabricated from createdAt)', async () => {
+        const res = await asAlice(request(app).get(url(tCompletedLegacy.id)));
+        expect(res.statusCode).toBe(200);
+        expect(res.body.transaction.status).toBe('COMPLETED');
         expect(res.body.transaction.settledAt).toBeNull();
-        expect(res.body.transaction.createdAt).toBeTruthy(); // initiation time, separately reported
     });
 
     test('ownership: another user transaction and unknown ids -> 404', async () => {

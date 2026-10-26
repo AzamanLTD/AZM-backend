@@ -690,11 +690,14 @@ exports.getDepositStatus = async (req, res) => {
         status: txn.status,                 // PENDING | COMPLETED | FAILED (| FROZEN_DISPUTE — honest, unchanged enum)
         amountUsdc: txn.amountUsdc,
         createdAt: txn.createdAt,
-        // settledAt: null until a real settlement timestamp is persisted at
-        // the provider-reconciliation/settlement transition. Initiation time
-        // (createdAt) is NOT settlement time and must never be relabelled
-        // as such (schema has no settledAt field at this head).
-        settledAt: null,
+        // AUTHORITATIVE settlement timestamp only: metadata.settledAt is
+        // written by the real provider-reconciliation/settlement transition
+        // (moolreDepositSettlement / quoteFiatDeposit settle paths). It is
+        // never inferred from createdAt — initiation and settlement can
+        // differ materially, so a COMPLETED row without a persisted
+        // settlement stamp honestly reports null rather than fabricating
+        // initiation time as settlement time.
+        settledAt: md.settledAt ?? null,
       },
       // Continuation payload — ONLY persisted initiation data, sufficient
       // for the client to finish (or safely abandon) the interrupted flow.
