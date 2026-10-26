@@ -445,17 +445,23 @@ class NotificationService {
     // converges safely with concurrent markAsRead (independent columns).
     async dismissNotification(notificationId, userId) {
         const parsedUserId = parseInt(userId, 10);
-        const notification = await this.prisma.notification.findUnique({
-            where: { id: notificationId }
+        // Owner-scoped mutation: the row is fetched (and later updated)
+        // keyed by BOTH id and owner. A notification that belongs to another
+        // user is indistinguishable from one that does not exist — same
+        // honest 404, no existence disclosure through a 403.
+        const notification = await this.prisma.notification.findFirst({
+            where: { id: notificationId, userId: parsedUserId }
         });
         if (!notification) throw new Error('Notification not found');
-        if (notification.userId !== parsedUserId) throw new Error('Not authorized');
 
-        // Idempotent: re-dismissing an already-dismissed row only refreshes
-        // dismissedAt; read state is never touched by dismissal.
+        // Idempotent: re-dismissing an already-dismissed row preserves the
+        // FIRST dismissal timestamp (audit field is write-once) and only
+        // re-asserts the flag; read state is never touched by dismissal.
+        const data = { isDismissed: true };
+        if (!notification.isDismissed) data.dismissedAt = new Date();
         return this.prisma.notification.update({
-            where: { id: notificationId },
-            data:  { isDismissed: true, dismissedAt: new Date() }
+            where: { id: notification.id },
+            data
         });
     }
 

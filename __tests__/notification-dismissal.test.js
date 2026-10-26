@@ -4,7 +4,8 @@
 // real PostgreSQL tests over the mounted route stack with canonical JWTs.
 //
 // Required cases:
-//   - owner-scoped dismissal (another user's notification -> 403)
+//   - owner-scoped dismissal (another user's notification -> same 404 as
+//     unknown ids — no existence disclosure through a distinct 403)
 //   - unknown notification ID -> honest 404
 //   - repeated dismissal idempotent (flag stays true, no error)
 //   - read/dismiss concurrency converges (either order, same end state)
@@ -111,9 +112,11 @@ describeOrSkip('Notification dismissal (Backend E)', () => {
         expect(res.body.success).toBe(false);
     });
 
-    test('dismissing another user notification -> 403, row untouched', async () => {
+    test('dismissing another user notification -> same 404 as unknown id, row untouched', async () => {
         const res = await asAlice(request(app).delete(`/api/notifications/${nForeign.id}`));
-        expect(res.statusCode).toBe(403);
+        // Owner-scoped read: a foreign-owned id is indistinguishable from a
+        // nonexistent one — identical honest 404, never a 403.
+        expect(res.statusCode).toBe(404);
         const row = await prisma.notification.findUnique({ where: { id: nForeign.id } });
         expect(row.isDismissed).toBe(false);
     });
@@ -138,12 +141,21 @@ describeOrSkip('Notification dismissal (Backend E)', () => {
         expect(after.body.count).toBe(beforeCount - 1); // consistent
     });
 
-    test('repeated dismissal is idempotent (soft, one record)', async () => {
+    test('repeated dismissal is idempotent (soft, one record) and preserves the FIRST dismissedAt', async () => {
+        const first = await asAlice(request(app).delete(`/api/notifications/${nUnread.id}`));
+        expect(first.statusCode).toBe(200);
+        const firstAt = await prisma.notification.findUnique({ where: { id: nUnread.id } });
+
+        // A measurable gap so a rewritten timestamp would be detectable.
+        await new Promise(r => setTimeout(r, 25));
         const again = await asAlice(request(app).delete(`/api/notifications/${nUnread.id}`));
         expect(again.statusCode).toBe(200);
         expect(again.body.notification.isDismissed).toBe(true);
         const rows = await prisma.notification.findMany({ where: { id: nUnread.id } });
         expect(rows).toHaveLength(1);
+        // Audit field is write-once: the repeat re-asserts the flag but the
+        // first dismissal timestamp is preserved, not refreshed.
+        expect(rows[0].dismissedAt.toISOString()).toBe(firstAt.dismissedAt.toISOString());
     });
 
     test('read/dismiss concurrency converges (either order, same end state)', async () => {
