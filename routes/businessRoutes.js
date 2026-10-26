@@ -252,6 +252,6 @@ router.get('/transit/trips', protect, resolveBizProfile, async (req, res) => {
 
 
 // Public business profile lookup — MUST be last
-router.get('/:bizId', ctrl.getBusinessByBizId);
+router.get('/:bizId', optionalAuth, ctrl.getBusinessByBizId);  // public; personalises the story ring when a token is present
 
 module.exports = router;

@@ -79,6 +79,14 @@ exports.getBusinessByBizId = async (req, res) => {
         if (business.isSuspended) {
             return res.status(404).json({ success: false, message: 'Business not found.' });
         }
+        // Backend B (storefront hero avatar): the storefront profile surface
+        // draws the SAME authoritative story ring as the listing cards, from
+        // the SAME single story authority — one business, one attach call.
+        // optionalAuth resolves the viewer when a valid token is present
+        // (personalising hasUnseenStory); anonymous callers get the public
+        // shape with hasUnseenStory: null. Additive: no existing field
+        // changes; privacy is unchanged (booleans + one timestamp only).
+        await attachStoryState(prisma, [business], req.user ? req.user.id : null);
         return res.status(200).json({ success: true, business });
     } catch (err) {
         logger.error({ err: err }, '[getBusinessByBizId] error');

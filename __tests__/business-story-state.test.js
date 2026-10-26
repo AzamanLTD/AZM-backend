@@ -214,4 +214,88 @@ describeOrSkip('Business story state (Backend B)', () => {
         expect(seen.bad).toBeNull();
         await shared.$disconnect().catch(() => {});
     });
+
+    // ─── storefront hero avatar: MOUNTED-route regression for the real
+    // profile/detail DTO (GET /api/business/:bizId) — the joystick draws the
+    // story ring on the storefront profile avatar from this response, so the
+    // SAME single story authority must attach there. The route is public
+    // (optionalAuth): anonymous → hasUnseenStory null; authenticated viewer
+    // → personalised; existing fields unchanged; suspended → 404; unknown →
+    // 404 with no leak.
+    test('GET /business/:bizId (mounted) carries the authoritative storyState for the hero avatar', async () => {
+        const express = require('express');
+        const supertest = require('supertest');
+        const app = express();
+        app.use(express.json());
+        const { prisma: shared } = require('../src/config/baseServices');
+        app.set('prisma', shared);
+        app.use('/api', require('../middleware/responseHelpers'));
+        app.use('/api', require('../src/middleware/prismaInjector'));
+        app.use('/api/business', require('../routes/businessRoutes'));
+        const request = supertest(app);
+
+        const { owner, biz } = await seedBizWithStories(1, { expiresInFuture: true });
+        const { signAccessToken } = require('../services/authTokenService');
+
+        // Anonymous: public shape — active ring real, unseen honestly null.
+        const anonRes = await request.get(`/api/business/${biz.bizId}`).expect(200);
+        expect(anonRes.body.business.id).toBe(biz.id);
+        expect(anonRes.body.business.businessName).toBe(biz.businessName);
+        expect(anonRes.body.business.storyState).toMatchObject({
+            hasActiveStory: true,
+            hasUnseenStory: null,
+        });
+        expect(typeof anonRes.body.business.storyState.latestStoryAt).toBe('string');
+
+        // Authenticated viewer who has NOT seen the story → unseen TRUE.
+        const viewer = await prisma.user.create({
+            data: {
+                username: `v_${uniq()}`, email: `v_${uniq()}@azaman.test`,
+                password: 'hashed-placeholder', azamanId: `AZM-${uniq()}`,
+                availableBalance: 0, escrowLockedBalance: 0, disputeEscrowBalance: 0,
+            },
+        });
+        seeded.users.push(viewer.id);
+        const token = signAccessToken({ id: viewer.id, username: viewer.username, role: 'USER', tokenVersion: 0 });
+        const unseenRes = await request
+            .get(`/api/business/${biz.bizId}`)
+            .set('Authorization', `Bearer ${token}`)
+            .expect(200);
+        expect(unseenRes.body.business.storyState).toMatchObject({
+            hasActiveStory: true,
+            hasUnseenStory: true,
+        });
+
+        // After the viewer sees the story (StoryView row via the existing
+        // authority), unseen flips to false — same semantics as the cards.
+        await prisma.storyView.create({
+            data: { storyId: seeded.stories[seeded.stories.length - 1], viewerId: viewer.id },
+        });
+        seeded.views.push(seeded.stories[seeded.stories.length - 1]);
+        const seenRes = await request
+            .get(`/api/business/${biz.bizId}`)
+            .set('Authorization', `Bearer ${token}`)
+            .expect(200);
+        expect(seenRes.body.business.storyState).toMatchObject({
+            hasActiveStory: true,
+            hasUnseenStory: false,
+        });
+
+        // Suspended business → the existing 404 contract is unchanged.
+        await prisma.businessProfile.update({ where: { id: biz.id }, data: { isSuspended: true } });
+        await request.get(`/api/business/${biz.bizId}`).expect(404);
+        await prisma.businessProfile.update({ where: { id: biz.id }, data: { isSuspended: false } });
+
+        // Unknown display code → honest 404, no story data leak.
+        await request.get(`/api/business/BIZ-${uniq()}`).expect(404);
+
+        // Read-only proof: no new stories/views beyond the one we created.
+        const storyCount = await prisma.story.count({ where: { businessProfileId: biz.id } });
+        const viewCount = await prisma.storyView.count({
+            where: { story: { businessProfileId: biz.id }, viewerId: viewer.id },
+        });
+        expect(storyCount).toBe(1);
+        expect(viewCount).toBe(1);
+        await shared.$disconnect().catch(() => {});
+    });
 });
