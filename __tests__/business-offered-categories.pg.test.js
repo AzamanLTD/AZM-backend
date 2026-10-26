@@ -571,7 +571,7 @@ run('Business offered-categories contract (real PostgreSQL)', () => {
         const user = await seedUser();
         await seedBusiness(user, { offeredCategories: ['FOOD_BEVERAGE'] });
 
-        const rows = await businessService.searchBusinesses(db, { query: 'OffCat Biz' });
+        const rows = (await businessService.searchBusinesses(db, { query: 'OffCat Biz' })).rows;
         const mine = rows.find((r) => r.offeredCategories?.includes('FOOD_BEVERAGE'));
         expect(mine).toBeDefined();
         expect(typeof mine.offeredCategories).toBe('object');

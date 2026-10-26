@@ -172,7 +172,7 @@ describeOrSkip('Business recommendation feedback (Backend D)', () => {
 
         // Anonymous view: escrows-desc — Alpha strictly before Bravo before
         // Charlie (their seeded escrow counts guarantee this).
-        const anon = await businessService.searchBusinesses(prisma, { limit: 50 });
+        const anon = (await businessService.searchBusinesses(prisma, { limit: 50 })).rows;
         const pos = (rows, id) => rows.findIndex(r => r.id === id);
         expect(pos(anon, biz1.id)).toBeGreaterThanOrEqual(0);
         expect(pos(anon, biz1.id)).toBeLessThan(pos(anon, biz2.id));
@@ -183,7 +183,7 @@ describeOrSkip('Business recommendation feedback (Backend D)', () => {
         // suppressed group BELOW the kept group while preserving order
         // inside each group: for alice, unsuppressed Charlie (biz3)
         // ranks ABOVE both Alpha and Bravo.
-        const aliceView = await businessService.searchBusinesses(prisma, { limit: 50, viewerId: aliceId });
+        const aliceView = (await businessService.searchBusinesses(prisma, { limit: 50, viewerId: aliceId })).rows;
         expect(pos(aliceView, biz1.id)).toBeGreaterThanOrEqual(0);
         expect(pos(aliceView, biz3.id)).toBeLessThan(pos(aliceView, biz1.id)); // kept group above demoted
         expect(pos(aliceView, biz3.id)).toBeLessThan(pos(aliceView, biz2.id));
@@ -191,7 +191,7 @@ describeOrSkip('Business recommendation feedback (Backend D)', () => {
         expect(aliceView.length).toBe(anon.length); // demoted, never removed
 
         // other viewers are unaffected.
-        const bobView = await businessService.searchBusinesses(prisma, { limit: 50, viewerId: bobId });
+        const bobView = (await businessService.searchBusinesses(prisma, { limit: 50, viewerId: bobId })).rows;
         expect(pos(bobView, biz1.id)).toBeLessThan(pos(bobView, biz2.id));
         expect(biz1EscrowRank).toBe(10); // documentation of the seed
     });
@@ -206,7 +206,7 @@ describeOrSkip('Business recommendation feedback (Backend D)', () => {
         expect(again.body.removed).toBe(false);
 
         const businessService = require('../services/businessService');
-        const aliceView = await businessService.searchBusinesses(prisma, { limit: 50, viewerId: aliceId });
+        const aliceView = (await businessService.searchBusinesses(prisma, { limit: 50, viewerId: aliceId })).rows;
         const pos = (rows, id) => rows.findIndex(r => r.id === id);
         // Only biz1's suppression was undone. biz2 remains suppressed
         // (applied by the independence test), so the assertion is about
@@ -228,6 +228,112 @@ describeOrSkip('Business recommendation feedback (Backend D)', () => {
         const page = await asAlice(request(app).get('/api/recommendation-feedback?limit=1&offset=0'));
         expect(page.body.suppressed).toHaveLength(1);
         expect(page.body.total).toBeGreaterThanOrEqual(2);
+    });
+
+    test('PAGINATION REGRESSION: demotion never moves the page boundary or exposes the sentinel', async () => {
+        // Fresh deterministic discovery set for this test only (escrows
+        // 10 > 5 > 4 > 3 > 1), page size 2 → DB order pages:
+        //   page1=[biz1,biz2] sentinel=p4 | page2=[p4,p5] sentinel=biz3
+        // alice suppresses biz2 (INSIDE page 1) and p4 (the first row of
+        // page 2 — the sentinel-adjacent boundary case).
+        const svc = require('../services/businessService');
+        const ownerRow = await prisma.user.findUnique({ where: { id: seeded.users[2] } });
+        const mk = async (name, escrows) => {
+            const b = await prisma.businessProfile.create({
+                data: {
+                    userId: ownerRow.id, bizId: `BIZ-${uniq()}`,
+                    businessName: `PgReg ${name} ${uniq()}`,
+                    category: 'FOOD_BEVERAGE', isVerified: true,
+                    kybStatus: 'VERIFIED', totalEscrows: escrows,
+                },
+            });
+            seeded.businesses.push(b.id);
+            return b;
+        };
+        const r1 = await mk('Alpha', 10);
+        const r2 = await mk('Bravo', 5);
+        const r3 = await mk('Delta', 4);
+        const r4 = await mk('Echo', 3);
+        const r5 = await mk('Foxtrot', 1);
+
+        const q = 'PgReg';
+        const view = (args) => svc.searchBusinesses(prisma, { query: q, ...args });
+
+        await asAlice(request(app).post('/api/recommendation-feedback').send({ businessProfileId: r2.id }));
+        await asAlice(request(app).post('/api/recommendation-feedback').send({ businessProfileId: r3.id }));
+
+        // PAGE 1 — DB rows [r1, r2], sentinel r3 must stay invisible.
+        const page1 = await view({ limit: 2, viewerId: aliceId });
+        expect(page1.rows).toHaveLength(2);
+        expect(page1.hasMore).toBe(true);
+        expect(page1.rows.map(r => r.id)).toEqual([r1.id, r2.id]); // r2 demoted last
+        // CURSOR CONTRACT: the cursor is the RAW DB-order boundary row —
+        // r2 — regardless of display reordering inside the page.
+        expect(page1.nextCursor).toBe(r2.id);
+
+        // PAGE 2 — cursor continues at the true DB boundary: DB rows
+        // [r3, r4], sentinel r5 invisible. r3 is suppressed → demoted to
+        // the END of the display, but the boundary stays r4.
+        const page2 = await view({ limit: 2, viewerId: aliceId, cursor: page1.nextCursor });
+        expect(page2.rows.map(r => r.id)).toEqual([r4.id, r3.id]); // r3 demoted last
+        expect(page2.hasMore).toBe(true);
+        expect(page2.nextCursor).toBe(r4.id);
+
+        // PAGE 3 — last DB row [r5]; no sentinel, honest end of feed.
+        const page3 = await view({ limit: 2, viewerId: aliceId, cursor: page2.nextCursor });
+        expect(page3.rows.map(r => r.id)).toEqual([r5.id]);
+        expect(page3.hasMore).toBe(false);
+        expect(page3.nextCursor).toBeNull();
+
+        // Union of pages == every business exactly once: no skips, no
+        // repeats, no sentinel exposure — even though a suppressed row sat
+        // INSIDE page 1 and another AT the sentinel-adjacent boundary.
+        const all = [...page1.rows, ...page2.rows, ...page3.rows].map(r => r.id);
+        expect(all).toHaveLength(5);
+        expect(new Set(all).size).toBe(5);
+        for (const id of [r1.id, r2.id, r3.id, r4.id, r5.id]) {
+            expect(all).toContain(id);
+        }
+
+        // cleanup scoped to this test: drop the suppressions this test
+        // created (r2's suppression may pre-exist from earlier tests —
+        // deleting twice is an idempotent no-op).
+        await asAlice(request(app).delete(`/api/recommendation-feedback/${r2.id}`));
+        await asAlice(request(app).delete(`/api/recommendation-feedback/${r3.id}`));
+    });
+
+    test('CONCURRENT-APPLY REGRESSION: simultaneous first applies converge on one row, never a 500', async () => {
+        const ownerRow = await prisma.user.findUnique({ where: { id: seeded.users[2] } });
+        const b = await prisma.businessProfile.create({
+            data: {
+                userId: ownerRow.id, bizId: `BIZ-${uniq()}`,
+                businessName: `Concur ${uniq()}`,
+                category: 'FOOD_BEVERAGE', isVerified: true,
+                kybStatus: 'VERIFIED', totalEscrows: 1,
+            },
+        });
+        seeded.businesses.push(b.id);
+
+        // Two simultaneous FIRST applies (both see "absent" before either
+        // commits). The unique pair is the convergence point: the loser
+        // re-reads the winner's row instead of surfacing P2002 as a 500.
+        const [a, r] = await Promise.all([
+            asAlice(request(app).post('/api/recommendation-feedback').send({ businessProfileId: b.id })),
+            asAlice(request(app).post('/api/recommendation-feedback').send({ businessProfileId: b.id })),
+        ]);
+        expect([a.statusCode, r.statusCode]).not.toContain(500);
+        expect([200, 201]).toContain(a.statusCode);
+        expect([200, 201]).toContain(r.statusCode);
+        // Winner reports the apply; loser converges on the idempotent
+        // result — at least one honest alreadyApplied:true.
+        expect([a.body.alreadyApplied, r.body.alreadyApplied]).toContain(true);
+        // Exactly ONE feedback row for the pair, ever.
+        const rows = await prisma.businessRecommendationFeedback.findMany({
+            where: { userId: aliceId, businessProfileId: b.id },
+        });
+        expect(rows).toHaveLength(1);
+
+        await asAlice(request(app).delete(`/api/recommendation-feedback/${b.id}`));
     });
 
     test('own-business feedback is allowed but never a ranking shortcut (documented behaviour)', async () => {

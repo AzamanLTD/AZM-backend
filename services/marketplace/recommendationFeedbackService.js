@@ -50,10 +50,27 @@ class RecommendationFeedbackService {
         if (existing) {
             return { alreadyApplied: true, appliedAt: existing.createdAt };
         }
-        const created = await this.prisma.businessRecommendationFeedback.create({
-            data: { userId, businessProfileId, feedbackType: 'SHOW_LESS' },
-        });
-        return { alreadyApplied: false, appliedAt: created.createdAt };
+        try {
+            const created = await this.prisma.businessRecommendationFeedback.create({
+                data: { userId, businessProfileId, feedbackType: 'SHOW_LESS' },
+            });
+            return { alreadyApplied: false, appliedAt: created.createdAt };
+        } catch (err) {
+            // CONCURRENT FIRST-APPLY CONVERGENCE: the read-then-create above
+            // races when two simultaneous first applies both see "absent" —
+            // the loser would otherwise surface a P2002 500 and turn an
+            // idempotent action into a failure. The unique pair is the
+            // convergence point: on conflict, the loser re-reads the
+            // winner's committed row and reports the SAME idempotent result
+            // as a sequential duplicate apply. Exactly one row ever exists.
+            if (err && err.code === 'P2002') {
+                const converged = await this.prisma.businessRecommendationFeedback.findUnique({
+                    where: { userId_businessProfileId: { userId, businessProfileId } },
+                });
+                return { alreadyApplied: true, appliedAt: converged?.createdAt ?? null };
+            }
+            throw err;
+        }
     }
 
     // Undo — removes the suppression row. Idempotent no-op when absent.

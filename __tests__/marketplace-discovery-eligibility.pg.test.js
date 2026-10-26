@@ -87,7 +87,7 @@ run('marketplace discovery eligibility (PostgreSQL)', () => {
         expect(suspended.biz.isSuspended).toBe(true);
 
         const { searchBusinesses } = require('../services/businessService');
-        const rows = await searchBusinesses(prisma, { query: 'Kitchen', limit: 50 });
+        const rows = (await searchBusinesses(prisma, { query: 'Kitchen', limit: 50 })).rows;
 
         const ids = rows.map((r) => r.id);
         expect(ids).toContain(active.biz.id);
@@ -102,14 +102,14 @@ run('marketplace discovery eligibility (PostgreSQL)', () => {
         });
 
         const { searchBusinesses } = require('../services/businessService');
-        let rows = await searchBusinesses(prisma, { query: 'Reopened Kitchen', limit: 50 });
+        let rows = (await searchBusinesses(prisma, { query: 'Reopened Kitchen', limit: 50 })).rows;
         expect(rows.map((r) => r.id)).not.toContain(biz.biz.id);
 
         await prisma.businessProfile.update({
             where: { id: biz.biz.id },
             data: { isPausedByOwner: false },
         });
-        rows = await searchBusinesses(prisma, { query: 'Reopened Kitchen', limit: 50 });
+        rows = (await searchBusinesses(prisma, { query: 'Reopened Kitchen', limit: 50 })).rows;
         expect(rows.map((r) => r.id)).toContain(biz.biz.id);
     });
 });

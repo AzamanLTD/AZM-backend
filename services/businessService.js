@@ -209,7 +209,7 @@ const searchBusinesses = async (prisma, { query, category, verified, limit, curs
     }
 
     const useTrending = sort === 'trending';
-    const rows = await prisma.businessProfile.findMany({
+    const fetched = await prisma.businessProfile.findMany({
         where,
         take: take + 1,
         orderBy: useTrending ? { averageRating: 'desc' } : { totalEscrows: 'desc' },
@@ -218,6 +218,18 @@ const searchBusinesses = async (prisma, { query, category, verified, limit, curs
         },
         ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {})
     });
+
+    // PAGE-BOUNDARY CONTRACT: hasMore and nextCursor are derived from the
+    // RAW DB-ordered query result — BEFORE any display reordering (trending
+    // score sort, "Show less" demotion) touches it. Display reordering then
+    // applies ONLY to the actual page rows, so a suppressed or
+    // score-shifted row can never cross the page boundary, the take+1
+    // sentinel can never become visible, and nextCursor always points at
+    // the true DB-order boundary row. Without this, a reordered boundary
+    // makes consecutive pages skip or repeat rows.
+    const hasMore = fetched.length > take;
+    const rows = fetched.slice(0, take);
+    const nextCursor = hasMore ? rows[rows.length - 1].id : null;
 
     if (useTrending) {
         const logger = require('../src/config/logger');
@@ -259,7 +271,7 @@ const searchBusinesses = async (prisma, { query, category, verified, limit, curs
         }
     }
 
-    return rows.map(_withEscrowProtectionCapability);
+    return { rows: rows.map(_withEscrowProtectionCapability), hasMore, nextCursor };
 };
 
 // =============================================================================

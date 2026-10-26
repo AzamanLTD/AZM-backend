@@ -110,9 +110,12 @@ exports.searchBusinesses = async (req, res) => {
             viewerId: req.user ? req.user.id : null
         });
 
-        const hasMore = rows.length > take;
-        const businesses = hasMore ? rows.slice(0, take) : rows;
-        const nextCursor = hasMore ? businesses[businesses.length - 1].id : null;
+        // searchBusinesses now derives hasMore/nextCursor from the RAW
+        // DB-ordered page boundary (before trending/show-less display
+        // reordering) and returns exactly the page rows — the take+1
+        // sentinel is never visible and the cursor is always the true
+        // DB-order boundary row.
+        const { rows: businesses, hasMore, nextCursor } = rows;
 
         return res.status(200).json({ success: true, businesses, hasMore, nextCursor });
     } catch (err) {
