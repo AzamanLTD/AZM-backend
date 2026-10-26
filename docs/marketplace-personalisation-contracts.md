@@ -91,6 +91,22 @@ route (`GET /api/business/:bizId`). Both identifiers ship on every row:
 and deletes — never substitute one for the other. `bizId` is a read-side
 navigation convenience only and is never accepted as a write key.
 
+### Concurrency and suspended businesses
+
+Idempotent saves hold under CONCURRENCY, not just sequentially: two
+simultaneous first saves race past the existence check, the unique
+`(businessProfileId, customerId)` pair makes exactly one create the
+winner, and the loser converges to the idempotent repeat result
+(`200`, `alreadyBookmarked: true`) — never a P2002/500.
+
+Suspended businesses: NEW saves are refused with the same
+`404 BUSINESS_NOT_FOUND` as an unknown id (mirroring the public profile
+route's 404 for suspended profiles — a new saved link must not be created
+into a guaranteed dead end). EXISTING bookmarks are preserved and the
+list DTO ships an explicit `businessSuspended: boolean` on every row so
+the client renders an unavailable-state card instead of navigating into a
+404; unbookmarking a suspended business stays available for cleanup.
+
 ### Referential integrity
 
 `ON DELETE CASCADE` on both sides: deleting a business profile removes its

@@ -192,6 +192,86 @@ describeOrSkip('Business bookmark API (integration)', () => {
         expect(rows).toHaveLength(1);
     });
 
+    test('concurrent first saves converge instead of 500 (P2002 path pinned)', async () => {
+        // (a) DETERMINISTIC service-level pin of the race branch: both
+        // findUnique calls miss, both create() calls fire, exactly one wins
+        // and the loser converges to the idempotent repeat result — not a
+        // P2002 500. Stub prisma replays exactly that interleaving.
+        const { Prisma } = require('@prisma/client');
+        const stubCalls = { findUnique: 0, create: 0, first: null };
+        const winnerRow = { customerId: aliceId, businessProfileId: bizA.id, createdAt: new Date() };
+        const stubPrisma = {
+            businessProfile: { findUnique: async () => ({ userId: bobId, isSuspended: false }) },
+            businessBookmark: {
+                findUnique: async () => (++stubCalls.findUnique === 1 ? null : winnerRow),
+                create: async () => { stubCalls.create++; throw new Prisma.PrismaClientKnownRequestError('Unique constraint failed', { code: 'P2002', clientVersion: 'test' }); },
+            },
+        };
+        const svc = new (require('../services/marketplace/bookmarkService'))(stubPrisma);
+        const outcome = await svc.bookmark(aliceId, bizA.id);
+        expect(outcome.alreadyBookmarked).toBe(true);
+        expect(outcome.bookmark.businessProfileId).toBe(bizA.id);
+        expect(stubCalls.create).toBe(1); // the losing create really fired
+
+        // (b) REAL-DB end-to-end: two simultaneous first saves on a fresh
+        // pair — both resolve, exactly one row, no error surfaced.
+        const svcReal = new (require('../services/marketplace/bookmarkService'))(prisma);
+        const [r1, r2] = await Promise.allSettled([
+            svcReal.bookmark(bobId, bizB.id),
+            svcReal.bookmark(bobId, bizB.id),
+        ]);
+        expect(r1.status).toBe('fulfilled');
+        expect(r2.status).toBe('fulfilled');
+        const outcomes = [r1.value, r2.value].sort((a, b) => Number(a.alreadyBookmarked) - Number(b.alreadyBookmarked));
+        expect(outcomes[0].alreadyBookmarked).toBe(false);   // one genuine first save
+        expect(outcomes[1].alreadyBookmarked).toBe(true);    // one idempotent repeat
+        const rows = await prisma.businessBookmark.findMany({ where: { customerId: bobId, businessProfileId: bizB.id } });
+        expect(rows).toHaveLength(1);
+
+        // Restore suite state: later isolation assertions expect bob's list
+        // to hold only bizC.
+        await prisma.businessBookmark.deleteMany({ where: { customerId: bobId, businessProfileId: bizB.id } });
+    });
+
+    test('suspended businesses: new saves are refused like unknown ids, existing saves are preserved with an explicit signal', async () => {
+        // Suspend a business that Alice has ALREADY saved.
+        await prisma.businessProfile.update({ where: { id: bizA.id }, data: { isSuspended: true } });
+
+        // New save by Bob -> indistinguishable from an unknown business
+        // (mirrors the public profile 404 for suspended profiles).
+        const res = await request(app)
+            .post('/api/bookmarks')
+            .set('Authorization', `Bearer ${bobToken}`)
+            .send({ businessProfileId: bizA.id });
+        expect(res.statusCode).toBe(404);
+        expect(res.body.code).toBe('BUSINESS_NOT_FOUND');
+
+        // Existing save is preserved and flagged, so the client renders an
+        // unavailable card instead of navigating into a dead 404.
+        const list = await request(app)
+            .get('/api/bookmarks')
+            .set('Authorization', `Bearer ${aliceToken}`);
+        expect(list.statusCode).toBe(200);
+        const suspendedRow = list.body.bookmarks.find(b => b.businessProfileId === bizA.id);
+        expect(suspendedRow).toBeTruthy();
+        expect(suspendedRow.businessSuspended).toBe(true);
+
+        // Unbookmarking a suspended business stays available for cleanup.
+        const del = await request(app)
+            .delete(`/api/bookmarks/${bizA.id}`)
+            .set('Authorization', `Bearer ${aliceToken}`);
+        expect(del.statusCode).toBe(200);
+
+        // Restore the seed state for the rest of the suite: unsuspend, then
+        // re-save (a fresh first save — the row was removed above).
+        await prisma.businessProfile.update({ where: { id: bizA.id }, data: { isSuspended: false } });
+        const resave = await request(app)
+            .post('/api/bookmarks')
+            .set('Authorization', `Bearer ${aliceToken}`)
+            .send({ businessProfileId: bizA.id });
+        expect(resave.statusCode).toBe(201);
+    });
+
     test('missing businessProfileId fails with 400, not a fake success', async () => {
         const res = await request(app)
             .post('/api/bookmarks')

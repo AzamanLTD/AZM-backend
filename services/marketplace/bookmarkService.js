@@ -49,6 +49,18 @@ class BookmarkService {
             err.status = 400; err.code = 'OWN_BUSINESS';
             throw err;
         }
+        // Suspended businesses are not bookmarkable: the public profile
+        // route 404s a suspended profile, so a new saved link must not be
+        // created into a guaranteed dead end. Indistinguishable from a
+        // nonexistent business, mirroring the public boundary. EXISTING
+        // bookmarks are preserved — the list DTO flags the state so the
+        // client renders an unavailable card instead of navigating to a
+        // 404, and unbookmark stays available for cleanup.
+        if (business.isSuspended) {
+            const err = new Error('Business not found.');
+            err.status = 404; err.code = 'BUSINESS_NOT_FOUND';
+            throw err;
+        }
 
         const existing = await this.prisma.businessBookmark.findUnique({
             where: {
@@ -67,13 +79,39 @@ class BookmarkService {
             };
         }
 
-        const created = await this.prisma.businessBookmark.create({
-            data: { customerId: userId, businessProfileId },
-        });
-        return {
-            alreadyBookmarked: false,
-            bookmark: { businessProfileId, savedAt: created.createdAt },
-        };
+        try {
+            const created = await this.prisma.businessBookmark.create({
+                data: { customerId: userId, businessProfileId },
+            });
+            return {
+                alreadyBookmarked: false,
+                bookmark: { businessProfileId, savedAt: created.createdAt },
+            };
+        } catch (e) {
+            // Two concurrent FIRST saves both pass the findUnique miss and
+            // race into create(); the unique (businessProfileId, customerId)
+            // pair makes exactly one winner. The loser converges to the
+            // idempotent repeat result instead of surfacing a 500 — the
+            // documented contract must hold under concurrency, not just
+            // sequentially.
+            if (e.code === 'P2002') {
+                const existing = await this.prisma.businessBookmark.findUnique({
+                    where: {
+                        businessProfileId_customerId: {
+                            businessProfileId,
+                            customerId: userId,
+                        },
+                    },
+                });
+                if (existing) {
+                    return {
+                        alreadyBookmarked: true,
+                        bookmark: { businessProfileId, savedAt: existing.createdAt },
+                    };
+                }
+            }
+            throw e;
+        }
     }
 
     async unbookmark(userId, businessProfileId) {
@@ -117,6 +155,7 @@ class BookmarkService {
                             logoUrl: true,
                             category: true, isVerified: true,
                             averageRating: true,
+                            isSuspended: true,
                         },
                     },
                 },
@@ -140,6 +179,11 @@ class BookmarkService {
                 category: r.businessProfile.category,
                 isVerified: r.businessProfile.isVerified,
                 averageRating: r.businessProfile.averageRating,
+                // Explicit unavailable-state signal: a suspended profile
+                // 404s on the public route, so the client renders an
+                // unavailable card instead of navigating into a dead end.
+                // Existing saves are never silently dropped.
+                businessSuspended: r.businessProfile.isSuspended,
                 savedAt: r.createdAt,
             })),
         };
