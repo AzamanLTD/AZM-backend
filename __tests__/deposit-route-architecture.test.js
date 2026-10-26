@@ -36,8 +36,9 @@ describe('Deposit route architecture — fiat settlement is quote-backed only', 
 
     test('the deposit router mounts the expected number of routes', () => {
         // 7 POST routes: fiat initiate, fiat webhook, tatum, moolre initiate,
-        // moolre otp, moolre webhook, validate-name.
-        expect(Object.keys(handlers).length).toBe(7);
+        // moolre OTP, moolre webhook, validate-name — plus the ONE read-only
+        // continuation GET (Backend F: GET /fiat/status/:transactionId).
+        expect(Object.keys(handlers).length).toBe(8);
     });
 
     test('every mounted fiat initiation/settlement route resolves to a quote-backed controller handler', () => {
@@ -62,7 +63,7 @@ describe('Deposit route architecture — fiat settlement is quote-backed only', 
 
     test('the quote controllers export only their mounted quote-backed handlers', () => {
         expect(Object.keys(quoteFiatDepositController).sort()).toEqual(['confirmMoolreOtp', 'initiate', 'webhook']);
-        expect(Object.keys(moolreQuoteDepositController).sort()).toEqual(['initiate', 'webhook']);
+        expect(Object.keys(moolreQuoteDepositController).sort()).toEqual(['getDepositStatus', 'initiate', 'webhook']);
     });
 
     test('every quote-backed settlement handler is wired to consume a persisted TransactionQuote', () => {
