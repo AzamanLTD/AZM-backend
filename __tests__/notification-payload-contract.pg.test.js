@@ -192,10 +192,10 @@ describeOrSkip('Notification payload contract — repaired producers (DB)', () =
     };
 
     // Minimal express-style req/res driver (r42 precedent).
-    const drive = (handler, { user, params, body, app }) => new Promise((resolve) => {
+    const drive = (handler, { user, params, body, app, prismaClient }) => new Promise((resolve) => {
         const req = {
             params: params || {}, body: body || {}, user,
-            prisma, app, get: (k) => app.get(k),
+            prisma: prismaClient || prisma, app, get: (k) => app.get(k),
         };
         const res = {
             statusCode: 200, headersSent: false,
@@ -276,6 +276,101 @@ describeOrSkip('Notification payload contract — repaired producers (DB)', () =
             type: 'COUNTER_PROPOSAL_ACCEPTED',
             reservationId: reservation.id,
         });
+    });
+
+    test('counterProposeReservation: notification write failure is non-fatal after the committed update (retry once, honest 200)', async () => {
+        const { biz, customer, reservation } = await seedReservationContext();
+        const app = { settings: {}, get(k) { return this.settings[k]; }, set(k, v) { this.settings[k] = v; } };
+
+        // Simulated transient notification persistence failure: EVERY create
+        // attempt throws. The committed reservation change must still be
+        // reported honestly — never a misleading 500 on a request that
+        // succeeded. Exactly one retry is attempted before giving up.
+        let createCalls = 0;
+        const failingPrisma = new Proxy(prisma, {
+            get(target, prop) {
+                if (prop === 'notification') {
+                    return {
+                        ...target.notification,
+                        create: async () => {
+                            createCalls++;
+                            throw new Error('simulated transient notification write failure');
+                        },
+                    };
+                }
+                return target[prop];
+            },
+        });
+
+        const { counterProposeReservation } = require('../controllers/reservationController');
+        const proposedStart = new Date(Date.now() + 48 * 60 * 60 * 1000).toISOString();
+        const out = await drive(counterProposeReservation, {
+            user: { id: biz.userId },
+            params: { reservationId: reservation.id },
+            body: { proposedStartDatetime: proposedStart, message: 'Evening slot instead?' },
+            app,
+            prismaClient: failingPrisma,
+        });
+
+        // The reservation change is the committed truth: success response,
+        // never a post-commit 500.
+        expect(out.status).toBe(200);
+        expect(out.body.success).toBe(true);
+        const updated = await prisma.reservation.findUnique({ where: { id: reservation.id } });
+        expect(updated.proposedStartDatetime).toEqual(new Date(proposedStart));
+        // Notification delivery was attempted once + one retry, then
+        // abandoned to the log without falsifying the response.
+        expect(createCalls).toBe(2);
+        const notifs = await prisma.notification.findMany({ where: { userId: customer.id } });
+        expect(notifs).toHaveLength(0);
+    });
+
+    test('acceptCounterProposal: notification write failure is non-fatal after the committed acceptance (retry once, honest 200)', async () => {
+        const { biz, customer, reservation } = await seedReservationContext();
+        const proposedStart = new Date(Date.now() + 48 * 60 * 60 * 1000);
+        await prisma.reservation.update({
+            where: { id: reservation.id },
+            data: {
+                proposedStartDatetime: proposedStart,
+                proposedEndDatetime: new Date(Date.now() + 49 * 60 * 60 * 1000),
+            },
+        });
+        const app = { settings: {}, get(k) { return this.settings[k]; }, set(k, v) { this.settings[k] = v; } };
+
+        let createCalls = 0;
+        const failingPrisma = new Proxy(prisma, {
+            get(target, prop) {
+                if (prop === 'notification') {
+                    return {
+                        ...target.notification,
+                        create: async () => {
+                            createCalls++;
+                            throw new Error('simulated transient notification write failure');
+                        },
+                    };
+                }
+                return target[prop];
+            },
+        });
+
+        const { acceptCounterProposal } = require('../controllers/reservationController');
+        const out = await drive(acceptCounterProposal, {
+            user: { id: customer.id },
+            params: { reservationId: reservation.id },
+            app,
+            prismaClient: failingPrisma,
+        });
+
+        expect(out.status).toBe(200);
+        expect(out.body.success).toBe(true);
+        const updated = await prisma.reservation.findUnique({ where: { id: reservation.id } });
+        expect(updated.proposedStartDatetime).toBeNull();
+        // The proposed time was APPLIED to the reservation — the committed
+        // acceptance is fully reflected, notification delivery aside.
+        expect(updated.startDatetime.getTime()).toBe(proposedStart.getTime());
+        expect(createCalls).toBe(2);
+        const notifs = await prisma.notification.findMany({ where: { userId: biz.userId } });
+        expect(notifs).toHaveLength(0);
     });
 
     test('createReview: the business owner now receives a schema-valid review notification', async () => {

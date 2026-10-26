@@ -399,6 +399,30 @@ exports.getAvailability = async (req, res) => {
     }
 };
 
+// ── post-commit notification delivery (best-effort contract) ──────────────
+// The reservation state change is the COMMITTED TRUTH of these flows. The
+// notification is a side effect delivered AFTER that commit; making its
+// transient failure fatal would return a misleading 500 for a request that
+// actually succeeded (the exact failure class this PR removes). Contract:
+// notification persistence is best-effort — on failure it is retried once,
+// then logged for operator follow-up ( WARN), and the response reflects the
+// already-committed reservation. This is deliberately NOT an outbox; a
+// durable/transactional outbox for reservation events would be its own
+// separately scoped change. Real-time emits are likewise non-fatal.
+const notifyBestEffort = async (prisma, payload, flowTag) => {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+            await prisma.notification.create({ data: payload });
+            return;
+        } catch (err) {
+            if (attempt === 2) {
+                logger.warn({ err: err && err.message, flowTag }, 'Reservation notification delivery failed after retry; reservation change already committed');
+                return;
+            }
+        }
+    }
+};
+
 // ── counterProposeReservation ───────────────────────────────────────────
 // Business proposes an alternative time for a reservation.
 exports.counterProposeReservation = async (req, res) => {
@@ -443,31 +467,34 @@ exports.counterProposeReservation = async (req, res) => {
         // succeeded and the business side got nothing). The event type rides
         // inside actionPayload (the model's Json column) and the category uses
         // a real enum value, matching the transit-reminder remediation (#270).
-        await req.prisma.notification.create({
-            data: {
-                userId: reservation.customerId,
-                category: 'GENERAL',
-                title: `${reservation.businessProfile.businessName} proposed an alternative time`,
-                body: message || `The business has proposed ${new Date(proposedStartDatetime).toLocaleString()}. Tap to review.`,
-                actionPayload: {
-                    action: 'COUNTER_PROPOSAL',
-                    type: 'COUNTER_PROPOSAL',
-                    reservationId: reservationId,
-                    proposedStartDatetime: proposedStartDatetime,
-                    proposedEndDatetime: proposedEndDatetime || null,
-                },
-            }
-        });
+        await notifyBestEffort(req.prisma, {
+            userId: reservation.customerId,
+            category: 'GENERAL',
+            title: `${reservation.businessProfile.businessName} proposed an alternative time`,
+            body: message || `The business has proposed ${new Date(proposedStartDatetime).toLocaleString()}. Tap to review.`,
+            actionPayload: {
+                action: 'COUNTER_PROPOSAL',
+                type: 'COUNTER_PROPOSAL',
+                reservationId: reservationId,
+                proposedStartDatetime: proposedStartDatetime,
+                proposedEndDatetime: proposedEndDatetime || null,
+            },
+        }, 'COUNTER_PROPOSAL');
 
-        // Real-time push
+        // Real-time push (non-fatal: a socket transport error must not turn a
+        // committed counter-proposal into a 500 either)
         if (req.app.get('io')) {
-            req.app.get('io').to(`user_${reservation.customerId}`).emit('counter_proposal', {
-                reservationId,
-                businessName: reservation.businessProfile.businessName,
-                proposedStartDatetime,
-                proposedEndDatetime,
-                message,
-            });
+            try {
+                req.app.get('io').to(`user_${reservation.customerId}`).emit('counter_proposal', {
+                    reservationId,
+                    businessName: reservation.businessProfile.businessName,
+                    proposedStartDatetime,
+                    proposedEndDatetime,
+                    message,
+                });
+            } catch (sockErr) {
+                logger.warn({ err: sockErr && sockErr.message }, 'counter_proposal socket emit non-fatal');
+            }
         }
 
         res.json({ success: true, reservation: updated });
@@ -515,19 +542,17 @@ exports.acceptCounterProposal = async (req, res) => {
             select: { userId: true }
         });
         if (counterBizOwner) {
-            await req.prisma.notification.create({
-                data: {
-                    userId: counterBizOwner.userId,
-                    category: 'GENERAL',
-                    title: 'Counter-proposal accepted',
-                    body: 'The customer accepted your proposed alternative time.',
-                    actionPayload: {
-                        action: 'COUNTER_PROPOSAL_ACCEPTED',
-                        type: 'COUNTER_PROPOSAL_ACCEPTED',
-                        reservationId: reservationId,
-                    },
-                }
-            });
+            await notifyBestEffort(req.prisma, {
+                userId: counterBizOwner.userId,
+                category: 'GENERAL',
+                title: 'Counter-proposal accepted',
+                body: 'The customer accepted your proposed alternative time.',
+                actionPayload: {
+                    action: 'COUNTER_PROPOSAL_ACCEPTED',
+                    type: 'COUNTER_PROPOSAL_ACCEPTED',
+                    reservationId: reservationId,
+                },
+            }, 'COUNTER_PROPOSAL_ACCEPTED');
         }
 
         res.json({ success: true, reservation: updated });
