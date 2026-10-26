@@ -291,6 +291,60 @@ const MARK = `swp-${Date.now()}`;
             expect(parseFloat(m.availableBalance)).toBeCloseTo(25, 6); // refunded exactly once
             expect(parseFloat(m.escrowLockedBalance)).toBeCloseTo(0, 6);
         });
+
+        test('ELIGIBILITY REGRESSION: a COMPLETED vault cannot be cancelled (funds are spent on the goal)', async () => {
+            const owner = await mkUser(24);
+            seeded.userIds.push(owner.id);
+            const vault = await prisma.sharedVault.create({
+                data: {
+                    name: `${MARK} done`, targetAmountUsdc: 100, creatorId: owner.id,
+                    status: 'COMPLETED', completedAt: new Date(),
+                    members: { create: [{ userId: owner.id, role: 'OWNER', contributedUsdc: 100 }] },
+                },
+            });
+            seeded.vaultIds.push(vault.id);
+
+            mockAuthUserId = owner.id;
+            const res = await request(app).delete(`/api/shared-vaults/${vault.id}`);
+            expect(res.status).toBe(409);
+            expect(res.body.code).toBe('VAULT_NOT_CANCELLABLE');
+            // No refund was fabricated for the completed vault.
+            const u = await prisma.user.findUnique({ where: { id: owner.id } });
+            expect(parseFloat(u.availableBalance)).toBeCloseTo(0, 6);
+            expect(parseFloat(u.escrowLockedBalance)).toBeCloseTo(0, 6);
+            const v = await prisma.sharedVault.findUnique({ where: { id: vault.id } });
+            expect(v.status).toBe('COMPLETED');
+            expect(v.cancelledAt).toBeNull();
+        });
+
+        test('RACE REGRESSION: deposit into a CANCELLED vault → 409 VAULT_NOT_ACTIVE, debit fully rolled back', async () => {
+            const owner = await mkUser(25);
+            const member = await mkUser(26, { available: 100 });
+            seeded.userIds.push(owner.id, member.id);
+            const vault = await prisma.sharedVault.create({
+                data: {
+                    name: `${MARK} closed`, targetAmountUsdc: 1000, creatorId: owner.id,
+                    status: 'CANCELLED', cancelledAt: new Date(),
+                    members: { create: [{ userId: owner.id, role: 'OWNER', contributedUsdc: 0 }, { userId: member.id, contributedUsdc: 0 }] },
+                },
+            });
+            seeded.vaultIds.push(vault.id);
+
+            mockAuthUserId = member.id;
+            const res = await request(app).post(`/api/shared-vaults/${vault.id}/deposit`)
+                .set('idempotency-key', `${MARK}-dep-closed`).send({ amountUsdc: 30 });
+            expect(res.status).toBe(409);
+            expect(res.body.code).toBe('VAULT_NOT_ACTIVE');
+
+            // The conditional debit (which wins BEFORE the vault predicate
+            // refuses) must be ROLLED BACK with the transaction — the
+            // user's balance is untouched and nothing landed in the vault.
+            const u = await prisma.user.findUnique({ where: { id: member.id } });
+            expect(parseFloat(u.availableBalance)).toBeCloseTo(100, 6);
+            expect(parseFloat(u.escrowLockedBalance)).toBeCloseTo(0, 6);
+            const v = await prisma.sharedVault.findUnique({ where: { id: vault.id } });
+            expect(parseFloat(v.currentAmountUsdc)).toBeCloseTo(0, 6);
+        });
     });
 
     // ────────────────────────────────────────────────────────────────────
@@ -307,6 +361,15 @@ const MARK = `swp-${Date.now()}`;
             });
             const cycle = await prisma.susuCycle.create({
                 data: { susuGroupId: group.id, cycleNumber: 1, collectionDate: new Date(), payoutAmount: 100, payoutUserId, status: 'COLLECTING_GRACE' },
+            });
+            // FUNDING PROOF (review fix): the payout now requires the
+            // cycle's PAID contributions to cover payoutAmount, so the
+            // seed funds the pool with one real PAID contribution.
+            const member = await prisma.susuMember.create({
+                data: { susuGroupId: group.id, userId: payoutUserId, cycleSlot: 1, trustScore: 1 },
+            });
+            await prisma.susuContribution.create({
+                data: { cycleId: cycle.id, memberId: member.id, userId: payoutUserId, amountUsdc: 100, status: 'PAID' },
             });
             seeded.cycleIds.push(cycle.id);
             return cycle;
@@ -395,6 +458,92 @@ const MARK = `swp-${Date.now()}`;
             expect(res.body.code).toBe('RATE_UNAVAILABLE');
             const wallet = await prisma.currencyWallet.findUnique({ where: { userId_currency: { userId: user.id, currency: 'USD' } } });
             expect(parseFloat(wallet.balance)).toBeCloseTo(0, 6);
+        });
+    });
+
+    // ────────────────────────────────────────────────────────────────────
+    // 3b/4b: payout ELIGIBILITY + FUNDING PROOF regressions (review fix)
+    // ────────────────────────────────────────────────────────────────────
+    describe('Cross-border susu payout — explicit eligible states + funding proof', () => {
+        const setupBare = async (payoutUserId, status) => {
+            const group = await prisma.susuGroup.create({
+                data: { contributionUsdc: 10, totalCycles: 1, contractRequiredCount: 1, startDate: new Date(), rotationSnapshot: [], frequency: 'WEEKLY' },
+            });
+            seeded.groupIds.push(group.id);
+            await prisma.crossBorderSusuConfig.create({
+                data: { susuGroupId: group.id, baseCurrency: 'GHS', memberCountries: [], createdBy: payoutUserId },
+            });
+            const cycle = await prisma.susuCycle.create({
+                data: { susuGroupId: group.id, cycleNumber: 1, collectionDate: new Date(), payoutAmount: 100, payoutUserId, status },
+            });
+            seeded.cycleIds.push(cycle.id);
+            return cycle;
+        };
+
+        test('PENDING cycle (never started) → honest 409 CYCLE_NOT_PAYOUT_ELIGIBLE, no credit', async () => {
+            await upsertFxRate('GHS', 'USD', 0.08, new Date());
+            const user = await mkUser(20);
+            seeded.userIds.push(user.id);
+            await prisma.currencyWallet.create({ data: { userId: user.id, currency: 'USD', balance: 0 } });
+            const cycle = await setupBare(user.id, 'PENDING');
+            mockAuthUserId = user.id;
+            const res = await request(app).post('/api/cross-border-susu/payout')
+                .set('idempotency-key', `${MARK}-pend`).send({ cycleId: cycle.id, targetCurrency: 'USD' });
+            expect(res.status).toBe(409);
+            expect(res.body.code).toBe('CYCLE_NOT_PAYOUT_ELIGIBLE');
+            const wallet = await prisma.currencyWallet.findUnique({ where: { userId_currency: { userId: user.id, currency: 'USD' } } });
+            expect(parseFloat(wallet.balance)).toBe(0);
+        });
+
+        test('DEFAULTED cycle (already resolved by the penalty ladder) → 409 CYCLE_NOT_PAYOUT_ELIGIBLE', async () => {
+            const user = await mkUser(21);
+            seeded.userIds.push(user.id);
+            await prisma.currencyWallet.create({ data: { userId: user.id, currency: 'USD', balance: 0 } });
+            const cycle = await setupBare(user.id, 'DEFAULTED');
+            mockAuthUserId = user.id;
+            const res = await request(app).post('/api/cross-border-susu/payout')
+                .set('idempotency-key', `${MARK}-def`).send({ cycleId: cycle.id, targetCurrency: 'USD' });
+            expect(res.status).toBe(409);
+            expect(res.body.code).toBe('CYCLE_NOT_PAYOUT_ELIGIBLE');
+            const wallet = await prisma.currencyWallet.findUnique({ where: { userId_currency: { userId: user.id, currency: 'USD' } } });
+            expect(parseFloat(wallet.balance)).toBe(0);
+        });
+
+        test('COLLECTING cycle with NO contributions → honest 409 CYCLE_NOT_FUNDED (never fabricates money)', async () => {
+            const user = await mkUser(22);
+            seeded.userIds.push(user.id);
+            await prisma.currencyWallet.create({ data: { userId: user.id, currency: 'USD', balance: 0 } });
+            const cycle = await setupBare(user.id, 'COLLECTING'); // eligible status, EMPTY pool
+            mockAuthUserId = user.id;
+            const res = await request(app).post('/api/cross-border-susu/payout')
+                .set('idempotency-key', `${MARK}-nf`).send({ cycleId: cycle.id, targetCurrency: 'USD' });
+            expect(res.status).toBe(409);
+            expect(res.body.code).toBe('CYCLE_NOT_FUNDED');
+            const wallet = await prisma.currencyWallet.findUnique({ where: { userId_currency: { userId: user.id, currency: 'USD' } } });
+            expect(parseFloat(wallet.balance)).toBe(0);
+            const row = await prisma.susuCycle.findUnique({ where: { id: cycle.id } });
+            expect(row.status).toBe('COLLECTING'); // claim rolled back — no half-payout state
+        });
+
+        test('COLLECTING cycle PARTIALLY funded (contributions < payoutAmount) → 409 CYCLE_NOT_FUNDED', async () => {
+            const user = await mkUser(23);
+            seeded.userIds.push(user.id);
+            await prisma.currencyWallet.create({ data: { userId: user.id, currency: 'USD', balance: 0 } });
+            const cycle = await setupBare(user.id, 'COLLECTING');
+            const member = await prisma.susuMember.create({
+                data: { susuGroupId: cycle.susuGroupId, userId: user.id, cycleSlot: 1, trustScore: 1 },
+            });
+            await prisma.susuContribution.create({
+                data: { cycleId: cycle.id, memberId: member.id, userId: user.id, amountUsdc: 40, status: 'PAID' }, // 40 < 100
+            });
+            mockAuthUserId = user.id;
+            const res = await request(app).post('/api/cross-border-susu/payout')
+                .set('idempotency-key', `${MARK}-pf`).send({ cycleId: cycle.id, targetCurrency: 'USD' });
+            expect(res.status).toBe(409);
+            expect(res.body.code).toBe('CYCLE_NOT_FUNDED');
+            const row = await prisma.susuCycle.findUnique({ where: { id: cycle.id } });
+            expect(row.status).toBe('COLLECTING');
+            expect(row.paidOutAt).toBeNull();
         });
     });
 

@@ -214,8 +214,13 @@ async function deposit(req, res) {
     });
 
     if (!vault) return res.status(404).json({ success: false, message: 'Vault not found.' });
-    if (vault.status !== 'ACTIVE') return res.status(400).json({ success: false, message: 'Vault is not active.' });
 
+    // NOTE: there is deliberately NO vault-status check on this stale
+    // snapshot. The ACTIVE predicate lives INSIDE the transaction on the
+    // vault increment itself (see below) — an outside check is exactly
+    // the TOCTOU window the review flagged, and would only ever return a
+    // verdict about the PAST. Membership is structurally stable, so the
+    // membership 403 stays here.
     const membership = vault.members.find(m => m.userId === userId);
     if (!membership) return res.status(403).json({ success: false, message: 'Not a member of this vault.' });
 
@@ -247,11 +252,29 @@ async function deposit(req, res) {
             throw err;
         }
 
+        // RACE FIX: the ACTIVE check above ran OUTSIDE the transaction
+        // against a stale snapshot; the writes below could land AFTER a
+        // concurrent cancel had already flipped the vault (and refunded
+        // its members), silently locking funds into a cancelled vault.
+        // The vault increment is now a CONDITIONAL single-winner write on
+        // `status: 'ACTIVE'` INSIDE this transaction: a deposit racing a
+        // cancel either wins the row lock while the vault is still
+        // ACTIVE (then the cancel refunds the new contribution too —
+        // cancel re-reads members in ITS transaction), or finds the vault
+        // no longer ACTIVE, refuses, and the whole transaction —
+        // including the user debit — rolls back.
+        const vaultBump = await tx.sharedVault.updateMany({
+            where: { id, status: 'ACTIVE' },
+            data: { currentAmountUsdc: { increment: amount } },
+        });
+        if (vaultBump.count !== 1) {
+            const err = new Error('Vault is not active.');
+            err.code = 'VAULT_NOT_ACTIVE';
+            throw err;
+        }
+
         const [updatedVault, updatedMember] = await Promise.all([
-            tx.sharedVault.update({
-                where: { id },
-                data: { currentAmountUsdc: { increment: amount } },
-            }),
+            tx.sharedVault.findUnique({ where: { id } }),
             tx.sharedVaultMember.update({
                 where: { id: membership.id },
                 data: { contributedUsdc: { increment: amount } },
@@ -261,7 +284,7 @@ async function deposit(req, res) {
         // Target reached → guarded completion transition (single-winner:
         // a concurrent second deposit cannot double-flip COMPLETED).
         const newTotal = parseFloat(updatedVault.currentAmountUsdc);
-        if (newTotal >= parseFloat(updatedVault.targetAmountUsdc) && vault.status === 'ACTIVE') {
+        if (newTotal >= parseFloat(updatedVault.targetAmountUsdc)) {
             await tx.sharedVault.updateMany({
                 where: { id, status: 'ACTIVE' },
                 data: { status: 'COMPLETED', completedAt: new Date() },
@@ -300,6 +323,9 @@ async function deposit(req, res) {
   } catch (err) {
     if (err?.code === 'INSUFFICIENT_FUNDS') {
       return res.status(400).json({ success: false, message: err.message });
+    }
+    if (err?.code === 'VAULT_NOT_ACTIVE') {
+      return res.status(409).json({ success: false, code: 'VAULT_NOT_ACTIVE', message: err.message });
     }
     logger.error({ err: err.message, vaultId: id, userId }, '[sharedVault] Deposit failed');
     return res.status(500).json({ success: false, message: 'Deposit failed.' });
@@ -375,23 +401,44 @@ async function cancel(req, res) {
     // Cancellation is a REVERSAL of already-authorized deposits: it stays
     // available during an FX outage (documented settlement-protection
     // exception — see docs/native-ghs-fx-audit.md §4.1). Its integrity
-    // requirement is SINGLE-WINNER: the CANCELLED transition flips FIRST,
-    // inside the same interactive transaction as the refunds. Only the
-    // request that wins the transition refunds; a replayed or concurrent
-    // cancel finds zero updated rows and is refused 409 — contributors can
-    // never be refunded twice for one vault.
+    // requirements are SINGLE-WINNER and TRANSACTION-CONSISTENT SNAPSHOT
+    // (review fix): the CANCELLED transition flips FIRST, on an EXPLICIT
+    // eligible state (ACTIVE only — a COMPLETED vault's funds are already
+    // spent on the goal and must never be "refunded"; the old
+    // `not: CANCELLED` predicate would cancel a COMPLETED vault), inside
+    // the same interactive transaction as the refunds. Members are
+    // re-read INSIDE that transaction after the claim is won — never from
+    // the stale pre-transaction snapshot, which could omit a deposit that
+    // raced in after the outer read and strand that member's funds.
     let cancelled = false;
+    let refundState = 'NOT_CANCELLABLE';
     await prisma.$transaction(async (tx) => {
       const transition = await tx.sharedVault.updateMany({
-        where: { id, status: { not: 'CANCELLED' } },
+        where: { id, status: 'ACTIVE' },
         data: { status: 'CANCELLED', cancelledAt: new Date() },
       });
-      if (transition.count !== 1) return; // already cancelled — no refunds
+      if (transition.count !== 1) {
+        // Honest refusal: distinguish an already-cancelled replay from a
+        // vault that is not in a cancellable state at all.
+        const current = await tx.sharedVault.findUnique({
+          where: { id },
+          select: { status: true },
+        });
+        refundState = current?.status === 'CANCELLED' ? 'ALREADY_CANCELLED' : 'NOT_CANCELLABLE';
+        return;
+      }
+
+      // Refunds derive from the TRANSACTION-CONSISTENT member rows: read
+      // them here, after the claim won the row lock, so a deposit that
+      // committed before our claim is included in the refunds.
+      const members = await tx.sharedVaultMember.findMany({
+        where: { sharedVaultId: id },
+      });
 
       // Refund each contributor to the REAL money authority
       // (User.availableBalance) and release the matching escrow
       // restriction, with the §P.4 ledger reversal of the deposit legs.
-      for (const m of vault.members) {
+      for (const m of members) {
         const contributed = parseFloat(m.contributedUsdc);
         if (!(contributed > 0)) continue;
         await tx.user.update({
@@ -418,7 +465,10 @@ async function cancel(req, res) {
     });
 
     if (!cancelled) {
-      return res.status(409).json({ success: false, code: 'VAULT_ALREADY_CANCELLED', message: 'This shared vault has already been cancelled.' });
+      if (refundState === 'ALREADY_CANCELLED') {
+        return res.status(409).json({ success: false, code: 'VAULT_ALREADY_CANCELLED', message: 'This shared vault has already been cancelled.' });
+      }
+      return res.status(409).json({ success: false, code: 'VAULT_NOT_CANCELLABLE', message: 'Only an active vault can be cancelled.' });
     }
     return res.status(200).json({ success: true, message: 'Vault cancelled. Funds returned to contributors.' });
   } catch (err) {

@@ -15,7 +15,7 @@
 // - Cross-border fee: 0.5% (lower than standard conversion since pool volume)
 // =============================================================================
 
-const { PrismaClient } = require('@prisma/client');
+const { PrismaClient, Prisma } = require('@prisma/client');
 const prisma = new PrismaClient();
 const logger = require('../src/config/logger');
 const { SUPPORTED_CURRENCIES } = require('./multiCurrencyController');
@@ -147,6 +147,22 @@ async function contributeLocalCurrency(req, res) {
       return res.status(400).json({ success: false, message: 'Unsupported currency.' });
     }
 
+    // AMOUNT VALIDATION (review fix): the old truthiness check accepted
+    // zero and NEGATIVE amounts — a negative contribution CREDITS the
+    // wallet and produces a negative "pool" entry. Amounts are parsed
+    // ONCE into an exact Prisma.Decimal here, validated strictly
+    // (finite, > 0), and every downstream calculation and DB write uses
+    // that Decimal — no float arithmetic anywhere on the money path.
+    let localAmountDec;
+    try {
+      localAmountDec = new Prisma.Decimal(String(localAmount).trim());
+    } catch (_e) {
+      return res.status(400).json({ success: false, message: 'Invalid amount.' });
+    }
+    if (!localAmountDec.isFinite() || localAmountDec.lte(0)) {
+      return res.status(400).json({ success: false, message: 'Invalid amount.' });
+    }
+
     // Get cross-border config
     const config = await prisma.crossBorderSusuConfig.findUnique({
       where: { susuGroupId },
@@ -166,9 +182,15 @@ async function contributeLocalCurrency(req, res) {
     }
     const fxRate = freshRate.rate;
 
-    // Apply cross-border fee
-    const effectiveRate = fxRate * (1 - CROSS_BORDER_FEE);
-    const baseAmount = parseFloat(localAmount) * effectiveRate;
+    // Apply cross-border fee — EXACT DECIMAL ARITHMETIC (review fix):
+    // the contribution money path previously ran through JS floats
+    // (parseFloat * rate), losing sub-cent precision on every conversion.
+    // All amounts are now Prisma.Decimal end-to-end: parse, fee
+    // application, conditional debit, contribution record, FX snapshot.
+    const effectiveRate = new Prisma.Decimal(String(fxRate))
+      .mul(new Prisma.Decimal(1).minus(new Prisma.Decimal(String(CROSS_BORDER_FEE))));
+    const baseAmount = localAmountDec.mul(effectiveRate);
+    const feeAmount = localAmountDec.mul(new Prisma.Decimal(String(CROSS_BORDER_FEE)));
 
     // Resolve the wallet for the 404 verdict; the balance CHECK happens
     // inside the transaction as a conditional debit so two concurrent
@@ -185,8 +207,8 @@ async function contributeLocalCurrency(req, res) {
       // Debit local wallet — SINGLE-WINNER conditional update: a wallet
       // whose live balance is below the amount is not debited at all.
       const debited = await tx.currencyWallet.updateMany({
-        where: { id: wallet.id, balance: { gte: parseFloat(localAmount) } },
-        data: { balance: { decrement: parseFloat(localAmount) } },
+        where: { id: wallet.id, balance: { gte: localAmountDec } },
+        data: { balance: { decrement: localAmountDec } },
       });
       if (debited.count !== 1) {
         const err = new Error(`Insufficient ${localCurr} balance.`);
@@ -200,7 +222,7 @@ async function contributeLocalCurrency(req, res) {
           cycleId,
           memberId: req.body.memberId,
           userId,
-          amountUsdc: baseAmount, // stored in base currency
+          amountUsdc: baseAmount, // stored in base currency (exact Decimal)
           status: 'PAID',
         },
       });
@@ -213,14 +235,14 @@ async function contributeLocalCurrency(req, res) {
           userId,
           fromCurrency: localCurr,
           toCurrency: config.baseCurrency,
-          localAmount: parseFloat(localAmount),
+          localAmount: localAmountDec,
           baseAmount,
           rate: effectiveRate,
-          fee: parseFloat(localAmount) * CROSS_BORDER_FEE,
+          fee: feeAmount,
         },
       });
 
-      return { contribution, baseAmount };
+      return { contribution, baseAmount, feeAmount };
     });
 
     return res.json({
@@ -230,8 +252,11 @@ async function contributeLocalCurrency(req, res) {
       fxSnapshot: {
         from: localCurr,
         to: config.baseCurrency,
-        rate: effectiveRate,
-        fee: parseFloat(localAmount) * CROSS_BORDER_FEE,
+        // exact wire representation — authoritative Decimal strings
+        localAmount: localAmountDec.toString(),
+        baseAmount: result.baseAmount.toString(),
+        rate: effectiveRate.toString(),
+        fee: result.feeAmount.toString(),
       },
     });
   } catch (err) {
@@ -278,7 +303,7 @@ async function payoutLocalCurrency(req, res) {
     // non-demo observation of the payout pair: the display utility
     // getFxRate (with its hardcoded BASE_RATES fallback) is never used for
     // money movement.
-    const basePayout = parseFloat(cycle.payoutAmount.toString());
+    const basePayout = new Prisma.Decimal(cycle.payoutAmount.toString());
     let freshRate;
     try {
       freshRate = await getFreshCrossBorderRate(config.baseCurrency, targetCurr);
@@ -288,7 +313,7 @@ async function payoutLocalCurrency(req, res) {
     const fxRate = freshRate.rate;
 
     // No fee on payout (fee was collected at contribution time)
-    const targetAmount = basePayout * fxRate;
+    const targetAmount = basePayout.mul(new Prisma.Decimal(String(fxRate)));
 
     // Resolve the target wallet for the 404 verdict; the wallet is created
     // inside the transaction.
@@ -297,18 +322,49 @@ async function payoutLocalCurrency(req, res) {
     });
 
     const result = await prisma.$transaction(async (tx) => {
-      // SINGLE-WINNER payout transition, FIRST inside the transaction and
-      // ATOMIC with the credit: only a request that flips a not-yet-paid
-      // cycle to PAID_OUT proceeds. A replayed or concurrent request finds
-      // zero updated rows and is refused BEFORE any wallet credit — the
-      // same cycle can never be paid out twice.
+      // SINGLE-WINNER payout transition, ATOMIC with the credit, over an
+      // EXPLICIT eligible set (review fix): only a cycle actively
+      // COLLECTING (or in its grace window) may be paid out. The previous
+      // `status: { not: 'PAID_OUT' }` predicate would also pay out PENDING
+      // cycles (never started) and DEFAULTED cycles (already resolved by
+      // the penalty ladder) — an inventory hole, not an eligibility
+      // contract. A replayed or concurrent request finds zero updated
+      // rows and is refused BEFORE any wallet credit.
       const transition = await tx.susuCycle.updateMany({
-        where: { id: cycleId, status: { not: 'PAID_OUT' } },
+        where: { id: cycleId, status: { in: ['COLLECTING', 'COLLECTING_GRACE'] } },
         data: { status: 'PAID_OUT', paidOutAt: new Date() },
       });
       if (transition.count !== 1) {
-        const err = new Error('This cycle has already been paid out.');
-        err.code = 'PAYOUT_ALREADY_COMPLETED';
+        const current = await tx.susuCycle.findUnique({
+          where: { id: cycleId },
+          select: { status: true },
+        });
+        const err = new Error(
+          current?.status === 'PAID_OUT'
+            ? 'This cycle has already been paid out.'
+            : 'This cycle is not eligible for payout.'
+        );
+        err.code = current?.status === 'PAID_OUT' ? 'PAYOUT_ALREADY_COMPLETED' : 'CYCLE_NOT_PAYOUT_ELIGIBLE';
+        throw err;
+      }
+
+      // FUNDING PROOF (review fix): the payout is only as real as the
+      // contributions backing it. The eligibility claim above won the
+      // row; the PAID contributions of THIS cycle must now cover the
+      // payout amount exactly-or-better. An unfunded (or
+      // partially-funded) cycle is refused with an honest CYCLE_NOT_FUNDED
+      // and NO wallet credit — the claim rolls back with the whole
+      // transaction — instead of fabricating money from a
+      // scheduler-assigned payoutAmount with no pool behind it.
+      const funded = await tx.susuContribution.aggregate({
+        where: { cycleId, status: 'PAID' },
+        _sum: { amountUsdc: true },
+      });
+      const poolSum = new Prisma.Decimal(funded._sum.amountUsdc == null ? '0' : String(funded._sum.amountUsdc));
+      const payoutAmt = new Prisma.Decimal(cycle.payoutAmount.toString());
+      if (poolSum.lt(payoutAmt)) {
+        const err = new Error('Cycle pool is not fully funded yet.');
+        err.code = 'CYCLE_NOT_FUNDED';
         throw err;
       }
 
@@ -347,16 +403,23 @@ async function payoutLocalCurrency(req, res) {
       success: true,
       message: `Payout: ${basePayout.toFixed(2)} ${config.baseCurrency} → ${result.targetAmount.toFixed(2)} ${targetCurr}.`,
       payout: {
-        baseAmount: basePayout,
+        // exact wire representation — authoritative Decimal strings
+        baseAmount: basePayout.toString(),
         baseCurrency: config.baseCurrency,
-        targetAmount: parseFloat(result.targetAmount.toFixed(2)),
+        targetAmount: result.targetAmount.toString(),
         targetCurrency: targetCurr,
-        rate: fxRate,
+        rate: String(fxRate),
       },
     });
   } catch (err) {
     if (err?.code === 'PAYOUT_ALREADY_COMPLETED') {
       return res.status(409).json({ success: false, code: 'PAYOUT_ALREADY_COMPLETED', message: err.message });
+    }
+    if (err?.code === 'CYCLE_NOT_PAYOUT_ELIGIBLE') {
+      return res.status(409).json({ success: false, code: 'CYCLE_NOT_PAYOUT_ELIGIBLE', message: err.message });
+    }
+    if (err?.code === 'CYCLE_NOT_FUNDED') {
+      return res.status(409).json({ success: false, code: 'CYCLE_NOT_FUNDED', message: err.message });
     }
     logger.error({ err }, '[crossBorderSusu] payout error');
     return res.status(500).json({ success: false, message: 'Payout failed.' });
