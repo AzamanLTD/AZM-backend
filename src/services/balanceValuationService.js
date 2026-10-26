@@ -35,8 +35,11 @@
 //     presented as the full valued aggregate.
 //   • No rate + available USDC == 0 → the native GHS amount IS the complete
 //     total (FX is genuinely not needed); status NATIVE_GHS_ONLY.
-//   • Every Decimal financial quantity is serialized as BOTH an exact string
-//     (`*Exact`) and a JS number projection for presentation only.
+//   • Every Decimal financial quantity serializes as a money OBJECT
+//     `{ exact, value }` via _money(): `exact` is the authoritative
+//     fixed-scale (8dp) decimal STRING, `value` the presentation-only JS
+//     number projection. There are NO bare `*Exact` sibling fields on the
+//     wire (pinned by __tests__/balance-route-contract.test.js).
 
 const { Prisma } = require('@prisma/client');
 const { getFreshServerRateGhsPerUsdc } = require('./transactionQuoteService');
