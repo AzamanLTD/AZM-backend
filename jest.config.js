@@ -35,4 +35,8 @@ module.exports = {
     // 30s is the default for both; slower CI runners are covered, and any
     // genuinely hung test merely takes 30s instead of 5s to surface.
     testTimeout: 30000,
+    // Runs once before any suite (CI and local): converges the GlobalSettings
+    // singleton so the battery is order-independent on a freshly-pushed DB.
+    // See test-support/global-setup.js for the full contract.
+    globalSetup: './test-support/global-setup.js',
 };

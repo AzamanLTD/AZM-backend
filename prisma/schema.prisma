@@ -652,6 +652,14 @@ model User {
   vendorUnallocatedBalance Decimal @default(0.0) @db.Decimal(20, 8) // USDT returned to vendor post auto-cancel
   escrowLockedBalance      Decimal @default(0.0) @db.Decimal(20, 8) // USDT locked in escrow for active trades
   disputeEscrowBalance     Decimal @default(0.0) @db.Decimal(20, 8) // USDT frozen during an open dispute
+  // Native-GHS customer wallet (FX-balance workstream). This is REAL GHS
+  // owed to the customer — a separate liability from the USDC wallet, never
+  // a display conversion of availableBalance. Additive column: existing
+  // USDC balances and every existing flow are untouched. The DB-level
+  // CHECK (nativeGhsBalance >= 0) lives in
+  // infra/install-ghs-wallet-overlay.js (Prisma cannot express CHECKs).
+  // Mirrored by the dynamic ledger account ghs:user:{id}:liability.
+  nativeGhsBalance         Decimal @default(0.0) @db.Decimal(20, 8)
 
   // --- AZM LOYALTY POINTS (independent reward ledger) ---
   // AZM is an internal platform loyalty-point currency (like BNB or airline
@@ -1542,6 +1550,49 @@ model GlobalSettings {
 
   updatedAt DateTime @updatedAt
 }
+
+// =============================================================================
+// FX SAVED-RATE SNAPSHOT (FX-balance workstream)
+//
+// The LAST SUCCESSFULLY VALIDATED external USDC/GHS observation, kept
+// SEPARATE from GlobalSettings.liveRetailRate (the canonical CURRENT rate
+// whose freshness the 271C gate judges). This row is a DISPLAY-ONLY
+// fallback: it may never make a transaction gate pass and is never
+// presented as a fresh/live rate.
+//
+// Write path: fxRateSnapshotService.saveValidatedRateSnapshot — called only
+// from the oracle's success-only external write. A failed, stale,
+// malformed, noncanonical or partial observation never overwrites a valid
+// saved snapshot. A DEMO seed (isDemoSeed = true, source 'DEMO_SEED') is
+// written only by the explicit demo/test seeder and never overwrites a
+// genuine observation.
+// =============================================================================
+model FxSavedRate {
+  id         String   @id @default(uuid())
+  // Exact pair and direction: 'USDC/GHS' — GHS per 1 USDC.
+  pair       String   @unique @db.VarChar(16)
+  rate       Decimal  @db.Decimal(20, 8)
+  // Provenance: KOTANI_PAY | FALLBACK_FX | DEMO_SEED | ... (never 'Binance'
+  // unless a real observation from that provider passed validation).
+  source     String   @db.VarChar(32)
+  // External observation timestamp (UTC) — when the market was observed.
+  observedAt DateTime
+  // Successful receipt/save timestamp (UTC) — when WE persisted it.
+  savedAt    DateTime @default(now())
+  // True only for the explicit demo/test seed (1 USDC = GHS 12.03). Demo
+  // rows are display-eligible only in demo/test environments and NEVER
+  // authorize transactions.
+  isDemoSeed Boolean  @default(false)
+  // Freshness/canonicality metadata at save time (validation verdict, max
+  // age policy version, oracle mode) — enough to revalidate the snapshot.
+  validation Json?
+
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([pair, savedAt(sort: Desc)])
+}
+
 
 // QR Forge scan tracking (Phase 3)
 model QrScan {
