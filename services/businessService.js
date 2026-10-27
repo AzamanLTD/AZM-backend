@@ -173,7 +173,7 @@ const getBusinessProfile = async (prisma, { bizId, userId }) => {
 // =============================================================================
 // 3. SEARCH BUSINESSES — name / bizId / description, optional filters.
 // =============================================================================
-const searchBusinesses = async (prisma, { query, category, verified, limit, cursor, subcategory, priceRange, minRating, sort }) => {
+const searchBusinesses = async (prisma, { query, category, verified, limit, cursor, subcategory, priceRange, minRating, sort, viewerId }) => {
     const take = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 50);
 
     // Names that must never appear in the public marketplace feed (test/seed accounts).
@@ -209,7 +209,7 @@ const searchBusinesses = async (prisma, { query, category, verified, limit, curs
     }
 
     const useTrending = sort === 'trending';
-    const rows = await prisma.businessProfile.findMany({
+    const fetched = await prisma.businessProfile.findMany({
         where,
         take: take + 1,
         orderBy: useTrending ? { averageRating: 'desc' } : { totalEscrows: 'desc' },
@@ -218,6 +218,18 @@ const searchBusinesses = async (prisma, { query, category, verified, limit, curs
         },
         ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {})
     });
+
+    // PAGE-BOUNDARY CONTRACT: hasMore and nextCursor are derived from the
+    // RAW DB-ordered query result — BEFORE any display reordering (trending
+    // score sort, "Show less" demotion) touches it. Display reordering then
+    // applies ONLY to the actual page rows, so a suppressed or
+    // score-shifted row can never cross the page boundary, the take+1
+    // sentinel can never become visible, and nextCursor always points at
+    // the true DB-order boundary row. Without this, a reordered boundary
+    // makes consecutive pages skip or repeat rows.
+    const hasMore = fetched.length > take;
+    const rows = fetched.slice(0, take);
+    const nextCursor = hasMore ? rows[rows.length - 1].id : null;
 
     if (useTrending) {
         const logger = require('../src/config/logger');
@@ -242,7 +254,24 @@ const searchBusinesses = async (prisma, { query, category, verified, limit, curs
         }
     }
 
-    return rows.map(_withEscrowProtectionCapability);
+    // Backend D — RANKING EFFECT: for an authenticated viewer, businesses
+    // they suppressed with "Show less like this" are DEMOTED to the end of
+    // the page (one batched query; relative order preserved in both
+    // groups). Demotion only: the business is never removed, hidden or
+    // altered — hard eligibility/suspension filters above still apply, and
+    // the caller can still open the profile or follow/bookmark it freely.
+    if (viewerId != null && rows.length > 0) {
+        const RecommendationFeedbackService = require('./marketplace/recommendationFeedbackService');
+        const svc = new RecommendationFeedbackService(prisma);
+        const suppressed = await svc.getSuppressedIds(viewerId, rows.map(r => r.id));
+        if (suppressed.size > 0) {
+            const demoted = svc.demoteSuppressed(rows, suppressed);
+            rows.length = 0;
+            rows.push(...demoted);
+        }
+    }
+
+    return { rows: rows.map(_withEscrowProtectionCapability), hasMore, nextCursor };
 };
 
 // =============================================================================

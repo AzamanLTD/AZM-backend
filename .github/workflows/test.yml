@@ -150,6 +150,14 @@ jobs:
         # array column. Mirrors the release chain (npm run release); after
         # db push the ADD COLUMN IF NOT EXISTS no-ops.
         run: node infra/install-business-offered-categories-overlay.js
+      - name: Install business bookmark overlay
+        # Marketplace personalisation (Backend A): BusinessBookmark table
+        # behind /api/bookmarks. Mirrors the release chain (npm run release).
+        run: node infra/install-business-bookmark-overlay.js
+      - name: Install business recommendation feedback overlay
+        # Marketplace personalisation (Backend D): per-user "Show less"
+        # feedback table. Mirrors the release chain (npm run release).
+        run: node infra/install-business-recommendation-feedback-overlay.js
 
       - name: Install inventory restock authority
         run: node infra/install-inventory-restock-overlay.js

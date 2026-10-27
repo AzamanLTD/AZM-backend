@@ -43,7 +43,12 @@ exports.getFollowers = async (prisma, { businessProfileId, limit, offset }) => {
 
 exports.getFollowing = async (prisma, { customerId, limit, offset }) => {
     const svc = new FollowService(prisma);
-    return svc.getFollowing(customerId, { limit, offset });
+    const cards = await svc.getFollowing(customerId, { limit, offset });
+    // Backend B: authoritative active/unseen story state for the followed
+    // business cards, computed from the Story/StoryView authorities
+    // (additive `storyState` block; exactly two batch queries per page).
+    const { attachStoryState } = require('./marketplace/businessStoryStateService');
+    return attachStoryState(prisma, cards, customerId);
 };
 
 exports.getFollowedBusinessIds = async (prisma, { userId }) => {

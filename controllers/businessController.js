@@ -10,6 +10,7 @@
 
 const logger = require('../src/config/logger');
 const businessService = require('../services/businessService');
+const { attachStoryState } = require('../services/marketplace/businessStoryStateService');
 const storefrontRenderService = require('../services/storefrontRenderService');
 
 // =============================================================================
@@ -78,6 +79,14 @@ exports.getBusinessByBizId = async (req, res) => {
         if (business.isSuspended) {
             return res.status(404).json({ success: false, message: 'Business not found.' });
         }
+        // Backend B (storefront hero avatar): the storefront profile surface
+        // draws the SAME authoritative story ring as the listing cards, from
+        // the SAME single story authority — one business, one attach call.
+        // optionalAuth resolves the viewer when a valid token is present
+        // (personalising hasUnseenStory); anonymous callers get the public
+        // shape with hasUnseenStory: null. Additive: no existing field
+        // changes; privacy is unchanged (booleans + one timestamp only).
+        await attachStoryState(prisma, [business], req.user ? req.user.id : null);
         return res.status(200).json({ success: true, business });
     } catch (err) {
         logger.error({ err: err }, '[getBusinessByBizId] error');
@@ -103,12 +112,25 @@ exports.searchBusinesses = async (req, res) => {
             subcategory: subcategory || null,
             priceRange: priceRange || null,
             minRating: minRating || null,
-            sort: sort || null
+            sort: sort || null,
+            // Backend D: per-viewer "Show less" demotion. Null for
+            // anonymous callers; the search route resolves the viewer via
+            // optionalAuth when #371 lands.
+            viewerId: req.user ? req.user.id : null
         });
 
-        const hasMore = rows.length > take;
-        const businesses = hasMore ? rows.slice(0, take) : rows;
-        const nextCursor = hasMore ? businesses[businesses.length - 1].id : null;
+        // searchBusinesses now derives hasMore/nextCursor from the RAW
+        // DB-ordered page boundary (before trending/show-less display
+        // reordering) and returns exactly the page rows — the take+1
+        // sentinel is never visible and the cursor is always the true
+        // DB-order boundary row.
+        const { rows: businesses, hasMore, nextCursor } = rows;
+
+        // Backend B: authoritative active/unseen story state for the ring —
+        // attached only from the Story/StoryView authorities (additive
+        // `storyState` block; anonymous viewers get hasUnseenStory: null).
+        const viewerId = req.user ? req.user.id : null;
+        await attachStoryState(prisma, businesses, viewerId);
 
         return res.status(200).json({ success: true, businesses, hasMore, nextCursor });
     } catch (err) {

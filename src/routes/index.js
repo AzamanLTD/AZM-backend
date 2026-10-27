@@ -83,6 +83,15 @@ function mountRoutes(app, {
     app.use('/api/discovery', generalLimiter, require('../../routes/discoveryRoutes'));
     app.use('/api/reservations', generalLimiter, require('../../routes/reservationRoutes'));
     app.use('/api/follows', generalLimiter, require('../../routes/followRoutes'));
+    // Marketplace personalisation (Backend A): user-scoped saved businesses.
+    // Distinct from follows by contract — private collection, no feed effect.
+    app.use('/api/bookmarks', generalLimiter, require('../../routes/bookmarkRoutes'));
+    // Marketplace personalisation (Backend C): per-viewer social-proof
+    // aggregates (friends / friends-of-friends following a business).
+    app.use('/api/social-proof', generalLimiter, require('../../routes/socialProofRoutes'));
+    // Marketplace personalisation (Backend D): per-user "Show less like
+    // this" recommendation feedback.
+    app.use('/api/recommendation-feedback', generalLimiter, require('../../routes/recommendationFeedbackRoutes'));
     app.use('/api/ad-posts', generalLimiter, require('../../routes/adPostRoutes'));
     app.use('/api/dine-in', financialLimiter, require('../../routes/dineInRoutes'));
     app.use('/api/showcases', generalLimiter, require('../../routes/showcaseRoutes'));

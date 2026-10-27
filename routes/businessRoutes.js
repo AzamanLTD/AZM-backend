@@ -19,6 +19,7 @@ const { validate }      = require('../middleware/validate');
 const { businessRegisterSchema, businessUpdateSchema } = require('../services/validation/businessSchemas');
 
 const ctrl        = require('../controllers/businessController');
+const { optionalAuth } = require('../middleware/optionalAuth');
 const productCtrl = require('../controllers/businessProductController');
 
 // Resolves businessProfileId from DB and attaches to req.user.
@@ -48,7 +49,7 @@ const catalogCtrl  = require('../controllers/catalogSectionController');
 // mirroring withdrawalRoutes; controllers keep their fallback checks intact.
 router.post('/register', protectActive, validate(businessRegisterSchema), ctrl.registerBusiness);
 router.get('/subcategories', ctrl.getSubcategories);         // public — category hierarchy
-router.get('/search', ctrl.searchBusinesses);                // public
+router.get('/search', optionalAuth, ctrl.searchBusinesses);  // public, personalises story state when a token is present
 router.get('/me', protect, ctrl.getMyBusiness);
 router.patch('/profile', protect, validate(businessUpdateSchema), ctrl.updateBusinessProfile);
 
@@ -251,6 +252,6 @@ router.get('/transit/trips', protect, resolveBizProfile, async (req, res) => {
 
 
 // Public business profile lookup — MUST be last
-router.get('/:bizId', ctrl.getBusinessByBizId);
+router.get('/:bizId', optionalAuth, ctrl.getBusinessByBizId);  // public; personalises the story ring when a token is present
 
 module.exports = router;

@@ -209,6 +209,32 @@ async function autoRelease(prisma, opts = {}) {
       log(`offered-categories overlay failed (non-fatal): ${e.message}`);
     }
 
+    // MARKETPLACE PERSONALISATION (Backend A) — BusinessBookmark table.
+    // Same exported-function convention; idempotent, additive, fail-closed
+    // on drift. Part of the REAL boot-time production path on Render Free.
+    try {
+      const { installBusinessBookmarkOverlay } = require('./install-business-bookmark-overlay');
+      const r = await installBusinessBookmarkOverlay(prisma);
+      releaseStatus.businessBookmarkOverlay = r;
+      log(`business-bookmark overlay: ${r.ok} ok, ${r.failed} failed`);
+    } catch (e) {
+      releaseStatus.businessBookmarkOverlay = { error: e.message };
+      log(`business-bookmark overlay failed (non-fatal): ${e.message}`);
+    }
+
+    // MARKETPLACE PERSONALISATION (Backend D) — per-user recommendation
+    // feedback ("Show less like this"). Same convention: idempotent,
+    // additive, fail-closed on drift; part of the boot-time path.
+    try {
+      const { installBusinessRecommendationFeedbackOverlay } = require('./install-business-recommendation-feedback-overlay');
+      const r = await installBusinessRecommendationFeedbackOverlay(prisma);
+      releaseStatus.businessRecommendationFeedbackOverlay = r;
+      log(`business-recommendation-feedback overlay: ${r.ok} ok, ${r.failed} failed`);
+    } catch (e) {
+      releaseStatus.businessRecommendationFeedbackOverlay = { error: e.message };
+      log(`business-recommendation-feedback overlay failed (non-fatal): ${e.message}`);
+    }
+
     releaseStatus.finishedAt = new Date().toISOString();
     log('Release step finished.');
     return releaseStatus;
