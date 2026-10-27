@@ -209,6 +209,18 @@ async function autoRelease(prisma, opts = {}) {
       log(`offered-categories overlay failed (non-fatal): ${e.message}`);
     }
 
+    // MARKETPLACE PERSONALISATION (Backend E) — Notification soft-dismissal
+    // columns + index. Same convention: idempotent, additive, fail-closed.
+    try {
+      const { installNotificationDismissalOverlay } = require('./install-notification-dismissal-overlay');
+      const r = await installNotificationDismissalOverlay(prisma);
+      releaseStatus.notificationDismissalOverlay = r;
+      log(`notification-dismissal overlay: ${r.ok} ok, ${r.failed} failed`);
+    } catch (e) {
+      releaseStatus.notificationDismissalOverlay = { error: e.message };
+      log(`notification-dismissal overlay failed (non-fatal): ${e.message}`);
+    }
+
     releaseStatus.finishedAt = new Date().toISOString();
     log('Release step finished.');
     return releaseStatus;

@@ -206,7 +206,7 @@ class DisputeResolutionService {
                     userId: trade.userId,
                     title: 'Dispute Resolved',
                     body: `Trade #${tradeId} dispute resolved ${ruling === 'BUYER_WINS' ? 'in your favor' : ruling === 'VENDOR_WINS' ? 'in the vendor\'s favor' : 'with a split'}. ${buyerAmount > 0 ? `$${buyerAmount.toFixed(2)} credited.` : ''}`,
-                    category: 'TRADE',
+                    category: 'SECURITY_ACCOUNT', // canonical dispute category (notificationService.formatDisputeUpdated); 'TRADE' is not a NotificationCategory value and was silently downgraded to GENERAL
                     actionPayload: { action: 'OPEN_TRADE', tradeId: String(tradeId) },
                 });
 
@@ -215,7 +215,7 @@ class DisputeResolutionService {
                     userId: trade.vendorId,
                     title: 'Dispute Resolved',
                     body: `Trade #${tradeId} dispute resolved ${ruling === 'VENDOR_WINS' ? 'in your favor' : ruling === 'BUYER_WINS' ? 'in the buyer\'s favor' : 'with a split'}. ${vendorAmount > 0 ? `$${vendorAmount.toFixed(2)} credited.` : ''}`,
-                    category: 'TRADE',
+                    category: 'SECURITY_ACCOUNT', // canonical dispute category (notificationService.formatDisputeUpdated); 'TRADE' is not a NotificationCategory value and was silently downgraded to GENERAL
                     actionPayload: { action: 'OPEN_TRADE', tradeId: String(tradeId) },
                 });
             } catch (err) {

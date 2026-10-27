@@ -228,7 +228,7 @@ function setupSocketHandlers(io, deps) {
                     userId:        trade.userId,
                     title:         'Trade Accepted',
                     body:          `Vendor accepted your order #${tradeId}. Complete payment to continue.`,
-                    category:      'TRADE',
+                    category:      'GENERAL', // 'TRADE' is not a NotificationCategory value; GENERAL is what actually persisted
                     actionPayload: { action: 'OPEN_TRADE', tradeId: String(tradeId) }
                 });
                 pushIfOffline(

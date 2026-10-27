@@ -1684,6 +1684,13 @@ model Notification {
   body          String
   category      NotificationCategory
   isRead        Boolean              @default(false)
+  // Marketplace personalisation (Backend E): owner-scoped soft dismissal.
+  // A dismissed notification is HIDDEN from the owner's list and unread
+  // count but the EVENT RECORD IS PRESERVED (financial/security audit
+  // trails keep their Notification rows; nothing is deleted). isRead and
+  // isDismissed are independent, explicit states.
+  isDismissed   Boolean              @default(false)
+  dismissedAt   DateTime?
   actionPayload Json
   createdAt     DateTime             @default(now())
   updatedAt     DateTime             @updatedAt
@@ -1699,6 +1706,9 @@ model Notification {
   // with any ad-hoc admin queries.
   @@index([userId, createdAt(sort: Desc)])
   @@index([userId, isRead, createdAt(sort: Desc)])
+  // Backend E: powers the isDismissed=false filters on the owner's list
+  // and unread-count reads.
+  @@index([userId, isDismissed])
 }
 
 // =============================================================================
