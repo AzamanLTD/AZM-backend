@@ -151,6 +151,54 @@ refuse a USDC-to-USDC transfer.
 
 Any future route whose authorization adds a GHS conversion, GHS-valued limit, or executable GHS quote MUST mount the gate; `__tests__/route-specific-fx-authorization-gate.test.js` pins the gated set (stale → 503 CLOSED), the USDC-native availability rule (never a gate refusal on same-asset routes), the MoMo-destination conditional, the idempotency non-claim, the saved-rate display-only rule, the auth-before-gate ordering (401 never 503 for unauthenticated callers), the per-mount stack order (auth/ban/2FA → gate → idempotency), and the executor behavior (WITHDRAW_MOMO fail-closed; same-asset legs available; crash-resume never re-gated).
 
+### 4.2 Settlement scale on the gated money paths (cross-border + shared vault)
+
+The gate decides WHETHER a conversion may execute; the settlement-scale
+policy decides WHAT the conversion produces. `services/settlementScale.js`
+is the single settlement authority (full contract in
+`docs/CURRENCY_AND_SETTLEMENT_CONTRACT.md` §Settlement scale and rounding):
+
+- USDC settles at 8 dp; fiat wallet currencies at 2 dp — per currency, never
+  assumed uniform. Rounding is ROUND_HALF_UP, and nothing else may round on
+  these paths.
+- Computed conversions quantize ONCE at the settlement boundary: the
+  fee-adjusted effective rate settles to the snapshot rate column's scale
+  (8 dp) BEFORE multiplying, so the persisted rate is bit-for-bit the rate
+  applied; the conversion product then settles at the destination
+  currency's scale. The SAME settled Decimal is persisted, moved and
+  serialized — the response can never show a number the database did not
+  store (previously the unquantized product went to a `Decimal(20, 8)`
+  column and PostgreSQL silently rounded the write).
+- User-supplied amounts are refused (never rounded) when they carry more
+  precision than the currency's settlement scale: `400
+  AMOUNT_PRECISION_EXCEEDED`. Amounts beyond the storage envelope
+  (`1e409`) are refused at parse time.
+- The shared-vault completion threshold compares exact Decimals (two
+  differing `Decimal(20, 8)` values can be the same JS double); the cancel
+  refund moves the EXACT persisted contribution (a `parseFloat` of a
+  20-significant-digit row moved `12345678901.12345695` instead of the
+  deposited `12345678901.12345678`).
+- Wire serialization is fixed notation (`0.00000001`, never `1e-8`).
+
+Cross-border Susu reads its conversion rate from the persisted
+`FxRate` observation as an EXACT Decimal — the previous
+`parseFloat(row.toString())` round-trip demoted the observation to a JS
+double before the money math ran. Rate freshness discipline (30-minute
+observation age, fail-closed `RATE_UNAVAILABLE`/`RATE_STALE`, no demo
+fallback) is unchanged.
+
+**Proposed pending approval (owner product decisions, not implemented
+here):**
+1. An explicit `destinationType` field on payout requests, to close the
+   8-12-digit numeric-window ambiguity between MoMo numbers and Binance Pay
+   IDs (pinned as a known contract gap in the gate suite; today the
+   classification contract cannot distinguish a 10-digit MoMo-style number
+   from a Binance Pay ID).
+2. A dust-threshold policy for cross-border payouts (a settled payout of
+   `0.00` in the target currency is honest under the scale policy —
+   pinning whether sub-threshold payouts should be refused outright is a
+   product decision, not a money-integrity one).
+
 ---
 
 ## 5. Oracle API — additive `savedRate` block (`GET /api/oracle/rates`)
