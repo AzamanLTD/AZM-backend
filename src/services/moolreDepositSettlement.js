@@ -32,6 +32,7 @@ const {
 } = require('../config/lateDepositSettlement');
 const fiatLiquidity = require('./fiatLiquidityService');
 const modelBSettlement = require('../../services/modelBSettlementService');
+const nativeGhsSettlement = require('../../src/services/nativeGhsSettlementService'); // GHS-native collection settlement (flag-gated, #369)
 const ledger = require('../../services/ledgerService'); // §P.4 authoritative ledger
 
 class ProviderRefContradictionError extends Error {
@@ -121,6 +122,18 @@ async function settleMoolreDeposit(prisma, {
     // §P.5-E: OFF (default) keeps the §P.4 clearing:conversion bridge; ON
     // settles the purchase through authoritative inventory (Model B).
     const modelBOn = await modelBSettlement.isModelBSettlementEnabled(prisma);
+    // GHS-native collection settlement (#369 owner intent): OFF (default)
+    // keeps the legacy USDC conversion credit byte-identical; ON credits the
+    // native-GHS wallet in exact pesewas instead. MUTUALLY EXCLUSIVE with
+    // Model B USDC inventory settlement — an ambiguous configuration fails
+    // CLOSED before any mutation: the deposit stays PENDING and retryable.
+    const nativeGhsOn = await nativeGhsSettlement.isNativeGhsSettlementEnabled(prisma);
+    if (nativeGhsOn && modelBOn) {
+        throw new nativeGhsSettlement.NativeGhsSettlementError(
+            'Ambiguous settlement configuration: nativeGhsSettlementEnabled and modelBSettlementEnabled are both on — refusing to settle',
+            'NATIVE_GHS_MODEL_B_CONTRADICTION',
+        );
+    }
 
     const result = await prisma.$transaction(async (tx) => {
     // §271 late-settlement policy (shared by the mounted webhook AND the
@@ -195,6 +208,14 @@ async function settleMoolreDeposit(prisma, {
           settledRoute: quote.selectedRoute || null,
           settledRoutePolicyVersion: quote.routePolicyVersion || null,
           providerData: providerData ?? null,
+          // Honest settlement destination marker (#369): GHS_NATIVE means
+          // the customer credit went to the native-GHS wallet; USDC is the
+          // legacy conversion credit. The reconciliation sweep keys on it.
+          settlementCurrency: nativeGhsOn ? nativeGhsSettlement.SETTLEMENT_CURRENCY : 'USDC',
+          // The exact identity the settlement ledger key was built from
+          // (externalRef ≠ txHash when the provider carries its own
+          // relatedReference). The sweep re-derives the key from THIS.
+          settlementExternalRef: externalRef,
           ...(quote.consumedLate ? { lateSettlement: true, quoteExpiredAt: quote.expiresAt } : {}),
         },
       },
@@ -208,13 +229,32 @@ async function settleMoolreDeposit(prisma, {
     // different state.
     const updatedTx = await tx.transactionHistory.findUnique({ where: { id: deposit.id } });
 
-    // §P.5-E audit r13 (§2): the balance increment is the EXACT 8dp ledger
+    // ── Customer credit ───────────────────────────────────────────────
+    // GHS-native (flag ON, #369): the settled GHS credits the native-GHS
+    // wallet in EXACT pesewas — no conversion, no USDC mutation. The
+    // settled TransactionHistory row still records the quote's USDC
+    // projection as history (amountUsdc above), but `availableBalance` is
+    // never touched and existing USDC balances are never reinterpreted.
+    //
+    // Legacy (flag OFF): the balance increment is the EXACT 8dp ledger
     // projection of the persisted 12dp quote — never a lossy JS Number
     // that PostgreSQL would have to re-round.
-    await tx.user.update({
-      where: { id: deposit.userId },
-      data: { availableBalance: { increment: settledUsdcLedger } },
-    });
+    let nativeGhsCredit = null;
+    if (nativeGhsOn) {
+      nativeGhsCredit = await nativeGhsSettlement.settleCollectionToNativeGhs(tx, {
+        userId: deposit.userId,
+        amountGhs: settledGhs,
+        reference: externalRef,
+        transactionHistoryId: deposit.id,
+        quoteId,
+        providerRef: settlementProviderRef ?? null,
+      });
+    } else {
+      await tx.user.update({
+        where: { id: deposit.userId },
+        data: { availableBalance: { increment: settledUsdcLedger } },
+      });
+    }
 
     // §P.4 AUTHORITATIVE ACCOUNTING — same caller transaction as the
     // projection credit + TransactionHistory settlement:
@@ -226,7 +266,14 @@ async function settleMoolreDeposit(prisma, {
     // COGS realization, treasury-stake-funded customer liability and the
     // durable realized-economics record — clearing:conversion is NOT
     // touched (docs/p5e-model-b-settlement.md §2.4).
-    if (modelBOn) {
+    //
+    // GHS-native (#369): the §P.4 GHS entry (D fiat:momo:ghs asset,
+    // C ghs:user:{id}:liability) was already posted INSIDE the credit leg
+    // above — Model B and the clearing:conversion bridge are both skipped:
+    // there is no USDC conversion to settle or clear.
+    if (nativeGhsOn) {
+      // posted by settleCollectionToNativeGhs — nothing further here
+    } else if (modelBOn) {
       await modelBSettlement.settleDepositFromInventory(tx, {
         reference: externalRef,
         transactionHistoryId: deposit.id,
@@ -305,7 +352,14 @@ async function settleMoolreDeposit(prisma, {
       });
     }
 
-    return { updatedTx, quote, newBalance: Number(user.availableBalance) + Number(quote.usdcAmount) };
+    return {
+        updatedTx, quote,
+        // GHS-native: the new NATIVE-GHS balance (USDC unchanged).
+        // Legacy: the projected USDC balance, exactly as before.
+        newBalance: nativeGhsOn
+            ? Number(nativeGhsCredit.newNativeGhsBalance)
+            : Number(user.availableBalance) + Number(quote.usdcAmount),
+    };
     });
     return result;
 }

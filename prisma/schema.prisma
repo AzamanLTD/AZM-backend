@@ -1515,6 +1515,12 @@ model GlobalSettings {
   // durable realized economics (cost basis + customer spread).
   modelBSettlementEnabled Boolean @default(false)
 
+  // Native-GHS settlement rollout flag (owner intent, #369): OFF (default)
+  // keeps the legacy USDC conversion credit for settled Moolre collections;
+  // ON credits the customer's native-GHS wallet in exact pesewas instead —
+  // GHS stays GHS. Mutually exclusive with Model B (fail-closed).
+  nativeGhsSettlementEnabled Boolean @default(false)
+
   // Phase Q15: App Version Gate
   minAppVersion  String @default("1.0.0") // Minimum supported app version (semver)
   forceUpdateUrl String @default("https://play.google.com/store/apps/details?id=com.azaman.app")
