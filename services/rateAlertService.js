@@ -92,7 +92,7 @@ class RateAlertService {
                             userId: alert.userId,
                             title: 'Rate Alert Triggered',
                             body: `USDC/GHS is now ${formattedRate} — crossed your ${direction} target of ${formattedTarget}${label}`,
-                            category: 'MARKET',
+                            category: 'GENERAL', // 'MARKET' is not a NotificationCategory value; GENERAL is what actually persisted
                             actionPayload: {
                                 action: 'OPEN_WALLET',
                                 ratePair: CANONICAL_RATE_PAIR,
