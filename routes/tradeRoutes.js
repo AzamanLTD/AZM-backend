@@ -46,10 +46,12 @@ router.get('/:id',     protect, getTradeDetails);
 // controller's explicit pre-economics guards mark the claim releasable
 // (res.locals.financialClaimRelease), and those provably run before the
 // economic transaction.
-router.post('/initiate', protectActive, require2FA(), idempotency(), initiateTrade);
+router.post('/initiate', protectActive, require2FA(),
+    idempotency(), initiateTrade);
 
 // ── Vendor approval actions ──────────────────────────────────────────────────
-router.post('/accept',  protectActive, idempotency(), acceptTrade);
+router.post('/accept',  protectActive,
+    idempotency(), acceptTrade);
 router.post('/decline', protectActive, declineTrade);
 
 // ── Time extension ───────────────────────────────────────────────────────────

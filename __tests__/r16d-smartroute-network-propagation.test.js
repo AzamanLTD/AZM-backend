@@ -79,8 +79,8 @@ describeOrSkip('r16d P0: Smart Route MoMo network propagation', () => {
     async function seedFiatEnv() {
         await prisma.globalSettings.upsert({
             where: { id: 1 },
-            update: { liveRetailRate: 15, liveUsdToGhs: 15 },
-            create: { id: 1, liveRetailRate: 15, liveUsdToGhs: 15 }
+            update: { liveRetailRate: 15, liveUsdToGhs: 15, lastExternalSync: new Date(), lastRateSync: new Date(), liveRateSource: 'KOTANI_PAY' },
+            create: { id: 1, liveRetailRate: 15, liveUsdToGhs: 15, lastExternalSync: new Date(), lastRateSync: new Date(), liveRateSource: 'KOTANI_PAY' }
         });
         await prisma.systemFiatPool.upsert({ where: { id: 1 }, update: { balance: 100000 }, create: { id: 1, balance: 100000 } });
         await prisma.systemMasterCrypto.upsert({ where: { id: 1 }, update: { balance: 0 }, create: { id: 1, balance: 0 } });

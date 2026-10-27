@@ -20,8 +20,11 @@ exports.requestWithdrawal = async (req, res) => {
     const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
     
     try {
-        // We now look for 'destination' (which handles IDs, Wallets, and Phone Numbers)
-        const { amount, destination, networkPref } = req.body;
+        // We now look for 'destination' plus the explicit 'destinationType'
+        // (owner-approved contract, 2026-10-27): numeric destinations are
+        // ambiguous between MoMo numbers and Binance Pay IDs and are never
+        // digit-length-guessed.
+        const { amount, destination, destinationType, networkPref } = req.body;
         const userId = req.user.id;
         const withdrawAmount = parseFloat(amount);
 
@@ -37,6 +40,24 @@ exports.requestWithdrawal = async (req, res) => {
             return res.status(400).json({ success: false, message: "Destination address or number is required." });
         }
 
+        // Destination resolution is the SINGLE shared contract
+        // (services/payoutDestinationClassification.js): the FX
+        // authorization gate and this dispatch read the SAME resolution
+        // so they can never disagree (financial-core blocker A). An
+        // unresolvable destination (numeric without a type, format
+        // mismatch, unknown format) is refused BEFORE any economics —
+        // the same code and message the gate produces.
+        const {
+            resolvePayoutDestination,
+            payoutDestinationRefusal,
+        } = require('../services/payoutDestinationClassification');
+        const resolution = resolvePayoutDestination(destination, destinationType, networkPref);
+        if (resolution.status !== 'RESOLVED') {
+            const refusal = payoutDestinationRefusal(resolution);
+            res.locals.financialClaimRelease = true;
+            return res.status(400).json({ success: false, code: refusal.code, message: refusal.message });
+        }
+
         // 2. Fetch Global Settings for Live Gas Prices
         const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
         if (!settings) throw new Error("Global settings offline.");
@@ -46,37 +67,21 @@ exports.requestWithdrawal = async (req, res) => {
         const platformFeeUsdc = parseFloat((withdrawAmount * cryptoPlatformFeePct).toFixed(6));
         const netAfterPlatformFee = withdrawAmount - platformFeeUsdc;
 
-        // --- THE BACKEND DETECTIVE ---
-        let payoutMethod = "UNKNOWN";
-        let detectedNetwork = networkPref || "UNKNOWN";
+        // --- PAYOUT CLASSIFICATION (resolved above; no silent guessing) ---
         let totalGasFee = 0.0;
 
         const cleanDest = destination.trim();
-        const isNumeric = /^\d+$/.test(cleanDest);
-
-        if (isNumeric && cleanDest.length >= 8 && cleanDest.length <= 12) {
-            // 8 to 12 digits is the standard length of a Binance Pay ID
-            payoutMethod = "BINANCE_ID";
-            detectedNetwork = "BINANCE_PAY";
+        const { payoutMethod, detectedNetwork } = resolution;
+        // Gas-fee resolution per classification (unchanged semantics):
+        if (payoutMethod === "BINANCE_ID") {
             totalGasFee = 0.0; // ZERO FEES!
-        } 
-        else if (cleanDest.startsWith('T') && cleanDest.length === 34) {
-            // Tron (TRC20) addresses always start with 'T' and are 34 chars long
-            payoutMethod = "EXTERNAL_WALLET";
-            detectedNetwork = "TRC20";
+        } else if (payoutMethod === "EXTERNAL_WALLET" && detectedNetwork === "TRC20") {
             totalGasFee = settings.gasFeeTrc20;
-        } 
-        else if (cleanDest.startsWith('0x') && cleanDest.length === 42) {
-            // Ethereum (ERC20) or Binance Smart Chain (BEP20)
-            payoutMethod = "EXTERNAL_WALLET";
-            detectedNetwork = networkPref || "BEP20"; // Default to cheaper BEP20 if not specified
+        } else if (payoutMethod === "EXTERNAL_WALLET") {
+            // ERC20 or BEP20 — detectedNetwork already defaulted by the classifier
             totalGasFee = detectedNetwork === "ERC20" ? settings.gasFeeErc20 : settings.gasFeeBep20;
-        } 
-        else if (isNumeric && cleanDest.length >= 9) {
-            // Looks like an MTN/Telecel phone number
-            payoutMethod = "MOMO";
-            detectedNetwork = networkPref || "MTN";
-            totalGasFee = 0.0; 
+        } else if (payoutMethod === "MOMO") {
+            totalGasFee = 0.0;
         }
 
         // Calculate the 50/50 Split!

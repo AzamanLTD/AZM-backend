@@ -44,12 +44,21 @@ const exactNum = (decimalish) =>
 describeOrSkip('r25 financial concurrency authority (real PostgreSQL)', () => {
     let prisma;
 
-    beforeAll(() => {
+    beforeAll(async () => {
         process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
         process.env.NODE_ENV = 'test';
         process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_secret_at_least_32_chars_long_xxxxx';
         const { PrismaClient } = require('@prisma/client');
         prisma = new PrismaClient();
+        // Hermeticity on a PERSISTENT test DB: LedgerTransaction is not
+        // truncated by afterEach, and the withdrawal ledger keys are derived
+        // from the row id (`ledger:wallet:withdrawal:{id}`), which restarts
+        // after a truncate. Stale postings from a previous run would
+        // replay-refuse this run's first withdrawal. Purge them (the
+        // JournalEntry lines FK to LedgerTransaction — delete children first).
+        await prisma.$executeRaw`DELETE FROM "JournalEntry" WHERE "ledgerTransactionId" IN (
+            SELECT id FROM "LedgerTransaction" WHERE "idempotencyKey" LIKE 'ledger:wallet:withdrawal:%')`;
+        await prisma.$executeRaw`DELETE FROM "LedgerTransaction" WHERE "idempotencyKey" LIKE 'ledger:wallet:withdrawal:%'`;
     });
 
     afterAll(async () => {
@@ -349,6 +358,30 @@ describeOrSkip('r25 financial concurrency authority (real PostgreSQL)', () => {
 
     // ── §6 walletController.requestWithdrawal ───────────────────────────────
     describe('walletController.requestWithdrawal — atomic balance claim', () => {
+        test('missing destinationType on a numeric MoMo destination is refused BEFORE any economic mutation', async () => {
+            await ensureSettings();
+            const ctrl = require('../controllers/walletController');
+            const user = await seedUser(prisma, { availableBalance: 100 });
+
+            const res = mockRes();
+            await ctrl.requestWithdrawal(
+                {
+                    user: { id: user.id },
+                    body: { amount: 60, destination: '0241234567' }, // numeric, NO destinationType
+                    app: mockApp(),
+                },
+                res
+            );
+
+            // The routing refusal happens before economics: nothing was
+            // debited and no Withdrawal row exists.
+            expect(res._status).toBe(400);
+            const withdrawals = await prisma.withdrawal.findMany({ where: { userId: user.id } });
+            expect(withdrawals).toHaveLength(0);
+            const after = await userBalances(user.id);
+            expect(after.available).toBe(100);
+        });
+
         test('two concurrent withdrawals, budget for one: exactly one Withdrawal row, no negative balance', async () => {
             await ensureSettings();
             const ctrl = require('../controllers/walletController');
@@ -358,7 +391,7 @@ describeOrSkip('r25 financial concurrency authority (real PostgreSQL)', () => {
                 ctrl.requestWithdrawal(
                     {
                         user: { id: user.id },
-                        body: { amount: 60, destination: '0241234567' }, // MOMO-shaped, zero gas fee
+                        body: { amount: 60, destination: '0241234567', destinationType: 'MOMO' }, // explicit type — no length-based heuristic; zero gas fee
                         app: mockApp(),
                     },
                     res

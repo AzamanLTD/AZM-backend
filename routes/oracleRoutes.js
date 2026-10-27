@@ -10,6 +10,7 @@
 
 const logger = require('../src/config/logger');
 const express = require('express');
+const { getSavedRateForDisplay } = require('../src/services/fxRateSnapshotService');
 const {
     RATE_FRESHNESS_MAX_AGE_SECONDS,
     RATE_FRESHNESS_CLOCK_SKEW_ALLOWANCE_MS,
@@ -76,6 +77,16 @@ router.get('/rates', async (req, res) => {
     try {
         const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
 
+        // Display-only saved-rate fallback (separate concept from the
+        // current rate). Failure to read it must never break the canonical
+        // rates read: degrade to null.
+        let savedRate = null;
+        try {
+            savedRate = await getSavedRateForDisplay({ prisma });
+        } catch (savedRateErr) {
+            logger.warn({ err: savedRateErr }, '[Oracle] saved-rate snapshot read failed');
+        }
+
         return res.status(200).json({
             success: true,
             data: {
@@ -117,6 +128,13 @@ router.get('/rates', async (req, res) => {
                 })(),
                 rateFreshnessMaxAgeSeconds: RATE_FRESHNESS_MAX_AGE_SECONDS,
                 refreshIntervalSeconds: ORACLE_REFRESH_INTERVAL_SECONDS,
+                // FX-balance workstream — the LAST SUCCESSFULLY VALIDATED
+                // observation as a SEPARATE concept from the current rate
+                // above (additive block). Never labelled fresh/current:
+                // eligibleForDisplayFallback says the honest thing, and a
+                // saved (or demo-seeded) rate is DISPLAY-ONLY — it can
+                // never satisfy the 271C transaction gate.
+                savedRate: savedRate,
             }
         });
     } catch (error) {
