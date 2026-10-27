@@ -210,29 +210,22 @@ describe('FX transaction gate middleware (real PostgreSQL)', () => {
 
     // ── D. NO conditional bypass (universal scope) ──────────────────────
 
-    test('the retired `when` predicate cannot soften the gate — no bypass exists', async () => {
-        await setGlobal('12.5', null); // gate CLOSED
+    test('a call site cannot soften the gate with a lambda — only reviewed scope classifications exist', async () => {
+        // Route-specific contract (AZM-Planning #75): scoping is a CLOSED
+        // ENUM of reviewed classifications, never an arbitrary predicate a
+        // call site can pass to opt out. A lambda (or any unknown scope)
+        // is refused LOUDLY at factory time.
+        expect(() => requireFreshFxRate({ when: () => true })).toThrow(/unknown scope/);
+        expect(() => requireFreshFxRate({ when: 'MOMO_PAYOUT_DESTINATION' })).not.toThrow();
+        expect(() => requireFreshFxRate()).not.toThrow();
 
-        // The factory takes NO options: a leftover conditional-style call
-        // site requireFreshFxRate({ when: ... }) is inert — the gate still
-        // runs unconditionally.
-        const gate = requireFreshFxRate({
-            when: () => true, // a stale call site trying to opt out
-        });
-        expect(requireFreshFxRate.length).toBe(0); // signature has no params
-
-        // "FX-independent-looking" request (crypto destination): still refused
-        const refusedRes = buildRes();
-        const refusedNext = jest.fn();
-        await gate(buildReq({ destination: '0x742d35Cc6634C0532925a3b844Bc454e44384444' }), refusedRes, refusedNext);
-        expect(refusedNext).not.toHaveBeenCalled();
-        expect(refusedRes.status).toHaveBeenCalledWith(503);
-
-        // And the middleware source ships no conditional bypass at all.
+        // The middleware source contains no lambda bypass — the only
+        // conditional branch is the reviewed MoMo-destination
+        // classification with its in-file predicate.
         const src = require('fs').readFileSync(
             require('path').resolve(__dirname, '../middleware/fxTransactionGateMiddleware.js'), 'utf8');
-        expect(src).not.toMatch(/function requireFreshFxRate\(\{ when \}/);
-        expect(src).not.toMatch(/!when\(req\)/);
+        expect(src).not.toMatch(/when\(req\)/);
+        expect(src).toMatch(/SCOPE_ENUM/);
     });
 
     // ── E/F. real route wiring pinned ───────────────────────────────────

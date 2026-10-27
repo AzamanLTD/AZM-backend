@@ -47,7 +47,6 @@ router.post('/fiat',
 // oracle, even when the payout destination itself is on-chain USDC.
 router.post('/crypto',
     protect, require2FA(),
-    requireFreshFxRate(),
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
     validate(cryptoWithdrawalSchema),
     withdrawalController.cryptoWithdrawal);

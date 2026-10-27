@@ -88,46 +88,68 @@ Honesty rules (proven by tests):
 
 ## 4. Transaction gate — `middleware/fxTransactionGateMiddleware.js`
 
-`requireFreshFxRate()` — UNIVERSAL, no options, no conditional bypass:
+`requireFreshFxRate()` — route-specific, fail-closed on every mount:
 
 - Delegates to the ONE canonical freshness authority (271C): `getFreshServerRateGhsPerUsdc` — fail-closed on NULL/future/stale `lastExternalSync` or unusable rate value, recomputed AT REQUEST TIME.
 - Refuses 503 with `success=false`, stable `code` (`RATE_STALE`/`RATE_UNAVAILABLE`), `retryable=true`, `usdcTransactionGate:'CLOSED'`, and the honest `savedRateIsDisplayOnly:true` hint. No client retry storm can turn a stale oracle green.
 - Mount ORDERING contract (pinned by tests): authentication / ban guard / required 2FA run BEFORE the gate; the gate runs BEFORE `idempotency` and before any controller. An unauthenticated request gets the auth verdict (401) and never learns the gate's state; a refused request never claims an idempotency key, never moves money, never dispatches to a provider. Controllers' own internal gates re-validate inside the financial transaction for defense in depth.
-- The gate is mounted UNCONDITIONALLY on every new USDC-enabled transaction authorization (see §4.1) — USDC-native destinations do NOT stay enabled on a stale oracle, because the balance being spent against cannot be honestly valued. The retired `when` predicate NO LONGER EXISTS in the middleware: there is no lambda a call site can pass to soften the gate. Any future exception must be a reviewed, documented, TESTED exception in this inventory — not a runtime flag.
+- SCOPING (AZM-Planning #75): the gate is mounted on FX-DEPENDENT authorizations only — routes whose authorization needs GHS conversion, a GHS-valued limit, or an executable GHS quote (see §4.1). There is no arbitrary runtime lambda; the ONLY conditional form is the reviewed, built-in `requireFreshFxRate({ when: 'MOMO_PAYOUT_DESTINATION' })` destination predicate (a closed enum — unknown scopes throw at mount time). USDC-native same-asset routes simply do not mount the gate; every such route is classified with evidence in the §4.1 inventory.
 
-### 4.1 Gate scope — UNIVERSAL (every new USDC-enabled transaction authorization)
+### 4.1 Gate scope — ROUTE-SPECIFIC (FX-dependent authorizations only; AZM-Planning #75)
 
-**Superseded scope.** The earlier conditional scoping (`when: isMomoPayoutDestination`, FX-dependence-only rows) is RETIRED. The universal policy is now shipped: a stale/missing canonical rate makes the whole combined wallet valuation unpriceable at authorization time, so EVERY new USDC-enabled transaction authorization — including flows whose own math computes no GHS conversion (USDC-to-USDC transfers, escrow funding, vault/savings deposits, on-chain crypto dispatch, checkout, dine-in pay, chat money-accept, order-book orders, round-up processing, AZM→USDC conversion, manual smart-route execution) — is refused while the canonical observation is missing, invalid, or stale. Reference behavior (Wise/Revolut): money movement is disabled entirely when the FX feed is down.
+**Rework of the earlier universal scope.** The universal policy ("every new
+USDC-enabled transaction authorization is refused while the canonical rate is
+stale, including flows whose own math computes no GHS conversion") conflated
+two availability concepts and is RETIRED. The route-specific contract is now
+shipped: **a fresh canonical GHS/USDC rate is required exactly when an
+authorization needs (a) GHS conversion, (b) a GHS-valued limit, or (c) a
+route-specific executable quote.** USDC-native SAME-ASSET actions are NOT
+gated: their availability is independent of whether the combined GHS display
+valuation can be refreshed. A combined-balance display outage must not
+refuse a USDC-to-USDC transfer.
 
-| Route family | Gated? |
+**Gated — FX-dependent authorizations (evidence-based classification):**
+
+| Route | Why the authorization needs a fresh rate |
 |---|---|
-| `POST /api/withdraw/fiat`, `POST /api/withdraw/crypto` | **YES — unconditional** |
-| `POST /api/wallet/withdraw` (ALL destinations — MoMo phone AND crypto/Binance/TRC20) | **YES — unconditional** (the conditional `isMomoPayoutDestination` predicate is retired) |
-| `POST /api/wallet/internal-transfer` | **YES** |
-| P2P trades `/initiate`, `/accept`; p2p ping `/accept` | **YES** |
-| Savings goals `deposit`, `withdraw` | **YES** (plus the controllers' own internal gates — defense in depth) |
-| Vault `/deposit`; vault `/break` (early release: returns remaining funds, applies penalty, posts a ledger release); shared-vault `/deposit` | **YES** |
-| `POST /api/escrow/fund` | **YES** |
-| Chat money `accept-money` | **YES** |
-| Storefront `checkout`, `order` | **YES** |
-| Dine-in `tabs/:tabId/pay` | **YES** |
-| Cross-border susu `contribute` | **YES** |
-| Order-book `POST /orders` | **YES** |
-| Round-up `process` | **YES** |
-| AZM→USDC conversion | **YES** |
-| Smart-route `run-now` (manual execution) | **YES** |
-| Deposit quotes (fiat initiate/moolre/otp) | Already gated internally (`quoteFiatDepositController.js:127` maps `RateUnavailableError` → 503) |
-| **SmartRoute scheduled executors** (WITHDRAW_MOMO, INTERNAL_TRANSFER, VAULT_DEPOSIT) | **YES — fail-closed at the executor seam** before any reservation/debit/ledger/provider intent; rate-classified failure, next occurrence retries. The MoMo crash-RESUME path is intentionally NOT re-gated (a prior authorization converges at its originally reserved amount). |
+| `POST /api/withdraw/fiat` | GHS MoMo payout quoted at authorization (`rateGhsPerUsdc` at quote time) — executable GHS quote. |
+| `POST /api/wallet/withdraw` | **Destination-conditional**: MoMo phone destinations dispatch a GHS payout (needs the executable quote); crypto/Binance/TRC20 destinations are same-asset USDC dispatch and pass through. The predicate is a reviewed, built-in scope (`requireFreshFxRate({ when: 'MOMO_PAYOUT_DESTINATION' })`) — not an arbitrary lambda. |
+| Savings goals `deposit`, `withdraw` | USDC⇄GHS goal conversion quoted at authorization (`quoteGhsPerUsdc`; `RateUnavailableError` → 503 internally too — defense in depth). |
+| `POST /api/cross-border-susu/contribute` | Local→base currency conversion at a fresh pair observation (executable quote). |
+| Smart-route executor `WITHDRAW_MOMO` | Fail-closed at the executor seam before any reservation/debit/provider intent; crash-RESUME of an existing reservation is intentionally NOT re-gated. |
+| Deposit quotes (fiat initiate/moolre/otp) | Already gated internally (`quoteFiatDepositController.js:127` maps `RateUnavailableError` → 503). |
+
+**NOT gated — USDC-native same-asset authorizations (each classified under the same rules):**
+
+| Route | Classification evidence |
+|---|---|
+| `POST /api/friends/transfer/send` | USDC peer transfer (`amount` debited from `availableBalance`, credited to recipient) — same-asset; no GHS conversion, limit, or quote anywhere in the path. Inventory entry: correctly NOT gated (it never mounted the gate). |
+| `POST /api/conversations/:id/messages/:id/accept-money` | Accepts a USDC money-request ticket: `ticket.amount` USDC debit/credit, no rate read in the service. |
+| `POST /api/escrow/fund` | Funds escrow with the deal's `amountUsdc`; no rate read. |
+| `POST /api/trades/initiate`, `/accept` | Phase F2: flat USDC fee, no GHS oracle math (USDC↔USD 1:1 parity minus platform fee; oracle rate is only for the internal MoMo rail). |
+| `POST /api/p2p/ping/accept` | Moves `topUpAmount` USDC to unallocated; no rate read. |
+| `POST /api/order-book/orders` | Orders reserve `priceUsdc`; no rate read. |
+| `POST /api/round-up/process` | Rounds up USDC spend into a USDC savings bucket; no conversion. |
+| `POST /api/storefront/:id/checkout`, `/order` | USDC-priced items (`unitPriceUsdc`); no GHS math in the flow. |
+| `POST /api/dine-in/tabs/:id/pay` | Tab totals are USDC (`billTotalUsdc`, `tipUsdc`, `feeUsdc`); no rate read. |
+| `POST /api/vaults/:id/deposit`, `/break`; `POST /api/shared-vaults/:id/deposit` | USDC vaults (`amountUsdc`); no rate read. |
+| `POST /api/wallet/internal-transfer` | Same-asset USDC peer move. |
+| `POST /api/withdraw/crypto` | USDC dispatch to an external wallet. |
+| `POST /api/azm-convert` | Converts at the INTERNAL policy rate (`BASE_RATE` × profit-pool health factor) — not the canonical GHS/USDC oracle. |
+| `POST /api/smart-routes/:id/run-now` | Manual execution is action-classified at the executor seam (above), not by a route-level gate. INTERNAL_TRANSFER and VAULT_DEPOSIT executor legs are same-asset and execute without a rate check. |
+| Smart-route executors `INTERNAL_TRANSFER`, `VAULT_DEPOSIT` | Same-asset USDC moves — no executor-seam rate assert (reworked). |
 
 **Intentionally NOT gated — settlement protection.** Lifecycle/settlement routes (trades decline, escrow satisfy/cancel, refunds, expiries, reconciliation convergence) finalize or reverse ALREADY-AUTHORIZED operations. A rate refusal can never block settlement. `requireFreshFxRate()` is mounted only on authorization entry points. Documented exceptions:
 
 | Route | Classification | Integrity requirement |
 |---|---|---|
-| `DELETE /api/shared-vaults/:id` (owner cancels, refunds all contributors) | **Reversal of already-authorized deposits** — deliberately available during an FX outage (users must be able to exit a shared vault when the oracle is down). NOT a new authorization, so NOT gated. | The cancellation/refund must be SINGLE-WINNER: a second cancel request must never re-refund. Guarded `status → CANCELLED` transition + refunds inside one transaction (tracked in the financial-integrity follow-up PR). |
-| `POST /api/cross-border-susu/payout` | **NOT covered by this gate.** It converts the base-currency payout into the recipient's chosen target currency at payout-time rates via the multi-currency `FxRate` table — a NEW FX conversion at execution time, not settlement of a persisted USDC/GHS quote. The USDC/GHS canonical gate does not authorize this pair. | Single-winner `status → PAID_OUT` transition atomic with the wallet credit (no replay double-credit), and payout-pair rate honesty (no demo fallback, freshness-checked observation). Tracked as a high-priority financial-integrity issue in the follow-up PR — NOT silently classified as safe settlement. |
-| `POST /api/wallet/deposit/initialize` | **NOT a live provider payment path.** It generates a deposit reference and returns payment instructions without creating a durable provider operation or dispatching a Moolre request. Classified as instructions/reference generation, not a functioning deposit authorization. | Do not present this route as a covered live financial route; a real provider integration remains open work. |
+| `DELETE /api/shared-vaults/:id` (owner cancels, refunds all contributors) | **Reversal of already-authorized deposits** — deliberately available during an FX outage (users must be able to exit a shared vault when the oracle is down). NOT a new authorization, so NOT gated. | The cancellation/refund must be SINGLE-WINNER: guarded `status: ACTIVE → CANCELLED` claim + transaction-consistent member refunds in ONE transaction (proven in the financial-integrity PR). |
+| `POST /api/cross-border-susu/payout` | **NOT covered by this gate.** It converts the base-currency payout into the recipient's chosen target currency at payout-time rates via the multi-currency `FxRate` table — a NEW FX conversion at execution time, not settlement of a persisted USDC/GHS quote. | Explicit eligible-state claim + funding proof + payout-pair rate honesty (proven in the financial-integrity PR). |
+| `POST /api/wallet/deposit/initialize` | **NOT a live provider payment path.** Reference/instructions generation only. | Real provider integration remains open work. |
 
-Any future NEW USDC-enabled transaction authorization MUST mount the gate; `__tests__/universal-usdc-transaction-gate.test.js` pins every currently-gated mount (stale → 503 CLOSED), the idempotency non-claim, the saved-rate display-only rule, the auth-before-gate ordering (401 never 503 for unauthenticated callers), the per-mount stack order (auth/ban/2FA → gate → idempotency), and the executor fail-closed/resume behavior.
+**Valuation reconciliation (`valuation.usdcTransactionGateOpen`).** One boolean must not imply identical availability for every USDC-native action. `usdcTransactionGateOpen` remains the honest mirror of the fresh-rate authority but is now documented as governing FX-DEPENDENT authorizations ONLY. The additive sibling `usdcNativeActionsAvailable: true` states that same-asset USDC actions are available regardless of the oracle state (they never consult it). Frontends must not derive USDC-native button availability from the FX-dependent boolean.
+
+Any future route whose authorization adds a GHS conversion, GHS-valued limit, or executable GHS quote MUST mount the gate; `__tests__/route-specific-fx-authorization-gate.test.js` pins the gated set (stale → 503 CLOSED), the USDC-native availability rule (never a gate refusal on same-asset routes), the MoMo-destination conditional, the idempotency non-claim, the saved-rate display-only rule, the auth-before-gate ordering (401 never 503 for unauthenticated callers), the per-mount stack order (auth/ban/2FA → gate → idempotency), and the executor behavior (WITHDRAW_MOMO fail-closed; same-asset legs available; crash-resume never re-gated).
 
 ---
 

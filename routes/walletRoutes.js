@@ -38,7 +38,7 @@ const { requireFreshFxRate } = require('../middleware/fxTransactionGateMiddlewar
 // the gate. (The former isMomoPayoutDestination predicate is retired.)
 router.post('/withdraw',
     protectActive, require2FA(),
-    requireFreshFxRate(),
+    requireFreshFxRate({ when: 'MOMO_PAYOUT_DESTINATION' }),
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
     walletController.requestWithdrawal);
 
@@ -107,7 +107,7 @@ router.get('/pool-withdrawal-preview', protect, async (req, res) => {
 
 // POST /api/wallet/internal-transfer
 // Body: { direction: 'TO_POOL' | 'FROM_POOL', amount: number }
-router.post('/internal-transfer', protectActive, require2FA(), requireFreshFxRate(),
+router.post('/internal-transfer', protectActive, require2FA(),
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), async (req, res) => {
     const prisma = req.app.get('prisma');
     const emitBalanceUpdate = req.app.get('emitBalanceUpdate');

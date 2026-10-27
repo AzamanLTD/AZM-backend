@@ -23,7 +23,6 @@
 // =============================================================================
 
 const express = require('express');
-const { requireFreshFxRate } = require('../middleware/fxTransactionGateMiddleware');
 const router = express.Router();
 const crypto = require('crypto');
 const logger = require('../src/config/logger');
@@ -311,7 +310,7 @@ const _action = (fn) => async (req, res) => {
 
 // 3. Accept a money request
 router.post('/:conversationId/messages/:messageId/accept-money', protectActive,
-    requireFreshFxRate(), _action((s, a) => s.acceptMoney(a)));
+    _action((s, a) => s.acceptMoney(a)));
 
 // 4. Decline a money request
 router.post('/:conversationId/messages/:messageId/decline-money', protectActive,
