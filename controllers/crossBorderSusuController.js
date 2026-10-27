@@ -19,6 +19,12 @@ const { PrismaClient, Prisma } = require('@prisma/client');
 const prisma = new PrismaClient();
 const logger = require('../src/config/logger');
 const { SUPPORTED_CURRENCIES } = require('./multiCurrencyController');
+const {
+    Decimal,
+    quantizeFor,
+    toWireString,
+    parseUserAmount,
+} = require('../services/settlementScale');
 
 const CROSS_BORDER_FEE = 0.005; // 0.5% fee on cross-border conversions
 const MAX_COUNTRIES_PER_GROUP = 5;
@@ -42,8 +48,14 @@ async function getFreshCrossBorderRate(from, to) {
     err.code = 'RATE_UNAVAILABLE';
     throw err;
   }
-  const rate = parseFloat(row.rate.toString());
-  if (!Number.isFinite(rate) || rate <= 0) {
+  // SETTLEMENT SCALE: the persisted FxRate row is already a Prisma.Decimal
+  // (column Decimal(20, 8)) — the exact observation. The previous
+  // parseFloat(row.toString()) round-trip demoted it to a JS double and
+  // the money math then re-parsed that lossy representation. Conversions
+  // use the exact Decimal; finiteness/positivity are checked with Decimal
+  // arithmetic, not Number.isFinite.
+  const rate = new Decimal(row.rate.toString());
+  if (!rate.isFinite() || rate.lte(0)) {
     const err = new Error('FX rate unavailable.');
     err.code = 'RATE_UNAVAILABLE';
     throw err;
@@ -81,6 +93,23 @@ async function createCrossBorderSusu(req, res) {
       return res.status(400).json({ success: false, message: 'Unsupported base currency.' });
     }
 
+    // SETTLEMENT SCALE (Blocker B): the per-cycle contribution is a real
+    // money amount persisted to a Decimal(20, 8) column. Parse it through
+    // the settlement authority BEFORE the group is created — refuses
+    // zero/negative/non-numeric input and precision beyond the base
+    // currency's settlement scale instead of silently rounding a
+    // parseFloat into the ledger.
+    const contributionParse = parseUserAmount(contributionAmount, baseCurr);
+    if (!contributionParse.ok) {
+      return res.status(400).json({
+        success: false,
+        code: contributionParse.code,
+        message: contributionParse.code === 'AMOUNT_PRECISION_EXCEEDED'
+          ? `Contribution amount exceeds ${baseCurr} settlement precision.`
+          : 'Invalid contribution amount.',
+      });
+    }
+
     if (!memberCountries || memberCountries.length < 2) {
       return res.status(400).json({ success: false, message: 'Cross-border Susu requires members from at least 2 countries.' });
     }
@@ -100,7 +129,9 @@ async function createCrossBorderSusu(req, res) {
     const susuGroup = await prisma.susuGroup.create({
       data: {
         status: 'CONFIGURING',
-        contributionUsdc: parseFloat(contributionAmount), // base currency amount
+        // Validated + settled above (contributionParse) — the exact
+        // Decimal, never a parseFloat of the raw request.
+        contributionUsdc: contributionParse.amount, // base currency amount
         frequency: frequency.toUpperCase(),
         totalCycles: parseInt(totalCycles),
         startDate: new Date(req.body.startDate || Date.now() + 24 * 60 * 60 * 1000),
@@ -153,15 +184,23 @@ async function contributeLocalCurrency(req, res) {
     // ONCE into an exact Prisma.Decimal here, validated strictly
     // (finite, > 0), and every downstream calculation and DB write uses
     // that Decimal — no float arithmetic anywhere on the money path.
-    let localAmountDec;
-    try {
-      localAmountDec = new Prisma.Decimal(String(localAmount).trim());
-    } catch (_e) {
-      return res.status(400).json({ success: false, message: 'Invalid amount.' });
+    // SETTLEMENT SCALE (Blocker B): user-supplied amounts are NEVER
+    // silently rounded. The old path accepted any Decimal — including
+    // sub-minor-unit precision ("10.000000001" GHS) that the wallet debit
+    // and the Decimal(20, 8) snapshot could not both represent. The
+    // request must settle exactly at the local currency's scale or be
+    // refused with an explicit AMOUNT_PRECISION_EXCEEDED.
+    const localParse = parseUserAmount(localAmount, localCurr);
+    if (!localParse.ok) {
+      return res.status(400).json({
+        success: false,
+        code: localParse.code,
+        message: localParse.code === 'AMOUNT_PRECISION_EXCEEDED'
+          ? `Amount exceeds ${localCurr} settlement precision.`
+          : 'Invalid amount.',
+      });
     }
-    if (!localAmountDec.isFinite() || localAmountDec.lte(0)) {
-      return res.status(400).json({ success: false, message: 'Invalid amount.' });
-    }
+    const localAmountDec = localParse.amount;
 
     // Get cross-border config
     const config = await prisma.crossBorderSusuConfig.findUnique({
@@ -182,15 +221,29 @@ async function contributeLocalCurrency(req, res) {
     }
     const fxRate = freshRate.rate;
 
-    // Apply cross-border fee — EXACT DECIMAL ARITHMETIC (review fix):
-    // the contribution money path previously ran through JS floats
-    // (parseFloat * rate), losing sub-cent precision on every conversion.
-    // All amounts are now Prisma.Decimal end-to-end: parse, fee
-    // application, conditional debit, contribution record, FX snapshot.
-    const effectiveRate = new Prisma.Decimal(String(fxRate))
-      .mul(new Prisma.Decimal(1).minus(new Prisma.Decimal(String(CROSS_BORDER_FEE))));
-    const baseAmount = localAmountDec.mul(effectiveRate);
-    const feeAmount = localAmountDec.mul(new Prisma.Decimal(String(CROSS_BORDER_FEE)));
+    // Apply cross-border fee — EXACT DECIMAL ARITHMETIC, settled at the
+    // boundary (Blocker B): the full-precision conversion product is
+    // quantized ONCE to the base currency's settlement scale with the
+    // policy rounding (ROUND_HALF_UP). The SETTLED values — not the
+    // full-precision intermediates — are what the contribution record,
+    // the FX snapshot, and the response all carry, so the persisted row,
+    // the wallet math and the client see THE SAME number. (Previously the
+    // unquantized product was persisted and PostgreSQL silently rounded
+    // the Decimal(20, 8) column on insert — the response then serialized
+    // the pre-rounding value the database never stored.)
+    //
+    // The effective rate is itself settled to the snapshot column's scale
+    // (Decimal(18, 8)) BEFORE the multiplication, so the persisted
+    // snapshot rate is bit-for-bit the rate actually applied.
+    const effectiveRate = quantizeFor(
+      new Decimal(String(fxRate)).mul(new Decimal(1).minus(new Decimal(String(CROSS_BORDER_FEE)))),
+      'USDC' // rate columns settle at the base scale
+    );
+    const baseAmount = quantizeFor(localAmountDec.mul(effectiveRate), config.baseCurrency);
+    const feeAmount = quantizeFor(
+      localAmountDec.mul(new Decimal(String(CROSS_BORDER_FEE))),
+      localCurr
+    );
 
     // Resolve the wallet for the 404 verdict; the balance CHECK happens
     // inside the transaction as a conditional debit so two concurrent
@@ -252,11 +305,13 @@ async function contributeLocalCurrency(req, res) {
       fxSnapshot: {
         from: localCurr,
         to: config.baseCurrency,
-        // exact wire representation — authoritative Decimal strings
-        localAmount: localAmountDec.toString(),
-        baseAmount: result.baseAmount.toString(),
-        rate: effectiveRate.toString(),
-        fee: result.feeAmount.toString(),
+        // exact wire representation — the SETTLED values, fixed notation,
+        // bit-for-bit what was persisted (never scientific notation, never
+        // a pre-rounding intermediate)
+        localAmount: toWireString(localAmountDec, localCurr),
+        baseAmount: toWireString(result.baseAmount, config.baseCurrency),
+        rate: toWireString(effectiveRate, 'USDC'),
+        fee: toWireString(result.feeAmount, localCurr),
       },
     });
   } catch (err) {
@@ -312,8 +367,18 @@ async function payoutLocalCurrency(req, res) {
     }
     const fxRate = freshRate.rate;
 
-    // No fee on payout (fee was collected at contribution time)
-    const targetAmount = basePayout.mul(new Prisma.Decimal(String(fxRate)));
+    // No fee on payout (fee was collected at contribution time).
+    //
+    // SETTLEMENT SCALE (Blocker B): the payout conversion is quantized
+    // ONCE to the TARGET currency's settlement scale with the policy
+    // rounding — the same settled Decimal is then what the wallet credit
+    // increments, the FX snapshot persists and the response serializes.
+    // The unquantized product previously diverged from the persisted
+    // Decimal(20, 8) row PostgreSQL silently rounded.
+    const targetAmount = quantizeFor(
+      basePayout.mul(new Decimal(String(fxRate))),
+      targetCurr
+    );
 
     // Resolve the target wallet for the 404 verdict; the wallet is created
     // inside the transaction.
@@ -380,7 +445,8 @@ async function payoutLocalCurrency(req, res) {
         data: { balance: { increment: targetAmount } },
       });
 
-      // Record payout FX snapshot
+      // Record payout FX snapshot — the SETTLED targetAmount (same value
+      // credited above) and the rate column's own scale (Decimal(18, 8)).
       await tx.crossBorderFxSnapshot.create({
         data: {
           susuGroupId: cycle.susuGroupId,
@@ -390,7 +456,7 @@ async function payoutLocalCurrency(req, res) {
           toCurrency: targetCurr,
           localAmount: basePayout,
           baseAmount: targetAmount,
-          rate: fxRate,
+          rate: quantizeFor(new Decimal(String(fxRate)), 'USDC'),
           fee: 0, // no fee on payout
         },
       });
@@ -403,10 +469,11 @@ async function payoutLocalCurrency(req, res) {
       success: true,
       message: `Payout: ${basePayout.toFixed(2)} ${config.baseCurrency} → ${result.targetAmount.toFixed(2)} ${targetCurr}.`,
       payout: {
-        // exact wire representation — authoritative Decimal strings
-        baseAmount: basePayout.toString(),
+        // exact wire representation — the SETTLED values, fixed notation,
+        // bit-for-bit what was persisted and credited
+        baseAmount: toWireString(basePayout, config.baseCurrency),
         baseCurrency: config.baseCurrency,
-        targetAmount: result.targetAmount.toString(),
+        targetAmount: toWireString(result.targetAmount, targetCurr),
         targetCurrency: targetCurr,
         rate: String(fxRate),
       },

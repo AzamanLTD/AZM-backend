@@ -113,7 +113,7 @@ const MARK = `swp-${Date.now()}`;
         await setFreshRate();
         // Snapshot every FX pair this suite touches so afterAll can restore
         // the exact pre-existing state (row values OR absence).
-        for (const [from, to] of [['GHS', 'USD'], ['USD', 'GHS']]) {
+        for (const [from, to] of [['GHS', 'USD'], ['USD', 'GHS'], ['GHS', 'NGN']]) {
             originalFxPairs[`${from}:${to}`] = await prisma.fxRate.findUnique({
                 where: { fromCurrency_toCurrency: { fromCurrency: from, toCurrency: to } },
             });
@@ -607,6 +607,308 @@ const MARK = `swp-${Date.now()}`;
             expect(parseFloat(wallet.balance)).toBeCloseTo(20, 6); // debited exactly once
             const contributions = await prisma.susuContribution.count({ where: { cycleId: cycle.id, userId: user.id } });
             expect(contributions).toBe(1);
+        });
+    });
+
+    // ── SETTLEMENT SCALE (Blocker B) ────────────────────────────────────────
+    //
+    // The cross-border money paths must settle computed conversions ONCE at
+    // the destination currency's scale, and the SAME settled Decimal must
+    // be what the DB row persists, the wallet moves and the response
+    // serializes. These regressions use deliberately awkward amounts and
+    // rates (sub-minor-unit products, 14-digit rates, dust payouts) to pin
+    // the boundary and the wire representation.
+    describe('Cross-border settlement scale — awkward amounts settle identically everywhere', () => {
+        const setupGroup = async (user, { payoutAmount, baseCurrency = 'GHS' } = {}) => {
+            const group = await prisma.susuGroup.create({
+                data: { contributionUsdc: 10, totalCycles: 1, contractRequiredCount: 1, startDate: new Date(), rotationSnapshot: [], frequency: 'WEEKLY' },
+            });
+            seeded.groupIds.push(group.id);
+            await prisma.crossBorderSusuConfig.create({
+                data: { susuGroupId: group.id, baseCurrency, memberCountries: [], createdBy: user.id },
+            });
+            const member = await prisma.susuMember.create({
+                data: { susuGroupId: group.id, userId: user.id, cycleSlot: 1, trustScore: 1 },
+            });
+            const cycle = await prisma.susuCycle.create({
+                data: { susuGroupId: group.id, cycleNumber: 1, collectionDate: new Date(), payoutAmount, payoutUserId: user.id, status: 'COLLECTING' },
+            });
+            seeded.cycleIds.push(cycle.id);
+            return { group, member, cycle };
+        };
+
+        test('a 14-digit rate contribution: response wire string === persisted contribution === persisted FX snapshot (bit-for-bit)', async () => {
+            // 12.34349999999999 is 17 significant digits — a JS double cannot
+            // represent it; only exact Decimal arithmetic survives the
+            // round trip. The fee-adjusted effective rate settles FIRST to
+            // the snapshot column scale (12.34349999999999 * 0.995 =
+            // 12.28178249999999... -> 12.28178250), then 10.01 USD *
+            // 12.28178250 = 122.941049... settles to 122.94 GHS (HALF_UP).
+            await upsertFxRate('USD', 'GHS', '12.34349999999999', new Date());
+            const user = await mkUser(30);
+            seeded.userIds.push(user.id);
+            await prisma.currencyWallet.create({ data: { userId: user.id, currency: 'USD', balance: 100 } });
+            const { group, member, cycle } = await setupGroup(user, { payoutAmount: 10 });
+
+            mockAuthUserId = user.id;
+            const res = await request(app).post('/api/cross-border-susu/contribute')
+                .set('idempotency-key', `${MARK}-scale-1`)
+                .send({ susuGroupId: group.id, cycleId: cycle.id, memberId: member.id, localAmount: '10.01', localCurrency: 'USD' });
+            expect(res.status).toBe(200);
+            expect(res.body.fxSnapshot.baseAmount).toBe('122.94');
+
+            // The SAME settled value the response serialized is what the
+            // database actually stored (Postgres would otherwise have
+            // silently rounded an unquantized write).
+            const contribution = await prisma.susuContribution.findFirst({ where: { cycleId: cycle.id, userId: user.id } });
+            expect(contribution.amountUsdc.toString()).toBe('122.94');
+            const snapshot = await prisma.crossBorderFxSnapshot.findFirst({ where: { cycleId: cycle.id, userId: user.id } });
+            expect(snapshot.baseAmount.toString()).toBe('122.94');
+            // Snapshot rate is the SETTLED effective rate actually applied
+            // (12.34349999999999 * 0.995 = 12.2817824999999... → 12.28178250;
+            // Postgres numeric normalizes the trailing zero on read-back).
+            expect(snapshot.rate.toString()).toBe('12.2817825');
+            // The wallet was debited the exact requested local amount.
+            const wallet = await prisma.currencyWallet.findUnique({ where: { userId_currency: { userId: user.id, currency: 'USD' } } });
+            expect(wallet.balance.toString()).toBe('89.99');
+        });
+
+        test('a contribution with sub-minor-unit precision is REFUSED — no silent rounding of a debit', async () => {
+            await upsertFxRate('USD', 'GHS', 12.5, new Date());
+            const user = await mkUser(31);
+            seeded.userIds.push(user.id);
+            await prisma.currencyWallet.create({ data: { userId: user.id, currency: 'USD', balance: 100 } });
+            const { group, member, cycle } = await setupGroup(user, { payoutAmount: 10 });
+
+            mockAuthUserId = user.id;
+            const res = await request(app).post('/api/cross-border-susu/contribute')
+                .set('idempotency-key', `${MARK}-scale-2`)
+                .send({ susuGroupId: group.id, cycleId: cycle.id, memberId: member.id, localAmount: '10.000000001', localCurrency: 'USD' });
+            expect(res.status).toBe(400);
+            expect(res.body.code).toBe('AMOUNT_PRECISION_EXCEEDED');
+
+            // Nothing moved: wallet untouched, no contribution, no snapshot.
+            const wallet = await prisma.currencyWallet.findUnique({ where: { userId_currency: { userId: user.id, currency: 'USD' } } });
+            expect(wallet.balance.toString()).toBe('100');
+            expect(await prisma.susuContribution.count({ where: { cycleId: cycle.id, userId: user.id } })).toBe(0);
+            expect(await prisma.crossBorderFxSnapshot.count({ where: { cycleId: cycle.id, userId: user.id } })).toBe(0);
+        });
+
+        test('group creation refuses an over-precision / zero / astronomical base contribution before any durable write', async () => {
+            const user = await mkUser(32);
+            seeded.userIds.push(user.id);
+            mockAuthUserId = user.id;
+            const base = { name: 'scale-group', contributionAmount: null, baseCurrency: 'GHS', frequency: 'WEEKLY', totalCycles: 1, memberCountries: [{ country: 'GH' }, { country: 'NG' }] };
+            const mkBody = (amount) => ({ ...base, contributionAmount: amount });
+
+            const over = await request(app).post('/api/cross-border-susu').send(mkBody('10.000000001'));
+            expect(over.status).toBe(400);
+            expect(over.body.code).toBe('AMOUNT_PRECISION_EXCEEDED');
+
+            const zero = await request(app).post('/api/cross-border-susu').send(mkBody('0'));
+            expect(zero.status).toBe(400);
+            expect(zero.body.code).toBe('INVALID_AMOUNT');
+
+            const huge = await request(app).post('/api/cross-border-susu').send(mkBody('1e409'));
+            expect(huge.status).toBe(400);
+            expect(huge.body.code).toBe('INVALID_AMOUNT');
+
+            // All three refusals happened BEFORE any durable write.
+            const groupsForUser = await prisma.crossBorderSusuConfig.count({ where: { createdBy: user.id } });
+            expect(groupsForUser).toBe(0);
+        });
+
+        test('an awkward payout: wallet credit === snapshot row === response string, settled at the TARGET currency scale', async () => {
+            // 33.33333333 GHS * 1234.56789123 NGN/GHS = 41152.2626736...
+            // settles to 41152.26 NGN (HALF_UP at the 3rd decimal) — an
+            // exact-Decimal product, not a double approximation.
+            await upsertFxRate('GHS', 'NGN', '1234.56789123', new Date());
+            const user = await mkUser(33);
+            seeded.userIds.push(user.id);
+            await prisma.currencyWallet.create({ data: { userId: user.id, currency: 'NGN', balance: 0 } });
+            const { cycle } = await setupGroup(user, { payoutAmount: '33.33333333' });
+            // Fund the pool exactly (funding proof requires PAID backing).
+            const member = await prisma.susuMember.findFirst({ where: { susuGroupId: cycle.susuGroupId, userId: user.id } });
+            await prisma.susuContribution.create({
+                data: { cycleId: cycle.id, memberId: member.id, userId: user.id, amountUsdc: '33.33333333', status: 'PAID' },
+            });
+            await prisma.susuCycle.update({ where: { id: cycle.id }, data: { status: 'COLLECTING_GRACE' } });
+
+            mockAuthUserId = user.id;
+            const res = await request(app).post('/api/cross-border-susu/payout')
+                .set('idempotency-key', `${MARK}-scale-4`)
+                .send({ cycleId: cycle.id, targetCurrency: 'NGN' });
+            expect(res.status).toBe(200);
+            expect(res.body.payout.targetAmount).toBe('41152.26');
+            expect(res.body.payout.targetAmount).not.toMatch(/e/i); // never scientific notation
+
+            // The SAME settled value was credited, persisted and returned.
+            const wallet = await prisma.currencyWallet.findUnique({ where: { userId_currency: { userId: user.id, currency: 'NGN' } } });
+            expect(wallet.balance.toString()).toBe('41152.26');
+            const snapshot = await prisma.crossBorderFxSnapshot.findFirst({ where: { cycleId: cycle.id, userId: user.id } });
+            expect(snapshot.baseAmount.toString()).toBe('41152.26');
+            expect(snapshot.rate.toString()).toBe('1234.56789123');
+        });
+
+        test('a dust payout settles to an honest fixed-notation zero — never an exponential credit', async () => {
+            await upsertFxRate('GHS', 'USD', 0.08, new Date());
+            const user = await mkUser(34);
+            seeded.userIds.push(user.id);
+            await prisma.currencyWallet.create({ data: { userId: user.id, currency: 'USD', balance: 0 } });
+            const { cycle } = await setupGroup(user, { payoutAmount: '0.00000001' });
+            const member = await prisma.susuMember.findFirst({ where: { susuGroupId: cycle.susuGroupId, userId: user.id } });
+            await prisma.susuContribution.create({
+                data: { cycleId: cycle.id, memberId: member.id, userId: user.id, amountUsdc: '0.00000001', status: 'PAID' },
+            });
+            await prisma.susuCycle.update({ where: { id: cycle.id }, data: { status: 'COLLECTING_GRACE' } });
+
+            mockAuthUserId = user.id;
+            const res = await request(app).post('/api/cross-border-susu/payout')
+                .set('idempotency-key', `${MARK}-scale-5`)
+                .send({ cycleId: cycle.id, targetCurrency: 'USD' });
+            expect(res.status).toBe(200);
+            // 0.00000001 GHS * 0.08 = 8e-10 USD — below USD settlement
+            // precision. The honest settled value is "0.00" in FIXED
+            // notation (Decimal.toString would render "8e-10"), and the
+            // snapshot row, wallet and response all agree on it.
+            expect(res.body.payout.targetAmount).toBe('0.00');
+            const snapshot = await prisma.crossBorderFxSnapshot.findFirst({ where: { cycleId: cycle.id, userId: user.id } });
+            // Postgres normalizes numeric 0.00 to 0 on the way back; the
+            // pinned contract is that the persisted value EQUALS the
+            // settled response amount (0) — and the response itself never
+            // leaks scientific notation.
+            expect(Number(snapshot.baseAmount)).toBe(0);
+        });
+    });
+
+    // ── SETTLEMENT SCALE (Blocker B) — shared vault ────────────────────────
+    //
+    // The vault completion threshold and the cancel refunds previously ran
+    // through parseFloat: a Decimal(20, 8) row demoted to a JS double.
+    // These regressions pin the exact-Decimal behavior at the boundaries
+    // where a double provably differs (20-significant-digit values, 8-dp
+    // deposits, threshold-at-exact-target).
+    describe('Shared vault — settlement scale on deposit, completion and refund', () => {
+        test('an exact 8-dp deposit survives the request/persistence/response cycle bit-for-bit', async () => {
+            const owner = await mkUser(40);
+            const member = await mkUser(41, { available: 1 });
+            seeded.userIds.push(owner.id, member.id);
+            const vault = await prisma.sharedVault.create({
+                data: { name: `${MARK} scale`, targetAmountUsdc: 1000, creatorId: owner.id, members: { create: [{ userId: member.id, role: 'CONTRIBUTOR' }] } },
+            });
+            seeded.vaultIds.push(vault.id);
+
+            mockAuthUserId = member.id;
+            const res = await request(app).post(`/api/shared-vaults/${vault.id}/deposit`)
+                .set('idempotency-key', `${MARK}-scale-dep-1`)
+                .send({ amountUsdc: '0.12345678' });
+            expect(res.status).toBe(200);
+
+            // Response carries exact fixed-notation strings.
+            expect(res.body.data.myContribution).toBe('0.12345678');
+            expect(res.body.data.newVaultTotal).toBe('0.12345678');
+
+            // The DB moved the exact Decimal, not a double.
+            const u = await prisma.user.findUnique({ where: { id: member.id } });
+            expect(u.availableBalance.toString()).toBe('0.87654322');
+            expect(u.escrowLockedBalance.toString()).toBe('0.12345678');
+            const v = await prisma.sharedVault.findUnique({ where: { id: vault.id }, include: { members: true } });
+            expect(v.currentAmountUsdc.toString()).toBe('0.12345678');
+            expect(v.members[0].contributedUsdc.toString()).toBe('0.12345678');
+        });
+
+        test('an over-precision deposit is REFUSED — nothing moves', async () => {
+            const owner = await mkUser(42);
+            const member = await mkUser(43, { available: 1 });
+            seeded.userIds.push(owner.id, member.id);
+            const vault = await prisma.sharedVault.create({
+                data: { name: `${MARK} over`, targetAmountUsdc: 1000, creatorId: owner.id, members: { create: [{ userId: member.id, role: 'CONTRIBUTOR' }] } },
+            });
+            seeded.vaultIds.push(vault.id);
+
+            mockAuthUserId = member.id;
+            const res = await request(app).post(`/api/shared-vaults/${vault.id}/deposit`)
+                .set('idempotency-key', `${MARK}-scale-dep-2`)
+                .send({ amountUsdc: '0.000000001' }); // 9 dp — beyond USDC scale
+            expect(res.status).toBe(400);
+            expect(res.body.code).toBe('AMOUNT_PRECISION_EXCEEDED');
+
+            const u = await prisma.user.findUnique({ where: { id: member.id } });
+            expect(u.availableBalance.toString()).toBe('1');
+            expect(u.escrowLockedBalance.toString()).toBe('0');
+            const v = await prisma.sharedVault.findUnique({ where: { id: vault.id }, include: { members: true } });
+            expect(v.currentAmountUsdc.toString()).toBe('0');
+            expect(v.members[0].contributedUsdc.toString()).toBe('0');
+        });
+
+        test('completion flips on an EXACT Decimal threshold (8-dp target reached exactly)', async () => {
+            const owner = await mkUser(44);
+            const member = await mkUser(45, { available: '123.45678912' });
+            seeded.userIds.push(owner.id, member.id);
+            const vault = await prisma.sharedVault.create({
+                data: { name: `${MARK} thr`, targetAmountUsdc: '123.45678912', creatorId: owner.id, members: { create: [{ userId: member.id, role: 'CONTRIBUTOR' }] } },
+            });
+            seeded.vaultIds.push(vault.id);
+
+            mockAuthUserId = member.id;
+            const res = await request(app).post(`/api/shared-vaults/${vault.id}/deposit`)
+                .set('idempotency-key', `${MARK}-scale-dep-3`)
+                .send({ amountUsdc: '123.45678912' });
+            expect(res.status).toBe(200);
+
+            const v = await prisma.sharedVault.findUnique({ where: { id: vault.id } });
+            // currentAmount == target EXACTLY (gte on exact Decimals).
+            expect(v.status).toBe('COMPLETED');
+            expect(v.completedAt).not.toBeNull();
+            expect(v.currentAmountUsdc.toString()).toBe('123.45678912');
+        });
+
+        test('a 20-significant-digit contribution refunds the EXACT deposited amount (a double provably differs)', async () => {
+            // 12345678901.12345678 needs all 20 digits of Decimal(20, 8);
+            // parseFloat renders it 12345678901.12345695 — a DIFFERENT
+            // number. The refund must move the deposited value exactly.
+            const contributed = '12345678901.12345678';
+            const owner = await mkUser(46, { locked: contributed });
+            const member = await mkUser(47, { locked: contributed });
+            seeded.userIds.push(owner.id, member.id);
+            const vault = await prisma.sharedVault.create({
+                data: {
+                    name: `${MARK} refund`, targetAmountUsdc: '99999999999', creatorId: owner.id,
+                    members: { create: [
+                        { userId: owner.id, role: 'OWNER', contributedUsdc: contributed },
+                        { userId: member.id, contributedUsdc: contributed },
+                    ] },
+                },
+            });
+            seeded.vaultIds.push(vault.id);
+
+            mockAuthUserId = owner.id;
+            const res = await request(app).delete(`/api/shared-vaults/${vault.id}`);
+            expect(res.status).toBe(200);
+
+            const ownerRow = await prisma.user.findUnique({ where: { id: owner.id } });
+            const memberRow = await prisma.user.findUnique({ where: { id: member.id } });
+            // EXACT refund — the persisted Decimal, not a double of it.
+            expect(ownerRow.availableBalance.toString()).toBe(contributed);
+            expect(ownerRow.escrowLockedBalance.toString()).toBe('0');
+            expect(memberRow.availableBalance.toString()).toBe(contributed);
+            expect(memberRow.escrowLockedBalance.toString()).toBe('0');
+
+            // The ledger lines carry the exact amounts too (double-entry:
+            // debit the released restriction, credit the liability — each
+            // line exactly the deposited Decimal).
+            const refundLines = await prisma.journalEntry.findMany({
+                where: { entryType: 'SHARED_VAULT_REFUND', relatedEntityId: vault.id },
+                select: { debit: true, credit: true },
+            });
+            expect(refundLines.length).toBe(4); // 2 lines per refunded member
+            // Double-entry: each posting balances — one debit line and one
+            // credit line, each carrying the EXACT deposited Decimal (a
+            // parseFloat refund would have persisted 12345678901.12345695).
+            const movement = (e) => (e.debit.gt(0) ? e.debit : e.credit);
+            expect(refundLines.every(e => movement(e).toString() === contributed)).toBe(true);
+            const balanced = refundLines.reduce((sum, e) => sum.plus(e.debit).minus(e.credit), new (require('@prisma/client').Prisma).Decimal(0));
+            expect(balanced.isZero()).toBe(true);
         });
     });
 });

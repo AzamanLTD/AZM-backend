@@ -16,6 +16,11 @@ const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 const logger = require('../src/config/logger');
 const ledger = require('../services/ledgerService');
+const {
+    Decimal,
+    parseUserAmount,
+    toWireString,
+} = require('../services/settlementScale');
 
 // ── Create ──────────────────────────────────────────────────────────────────
 async function create(req, res) {
@@ -24,6 +29,22 @@ async function create(req, res) {
 
   if (!name || !targetAmountUsdc) {
     return res.status(400).json({ success: false, message: 'Name and target amount are required.' });
+  }
+
+  // SETTLEMENT SCALE (Blocker B): the vault target is a USDC money amount
+  // persisted to a Decimal(20, 8) column. parseUserAmount validates it
+  // (positive, finite, within the storage envelope, at most 8 dp) and
+  // settles the exact Decimal — the previous parseFloat silently wrote a
+  // JS double and accepted zero/negative/over-precision input.
+  const targetParse = parseUserAmount(targetAmountUsdc, 'USDC');
+  if (!targetParse.ok) {
+    return res.status(400).json({
+      success: false,
+      code: targetParse.code,
+      message: targetParse.code === 'AMOUNT_PRECISION_EXCEEDED'
+        ? 'Target amount exceeds USDC settlement precision.'
+        : 'Invalid target amount.',
+    });
   }
 
   try {
@@ -39,7 +60,7 @@ async function create(req, res) {
       data: {
         name,
         emoji,
-        targetAmountUsdc: parseFloat(targetAmountUsdc),
+        targetAmountUsdc: targetParse.amount, // exact settled Decimal
         maturityDate: maturityDate ? new Date(maturityDate) : null,
         creatorId,
         members: {
@@ -201,11 +222,23 @@ async function deposit(req, res) {
   const { amountUsdc } = req.body;
   const userId = req.user.id;
 
-  if (!amountUsdc || parseFloat(amountUsdc) <= 0) {
-    return res.status(400).json({ success: false, message: 'Invalid amount.' });
+  // SETTLEMENT SCALE (Blocker B): a deposit is a real debit against
+  // User.availableBalance. The request amount must settle EXACTLY at the
+  // USDC scale — over-precision input is refused (never silently rounded
+  // into a debit), and the exact Decimal (not a parseFloat double) flows
+  // into the conditional debit, vault increment, member increment and
+  // ledger lines.
+  const amountParse = parseUserAmount(amountUsdc, 'USDC');
+  if (!amountParse.ok) {
+    return res.status(400).json({
+      success: false,
+      code: amountParse.code,
+      message: amountParse.code === 'AMOUNT_PRECISION_EXCEEDED'
+        ? 'Amount exceeds USDC settlement precision.'
+        : 'Invalid amount.',
+    });
   }
-
-  const amount = parseFloat(amountUsdc);
+  const amount = amountParse.amount;
 
   try {
     const vault = await prisma.sharedVault.findUnique({
@@ -283,8 +316,14 @@ async function deposit(req, res) {
 
         // Target reached → guarded completion transition (single-winner:
         // a concurrent second deposit cannot double-flip COMPLETED).
-        const newTotal = parseFloat(updatedVault.currentAmountUsdc);
-        if (newTotal >= parseFloat(updatedVault.targetAmountUsdc)) {
+        // SETTLEMENT SCALE (Blocker B): the threshold is an EXACT Decimal
+        // comparison. Decimal(20, 8) values carry up to 20 significant
+        // digits — a JS double cannot represent them, so the previous
+        // parseFloat >= comparison could misjudge completion at the
+        // boundary (e.g. 10,000,000.00000001 vs 10,000,000.00000002 are
+        // the SAME double).
+        if (new Decimal(updatedVault.currentAmountUsdc.toString())
+            .gte(new Decimal(updatedVault.targetAmountUsdc.toString()))) {
             await tx.sharedVault.updateMany({
                 where: { id, status: 'ACTIVE' },
                 data: { status: 'COMPLETED', completedAt: new Date() },
@@ -303,14 +342,17 @@ async function deposit(req, res) {
             relatedEntity: 'sharedVault',
             relatedEntityId: id,
             lines: [
-                { account: `user:${userId}:liability`, debit: amount.toFixed(8) },
-                { account: `escrow:shared-vault-${id}:locked`, credit: amount.toFixed(8) },
+                { account: `user:${userId}:liability`, debit: toWireString(amount, 'USDC') },
+                { account: `escrow:shared-vault-${id}:locked`, credit: toWireString(amount, 'USDC') },
             ],
         });
 
+        // SETTLEMENT SCALE (Blocker B): exact decimal strings, fixed
+        // notation — the same values the database just persisted (a
+        // parseFloat could not represent a 20-digit Decimal(20, 8) row).
         data = {
-            newVaultTotal: parseFloat(updatedVault.currentAmountUsdc),
-            myContribution: parseFloat(updatedMember.contributedUsdc),
+            newVaultTotal: toWireString(updatedVault.currentAmountUsdc, 'USDC'),
+            myContribution: toWireString(updatedMember.contributedUsdc, 'USDC'),
         };
     });
 
@@ -439,8 +481,16 @@ async function cancel(req, res) {
       // (User.availableBalance) and release the matching escrow
       // restriction, with the §P.4 ledger reversal of the deposit legs.
       for (const m of members) {
-        const contributed = parseFloat(m.contributedUsdc);
-        if (!(contributed > 0)) continue;
+        // SETTLEMENT SCALE (Blocker B): the refund moves the EXACT
+        // persisted Decimal. The previous parseFloat(m.contributedUsdc)
+        // demoted the Decimal(20, 8) row to a JS double — for
+        // 20-significant-digit balances the refund then moved a
+        // DIFFERENT amount than the member actually deposited (and the
+        // ledger line re-serialized the already-lossy double). The
+        // refund, the balance write and the ledger lines now all carry
+        // the exact stored value.
+        const contributed = new Decimal(m.contributedUsdc.toString());
+        if (contributed.lte(0)) continue;
         await tx.user.update({
           where: { id: m.userId },
           data: {
@@ -456,8 +506,8 @@ async function cancel(req, res) {
           relatedEntity: 'sharedVault',
           relatedEntityId: id,
           lines: [
-            { account: `escrow:shared-vault-${id}:locked`, debit: contributed.toFixed(8) },
-            { account: `user:${m.userId}:liability`, credit: contributed.toFixed(8) },
+            { account: `escrow:shared-vault-${id}:locked`, debit: toWireString(contributed, 'USDC') },
+            { account: `user:${m.userId}:liability`, credit: toWireString(contributed, 'USDC') },
           ],
         });
       }
