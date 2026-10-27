@@ -160,6 +160,7 @@ describe('Balance valuation contract (real PostgreSQL)', () => {
         expect(v.currentRate.isFresh).toBe(true);
         expect(v.currentRate.rateExact).toBe('12.50000000');
         expect(v.usdcTransactionGateOpen).toBe(true);
+        expect(v.usdcNativeActionsAvailable).toBe(true); // same-asset USDC actions are never FX-gated
         // 50 + 100*12.5 = 1300 GHS; 1300/12.5 = 104 USDC-equivalent
         expect(v.availableGhsValue.exact).toBe('1300.00000000');
         expect(v.usdcEquivalent.exact).toBe('104.00000000');
@@ -212,6 +213,7 @@ describe('Balance valuation contract (real PostgreSQL)', () => {
         expect(v.valuationStatus).toBe('SAVED_FALLBACK');
         expect(v.currentRate).toBeNull(); // a saved rate is NEVER labelled current
         expect(v.usdcTransactionGateOpen).toBe(false);
+        expect(v.usdcNativeActionsAvailable).toBe(true); // same-asset USDC actions are never FX-gated
         expect(v.usdcTransactionGateReason).toBe('NO_FRESH_CANONICAL_RATE_SAVED_FALLBACK_DISPLAY_ONLY');
         // 10 + 20*12 = 250
         expect(v.availableGhsValue.value).toBe(250);
@@ -227,6 +229,7 @@ describe('Balance valuation contract (real PostgreSQL)', () => {
         expect(v.rateStatus).toBe('DEMO_FALLBACK');
         expect(v.valuationStatus).toBe('DEMO_FALLBACK');
         expect(v.usdcTransactionGateOpen).toBe(false);
+        expect(v.usdcNativeActionsAvailable).toBe(true); // same-asset USDC actions are never FX-gated
         expect(v.usdcTransactionGateReason).toBe('NO_FRESH_CANONICAL_RATE_DEMO_FALLBACK_DISPLAY_ONLY');
         // 0 + 100*12.03 = 1203
         expect(v.availableGhsValue.value).toBe(1203);
@@ -247,6 +250,7 @@ describe('Balance valuation contract (real PostgreSQL)', () => {
         expect(v.usdcEquivalent).toBeNull();
         expect(v.displayRate).toBeNull();
         expect(v.usdcTransactionGateOpen).toBe(false);
+        expect(v.usdcNativeActionsAvailable).toBe(true); // same-asset USDC actions are never FX-gated
         // The native GHS component is still reported SEPARATELY and honestly
         expect(v.nativeGhsAvailable.value).toBe(30);
         expect(v.availableUsdc.value).toBe(75);
@@ -262,6 +266,7 @@ describe('Balance valuation contract (real PostgreSQL)', () => {
         expect(v.availableGhsValue.exact).toBe('30.00000000'); // native total remains valid
         expect(v.usdcEquivalent).toBeNull(); // nothing to value in USDC
         expect(v.usdcTransactionGateOpen).toBe(false);
+        expect(v.usdcNativeActionsAvailable).toBe(true); // same-asset USDC actions are never FX-gated
     });
 
     // ── F. locked buckets, native units, excluded from the headline ─────

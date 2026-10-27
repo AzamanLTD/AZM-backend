@@ -1,11 +1,17 @@
 'use strict';
 
-// FX-unavailable transaction gate middleware (FX-balance workstream).
+// FX-dependent authorization gate (FX-balance workstream).
 //
-// PRODUCT POLICY (enforced server-side, never by disabled frontend buttons):
-// when the CURRENT canonical USDC/GHS rate is not fresh/valid, USDC-enabled
-// transaction actions are UNAVAILABLE. A saved/demo fallback rate is NEVER
-// transaction authorization — it exists for display only.
+// ARCHITECTURE CONTRACT (AZM-Planning #75 — route-specific FX policy):
+// a fresh canonical GHS/USDC rate is required ONLY where the
+// authorization itself needs GHS conversion, applies a GHS-valued limit,
+// or executes a route-specific GHS quote. A same-asset USDC movement
+// (USDC-to-USDC transfer, escrow funding, vault/savings-USDC deposits,
+// on-chain crypto dispatch, checkout of USDC-priced goods, ...) does NOT
+// become unavailable because the separate combined GHS display valuation
+// cannot be refreshed. The display value of an asset is not the amount of
+// the asset held — availability of same-asset actions is never hostage to
+// the display oracle.
 //
 // The gate delegates to the ONE canonical freshness authority
 // (transactionQuoteService.getFreshServerRateGhsPerUsdc, 271C): fail-closed
@@ -29,27 +35,68 @@
 // unauthenticated request must never learn the gate's state, and a refused
 // request never claims an idempotency key.
 //
-// Scope discipline: mount ONLY on NEW USDC-enabled transaction
-// authorizations. Read models (balance/valuation/oracle), auth,
+// SCOPE SELECTION — a CLOSED enum, not a lambda. A mount site picks one of
+// the reviewed classifications below; there is no way for a call site to
+// pass an arbitrary predicate that could soften the freshness check itself.
+//   • (default)            — mount on a route whose authorization converts
+//                            GHS, applies a GHS-valued limit, or executes a
+//                            GHS quote (see docs/native-ghs-fx-audit.md
+//                            §4.1 for the per-route inventory + evidence).
+//   • 'MOMO_PAYOUT_DESTINATION' — mount on a route that is FX-dependent
+//                            ONLY for MoMo phone destinations (the GHS
+//                            payout quote); crypto/external-wallet
+//                            destinations are same-asset USDC dispatches
+//                            and pass through unconditionally. The
+//                            destination predicate is built in, tested,
+//                            and never caller-supplied.
+//
+// Settlement protection (unchanged): read models, auth,
 // settlement/lifecycle routes (decline, satisfy, cancel, refund, expiry —
 // completions/reversals of ALREADY-AUTHORIZED operations) and provider
-// WEBHOOKS are deliberately not gated: a rate refusal can never block
-// settlement — see docs/native-ghs-fx-audit.md §4.1 for the full route
-// inventory and documented exceptions.
+// WEBHOOKS are deliberately not gated — a rate refusal can never block
+// settlement.
 
 const { getFreshServerRateGhsPerUsdc } = require('../src/services/transactionQuoteService');
 
-// UNIVERSAL SCOPE — no conditional bypass. The earlier `when` predicate
-// (conditional FX-dependence scoping) is RETIRED: a stale/missing canonical
-// rate makes the whole combined wallet valuation unpriceable at
-// authorization time, so EVERY new USDC-enabled transaction authorization on
-// a gated route is refused — including flows whose own math computes no GHS
-// conversion. There is deliberately no way for a call site to soften this
-// middleware; if a future route needs a scoped exception it must be a
-// reviewed, documented, TESTED exception (see the settlement-protection
-// inventory in docs/native-ghs-fx-audit.md §4.1), not a lambda.
-function requireFreshFxRate() {
-    return async (req, res, next) => {
+// Destination predicate for the MoMo-destination classification. The
+// wallet-withdraw destination space is exactly: Binance Pay IDs, TRC20
+// addresses (T..., 34 chars), EVM addresses (0x..., 42 chars), and MoMo
+// phone numbers (numeric, >= 9 digits) — the same classifier the
+// controller's payout-method dispatch uses. A MoMo destination authorizes
+// a GHS payout (FX-dependent); every other destination is same-asset USDC.
+function _isMomoPayoutDestination(req) {
+    const dest = String(req.body?.destination ?? '').trim();
+    return dest.length > 0 && /^\d{9,15}$/.test(dest);
+}
+
+const SCOPE_ENUM = Object.freeze({
+    ALWAYS: 'ALWAYS',
+    MOMO_PAYOUT_DESTINATION: 'MOMO_PAYOUT_DESTINATION',
+});
+
+function requireFreshFxRate({ when } = {}) {
+    if (when !== undefined && !SCOPE_ENUM[when]) {
+        throw new Error(
+            `requireFreshFxRate: unknown scope '${when}' — use a reviewed classification (see docs/native-ghs-fx-audit.md §4.1)`
+        );
+    }
+    const scope = when || SCOPE_ENUM.ALWAYS;
+    // Named so the route-level stack-order pins can identify the gate
+    // layer by signature (freshFxRate / usdcTransactionGate).
+    async function freshFxRateGate(req, res, next) {
+        // Destination-conditional classification: non-MoMo destinations are
+        // same-asset USDC dispatches — never FX-gated (route-specific
+        // contract, AZM-Planning #75). This branch does NOT touch the
+        // freshness authority at all.
+        if (scope === SCOPE_ENUM.MOMO_PAYOUT_DESTINATION && !_isMomoPayoutDestination(req)) {
+            return next();
+        }
+        return _assertFresh(req, res, next);
+    }
+    return freshFxRateGate;
+}
+
+async function _assertFresh(req, res, next) {
         try {
             const prisma = req.app.get('prisma');
             if (!prisma) {
@@ -84,7 +131,6 @@ function requireFreshFxRate() {
                 savedRateIsDisplayOnly: true,
             });
         }
-    };
 }
 
-module.exports = { requireFreshFxRate };
+module.exports = { requireFreshFxRate, SCOPE_ENUM };

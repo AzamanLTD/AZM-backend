@@ -212,6 +212,7 @@ describe('GET /api/users/balance — route-level valuation contract (real Postgr
 
         // Fresh canonical rate ONLY opens the transaction gate.
         expect(v.usdcTransactionGateOpen).toBe(true);
+        expect(v.usdcNativeActionsAvailable).toBe(true); // same-asset USDC actions are never FX-gated
         expect(v.usdcTransactionGateReason).toBe('FRESH_CANONICAL_RATE');
 
         // Locked buckets arrive in NATIVE units, excluded from the headline.
@@ -245,6 +246,7 @@ describe('GET /api/users/balance — route-level valuation contract (real Postgr
         expect(v.availableGhsValue.exact).toBe('1240.00000000');
         expect(v.usdcEquivalent.exact).toBe('100.00000000');
         expect(v.usdcTransactionGateOpen).toBe(false);
+        expect(v.usdcNativeActionsAvailable).toBe(true); // same-asset USDC actions are never FX-gated
         expect(v.usdcTransactionGateReason).toBe('NO_FRESH_CANONICAL_RATE_SAVED_FALLBACK_DISPLAY_ONLY');
         expect(res.body.data.valuationStatus).toBe('SAVED_FALLBACK');
     });
@@ -262,6 +264,7 @@ describe('GET /api/users/balance — route-level valuation contract (real Postgr
         expect(v.valuationStatus).toBe('DEMO_FALLBACK');
         expect(v.displayRate.rateExact).toBe('12.03000000');
         expect(v.usdcTransactionGateOpen).toBe(false);
+        expect(v.usdcNativeActionsAvailable).toBe(true); // same-asset USDC actions are never FX-gated
         expect(v.usdcTransactionGateReason).toBe('NO_FRESH_CANONICAL_RATE_DEMO_FALLBACK_DISPLAY_ONLY');
     });
 
@@ -279,6 +282,7 @@ describe('GET /api/users/balance — route-level valuation contract (real Postgr
         expect(v.usdcEquivalent).toBeNull();
         expect(v.displayRate).toBeNull();
         expect(v.usdcTransactionGateOpen).toBe(false);
+        expect(v.usdcNativeActionsAvailable).toBe(true); // same-asset USDC actions are never FX-gated
         expect(v.usdcTransactionGateReason).toBe('NO_FRESH_CANONICAL_RATE');
         // The components stay separately, honestly reported.
         expect(v.nativeGhsAvailable.value).toBe(30);
@@ -300,6 +304,7 @@ describe('GET /api/users/balance — route-level valuation contract (real Postgr
         expect(v.availableGhsValue.exact).toBe('30.00000000');
         expect(v.usdcEquivalent).toBeNull();
         expect(v.usdcTransactionGateOpen).toBe(false);
+        expect(v.usdcNativeActionsAvailable).toBe(true); // same-asset USDC actions are never FX-gated
     });
 
     test('unknown caller: honest 404, no fabricated valuation', async () => {

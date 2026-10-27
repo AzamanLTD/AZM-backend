@@ -1,45 +1,51 @@
-// __tests__/universal-usdc-transaction-gate.test.js
+// __tests__/route-specific-fx-authorization-gate.test.js
 // =============================================================================
-// Universal USDC transaction gate — route-level pin + Smart Route executor
-// fail-closed proof (real PostgreSQL, real routers, no service mocks).
+// Route-specific FX authorization gate — route-level pin + Smart Route
+// executor proof (real PostgreSQL, real routers, no service mocks).
 //
-// PRODUCT POLICY (docs/native-ghs-fx-audit.md §4.1, superseded-scope fix):
-// every NEW USDC-enabled transaction authorization — including routes whose
-// own math computes no GHS conversion (peer transfers, escrow funding,
-// vault/savings deposits, crypto dispatch, checkout, dine-in pay, chat money
-// accept, order-book USDC reserves, round-up processing, AZM→USDC conversion,
-// manual smart-route execution) — is UNAVAILABLE while the canonical rate is
-// missing, invalid or stale. A saved/demo fallback rate NEVER opens the gate.
+// PRODUCT POLICY (AZM-Planning #75, rework of the universal scope):
+// a fresh canonical GHS/USDC rate is required exactly when an
+// authorization needs (a) GHS conversion, (b) a GHS-valued limit, or
+// (c) a route-specific executable quote. USDC-native SAME-ASSET actions
+// (peer transfers, escrow funding, vault/savings-bucket deposits in
+// USDC, crypto dispatch, checkout, dine-in pay, chat money accept,
+// order-book USDC reserves, round-up processing, AZM->USDC conversion at
+// the internal policy rate) are NOT gated: their availability is
+// independent of whether the combined GHS display valuation can be
+// refreshed.
 //
 // PROVES:
-//   1. Route pin: every gated route refuses 503 RATE_STALE (gate CLOSED)
-//      BEFORE the controller and BEFORE the idempotency claim.
-//   2. The refusal never claims an idempotency key: after the rate recovers,
-//      the SAME key reaches the controller fresh (no replayed 503).
+//   1. Route pin: every FX-DEPENDENT gated route refuses 503 RATE_STALE
+//      (gate CLOSED) BEFORE the controller and BEFORE the idempotency
+//      claim.
+//   1n. AVAILABILITY: USDC-native same-asset routes are NOT gated — a
+//      stale rate never produces the gate refusal on them.
+//   1m. DESTINATION-CONDITIONAL: /api/wallet/withdraw gates ONLY MoMo
+//      phone destinations (a GHS payout needs a fresh rate); crypto
+//      destinations pass through on the same stale rate.
+//   2. The refusal never claims an idempotency key: after the rate
+//      recovers, the SAME key reaches the controller fresh.
 //   3. A saved fallback snapshot does NOT open the gate (display-only).
 //   4. A missing observation fails closed as RATE_UNAVAILABLE.
-//   5. Fresh rate → routes reachable (gate passes; controllers respond with
+//   5. Fresh rate -> gated routes reachable (controllers respond with
 //      their own validation, never the gate refusal).
-//   6. SETTLEMENT PROTECTION: lifecycle/settlement routes (trades decline,
-//      escrow satisfy/cancel) are NOT gated — a stale rate never blocks the
-//      settlement of an already-authorized operation.
-//   1b. ORDERING — authentication precedes the gate: an unauthenticated
-//      request on ANY gated route gets the auth response (401), never the
-//      gate's 503 — it cannot learn the gate's state.
-//   1c. ORDERING — stack pin: on every gated mount, auth/ban/2FA layers run
-//      before the gate, and the gate runs before the idempotency layer.
-//   7. Smart Route executors fail closed on a stale/missing rate BEFORE any
-//      reservation, debit, ledger posting or provider intent (WITHDRAW_MOMO,
-//      INTERNAL_TRANSFER, VAULT_DEPOSIT); the run FAILED with a
-//      rate-classified reason and the next occurrence retries.
-//   8. The MoMo crash-RESUME path is NOT re-gated: an existing reservation
-//      settles on its originally reserved amount even with a stale rate.
+//   6. SETTLEMENT PROTECTION: lifecycle/settlement routes are NOT gated.
+//   1b. ORDERING - authentication precedes the gate.
+//   1c. ORDERING - stack pin on every gated mount: guards before gate,
+//      gate before idempotency.
+//   7. Smart Route executors: WITHDRAW_MOMO fails closed on a
+//      stale/missing rate BEFORE any reservation, debit, ledger posting
+//      or provider intent; INTERNAL_TRANSFER and VAULT_DEPOSIT (same
+//      USDC-native actions) EXECUTE on the same stale rate.
+//   8. The MoMo crash-RESUME path is NOT re-gated: an existing
+//      reservation settles on its originally reserved amount even with
+//      a stale rate.
 //
 // SKIPS unless TEST_DATABASE_URL is set (CI runs a disposable postgres).
 // =============================================================================
 
 const hasDb = !!process.env.TEST_DATABASE_URL;
-if (!hasDb) console.warn('[universal-usdc-transaction-gate.test] TEST_DATABASE_URL not set — skipping.');
+if (!hasDb) console.warn('[route-specific-fx-authorization-gate.test] TEST_DATABASE_URL not set — skipping.');
 
 var mockAuthUserId = null;
 
@@ -98,16 +104,25 @@ function buildApp(prisma) {
 // Every route mounted with the universal gate (new USDC-enabled transaction
 // authorizations). Path params are dummy ids — the gate refuses before any
 // controller lookup, so the ids never resolve.
+// EXACTLY the FX-dependent authorizations (docs/native-ghs-fx-audit.md §4.1,
+// route-specific scope): GHS conversion, GHS-valued limits, or a
+// route-specific executable quote at authorization time.
 const GATED_ROUTES = [
-    ['POST', '/api/trades/initiate'],
-    ['POST', '/api/trades/accept'],
-    ['POST', '/api/p2p/ping/accept'],
-    ['POST', '/api/wallet/withdraw'],
-    ['POST', '/api/wallet/internal-transfer'],
-    ['POST', '/api/withdraw/crypto'],
     ['POST', '/api/withdraw/fiat'],
     ['POST', '/api/savings/goals/1/deposit'],
     ['POST', '/api/savings/goals/1/withdraw'],
+    ['POST', '/api/cross-border-susu/contribute'],
+];
+
+// USDC-native SAME-ASSET authorizations — availability must be independent
+// of the canonical GHS/USDC display rate (route-specific contract). Each
+// entry documents its evidence-based classification in §4.1.
+const USDC_NATIVE_ROUTES = [
+    ['POST', '/api/trades/initiate'],
+    ['POST', '/api/trades/accept'],
+    ['POST', '/api/p2p/ping/accept'],
+    ['POST', '/api/wallet/internal-transfer'],
+    ['POST', '/api/withdraw/crypto'],
     ['POST', '/api/vaults/1/deposit'],
     ['POST', '/api/vaults/1/break'],
     ['POST', '/api/shared-vaults/1/deposit'],
@@ -116,7 +131,6 @@ const GATED_ROUTES = [
     ['POST', '/api/storefront/bp1/checkout'],
     ['POST', '/api/storefront/bp1/order'],
     ['POST', '/api/dine-in/tabs/1/pay'],
-    ['POST', '/api/cross-border-susu/contribute'],
     ['POST', '/api/order-book/orders'],
     ['POST', '/api/round-up/process'],
     ['POST', '/api/azm-convert/'],
@@ -214,6 +228,54 @@ describe('Universal USDC transaction gate — route-level pin (real PostgreSQL)'
         }
     });
 
+    test('1n: AVAILABILITY — USDC-native same-asset routes are NOT gated; a stale rate never produces the gate refusal on them', async () => {
+        await setStaleRate();
+        for (const [method, path] of USDC_NATIVE_ROUTES) {
+            const res = await request(app)[method.toLowerCase()](path).send({});
+            // The authorization is available: whatever the controller
+            // answers (validation 4xx, not-found, ...) it is NEVER the
+            // FX-gate refusal.
+            if (res.status === 503) {
+                expect(['RATE_STALE', 'RATE_UNAVAILABLE']).not.toContain(res.body.code);
+                expect(res.body.usdcTransactionGate).toBeUndefined();
+            } else {
+                expect(true).toBe(true);
+            }
+        }
+    });
+
+    test('1m: DESTINATION-CONDITIONAL — /api/wallet/withdraw gates ONLY MoMo phone destinations', async () => {
+        await setStaleRate();
+        // MoMo phone destination -> the GHS payout leg needs a fresh
+        // executable quote -> gate refuses CLOSED before the controller.
+        const momo = await request(app).post('/api/wallet/withdraw').send({ amount: 5, destination: '0244000000' });
+        expect(momo.status).toBe(503);
+        expect(['RATE_STALE', 'RATE_UNAVAILABLE']).toContain(momo.body.code);
+        expect(momo.body.usdcTransactionGate).toBe('CLOSED');
+        // Crypto destination (TRC20) -> same-asset USDC dispatch, no GHS
+        // conversion -> the SAME stale rate must NOT refuse it: the request
+        // proceeds to the controller's own validation.
+        const trc = await request(app).post('/api/wallet/withdraw').send({ amount: 5, destination: 'TQ5nRc9eK7mYfP2ZQ9G3eV2XtRrEStQXbW' });
+        if (trc.status === 503) {
+            expect(['RATE_STALE', 'RATE_UNAVAILABLE']).not.toContain(trc.body.code);
+        }
+        expect(trc.body && trc.body.usdcTransactionGate).toBeUndefined();
+    });
+
+    test('1c-m: stack pin — the conditional gate on /api/wallet/withdraw sits after guards, before idempotency', async () => {
+        const router = require('../routes/walletRoutes');
+        const sig = (h) => String(h);
+        const mount = router.stack.find((l) => l.route && l.route.path === '/withdraw' && l.route.methods && l.route.methods.post);
+        expect(mount).toBeTruthy();
+        const stack = mount.route.stack;
+        const gateIdx = stack.findIndex((l) => sig(l.handle).includes('freshFxRate') || sig(l.handle).includes('usdcTransactionGate'));
+        expect(gateIdx).toBeGreaterThanOrEqual(0);
+        const guardIdxs = stack.map((l, i) => (/protectGuard|protectActiveGuard|require2FAGuard/.test(sig(l.handle)) ? i : -1)).filter((i) => i >= 0);
+        for (const gi of guardIdxs) expect(gi).toBeLessThan(gateIdx);
+        const idemIdx = stack.findIndex((l) => /Idempotency-Key|idempotency/i.test(sig(l.handle)));
+        if (idemIdx >= 0) expect(gateIdx).toBeLessThan(idemIdx);
+    });
+
     test('2: a saved fallback snapshot NEVER opens the gate (display-only)', async () => {
         await setStaleRate();
         await prisma.fxSavedRate.create({
@@ -225,7 +287,7 @@ describe('Universal USDC transaction gate — route-level pin (real PostgreSQL)'
                 eligible: true,
             },
         }).catch(() => {}); // schema-tolerant: eligible column optional
-        const res = await request(app).post('/api/azm-convert/').send({});
+        const res = await request(app).post('/api/savings/goals/1/deposit').send({});
         expect(res.status).toBe(503);
         expect(['RATE_STALE', 'RATE_UNAVAILABLE']).toContain(res.body.code);
         expect(res.body.savedRateIsDisplayOnly).toBe(true);
@@ -233,7 +295,7 @@ describe('Universal USDC transaction gate — route-level pin (real PostgreSQL)'
 
     test('3: missing observation → RATE_UNAVAILABLE (no fabricated fallback)', async () => {
         await setMissingRate();
-        const res = await request(app).post('/api/azm-convert/').send({});
+        const res = await request(app).post('/api/savings/goals/1/deposit').send({});
         expect(res.status).toBe(503);
         expect(res.body.code).toBe('RATE_UNAVAILABLE');
         expect(res.body.usdcTransactionGate).toBe('CLOSED');
@@ -329,11 +391,11 @@ describe('Universal USDC transaction gate — route-level pin (real PostgreSQL)'
     test('5: a gate refusal NEVER claims an idempotency key — the same key reaches the controller after recovery', async () => {
         const KEY = 'gate-idempotency-probe-1';
         await setStaleRate();
-        const refused = await request(app).post('/api/azm-convert/').set('x-idempotency-key', KEY).send({ amount: 5 });
+        const refused = await request(app).post('/api/savings/goals/1/deposit').set('x-idempotency-key', KEY).send({ amount: 5 });
         expect(refused.status).toBe(503);
 
         await setFreshRate();
-        const replay = await request(app).post('/api/azm-convert/').set('x-idempotency-key', KEY).send({ amount: 5 });
+        const replay = await request(app).post('/api/savings/goals/1/deposit').set('x-idempotency-key', KEY).send({ amount: 5 });
         // If the refusal had claimed the key, the replay would be the byte-
         // identical 503. Reaching anything else proves no claim was made.
         expect(replay.status).not.toBe(503);
@@ -362,7 +424,28 @@ describe('Universal USDC transaction gate — Smart Route executors fail closed 
             io: null,
             notificationService: notifStub,
             mtnDisbursementService: null,
-            vaultService: null,
+            // The VAULT_DEPOSIT executor delegates the guarded deposit to
+            // the real vaultService seam. A minimal depositManual stand-in
+            // performs the same guarded debit + vault credit the executor
+            // contract expects (same-asset USDC move; no rate consulted).
+            vaultService: {
+                depositManual: async ({ userId, vaultId, amountUsdc, authorizationGuardInTransaction }) => {
+                    await prisma.$transaction(async (tx) => {
+                        if (authorizationGuardInTransaction) {
+                            await authorizationGuardInTransaction(tx);
+                        }
+                        const claimed = await tx.user.updateMany({
+                            where: { id: userId, availableBalance: { gte: amountUsdc } },
+                            data: { availableBalance: { decrement: amountUsdc } },
+                        });
+                        if (claimed.count !== 1) throw new Error('insufficient balance');
+                        await tx.vault.update({
+                            where: { id: vaultId },
+                            data: { currentAmountUsdc: { increment: amountUsdc } },
+                        });
+                    });
+                },
+            },
         });
     }
 
@@ -447,9 +530,10 @@ describe('Universal USDC transaction gate — Smart Route executors fail closed 
         expect(await prisma.withdrawal.count({})).toBe(0);
     });
 
-    test('7c: INTERNAL_TRANSFER fails closed on a stale rate before the transfer transaction opens', async () => {
+    test('7c: INTERNAL_TRANSFER (same-asset USDC move) EXECUTES on a stale rate — availability per the route-specific contract', async () => {
         const user = await seedUser(prisma, { availableBalance: 500 });
         const friend = await seedUser(prisma, { availableBalance: 0 });
+        await prisma.friendship.create({ data: { requesterId: user.id, addresseeId: friend.id, status: 'ACCEPTED' } });
         await seedObservation({ observedAt: new Date(Date.now() - 2 * 3600_000) });
         const route = await seedRoute(user.id, 'INTERNAL_TRANSFER', { destFriendUserId: friend.id });
 
@@ -457,17 +541,20 @@ describe('Universal USDC transaction gate — Smart Route executors fail closed 
         const claim = await svc._claimExecution(route.id, false);
         const run = await svc._executeClaim(claim);
 
-        expect(run.status).toBe('FAILED_OTHER');
-        expect(String(run.failureReason || '')).toMatch(/stale\/unavailable rate/);
+        // Same-asset USDC authorization: no GHS conversion, no GHS limit,
+        // no GHS quote — the stale canonical rate must NOT make it
+        // unavailable. The transfer completes.
+        expect(run.status).toBe('SUCCESS');
+        expect(String(run.failureReason || '')).not.toMatch(/stale.unavailable rate/);
         const [freshUser, freshFriend] = await Promise.all([
             prisma.user.findUnique({ where: { id: user.id } }),
             prisma.user.findUnique({ where: { id: friend.id } }),
         ]);
-        expect(Number(freshUser.availableBalance)).toBe(500);
-        expect(Number(freshFriend.availableBalance)).toBe(0);
+        expect(Number(freshUser.availableBalance)).toBe(490);
+        expect(Number(freshFriend.availableBalance)).toBe(10);
     });
 
-    test('7d: VAULT_DEPOSIT fails closed on a stale rate before any guarded claim', async () => {
+    test('7d: VAULT_DEPOSIT (same-asset USDC move) EXECUTES on a stale rate', async () => {
         const user = await seedUser(prisma, { availableBalance: 500 });
         const vault = await prisma.vault.create({
             data: {
@@ -486,9 +573,12 @@ describe('Universal USDC transaction gate — Smart Route executors fail closed 
         const claim = await svc._claimExecution(route.id, false);
         const run = await svc._executeClaim(claim);
 
-        expect(run.status).toBe('FAILED_OTHER');
-        expect(String(run.failureReason || '')).toMatch(/stale\/unavailable rate/);
-        expect(Number((await prisma.user.findUnique({ where: { id: user.id } })).availableBalance)).toBe(500);
+        expect(run.status).toBe('SUCCESS');
+        expect(String(run.failureReason || '')).not.toMatch(/stale.unavailable rate/);
+        const freshUser = await prisma.user.findUnique({ where: { id: user.id } });
+        expect(Number(freshUser.availableBalance)).toBe(490);
+        const freshVault = await prisma.vault.findUnique({ where: { id: vault.id } });
+        expect(Number(freshVault.currentAmountUsdc)).toBe(10);
     });
 
     test('8: the MoMo crash-RESUME path is NOT re-gated — an existing reservation converges even with a stale rate', async () => {

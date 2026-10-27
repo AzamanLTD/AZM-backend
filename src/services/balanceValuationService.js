@@ -204,13 +204,30 @@ async function buildBalanceValuation({ prisma, userId, now = new Date() }) {
         valuationStatus = VALUATION_STATUS.NATIVE_GHS_ONLY;
     }
 
-    // ── Transaction gate: fresh canonical rate ONLY ──────────────────────
+    // ── Transaction gate: fresh canonical rate ONLY, for FX-DEPENDENT
+    // authorizations (route-specific contract, AZM-Planning #75) ─────────
     // A saved/demo rate NEVER opens the gate. This is the same 271C
     // authority the transaction routes enforce independently
     // (requireFreshFxRate middleware + each service's own gate call) — the
     // frontend disables nothing by itself; this field is the honest
     // mirror of that same authority, not a second one.
+    //
+    // SCOPE (review reconciliation): `usdcTransactionGateOpen` governs ONLY
+    // the FX-dependent authorizations — the routes whose own math converts
+    // GHS, applies a GHS-valued limit, or executes a GHS quote (fiat MoMo
+    // withdrawal, cross-border susu contribution, savings-goal USDC⇄GHS
+    // conversions, MoMo-destination wallet withdrawals). It does NOT imply
+    // availability for same-asset USDC actions: those never consult this
+    // gate (see `usdcNativeActionsAvailable` below and the per-route
+    // inventory in docs/native-ghs-fx-audit.md §4.1). One boolean must not
+    // be read as identical availability for every USDC-native action.
     const usdcTransactionGateOpen = rateStatus === RATE_BASIS.CURRENT;
+    // Same-asset USDC movements (USDC→USDC transfers, escrow funding,
+    // USDC vault/savings-goal deposits, on-chain crypto dispatch, USDC
+    // checkout) are never FX-gated — availability is by construction
+    // independent of the canonical rate. The explicit constant prevents
+    // any consumer from misreading the gate boolean above as universal.
+    const usdcNativeActionsAvailable = true;
 
     return {
         pair: VALUATION_PAIR,
@@ -230,8 +247,13 @@ async function buildBalanceValuation({ prisma, userId, now = new Date() }) {
         displayRate: displayRate
             ? { basis: rateStatus, rate: Number(displayRate), rateExact: displayRate.toFixed(8) }
             : null,
-        // Gate for USDC-enabled transaction actions.
+        // Gate for FX-DEPENDENT USDC transaction actions only (see scope
+        // note above — NOT a universal availability boolean).
         usdcTransactionGateOpen,
+        // Same-asset USDC actions: always available, never FX-gated
+        // (route-specific contract). Distinct, explicit, and additive so
+        // no consumer can conflate the two availability concepts.
+        usdcNativeActionsAvailable: usdcNativeActionsAvailable,
         usdcTransactionGateReason: usdcTransactionGateOpen
             ? 'FRESH_CANONICAL_RATE'
             : rateStatus === RATE_BASIS.SAVED_FALLBACK
