@@ -220,6 +220,8 @@ async function autoRelease(prisma, opts = {}) {
     } catch (e) {
       releaseStatus.businessBookmarkOverlay = { error: e.message };
       log(`business-bookmark overlay failed (non-fatal): ${e.message}`);
+    }
+
     // MARKETPLACE PERSONALISATION (Backend D) — per-user recommendation
     // feedback ("Show less like this"). Same convention: idempotent,
     // additive, fail-closed on drift; part of the boot-time path.
