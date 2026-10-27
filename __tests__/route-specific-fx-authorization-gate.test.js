@@ -259,27 +259,43 @@ describe('Universal USDC transaction gate — route-level pin (real PostgreSQL)'
 
     test('1m: DESTINATION-CONDITIONAL — gate decision and dispatch classification are ONE contract (blocker A)', async () => {
         await setStaleRate();
-        // Realistic MoMo destination OUTSIDE the Binance Pay ID window
-        // (13+ digits): the GHS payout leg needs a fresh executable quote ->
+        // A numeric destination WITHOUT a type is ambiguous between MoMo
+        // and Binance Pay — refused 400 DESTINATION_TYPE_REQUIRED at the
+        // gate, BEFORE idempotency, regardless of digit count (the former
+        // 13+/16+ digit-length heuristics are abolished).
+        const ambiguous13 = await request(app).post('/api/wallet/withdraw').send({ amount: 5, destination: '0244000000123' });
+        expect(ambiguous13.status).toBe(400);
+        expect(ambiguous13.body.code).toBe('DESTINATION_TYPE_REQUIRED');
+        expect(ambiguous13.body.usdcTransactionGate).toBeUndefined();
+        const ambiguous10 = await request(app).post('/api/wallet/withdraw').send({ amount: 5, destination: '123456789' });
+        expect(ambiguous10.status).toBe(400);
+        expect(ambiguous10.body.code).toBe('DESTINATION_TYPE_REQUIRED');
+        // TYPED MOMO: the GHS payout leg needs a fresh executable quote ->
         // gate refuses CLOSED before the controller.
-        const momo = await request(app).post('/api/wallet/withdraw').send({ amount: 5, destination: '0244000000123' });
+        const momo = await request(app).post('/api/wallet/withdraw').send({ amount: 5, destination: '0244000000123', destinationType: 'MOMO' });
         expect(momo.status).toBe(503);
         expect(['RATE_STALE', 'RATE_UNAVAILABLE']).toContain(momo.body.code);
         expect(momo.body.usdcTransactionGate).toBe('CLOSED');
-        // 16+ digit MoMo destination: formerly a FAIL-OPEN HOLE (the old
-        // 9-15 regex never gated it, while the dispatcher pays it as GHS).
-        const momo16 = await request(app).post('/api/wallet/withdraw').send({ amount: 5, destination: '0244000000123456' });
-        expect(momo16.status).toBe(503);
-        expect(momo16.body.usdcTransactionGate).toBe('CLOSED');
-        // Realistic Binance Pay ID (9 digits, numeric): dispatched as a
+        // 16+ digit MoMo number: not a legal phone shape — refused 400 as a
+        // type/format MISMATCH. (The former fail-open hole is closed harder:
+        // it is not merely gated, it can never dispatch.)
+        const momo16 = await request(app).post('/api/wallet/withdraw').send({ amount: 5, destination: '0244000000123456', destinationType: 'MOMO' });
+        expect(momo16.status).toBe(400);
+        expect(momo16.body.code).toBe('DESTINATION_TYPE_MISMATCH');
+        expect(momo16.body.usdcTransactionGate).toBeUndefined();
+        // TYPED Binance Pay ID (9 digits, numeric): dispatched as a
         // same-asset USDC Binance payout -> the SAME stale rate must NOT
-        // refuse it (formerly mis-flagged as MoMo by the 9-15 regex).
-        const binance = await request(app).post('/api/wallet/withdraw').send({ amount: 5, destination: '123456789' });
+        // refuse it.
+        const binance = await request(app).post('/api/wallet/withdraw').send({ amount: 5, destination: '123456789', destinationType: 'BINANCE_PAY_ID' });
         expect(binance.status).not.toBe(503);
         expect(binance.body && binance.body.usdcTransactionGate).toBeUndefined();
+        // A type contradicting the format is refused 400 at the gate.
+        const mismatch = await request(app).post('/api/wallet/withdraw').send({ amount: 5, destination: '123456789', destinationType: 'TRC20' });
+        expect(mismatch.status).toBe(400);
+        expect(mismatch.body.code).toBe('DESTINATION_TYPE_MISMATCH');
         // Crypto destination (TRC20) -> same-asset USDC dispatch, no GHS
-        // conversion -> NOT gated; the request proceeds to the controller's
-        // own validation.
+        // conversion -> NOT gated; unambiguous formats remain callable
+        // without a type (existing clients).
         const trc = await request(app).post('/api/wallet/withdraw').send({ amount: 5, destination: 'TQ5nRc9eK7mYfP2ZQ9G3eV2XtRrEStQXbW' });
         expect(trc.status).not.toBe(503);
         expect(trc.body && trc.body.usdcTransactionGate).toBeUndefined();
@@ -297,17 +313,17 @@ describe('Universal USDC transaction gate — route-level pin (real PostgreSQL)'
         const user = await seedUser(prisma, { availableBalance: 50 });
         mockAuthUserId = user.id;
         try {
-            // 13-digit numeric -> gated class MOMO -> dispatch row MOMO.
+            // TYPED 13-digit MoMo number -> gated class MOMO -> dispatch row MOMO.
             const momo = await request(app).post('/api/wallet/withdraw')
                 .set('idempotency-key', 'blk-a-momo-1')
-                .send({ amount: 5, destination: '0244000000123' });
+                .send({ amount: 5, destination: '0244000000123', destinationType: 'MOMO' });
             expect(momo.status).toBe(200);
             expect(momo.body.withdrawal.payoutMethod).toBe('MOMO');
             expect(momo.body.withdrawal.network).toBe('MTN');
-            // 9-digit Binance Pay ID -> ungated class BINANCE_ID -> dispatch row BINANCE_ID.
+            // TYPED 9-digit Binance Pay ID -> ungated class BINANCE_ID -> dispatch row BINANCE_ID.
             const binance = await request(app).post('/api/wallet/withdraw')
                 .set('idempotency-key', 'blk-a-binance-1')
-                .send({ amount: 5, destination: '123456789' });
+                .send({ amount: 5, destination: '123456789', destinationType: 'BINANCE_PAY_ID' });
             expect(binance.status).toBe(200);
             expect(binance.body.withdrawal.payoutMethod).toBe('BINANCE_ID');
             expect(binance.body.withdrawal.network).toBe('BINANCE_PAY');
@@ -326,14 +342,13 @@ describe('Universal USDC transaction gate — route-level pin (real PostgreSQL)'
         }
     });
 
-    test('1m-3: KNOWN CONTRACT GAP — a 10-digit MoMo-style number dispatches as BINANCE_ID (pinned, reported to the owner)', async () => {
+    test('1m-3: GAP CLOSED (owner-approved destinationType contract) — a 10-digit MoMo-style number is REFUSED without a type', async () => {
         // The 8-12 digit numeric window is inherently ambiguous between a
-        // Ghana MoMo number and a Binance Pay ID under the current request
-        // contract ({ destination, networkPref }). The dispatcher has always
-        // resolved it as BINANCE_ID, so the gate follows the SAME rule. A
-        // durable fix needs an explicit destination-type request field (a
-        // contract change requiring product approval) — pinned here so the
-        // ambiguity is visible and cannot silently drift.
+        // Ghana MoMo number and a Binance Pay ID. The owner-approved
+        // explicit destinationType contract (2026-10-27) abolishes the
+        // silent digit-length resolution: without a type the request is
+        // refused; with MOMO it dispatches as the GHS cross-border leg,
+        // with BINANCE_PAY_ID as the same-asset zero-fee transfer.
         await setFreshRate();
         const { seedUser } = require('./helpers/factories');
         const prisma = app.get('prisma');
@@ -341,11 +356,26 @@ describe('Universal USDC transaction gate — route-level pin (real PostgreSQL)'
         const user = await seedUser(prisma, { availableBalance: 50 });
         mockAuthUserId = user.id;
         try {
-            const res = await request(app).post('/api/wallet/withdraw')
+            // Without a type: refused, nothing persisted, no debit.
+            const untyped = await request(app).post('/api/wallet/withdraw')
                 .set('idempotency-key', 'blk-a-gap-1')
                 .send({ amount: 5, destination: '0244000000' });
-            expect(res.status).toBe(200);
-            expect(res.body.withdrawal.payoutMethod).toBe('BINANCE_ID');
+            expect(untyped.status).toBe(400);
+            expect(untyped.body.code).toBe('DESTINATION_TYPE_REQUIRED');
+            // Typed MOMO: the same 10-digit number is the GHS leg now.
+            const asMomo = await request(app).post('/api/wallet/withdraw')
+                .set('idempotency-key', 'blk-a-gap-2')
+                .send({ amount: 5, destination: '0244000000', destinationType: 'MOMO' });
+            expect(asMomo.status).toBe(200);
+            expect(asMomo.body.withdrawal.payoutMethod).toBe('MOMO');
+            // Typed BINANCE_PAY_ID: the same-shaped number is a same-asset payout.
+            const asBinance = await request(app).post('/api/wallet/withdraw')
+                .set('idempotency-key', 'blk-a-gap-3')
+                .send({ amount: 5, destination: '123456789', destinationType: 'BINANCE_PAY_ID' });
+            expect(asBinance.status).toBe(200);
+            expect(asBinance.body.withdrawal.payoutMethod).toBe('BINANCE_ID');
+            const rows = await prisma.withdrawal.findMany({ where: { userId: user.id }, select: { payoutMethod: true } });
+            expect(rows.map(r => r.payoutMethod).sort()).toEqual(['BINANCE_ID', 'MOMO']);
         } finally {
             mockAuthUserId = prevAuth;
         }

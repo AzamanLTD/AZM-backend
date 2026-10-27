@@ -187,17 +187,23 @@ double before the money math ran. Rate freshness discipline (30-minute
 observation age, fail-closed `RATE_UNAVAILABLE`/`RATE_STALE`, no demo
 fallback) is unchanged.
 
-**Proposed pending approval (owner product decisions, not implemented
-here):**
-1. An explicit `destinationType` field on payout requests, to close the
-   8-12-digit numeric-window ambiguity between MoMo numbers and Binance Pay
-   IDs (pinned as a known contract gap in the gate suite; today the
-   classification contract cannot distinguish a 10-digit MoMo-style number
-   from a Binance Pay ID).
-2. A dust-threshold policy for cross-border payouts (a settled payout of
-   `0.00` in the target currency is honest under the scale policy —
-   pinning whether sub-threshold payouts should be refused outright is a
-   product decision, not a money-integrity one).
+**Owner decisions (approved 2026-10-27, implemented in follow-up PRs on
+top of this one — this document records the decision, the implementation
+lives in its own reviewable PRs):**
+1. An explicit, validated `destinationType` field on payout requests
+   (enum MOMO | BINANCE_PAY_ID | TRC20 | ERC20 | BEP20) closes the
+   8-12-digit numeric-window ambiguity between MoMo numbers and Binance
+   Pay IDs. Numeric destinations are NEVER silently digit-length-guessed:
+   without the type they are refused `400 DESTINATION_TYPE_REQUIRED`; a
+   type contradicting the format is refused `400 DESTINATION_TYPE_MISMATCH`.
+   The FX gate, the saved-destinations surface and the payout dispatcher
+   share the one resolution contract; unambiguous TRC20/EVM formats remain
+   callable without a type for existing clients.
+2. A dust-threshold policy for cross-border payouts: a payout that would
+   settle to `0.00` in the payout currency is refused outright with
+   `PAYOUT_SETTLES_TO_ZERO` BEFORE the user's balance is debited or any
+   provider dispatch. No provider minimum (e.g. an assumed GHS 1) is
+   encoded without verified, applicable provider documentation.
 
 ---
 
