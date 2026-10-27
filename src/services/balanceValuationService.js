@@ -8,9 +8,10 @@
 //   • nativeGhsAvailable  — REAL GHS owed to the customer (User.nativeGhsBalance,
 //                            projected by ghs:user:{id}:liability).
 //   • availableUsdc       — REAL liquid USDC held (User.availableBalance).
-//   • usdcEquivalent       — the DISPLAY valuation of the whole available
-//                            GHS value expressed in USDC at the display rate.
-//                            It is NOT the quantity of USDC held.
+//   • usdcEquivalent       — the DISPLAY estimate of the GHS headline in
+//                            USDC (nativeGhs / displayRate). It is NOT the
+//                            quantity of USDC held and NOT a combined
+//                            (GHS + USDC×rate) aggregate.
 //   • locked/restricted buckets and non-cash AZM points, each labelled with
 //     its native unit — never summed across currencies.
 //   • the rate situation: CURRENT (fresh canonical), SAVED_FALLBACK (last
@@ -19,22 +20,31 @@
 //   • usdcTransactionGate — whether USDC-enabled transaction actions are
 //     allowed (fresh canonical rate ONLY; a saved/demo rate NEVER opens it).
 //
-// Valuation semantics (per the agreed shared contract):
+// Valuation semantics (GHS-first contract, owner-corrected 2026-10-27):
 //
-//   availableGhsValue   = nativeGhsAvailable + (availableUsdc * displayRateGhsPerUsdc)
-//   availableUsdcEquivalent = availableGhsValue / displayRateGhsPerUsdc
+//   nativeGhsAvailable  — THE GHS HEADLINE. The authoritative native-GHS
+//                          wallet balance ONLY. It is never combined with
+//                          USDC value, and it never varies with the FX rate
+//                          or with the USDC actually held.
+//   availableUsdc       — REAL liquid USDC held, reported SEPARATELY. It is
+//                          never summed into the GHS headline and never
+//                          reinterpreted into GHS here.
+//   usdcEquivalent       — the ESTIMATED USDC equivalent OF THE GHS HEADLINE:
+//                          nativeGhsAvailable / displayRateGhsPerUsdc.
+//                          It is an estimate of the GHS balance's worth in
+//                          USDC — NOT the quantity of USDC held, and NOT a
+//                          combined (GHS + USDC×rate) valuation.
 //
 // The valuation is a READ: an FX revaluation changes only the displayed
-// value of the available-USDC component — it never mutates stored balances
-// and never writes anything.
+// estimate — it never mutates stored balances and never writes anything.
 //
 // Honesty rules:
-//   • No rate + available USDC > 0  → the combined GHS total is NOT reported
-//     as complete. nativeGhsAvailable is still reported, and the status
-//     says the total is partial/unavailable. Native GHS alone is never
-//     presented as the full valued aggregate.
-//   • No rate + available USDC == 0 → the native GHS amount IS the complete
-//     total (FX is genuinely not needed); status NATIVE_GHS_ONLY.
+//   • Missing FX rate must NOT make a valid GHS balance unavailable:
+//     nativeGhsAvailable is always reported in full; a missing rate only
+//     nulls the usdcEquivalent estimate (status FX_UNAVAILABLE). The
+//     headline never depends on FX.
+//   • The headline is invariant to actual USDC held: it is the native-GHS
+//     wallet balance alone, whatever the USDC position is.
 //   • Every Decimal financial quantity is serialized as BOTH an exact string
 //     (`*Exact`) and a JS number projection for presentation only.
 
@@ -61,8 +71,7 @@ const VALUATION_STATUS = {
     CURRENT: 'CURRENT',
     SAVED_FALLBACK: 'SAVED_FALLBACK',
     DEMO_FALLBACK: 'DEMO_FALLBACK',
-    NATIVE_GHS_ONLY: 'NATIVE_GHS_ONLY',     // complete without FX (available USDC is 0)
-    PARTIAL_FX_UNAVAILABLE: 'PARTIAL_FX_UNAVAILABLE', // available USDC cannot be valued
+    FX_UNAVAILABLE: 'FX_UNAVAILABLE', // estimate unavailable; GHS headline stays fully valid
 };
 
 class BalanceValuationError extends Error {
@@ -177,31 +186,28 @@ async function buildBalanceValuation({ prisma, userId, now = new Date() }) {
         }
     }
 
-    // ── Valuation ───────────────────────────────────────────────────────
-    // availableGhsValue = nativeGhsAvailable + availableUsdc * displayRate
-    // availableUsdcEquivalent = availableGhsValue / displayRate
-    let availableGhsValue = null;
+    // ── Valuation (GHS-first contract) ──────────────────────────────────
+    // The GHS headline is nativeGhsAvailable ONLY — never combined with
+    // USDC value (the former `nativeGhs + usdc×rate` aggregate is
+    // REMOVED from the contract). usdcEquivalent is the estimated USDC
+    // worth OF THAT GHS BALANCE: nativeGhs / displayRate. availableUsdc
+    // (the real USDC held) stays a separate reported field.
     let availableUsdcEquivalent = null;
     let valuationStatus;
 
     if (displayRate) {
-        availableGhsValue = nativeGhsAvailable.plus(availableUsdc.times(displayRate));
-        availableUsdcEquivalent = availableGhsValue.div(displayRate);
+        availableUsdcEquivalent = nativeGhsAvailable.div(displayRate);
         valuationStatus =
             rateStatus === RATE_BASIS.CURRENT
                 ? VALUATION_STATUS.CURRENT
                 : rateStatus === RATE_BASIS.SAVED_FALLBACK
                     ? VALUATION_STATUS.SAVED_FALLBACK
                     : VALUATION_STATUS.DEMO_FALLBACK;
-    } else if (availableUsdc.greaterThan(0)) {
-        // USDC exists and CANNOT be valued — the combined total is honestly
-        // partial/unavailable; native GHS alone must never be presented as
-        // the complete valued aggregate.
-        valuationStatus = VALUATION_STATUS.PARTIAL_FX_UNAVAILABLE;
     } else {
-        // No rate is genuinely needed: there is nothing to value.
-        availableGhsValue = nativeGhsAvailable;
-        valuationStatus = VALUATION_STATUS.NATIVE_GHS_ONLY;
+        // Missing rate: the GHS headline REMAINS fully available and valid
+        // (it is an authoritative stored balance, not an FX product). Only
+        // the estimate goes null — never fabricated, never headline-blanking.
+        valuationStatus = VALUATION_STATUS.FX_UNAVAILABLE;
     }
 
     // ── Transaction gate: fresh canonical rate ONLY, for FX-DEPENDENT
@@ -236,8 +242,8 @@ async function buildBalanceValuation({ prisma, userId, now = new Date() }) {
         availableUsdc: _money(availableUsdc),
         usdcEquivalent: availableUsdcEquivalent
             ? _money(availableUsdcEquivalent)
-            : null, // null = cannot be valued; never fabricate
-        availableGhsValue: availableGhsValue ? _money(availableGhsValue) : null,
+            : null, // null = estimate unavailable; never fabricated. The GHS
+                    // headline (nativeGhsAvailable) stays valid regardless.
         // Rate situation — the two concepts stay SEPARATE: a saved rate is
         // never labelled current/fresh.
         rateStatus,

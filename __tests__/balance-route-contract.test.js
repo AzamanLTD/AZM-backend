@@ -198,12 +198,13 @@ describe('GET /api/users/balance — route-level valuation contract (real Postgr
         expect(v.availableUsdc.exact).toBe('100.00000000');
         expect(v.availableUsdc.value).toBe(100);
 
-        // The equivalent is the WHOLE GHS valuation in USDC:
-        // (50 + 100 × 12.5) / 12.5 = 1300 / 12.5 = 104 — distinct from the
-        // 100 USDC actually held.
-        expect(v.availableGhsValue.exact).toBe('1300.00000000');
-        expect(v.usdcEquivalent.exact).toBe('104.00000000');
+        // GHS-first contract: the headline is the native-GHS wallet balance
+        // ONLY. The estimate is the headline expressed in USDC at the rate:
+        // 50 / 12.5 = 4 — distinct from the 100 USDC actually held, and NOT
+        // a combined (50 + 100×12.5 = 1300 GHS) valuation.
+        expect(v.usdcEquivalent.exact).toBe('4.00000000');
         expect(v.usdcEquivalent.value).not.toBe(v.availableUsdc.value);
+        expect(v).not.toHaveProperty('availableGhsValue');
 
         expect(v.currentRate.isFresh).toBe(true);
         expect(v.currentRate.rateExact).toBe('12.50000000');
@@ -220,7 +221,8 @@ describe('GET /api/users/balance — route-level valuation contract (real Postgr
         expect(v.locked.disputesUsdc.exact).toBe('7.00000000');
         expect(v.locked.vendorUnallocatedUsdc.exact).toBe('300.00000000');
         expect(v.nonCash.azmPoints.value).toBe(999);
-        expect(v.availableGhsValue.value).toBe(1300); // not 1300 + 999
+        // The headline counts ONLY native GHS: 50, never 50 + USDC or points.
+        expect(v.nativeGhsAvailable.value).toBe(50);
 
         expect(typeof v.evaluatedAt).toBe('string');
     });
@@ -242,9 +244,9 @@ describe('GET /api/users/balance — route-level valuation contract (real Postgr
         expect(v.currentRate).toBeNull(); // saved rate is NEVER labelled current
         expect(v.displayRate.basis).toBe('SAVED_FALLBACK');
         expect(v.displayRate.rateExact).toBe('12.40000000');
-        // 0 + 100 × 12.4 = 1240 GHS; equivalent 1240 / 12.4 = 100
-        expect(v.availableGhsValue.exact).toBe('1240.00000000');
-        expect(v.usdcEquivalent.exact).toBe('100.00000000');
+        // headline 0 GHS; estimate of the headline = 0 / 12.4 = 0
+        expect(v.nativeGhsAvailable.exact).toBe('0.00000000');
+        expect(v.usdcEquivalent.exact).toBe('0.00000000');
         expect(v.usdcTransactionGateOpen).toBe(false);
         expect(v.usdcNativeActionsAvailable).toBe(true); // same-asset USDC actions are never FX-gated
         expect(v.usdcTransactionGateReason).toBe('NO_FRESH_CANONICAL_RATE_SAVED_FALLBACK_DISPLAY_ONLY');
@@ -277,14 +279,15 @@ describe('GET /api/users/balance — route-level valuation contract (real Postgr
         expect(res.status).toBe(200);
         const v = res.body.data.valuation;
         expect(v.rateStatus).toBe('UNAVAILABLE');
-        expect(v.valuationStatus).toBe('PARTIAL_FX_UNAVAILABLE');
-        expect(v.availableGhsValue).toBeNull();
+        expect(v.valuationStatus).toBe('FX_UNAVAILABLE');
         expect(v.usdcEquivalent).toBeNull();
+        expect(v).not.toHaveProperty('availableGhsValue');
         expect(v.displayRate).toBeNull();
         expect(v.usdcTransactionGateOpen).toBe(false);
         expect(v.usdcNativeActionsAvailable).toBe(true); // same-asset USDC actions are never FX-gated
         expect(v.usdcTransactionGateReason).toBe('NO_FRESH_CANONICAL_RATE');
-        // The components stay separately, honestly reported.
+        // A missing rate never makes a valid GHS balance unavailable: the
+        // headline stays fully reported, only the estimate is null.
         expect(v.nativeGhsAvailable.value).toBe(30);
         expect(v.availableUsdc.value).toBe(75);
         // Legacy USDC fields are unaffected by the FX absence.
@@ -300,11 +303,50 @@ describe('GET /api/users/balance — route-level valuation contract (real Postgr
         expect(res.status).toBe(200);
         const v = res.body.data.valuation;
         expect(v.rateStatus).toBe('UNAVAILABLE');
-        expect(v.valuationStatus).toBe('NATIVE_GHS_ONLY');
-        expect(v.availableGhsValue.exact).toBe('30.00000000');
+        expect(v.valuationStatus).toBe('FX_UNAVAILABLE');
+        expect(v.nativeGhsAvailable.exact).toBe('30.00000000'); // headline stays valid
         expect(v.usdcEquivalent).toBeNull();
         expect(v.usdcTransactionGateOpen).toBe(false);
         expect(v.usdcNativeActionsAvailable).toBe(true); // same-asset USDC actions are never FX-gated
+    });
+
+    // ── OWNER REGRESSION (contract correction, #369, 2026-10-27) ────────
+    // nativeGhs = 100, USDC held = 500, rate = 10: the GHS headline MUST be
+    // 100 and the estimated USDC equivalent MUST be 10 — never the combined
+    // (100 + 500×10 = 5010 GHS → 501 USDC) valuation of the old formula.
+    test('GHS headline = native balance only; estimated USDC equivalent derives from the GHS balance', async () => {
+        const user = await seedUser(prisma, { nativeGhsBalance: 100, availableBalance: 500 });
+        mockAuthUserId = user.id;
+        await setFreshRate('10');
+
+        const res = await request(buildApp(prisma)).get('/api/users/balance');
+        expect(res.status).toBe(200);
+        const v = res.body.data.valuation;
+        expect(v.valuationStatus).toBe('CURRENT');
+        expect(v.nativeGhsAvailable.exact).toBe('100.00000000');
+        expect(v.availableUsdc.exact).toBe('500.00000000');
+        expect(v.usdcEquivalent.exact).toBe('10.00000000'); // 100 / 10
+        // NOT the combined valuation (501) and NOT the USDC held (500).
+        expect(v.usdcEquivalent.value).not.toBe(501);
+        expect(v.usdcEquivalent.value).not.toBe(v.availableUsdc.value);
+        expect(v).not.toHaveProperty('availableGhsValue');
+    });
+
+    // The native GHS figure must be unchanged by ANY variation in actual
+    // USDC held — proven at the production route seam, not just the service.
+    test('the GHS headline is unchanged by any variation in actual USDC held (route seam)', async () => {
+        const user = await seedUser(prisma, { nativeGhsBalance: 100, availableBalance: 500 });
+        mockAuthUserId = user.id;
+        await setFreshRate('10');
+
+        for (const usdcHeld of [0, 17, 5000]) {
+            await prisma.user.update({ where: { id: user.id }, data: { availableBalance: usdcHeld } });
+            const res = await request(buildApp(prisma)).get('/api/users/balance');
+            expect(res.status).toBe(200);
+            const v = res.body.data.valuation;
+            expect(v.nativeGhsAvailable.exact).toBe('100.00000000');
+            expect(v.usdcEquivalent.exact).toBe('10.00000000'); // estimate derives from GHS / rate
+        }
     });
 
     test('unknown caller: honest 404, no fabricated valuation', async () => {

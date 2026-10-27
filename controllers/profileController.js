@@ -269,8 +269,9 @@ exports.getBalance = async (req, res) => {
         // FX-balance workstream — the authoritative balance VALUATION
         // contract (additive: every legacy field above is untouched). The
         // valuation is a READ-ONLY model: it can never mutate balances, and
-        // an FX revaluation only changes the DISPLAY value of the available
-        // USDC component. Full contract:
+        // an FX revaluation only changes the DISPLAY estimate. GHS-first
+        // contract: the headline is the native-GHS wallet balance ONLY;
+        // usdcEquivalent is the estimate of that balance in USDC. Full contract:
         // docs/native-ghs-fx-audit.md §Valuation contract.
         let valuation = null;
         let valuationError = null;

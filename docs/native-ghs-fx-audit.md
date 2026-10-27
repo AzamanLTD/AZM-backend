@@ -59,21 +59,24 @@ Wired into: `package.json` (`install:ghs-wallet` + the `npm run release` chain),
 
 ## 3. Balance-valuation contract — `src/services/balanceValuationService.js`
 
-Read model consumed by `/api/users/balance` (additive `valuation` block; legacy fields untouched and still authoritative). READ-ONLY by construction: no service function mutates balances; an FX revaluation changes only the DISPLAY value of the available-USDC component.
+Read model consumed by `/api/users/balance` (additive `valuation` block; legacy fields untouched and still authoritative). READ-ONLY by construction: no service function mutates balances; an FX revaluation changes only the DISPLAY estimate.
 
-    availableGhsValue       = nativeGhsAvailable + (availableUsdc * displayRateGhsPerUsdc)
-    availableUsdcEquivalent = availableGhsValue / displayRateGhsPerUsdc
+**GHS-first contract (owner correction, 2026-10-27 — supersedes the earlier combined-valuation formula):**
+
+    headline (nativeGhsAvailable) = the authoritative native-GHS wallet balance ONLY
+    usdcEquivalent                 = nativeGhsAvailable / displayRateGhsPerUsdc
+
+The former aggregate `availableGhsValue = nativeGhs + availableUsdc × rate` is REMOVED from the contract: it is not acceptable for the GHS headline. `availableUsdc` (the real USDC held) stays a SEPARATE reported field — never summed into the headline, never reinterpreted into GHS by the valuation read.
 
 Response fields (every Decimal financial quantity serialized as BOTH exact string `*Exact` and a JS number projection for presentation):
 
 | Field | Meaning |
 |---|---|
-| `nativeGhsAvailable` | REAL GHS owed to the customer. |
-| `availableUsdc` | REAL liquid USDC held. |
-| `usdcEquivalent` | The DISPLAY valuation of the whole available GHS value expressed in USDC. NOT the quantity of USDC held. `null` when it cannot be valued (never fabricated). |
-| `availableGhsValue` | Combined display valuation; `null` under `PARTIAL_FX_UNAVAILABLE`. |
+| `nativeGhsAvailable` | THE GHS HEADLINE. REAL GHS owed to the customer, from the authoritative native-GHS wallet balance ONLY. Invariant to the FX rate and to the USDC actually held. |
+| `availableUsdc` | REAL liquid USDC held — reported separately, never part of the headline. |
+| `usdcEquivalent` | The ESTIMATED USDC equivalent OF THE GHS HEADLINE (`nativeGhsAvailable / displayRate`). NOT the quantity of USDC held, NOT a combined valuation. `null` when no rate is available (never fabricated). |
 | `rateStatus` | `CURRENT` (fresh canonical) / `SAVED_FALLBACK` (last validated observation, display-only) / `DEMO_FALLBACK` (demo seed, display-only) / `UNAVAILABLE`. |
-| `valuationStatus` | `CURRENT` / `SAVED_FALLBACK` / `DEMO_FALLBACK` / `NATIVE_GHS_ONLY` / `PARTIAL_FX_UNAVAILABLE`. |
+| `valuationStatus` | `CURRENT` / `SAVED_FALLBACK` / `DEMO_FALLBACK` / `FX_UNAVAILABLE`. |
 | `currentRate`, `savedRate` | The two concepts stay SEPARATE — a saved rate is never labelled current/fresh. |
 | `usdcTransactionGateOpen` | `true` ONLY when `rateStatus === CURRENT`. The honest mirror of the same server-side authority the transaction routes enforce; the frontend disables nothing by itself. |
 | `locked` | `escrowUsdc`, `disputesUsdc`, `vaultsUsdc` (vault status ACTIVE/COMPLETED), `committedSusuUsdc` (PAID contributions in COLLECTING/COLLECTING_GRACE cycles), `savingsGhs` (ACTIVE/PAUSED goals), `vendorUnallocatedUsdc`. Each in its NATIVE unit — never summed across currencies. |
@@ -81,8 +84,8 @@ Response fields (every Decimal financial quantity serialized as BOTH exact strin
 
 Honesty rules (proven by tests):
 
-- No rate + available USDC > 0 → the combined total is NOT reported as complete (`PARTIAL_FX_UNAVAILABLE`; `availableGhsValue`/`usdcEquivalent` null). Native GHS alone is never presented as the full valued aggregate.
-- No rate + available USDC == 0 → the native GHS amount IS the complete total (`NATIVE_GHS_ONLY`) — FX is genuinely not needed.
+- A missing FX rate NEVER makes a valid GHS balance unavailable: `nativeGhsAvailable` is always reported in full; a missing rate only nulls the `usdcEquivalent` estimate (`FX_UNAVAILABLE`). The headline never depends on FX.
+- The headline is INVARIANT to actual USDC held (owner regression: nativeGhs = 100, USDC held = 500, rate = 10 → headline 100, estimate 10 — never a combined 5010 GHS / 501 USDC valuation; the headline stays 100 across every variation of USDC held).
 
 ---
 
@@ -229,7 +232,7 @@ Legacy fields (`availableBalance`, `totalBalance`, `currency:'USDC'`, ...) untou
 
 - `__tests__/fx-rate-snapshot.test.js` — validated-only persistence; demo honesty (never overwrites genuine; genuine replaces demo); server-side boundary-exact display eligibility; demo visibility env-gating.
 - `__tests__/native-ghs-wallet.test.js` — balanced double entry (custody vs liability); projection equals ledger; CAS overdraft refusal (no ledger residue); idempotency-key duplicate refusal; exact-decimal arithmetic; reconciliation residual zero.
-- `__tests__/balance-valuation.test.js` — every valuationStatus branch; locked buckets in native units; AZM excluded; gate closed on SAVED/DEMO/UNAVAILABLE; `PARTIAL_FX_UNAVAILABLE` honesty (no fabricated totals).
+- `__tests__/balance-valuation.test.js` — every valuationStatus branch; locked buckets in native units; AZM excluded; gate closed on SAVED/DEMO/UNAVAILABLE; the GHS-first owner regressions (headline 100 / USDC held 500 / rate 10 → estimate 10, headline invariant to USDC held, missing rate never blanks a valid GHS balance).
 - `__tests__/fx-transaction-gate.test.js` — 503 fail-closed on stale/unavailable; fresh passes; MoMo-conditional scoping on `/api/wallet/withdraw`; gate ordered before the idempotency claim.
 - `__tests__/balance-route-contract.test.js` — ROUTE-LEVEL pin of the real route (`GET /api/users/balance`), envelope, `{exact, value}` money serialization, equivalent-vs-held distinction, every rate/valuation status variant over HTTP, saved/demo fallback never opening the transaction gate, the honest 404, the `VALUATION_UNAVAILABLE` degradation envelope, and the corrected `totalBalance` arithmetic.
 

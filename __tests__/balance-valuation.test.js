@@ -4,21 +4,18 @@
 //
 // PROVES, with Prisma never mocked (real PostgreSQL via TEST_DATABASE_URL):
 //
-//   A. CURRENT: a fresh canonical rate values the whole position exactly
-//      (availableGhsValue = nativeGhs + availableUsdc × rate;
-//       usdcEquivalent = availableGhsValue / rate) and the USDC transaction
+//   A. CURRENT: a fresh canonical rate estimates the GHS headline in USDC
+//      exactly (headline = nativeGhsAvailable ONLY;
+//       usdcEquivalent = nativeGhsAvailable / rate) and the USDC transaction
 //      gate is OPEN.
-//   B. The headline GHS value moves ONLY through the FX valuation of
-//      available USDC — a rate change never mutates the ledger, the GHS
-//      wallet, or the USDC wallet.
+//   B. A rate change moves ONLY the USDC estimate — the GHS headline and
+//      every stored balance are untouched; the valuation is a pure read.
 //   C. SAVED_FALLBACK / DEMO_FALLBACK: without a fresh rate, an eligible
 //      saved observation (or the demo seed in demo/test env) produces an
-//      HONEST display valuation — but the transaction gate stays CLOSED.
-//   D. UNAVAILABLE + available USDC > 0 → PARTIAL_FX_UNAVAILABLE: no
-//      fabricated combined total; availableGhsValue/usdcEquivalent are
-//      null; native GHS is reported separately.
-//   E. UNAVAILABLE + available USDC == 0 → NATIVE_GHS_ONLY: the native GHS
-//      amount IS the complete total without any FX.
+//      HONEST display estimate — but the transaction gate stays CLOSED.
+//   D/E. UNAVAILABLE → FX_UNAVAILABLE: the usdcEquivalent estimate is null,
+//      but the GHS HEADLINE stays fully valid — a missing rate NEVER makes
+//      a valid GHS balance unavailable.
 //   F. Locked buckets (escrow, disputes, vaults, savings, committed Susu,
 //      vendor pool) are reported in their NATIVE units and are NOT counted
 //      in the available headline.
@@ -161,11 +158,13 @@ describe('Balance valuation contract (real PostgreSQL)', () => {
         expect(v.currentRate.rateExact).toBe('12.50000000');
         expect(v.usdcTransactionGateOpen).toBe(true);
         expect(v.usdcNativeActionsAvailable).toBe(true); // same-asset USDC actions are never FX-gated
-        // 50 + 100*12.5 = 1300 GHS; 1300/12.5 = 104 USDC-equivalent
-        expect(v.availableGhsValue.exact).toBe('1300.00000000');
-        expect(v.usdcEquivalent.exact).toBe('104.00000000');
+        // GHS-first: the headline is the native-GHS wallet balance ONLY.
         expect(v.nativeGhsAvailable.value).toBe(50);
         expect(v.availableUsdc.value).toBe(100);
+        // Estimate = headline / rate = 50 / 12.5 = 4 USDC — an estimate of
+        // the GHS balance's worth, NOT a combined (50 + 100×12.5) valuation.
+        expect(v.usdcEquivalent.exact).toBe('4.00000000');
+        expect(v.usdcEquivalent.value).not.toBe(v.availableUsdc.value);
         // display basis is the CURRENT rate
         expect(v.displayRate.basis).toBe('CURRENT');
         expect(v.displayRate.rateExact).toBe('12.50000000');
@@ -173,18 +172,20 @@ describe('Balance valuation contract (real PostgreSQL)', () => {
 
     // ── B. FX moves the headline, never the money ────────────────────────
 
-    test('a rate change moves the headline GHS value but mutates NO ledger state', async () => {
+    test('a rate change moves ONLY the USDC estimate — headline and ledger untouched', async () => {
         const user = await seedUser(prisma, {
             nativeGhsBalance: 50, availableBalance: 100,
         });
         await setFreshRate('12.5');
         const v1 = await valuation.buildBalanceValuation({ prisma, userId: user.id, now: NOW });
-        expect(v1.availableGhsValue.value).toBe(1300);
+        expect(v1.nativeGhsAvailable.value).toBe(50);
+        expect(v1.usdcEquivalent.value).toBe(4); // 50 / 12.5
 
         await setFreshRate('13.0');
         const v2 = await valuation.buildBalanceValuation({ prisma, userId: user.id, now: NOW });
-        // 50 + 100*13 = 1350
-        expect(v2.availableGhsValue.value).toBe(1350);
+        // The headline is INVARIANT to the rate; only the estimate moves.
+        expect(v2.nativeGhsAvailable.value).toBe(50);
+        expect(v2.usdcEquivalent.value).toBeCloseTo(50 / 13, 6);
 
         // The underlying assets are byte-identical: the valuation is a pure
         // read model over unchanged money.
@@ -215,8 +216,9 @@ describe('Balance valuation contract (real PostgreSQL)', () => {
         expect(v.usdcTransactionGateOpen).toBe(false);
         expect(v.usdcNativeActionsAvailable).toBe(true); // same-asset USDC actions are never FX-gated
         expect(v.usdcTransactionGateReason).toBe('NO_FRESH_CANONICAL_RATE_SAVED_FALLBACK_DISPLAY_ONLY');
-        // 10 + 20*12 = 250
-        expect(v.availableGhsValue.value).toBe(250);
+        // headline 10 GHS; estimate = 10 / 12 = 0.8333...
+        expect(v.nativeGhsAvailable.value).toBe(10);
+        expect(v.usdcEquivalent.value).toBeCloseTo(10 / 12, 6);
         expect(v.displayRate.basis).toBe('SAVED_FALLBACK');
     });
 
@@ -231,23 +233,25 @@ describe('Balance valuation contract (real PostgreSQL)', () => {
         expect(v.usdcTransactionGateOpen).toBe(false);
         expect(v.usdcNativeActionsAvailable).toBe(true); // same-asset USDC actions are never FX-gated
         expect(v.usdcTransactionGateReason).toBe('NO_FRESH_CANONICAL_RATE_DEMO_FALLBACK_DISPLAY_ONLY');
-        // 0 + 100*12.03 = 1203
-        expect(v.availableGhsValue.value).toBe(1203);
+        // headline 0 GHS; estimate of the headline = 0 / 12.03 = 0
+        expect(v.nativeGhsAvailable.value).toBe(0);
+        expect(v.usdcEquivalent.value).toBe(0);
+        expect(v.availableUsdc.value).toBe(100); // USDC held stays separate, never reinterpreted
         expect(v.displayRate.rateExact).toBe('12.03000000');
         expect(v.displayRate.basis).toBe('DEMO_FALLBACK');
     });
 
     // ── D/E. honest unavailability ──────────────────────────────────────
 
-    test('no rate + available USDC > 0: PARTIAL_FX_UNAVAILABLE — no fabricated totals', async () => {
+    test('no rate + available USDC > 0: FX_UNAVAILABLE — estimate null, GHS headline still fully valid', async () => {
         const user = await seedUser(prisma, { nativeGhsBalance: 30, availableBalance: 75 });
         await setNoRate();
 
         const v = await valuation.buildBalanceValuation({ prisma, userId: user.id, now: NOW });
         expect(v.rateStatus).toBe('UNAVAILABLE');
-        expect(v.valuationStatus).toBe('PARTIAL_FX_UNAVAILABLE');
-        expect(v.availableGhsValue).toBeNull();
+        expect(v.valuationStatus).toBe('FX_UNAVAILABLE');
         expect(v.usdcEquivalent).toBeNull();
+        expect(v).not.toHaveProperty('availableGhsValue'); // combined aggregate REMOVED from the contract
         expect(v.displayRate).toBeNull();
         expect(v.usdcTransactionGateOpen).toBe(false);
         expect(v.usdcNativeActionsAvailable).toBe(true); // same-asset USDC actions are never FX-gated
@@ -256,15 +260,15 @@ describe('Balance valuation contract (real PostgreSQL)', () => {
         expect(v.availableUsdc.value).toBe(75);
     });
 
-    test('no rate + available USDC == 0: NATIVE_GHS_ONLY — complete without FX', async () => {
+    test('no rate + available USDC == 0: FX_UNAVAILABLE — headline still fully valid', async () => {
         const user = await seedUser(prisma, { nativeGhsBalance: 30, availableBalance: 0 });
         await setNoRate();
 
         const v = await valuation.buildBalanceValuation({ prisma, userId: user.id, now: NOW });
         expect(v.rateStatus).toBe('UNAVAILABLE');
-        expect(v.valuationStatus).toBe('NATIVE_GHS_ONLY');
-        expect(v.availableGhsValue.exact).toBe('30.00000000'); // native total remains valid
-        expect(v.usdcEquivalent).toBeNull(); // nothing to value in USDC
+        expect(v.valuationStatus).toBe('FX_UNAVAILABLE');
+        expect(v.nativeGhsAvailable.exact).toBe('30.00000000'); // native total remains valid
+        expect(v.usdcEquivalent).toBeNull(); // nothing to estimate in USDC
         expect(v.usdcTransactionGateOpen).toBe(false);
         expect(v.usdcNativeActionsAvailable).toBe(true); // same-asset USDC actions are never FX-gated
     });
@@ -326,12 +330,13 @@ describe('Balance valuation contract (real PostgreSQL)', () => {
         expect(v.locked.committedSusuUsdc.value).toBe(10);
         expect(v.locked.vendorUnallocatedUsdc.value).toBe(300);
 
-        // The available headline counts ONLY available assets:
-        // 5 GHS native + 40 USDC × 12.5 = 505 GHS — NOT 5+40×12.5+11+7+25+10
-        expect(v.availableGhsValue.value).toBe(505);
+        // The GHS headline counts ONLY the native-GHS wallet: 5 GHS. USDC
+        // held (40), every locked bucket, and AZM points are all reported
+        // separately in native units — never summed into the headline.
+        expect(v.nativeGhsAvailable.value).toBe(5);
+        expect(v.availableUsdc.value).toBe(40);
         // AZM points are non-cash and excluded from every monetary total
         expect(v.nonCash.azmPoints.value).toBe(999);
-        expect(v.availableGhsValue.value).not.toBe(505 + 999);
     });
 
     // ── H. distinct quantities ──────────────────────────────────────────
@@ -341,9 +346,54 @@ describe('Balance valuation contract (real PostgreSQL)', () => {
         await setFreshRate('12.5');
 
         const v = await valuation.buildBalanceValuation({ prisma, userId: user.id, now: NOW });
-        // Held: 100. Equivalent: (25 + 100*12.5)/12.5 = 1275/12.5 = 102
+        // Held: 100. Estimate of the headline: 25 / 12.5 = 2
         expect(v.availableUsdc.value).toBe(100);
-        expect(v.usdcEquivalent.value).toBe(102);
+        expect(v.usdcEquivalent.value).toBe(2);
         expect(v.usdcEquivalent.value).not.toBe(v.availableUsdc.value);
+    });
+
+    // ── OWNER REGRESSION (contract correction, #369, 2026-10-27) ────────
+    // The GHS headline is the authoritative native-GHS wallet balance ONLY.
+    // nativeGhs = 100, USDC held = 500, rate = 10 → headline MUST be 100
+    // and the estimated USDC equivalent of it MUST be 10 — NOT a combined
+    // (100 + 500×10 = 5010 GHS → 501 USDC) valuation.
+    test('GHS headline is the native balance only — never a combined valuation (owner regression)', async () => {
+        const user = await seedUser(prisma, { nativeGhsBalance: 100, availableBalance: 500 });
+        await setFreshRate('10');
+
+        const v = await valuation.buildBalanceValuation({ prisma, userId: user.id, now: NOW });
+        expect(v.nativeGhsAvailable.exact).toBe('100.00000000');
+        expect(v.availableUsdc.exact).toBe('500.00000000');
+        expect(v.usdcEquivalent.exact).toBe('10.00000000'); // 100 / 10
+        // Prove it is NOT the combined valuation (would be 5010/10 = 501).
+        expect(v.usdcEquivalent.value).not.toBe((100 + 500 * 10) / 10);
+        expect(v.usdcEquivalent.value).not.toBe(v.availableUsdc.value);
+    });
+
+    // The headline must be INVARIANT to any variation in actual USDC held.
+    test('the GHS headline is unchanged by any variation in actual USDC held', async () => {
+        const user = await seedUser(prisma, { nativeGhsBalance: 100, availableBalance: 500 });
+        await setFreshRate('10');
+        for (const usdcHeld of [0, 17, 500, 5000]) {
+            await prisma.user.update({
+                where: { id: user.id },
+                data: { availableBalance: usdcHeld },
+            });
+            const v = await valuation.buildBalanceValuation({ prisma, userId: user.id, now: NOW });
+            expect(v.nativeGhsAvailable.exact).toBe('100.00000000');
+            expect(v.usdcEquivalent.exact).toBe('10.00000000'); // estimate derives from GHS / rate
+        }
+    });
+
+    // A missing FX rate must NOT make a valid GHS balance unavailable.
+    test('a missing FX rate never makes a valid GHS balance unavailable', async () => {
+        const user = await seedUser(prisma, { nativeGhsBalance: 100, availableBalance: 500 });
+        await setNoRate();
+
+        const v = await valuation.buildBalanceValuation({ prisma, userId: user.id, now: NOW });
+        expect(v.valuationStatus).toBe('FX_UNAVAILABLE');
+        expect(v.nativeGhsAvailable.exact).toBe('100.00000000'); // headline fully available
+        expect(v.availableUsdc.exact).toBe('500.00000000');       // USDC held stays honest
+        expect(v.usdcEquivalent).toBeNull();                      // only the estimate is unavailable
     });
 });
