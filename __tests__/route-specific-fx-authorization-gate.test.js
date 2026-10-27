@@ -381,6 +381,41 @@ describe('Universal USDC transaction gate — route-level pin (real PostgreSQL)'
         }
     });
 
+    test('1m-4: DUST GUARD — a MoMo-typed withdrawal that quantizes to 0.00 GHS is refused PRE-DEBIT with the payable minimum', async () => {
+        // Owner policy on #369: the wallet MOMO leg debits the user at
+        // request time and the payout worker realizes GHS at dispatch. A
+        // dust amount would debit now and strand a PENDING row the worker
+        // can never dispatch (its own defense-in-depth parks such rows).
+        // The honest verdict is a pre-debit 400 with the payable minimum.
+        await setFreshRate(12.5);
+        const { seedUser } = require('./helpers/factories');
+        const prevAuth = mockAuthUserId;
+        const user = await seedUser(prisma, { availableBalance: 50 });
+        mockAuthUserId = user.id;
+        try {
+            // 0.0001 USDC * 12.5 = 0.00125 GHS -> 0.00 at pesewa precision.
+            const res = await request(app).post('/api/wallet/withdraw')
+                .set('idempotency-key', 'dust-guard-momo-1')
+                .send({ amount: 0.0001, destination: '0244000000123', destinationType: 'MOMO' });
+            expect(res.status).toBe(400);
+            expect(res.body.code).toBe('DUST_SETTLEMENT');
+            expect(Number(res.body.data.minAmountUsdc)).toBeGreaterThan(0);
+            // Nothing was deducted, no Withdrawal row was created, and the
+            // idempotency claim was released (pre-economics refusal).
+            const after = await prisma.user.findUnique({ where: { id: user.id }, select: { availableBalance: true } });
+            expect(Number(after.availableBalance)).toBeCloseTo(50, 6);
+            const rows = await prisma.withdrawal.findMany({ where: { userId: user.id }, select: { id: true } });
+            expect(rows).toHaveLength(0);
+            // The same key is replayable: the refusal claimed nothing.
+            const replay = await request(app).post('/api/wallet/withdraw')
+                .set('idempotency-key', 'dust-guard-momo-1')
+                .send({ amount: 1, destination: '0244000000123', destinationType: 'MOMO' });
+            expect(replay.status).toBe(200);
+        } finally {
+            mockAuthUserId = prevAuth;
+        }
+    });
+
     test('1c-m: stack pin — the conditional gate on /api/wallet/withdraw sits after guards, before idempotency', async () => {
         const router = require('../routes/walletRoutes');
         const sig = (h) => String(h);

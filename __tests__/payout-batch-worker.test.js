@@ -133,6 +133,49 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
             data: { status: 'NEEDS_MANUAL_REVIEW' },
         });
     });
+
+    // ── DUST-SETTLEMENT GUARD (owner policy on #369, defense in depth) ─────
+    // A legacy row whose USDC amount quantizes to 0.00 GHS at the current
+    // rate is a payout that cannot exist: NEVER dispatched to the provider.
+    // Parked pre-claim for manual resolution. New withdrawals are refused
+    // at request time (wallet/direct-fiat guards); this catches rows that
+    // predate those guards or slip past them.
+    test('a legacy dust withdrawal is parked, never dispatched as 0.00 GHS', async () => {
+        const initiateTransfer = jest.fn().mockResolvedValue({ _provider: 'mtn', provider: 'MTN_MOMO_DISBURSEMENT', status: 'ACCEPTED' });
+        const prisma = {
+            globalSettings: { findUnique: jest.fn().mockResolvedValue({ ...settings, liveRetailRate: 13 }) },
+            systemFiatPool: { findUnique: jest.fn().mockResolvedValue({ balance: 1000 }) },
+            fiatLiquidityReservation: { findUnique: jest.fn().mockResolvedValue(null) }, // legacy regime
+            withdrawal: {
+                findMany: jest.fn().mockResolvedValue([{
+                    id: 94, userId: 7, amount: 0.0001, destination: '0240000000', network: 'MTN',
+                    payoutMethod: 'MTN_MOMO', createdAt: new Date('2026-08-30T10:00:00.000Z'),
+                }]),
+                update: jest.fn().mockResolvedValue({}),
+                updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+            },
+            transactionHistory: {
+                findMany: jest.fn().mockResolvedValue([
+                    { id: 'tx-dust-1', txHash: 'dust-ref-1', status: 'PENDING', userId: 7, amountUsdc: 0.0001 },
+                ]),
+                findUnique: jest.fn(),
+            },
+            $queryRawUnsafe: jest.fn().mockResolvedValue([]),
+            $executeRawUnsafe: jest.fn().mockResolvedValue(1),
+        };
+        const worker = new PayoutBatchWorker(prisma, null, { initiateTransfer }, null);
+        const result = await worker._processBatch({ ...settings, liveRetailRate: 13 }, { isManualTrigger: true });
+
+        // 0.0001 USDC * 13 = 0.0013 GHS -> 0.00 at pesewa precision: dust.
+        expect(result.processed).toBe(0);
+        expect(result.flagged).toBe(1);
+        expect(result.details.flaggedManualReview[0]).toMatchObject({ id: 94, reason: 'DUST_SETTLEMENT' });
+        expect(initiateTransfer).not.toHaveBeenCalled();
+        expect(prisma.withdrawal.updateMany).toHaveBeenCalledWith({
+            where: { id: 94, status: { in: ['PENDING', 'APPROVED'] } },
+            data: { status: 'NEEDS_MANUAL_REVIEW' },
+        });
+    });
 });
 
 // ── P0: provider unknown-outcome classification ──────────────────────────────

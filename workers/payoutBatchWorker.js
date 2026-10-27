@@ -414,6 +414,31 @@ class PayoutBatchWorker {
                 // reservation row): preserve the historical SystemFiatPool
                 // pool/threshold policy. SystemFiatPool is a compatibility /
                 // legacy projection ONLY and is never an authority input.
+                // DUST-SETTLEMENT GUARD (owner policy on #369, defense in
+                // depth): a legacy row converts USDC -> GHS at dispatch with
+                // the SAME pesewa quantization as the request-time guards
+                // (which refuse dust pre-debit for every NEW withdrawal). A
+                // row that predates those guards — or one created by a path
+                // they missed — may quantize to 0.00 GHS here: a payout
+                // that cannot exist. NEVER dispatch it to the provider; park
+                // it for manual resolution so a human decides the refund.
+                // (Authority-recorded rows cannot be dust: the reservation
+                // was only creatable through the guarded service path.)
+                const legacyPayoutGhs = parseFloat((amount * liveRate).toFixed(2));
+                // Finite-only: an unrateable row (NaN) is a rate problem,
+                // not proven dust — it must never dispatch, but parking it
+                // as DUST_SETTLEMENT would mislabel the failure. Only a
+                // PROVEN zero (real number, quantized to 0.00) parks here.
+                if (Number.isFinite(legacyPayoutGhs) && legacyPayoutGhs <= 0) {
+                    const parked = await this._parkForManualReview(withdrawal, 'DUST_SETTLEMENT', {
+                        amount,
+                        liveRate,
+                        payoutGhs: legacyPayoutGhs,
+                        message: `Dust settlement: ${amount} USDC quantizes to 0.00 GHS at the current rate — never dispatched, parked for manual resolution`
+                    });
+                    if (parked) results.flaggedManualReview.push({ id: withdrawal.id, reason: 'DUST_SETTLEMENT', amount });
+                    continue;
+                }
                 const poolBalanceNow = await ensureLegacyPool();
                 if (poolBalanceNow < threshold || poolBalanceNow < amount) {
                     const parked = await this._parkForManualReview(withdrawal, 'INSUFFICIENT_POOL_LIQUIDITY', {
