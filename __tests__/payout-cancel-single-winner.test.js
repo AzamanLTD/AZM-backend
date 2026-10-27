@@ -407,7 +407,52 @@ const MARK = `swp-${Date.now()}`;
             expect(snapshots).toBe(1); // one payout snapshot, not two
         });
 
-        test('two CONCURRENT payouts with different keys: exactly one 200 and one 409, credited once', async () => {
+        // ────────────────────────────────────────────────────────────────
+    // 4b: CURRENCY-CONTRACT BOUNDARY (review closeout) — settlementScaleFor
+    // defaults unknown/absent currencies to fiat precision; it does NOT
+    // reject them. A legacy/malformed config row (DB-origin baseCurrency
+    // outside the supported contract) must be refused at the boundary
+    // with ZERO financial mutation — never silently settled at 2dp.
+    // ────────────────────────────────────────────────────────────────
+    test('payout with an UNSUPPORTED DB-origin baseCurrency is refused with no mutation', async () => {
+        const user = await mkUser(50);
+        seeded.userIds.push(user.id);
+        await prisma.currencyWallet.create({ data: { userId: user.id, currency: 'USD', balance: 0 } });
+        const cycle = await setupCycle(5, user.id, 'XYZ'); // unsupported stored base currency
+
+        mockAuthUserId = user.id;
+        const res = await request(app).post('/api/cross-border-susu/payout')
+            .set('idempotency-key', `${MARK}-badbase`).send({ cycleId: cycle.id, targetCurrency: 'USD' });
+        expect(res.status).toBe(400);
+        expect(res.body.code).toBe('UNSUPPORTED_BASE_CURRENCY');
+
+        const wallet = await prisma.currencyWallet.findUnique({ where: { userId_currency: { userId: user.id, currency: 'USD' } } });
+        expect(parseFloat(wallet.balance)).toBeCloseTo(0, 6); // NOTHING credited
+        const row = await prisma.susuCycle.findUnique({ where: { id: cycle.id } });
+        expect(row.status).toBe('COLLECTING_GRACE'); // never transitioned
+        expect(row.paidOutAt).toBeNull();
+        const snapshots = await prisma.crossBorderFxSnapshot.count({ where: { cycleId: cycle.id, userId: user.id } });
+        expect(snapshots).toBe(0); // no FX snapshot written
+    });
+
+    test('contribution with an UNSUPPORTED DB-origin baseCurrency is refused with no debit', async () => {
+        const user = await mkUser(51);
+        seeded.userIds.push(user.id);
+        const cycle = await setupCycle(6, user.id, 'XYZ'); // unsupported stored base currency
+        await prisma.currencyWallet.create({ data: { userId: user.id, currency: 'GHS', balance: 1000 } });
+
+        const member = await prisma.susuMember.findFirst({ where: { susuGroupId: cycle.susuGroupId } });
+        mockAuthUserId = user.id;
+        const res = await request(app).post('/api/cross-border-susu/contribute')
+            .set('idempotency-key', `${MARK}-badbase-c`).send({ susuGroupId: cycle.susuGroupId, cycleId: cycle.id, memberId: member.id, localAmount: '100', localCurrency: 'GHS' });
+        expect(res.status).toBe(400);
+        expect(res.body.code).toBe('UNSUPPORTED_BASE_CURRENCY');
+
+        const wallet = await prisma.currencyWallet.findUnique({ where: { userId_currency: { userId: user.id, currency: 'GHS' } } });
+        expect(parseFloat(wallet.balance)).toBeCloseTo(1000, 6); // never debited
+    });
+
+    test('two CONCURRENT payouts with different keys: exactly one 200 and one 409, credited once', async () => {
             const user = await mkUser(11);
             seeded.userIds.push(user.id);
             await prisma.currencyWallet.create({ data: { userId: user.id, currency: 'USD', balance: 0 } });

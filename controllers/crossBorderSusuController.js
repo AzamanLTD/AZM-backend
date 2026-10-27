@@ -211,6 +211,13 @@ async function contributeLocalCurrency(req, res) {
       return res.status(400).json({ success: false, message: 'Not a cross-border Susu group.' });
     }
 
+    // CURRENCY-CONTRACT BOUNDARY (review closeout): as on the payout leg —
+    // config.baseCurrency is DB-origin; re-check the supported-currency
+    // contract before any settlementScale helper touches money.
+    if (!SUPPORTED_CURRENCIES.includes(config.baseCurrency)) {
+      return res.status(400).json({ success: false, code: 'UNSUPPORTED_BASE_CURRENCY', message: `Unsupported base currency on this group's config: ${config.baseCurrency}` });
+    }
+
     // Get FX rate from local → base (authorization-grade: no demo
     // fallback, freshness-checked observation — see getFreshCrossBorderRate)
     let freshRate;
@@ -349,6 +356,17 @@ async function payoutLocalCurrency(req, res) {
 
     if (!config) {
       return res.status(400).json({ success: false, message: 'Not a cross-border Susu.' });
+    }
+
+    // CURRENCY-CONTRACT BOUNDARY (review closeout): config.baseCurrency is
+    // DB-origin, not request-origin — the request boundary validated it at
+    // creation, but settlementScaleFor() itself DEFAULTS unknown/absent
+    // currencies to fiat precision; the helper does not reject them. A
+    // legacy/malformed config row must not silently settle at an
+    // unvalidated scale, so the supported-currency contract is re-checked
+    // HERE, before any money moves.
+    if (!SUPPORTED_CURRENCIES.includes(config.baseCurrency)) {
+      return res.status(400).json({ success: false, code: 'UNSUPPORTED_BASE_CURRENCY', message: `Unsupported base currency on this group's config: ${config.baseCurrency}` });
     }
 
     // Convert payout from base → target currency. The payout leg is a NEW
