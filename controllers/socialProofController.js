@@ -19,8 +19,18 @@ exports.getForBusiness = async (req, res) => {
                 message: 'A businessProfileId is required.',
             });
         }
-        const business = await prisma.businessProfile.findUnique({
-            where: { id: businessProfileId },
+        // PUBLIC VISIBILITY BOUNDARY (review reconciliation): a business
+        // hidden from the public discovery feed (suspended, owner-paused, or
+        // not publicly discoverable) is served 404 here too — the same
+        // eligibility contract as the public discovery feed. The social
+        // proof of a hidden business is not readable while it is hidden.
+        const business = await prisma.businessProfile.findFirst({
+            where: {
+                id: businessProfileId,
+                isSuspended: false,
+                isPausedByOwner: false,
+                isPubliclyDiscoverable: true,
+            },
             select: { id: true },
         });
         if (!business) {
@@ -53,12 +63,31 @@ exports.getForBusinesses = async (req, res) => {
                 message: `businessProfileIds must be a non-empty array of strings (max ${MAX_BATCH}).`,
             });
         }
-        // Unknown IDs are simply absent from the result (honest zeros);
-        // the single-business route is the one that distinguishes 404.
+        // Unknown AND publicly-invisible IDs are simply absent from the
+        // result (honest zeros) — the same eligibility contract as the
+        // single-business route and the public discovery feed; the
+        // single-business route is the one that distinguishes 404.
+        const visible = await prisma.businessProfile.findMany({
+            where: {
+                id: { in: ids },
+                isSuspended: false,
+                isPausedByOwner: false,
+                isPubliclyDiscoverable: true,
+            },
+            select: { id: true },
+        });
         const proofs = await getSocialProofBatch(prisma, {
             viewerId: req.user.id,
-            businessProfileIds: ids,
+            businessProfileIds: visible.map(b => b.id),
         });
+        // Preserve the honest-zeros contract for every REQUESTED id:
+        // unknown and publicly-invisible businesses read as zeros (no
+        // personal aggregates), never as a distinguishable error.
+        for (const id of ids) {
+            if (!proofs[id]) {
+                proofs[id] = { friendsFollowingCount: 0, friendsOfFriendsFollowingCount: 0 };
+            }
+        }
         return res.status(200).json({ success: true, proofs });
     } catch (err) {
         return res.status(err.status || 500).json({

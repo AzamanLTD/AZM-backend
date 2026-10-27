@@ -50,7 +50,7 @@ describeOrSkip('Business social proof (Backend C)', () => {
         request = require('supertest');
 
         const { signAccessToken } = require('../services/authTokenService');
-        async function makeUser(name) {
+    async function makeUser(name) {
             const username = `${name}_${uniq()}`;
             const u = await prisma.user.create({
                 data: {
@@ -247,6 +247,87 @@ describeOrSkip('Business social proof (Backend C)', () => {
             where: { businessProfileId: biz.id },
         });
         expect(proof.friendsFollowingCount).toBeLessThan(followerCount);
+    });
+
+    // ─── review reconciliation: graph-node eligibility everywhere ────────
+    test('banned and deleted users are ineligible as direct-friend NODES', async () => {
+        const base = await authed(request(app).get(`/api/social-proof/${biz.id}`));
+        const bannedNode = await makeUser('bannednode');
+        await mkFriend(viewerId, bannedNode.id);
+        await mkFollow(bannedNode.id, biz.id);
+        await prisma.user.update({ where: { id: bannedNode.id }, data: { banStatus: 'BANNED_1W' } });
+        const delNode = await makeUser('delnode');
+        await mkFriend(viewerId, delNode.id);
+        await mkFollow(delNode.id, biz.id);
+        await prisma.user.update({ where: { id: delNode.id }, data: { isDeleted: true } });
+        const res = await authed(request(app).get(`/api/social-proof/${biz.id}`));
+        expect(res.body.friendsFollowingCount).toBe(base.body.friendsFollowingCount); // unchanged
+        expect(res.body.friendsOfFriendsFollowingCount).toBe(base.body.friendsOfFriendsFollowingCount);
+    });
+
+    test('banned and deleted users are ineligible as INTERMEDIARIES (fof via them not counted)', async () => {
+        const base = await authed(request(app).get(`/api/social-proof/${biz.id}`));
+        // BANNED intermediary: viewer -> banned intermediary -> fof follower.
+        const bannedMid = await makeUser('bannedmid');
+        await mkFriend(viewerId, bannedMid.id);
+        await prisma.user.update({ where: { id: bannedMid.id }, data: { banStatus: 'BANNED_1W' } });
+        const viaBanned = await makeUser('viabanned');
+        await mkFriend(bannedMid.id, viaBanned.id);
+        await mkFollow(viaBanned.id, biz.id);
+        // DELETED intermediary: viewer -> deleted intermediary -> fof follower.
+        const delMid = await makeUser('delmid');
+        await mkFriend(viewerId, delMid.id);
+        await prisma.user.update({ where: { id: delMid.id }, data: { isDeleted: true } });
+        const viaDeleted = await makeUser('viadeleted');
+        await mkFriend(delMid.id, viaDeleted.id);
+        await mkFollow(viaDeleted.id, biz.id);
+        const res = await authed(request(app).get(`/api/social-proof/${biz.id}`));
+        expect(res.body.friendsOfFriendsFollowingCount).toBe(base.body.friendsOfFriendsFollowingCount); // unchanged
+        expect(res.body.friendsFollowingCount).toBe(base.body.friendsFollowingCount);
+    });
+
+    test('an ELIGIBLE intermediary still counts its fof follower (guard against over-filtering)', async () => {
+        const base = await authed(request(app).get(`/api/social-proof/${biz.id}`));
+        const mid = await makeUser('okmid');
+        await mkFriend(viewerId, mid.id);
+        const fofU = await makeUser('okfof');
+        await mkFriend(mid.id, fofU.id);
+        await mkFollow(fofU.id, biz.id);
+        const res = await authed(request(app).get(`/api/social-proof/${biz.id}`));
+        expect(res.body.friendsOfFriendsFollowingCount).toBe(base.body.friendsOfFriendsFollowingCount + 1);
+    });
+
+    test('publicly-hidden businesses are refused on the single route and read zeros in the batch', async () => {
+        const hiddenOwner = await makeUser('hiddenowner');
+        const hidden = await prisma.businessProfile.create({
+            data: {
+                userId: hiddenOwner.id, bizId: `BIZ-${uniq()}`,
+                businessName: `Hidden ${uniq()}`, category: 'FOOD_BEVERAGE',
+                isVerified: true, kybStatus: 'VERIFIED',
+            },
+        });
+        seeded.businesses.push(hidden.id);
+        const visible = await authed(request(app).get(`/api/social-proof/${hidden.id}`));
+        expect(visible.statusCode).toBe(200);
+
+        for (const patch of [{ isSuspended: true }, { isPausedByOwner: true }, { isPubliclyDiscoverable: false }]) {
+            await prisma.businessProfile.update({ where: { id: hidden.id }, data: patch });
+            const res = await authed(request(app).get(`/api/social-proof/${hidden.id}`));
+            expect(res.statusCode).toBe(404);
+            expect(res.body.code).toBe('BUSINESS_NOT_FOUND');
+            // batch keeps honest zeros (never a distinguishable error, never
+            // personal aggregates for a hidden business).
+            const batch = await authed(request(app).post('/api/social-proof'))
+                .send({ businessProfileIds: [hidden.id, biz.id] });
+            expect(batch.statusCode).toBe(200);
+            expect(batch.body.proofs[hidden.id]).toEqual({
+                friendsFollowingCount: 0, friendsOfFriendsFollowingCount: 0,
+            });
+            await prisma.businessProfile.update({
+                where: { id: hidden.id },
+                data: Object.fromEntries(Object.entries(patch).map(([k]) => [k, k === 'isPubliclyDiscoverable' ? true : false])),
+            });
+        }
     });
 
     async function makeUser(name) {
