@@ -89,6 +89,9 @@ function mountRoutes(app, {
     // Marketplace personalisation (Backend C): per-viewer social-proof
     // aggregates (friends / friends-of-friends following a business).
     app.use('/api/social-proof', generalLimiter, require('../../routes/socialProofRoutes'));
+    // Marketplace personalisation (Backend D): per-user "Show less like
+    // this" recommendation feedback.
+    app.use('/api/recommendation-feedback', generalLimiter, require('../../routes/recommendationFeedbackRoutes'));
     app.use('/api/ad-posts', generalLimiter, require('../../routes/adPostRoutes'));
     app.use('/api/dine-in', financialLimiter, require('../../routes/dineInRoutes'));
     app.use('/api/showcases', generalLimiter, require('../../routes/showcaseRoutes'));

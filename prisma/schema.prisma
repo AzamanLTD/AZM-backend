@@ -982,6 +982,7 @@ model User {
   storyReactions      StoryReaction[]         @relation("StoryReactor")
   followingBusinesses BusinessFollower[]      @relation("BusinessFollower")
   savedBusinesses    BusinessBookmark[]       @relation("BusinessBookmark")
+  recommendationFeedback BusinessRecommendationFeedback[] @relation("BusinessRecommendationFeedback")
   dineInTabs          DineInTab[]             @relation("DineInTabCustomer")
   dineInTabItems      DineInTabItem[]         @relation("DineInTabStaff")
   trustScore          CustomerTrustScore?
@@ -2861,6 +2862,7 @@ model BusinessProfile {
   transitTrips               TransitTrip[]
   followers                  BusinessFollower[]
   customerBookmarks          BusinessBookmark[]
+  recommendationFeedback     BusinessRecommendationFeedback[]
   adPosts                    BusinessAdPost[]
   taxPresets                 BusinessTaxPreset[]
   dineInTabs                 DineInTab[]
@@ -4792,6 +4794,29 @@ model BusinessBookmark {
 
   @@unique([businessProfileId, customerId])
   @@index([customerId])
+  @@index([businessProfileId])
+}
+
+// Marketplace personalisation (Backend D): per-user recommendation feedback
+// for business discovery ("Show less like this"). User-scoped suppression
+// that DEMOTES a business in the caller's personalised ranking; it never
+// deletes or archives the business globally, never touches follows,
+// bookmarks or reviews, and never overrides hard eligibility/availability
+// rules. The @@unique pair makes repeated feedback idempotent at the
+// database level; DELETE of the row is the reliable undo (restores the
+// prior ranking, as the row was the only personalisation signal).
+model BusinessRecommendationFeedback {
+  id                String   @id @default(uuid())
+  userId            Int
+  businessProfileId String
+  feedbackType      String   @default("SHOW_LESS")
+  createdAt         DateTime @default(now())
+
+  user            User            @relation("BusinessRecommendationFeedback", fields: [userId], references: [id], onDelete: Cascade)
+  businessProfile  BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, businessProfileId])
+  @@index([userId])
   @@index([businessProfileId])
 }
 

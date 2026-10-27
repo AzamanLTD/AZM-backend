@@ -59,7 +59,12 @@ paths are:
      behind `/api/bookmarks`) if absent and fail-closed validates the exact
      `db push` shape: column set/types, pkey, both CASCADE foreign keys, the
      unique `(businessProfileId, customerId)` pair and both lookup indexes.
- 10. treasury lookup — the susu-foundation seed and id-number encryption
+ 10. **Business recommendation-feedback overlay (marketplace personalisation,
+     Backend D)** — creates the `BusinessRecommendationFeedback` table
+     (per-user "Show less like this") if absent, fail-closed validated
+     (columns, pkey, both CASCADE FKs, unique (userId, businessProfileId),
+     indexes).
+11. treasury lookup — the susu-foundation seed and id-number encryption
      run ONLY when the treasury row is missing or a forced release is
      requested; otherwise autoRelease skips both and finishes early.
   Separately, AFTER `autoRelease()` completes, `bootTreasury()` runs the
