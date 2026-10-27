@@ -65,8 +65,15 @@ const { getFreshServerRateGhsPerUsdc } = require('../src/services/transactionQuo
 // controller's payout-method dispatch uses. A MoMo destination authorizes
 // a GHS payout (FX-dependent); every other destination is same-asset USDC.
 function _isMomoPayoutDestination(req) {
-    const dest = String(req.body?.destination ?? '').trim();
-    return dest.length > 0 && /^\d{9,15}$/.test(dest);
+    // THE single authoritative classification
+    // (services/payoutDestinationClassification.js) — shared with the payout
+    // dispatcher, so the gate decision and the provider dispatch can never
+    // disagree (financial-core blocker A). The earlier local 9-15 digit
+    // regex BOTH mis-flagged 9-12 digit Binance Pay IDs (dispatched as
+    // same-asset USDC) AND failed open on 16+ digit MoMo destinations the
+    // dispatcher actually pays as GHS.
+    const { isMomoPayoutDestination } = require('../services/payoutDestinationClassification');
+    return isMomoPayoutDestination(req.body?.destination);
 }
 
 const SCOPE_ENUM = Object.freeze({

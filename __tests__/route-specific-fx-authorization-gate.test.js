@@ -193,6 +193,19 @@ describe('Universal USDC transaction gate — route-level pin (real PostgreSQL)'
         mockAuthUserId = 'gate-pin-user';
     });
 
+    // The dispatch-proof regressions (1m-2/1m-3/5) now persist REAL rows
+    // (seeded users + their ledger-backing deposits, withdrawals, idempotency
+    // claims). Without per-test cleanup those leaked into the executor
+    // describe's first run (7a) and polluted its exact-count assertions.
+    afterEach(async () => {
+        await prisma.$executeRawUnsafe(
+            'TRUNCATE TABLE "User", "TransactionHistory", "Withdrawal", "FinancialOperation", "SmartRoute", "SmartRouteRun", "Vault" RESTART IDENTITY CASCADE'
+        );
+        await prisma.$executeRawUnsafe(
+            'TRUNCATE TABLE "LedgerTransaction", "JournalEntry", "LedgerAccount", "RestrictedObligation" RESTART IDENTITY CASCADE'
+        );
+    });
+
     afterAll(async () => {
         if (prisma) {
             await prisma.fxSavedRate.deleteMany({});
@@ -244,22 +257,98 @@ describe('Universal USDC transaction gate — route-level pin (real PostgreSQL)'
         }
     });
 
-    test('1m: DESTINATION-CONDITIONAL — /api/wallet/withdraw gates ONLY MoMo phone destinations', async () => {
+    test('1m: DESTINATION-CONDITIONAL — gate decision and dispatch classification are ONE contract (blocker A)', async () => {
         await setStaleRate();
-        // MoMo phone destination -> the GHS payout leg needs a fresh
-        // executable quote -> gate refuses CLOSED before the controller.
-        const momo = await request(app).post('/api/wallet/withdraw').send({ amount: 5, destination: '0244000000' });
+        // Realistic MoMo destination OUTSIDE the Binance Pay ID window
+        // (13+ digits): the GHS payout leg needs a fresh executable quote ->
+        // gate refuses CLOSED before the controller.
+        const momo = await request(app).post('/api/wallet/withdraw').send({ amount: 5, destination: '0244000000123' });
         expect(momo.status).toBe(503);
         expect(['RATE_STALE', 'RATE_UNAVAILABLE']).toContain(momo.body.code);
         expect(momo.body.usdcTransactionGate).toBe('CLOSED');
+        // 16+ digit MoMo destination: formerly a FAIL-OPEN HOLE (the old
+        // 9-15 regex never gated it, while the dispatcher pays it as GHS).
+        const momo16 = await request(app).post('/api/wallet/withdraw').send({ amount: 5, destination: '0244000000123456' });
+        expect(momo16.status).toBe(503);
+        expect(momo16.body.usdcTransactionGate).toBe('CLOSED');
+        // Realistic Binance Pay ID (9 digits, numeric): dispatched as a
+        // same-asset USDC Binance payout -> the SAME stale rate must NOT
+        // refuse it (formerly mis-flagged as MoMo by the 9-15 regex).
+        const binance = await request(app).post('/api/wallet/withdraw').send({ amount: 5, destination: '123456789' });
+        expect(binance.status).not.toBe(503);
+        expect(binance.body && binance.body.usdcTransactionGate).toBeUndefined();
         // Crypto destination (TRC20) -> same-asset USDC dispatch, no GHS
-        // conversion -> the SAME stale rate must NOT refuse it: the request
-        // proceeds to the controller's own validation.
+        // conversion -> NOT gated; the request proceeds to the controller's
+        // own validation.
         const trc = await request(app).post('/api/wallet/withdraw').send({ amount: 5, destination: 'TQ5nRc9eK7mYfP2ZQ9G3eV2XtRrEStQXbW' });
-        if (trc.status === 503) {
-            expect(['RATE_STALE', 'RATE_UNAVAILABLE']).not.toContain(trc.body.code);
-        }
+        expect(trc.status).not.toBe(503);
         expect(trc.body && trc.body.usdcTransactionGate).toBeUndefined();
+    });
+
+    test('1m-2: DISPATCH PROOF — with a fresh rate the persisted Withdrawal carries the SAME payoutMethod the gate classified', async () => {
+        // Mounted-route end-to-end: gate passes on a fresh rate, the
+        // controller runs, and the created Withdrawal row records the actual
+        // provider dispatch classification. Gate and dispatch must agree for
+        // every destination class.
+        await setFreshRate();
+        const { seedUser } = require('./helpers/factories');
+        const prisma = app.get('prisma');
+        const prevAuth = mockAuthUserId;
+        const user = await seedUser(prisma, { availableBalance: 50 });
+        mockAuthUserId = user.id;
+        try {
+            // 13-digit numeric -> gated class MOMO -> dispatch row MOMO.
+            const momo = await request(app).post('/api/wallet/withdraw')
+                .set('idempotency-key', 'blk-a-momo-1')
+                .send({ amount: 5, destination: '0244000000123' });
+            expect(momo.status).toBe(200);
+            expect(momo.body.withdrawal.payoutMethod).toBe('MOMO');
+            expect(momo.body.withdrawal.network).toBe('MTN');
+            // 9-digit Binance Pay ID -> ungated class BINANCE_ID -> dispatch row BINANCE_ID.
+            const binance = await request(app).post('/api/wallet/withdraw')
+                .set('idempotency-key', 'blk-a-binance-1')
+                .send({ amount: 5, destination: '123456789' });
+            expect(binance.status).toBe(200);
+            expect(binance.body.withdrawal.payoutMethod).toBe('BINANCE_ID');
+            expect(binance.body.withdrawal.network).toBe('BINANCE_PAY');
+            // TRC20 -> ungated class EXTERNAL_WALLET -> dispatch row EXTERNAL_WALLET.
+            const trc = await request(app).post('/api/wallet/withdraw')
+                .set('idempotency-key', 'blk-a-trc-1')
+                .send({ amount: 5, destination: 'TQ5nRc9eK7mYfP2ZQ9G3eV2XtRrEStQXbW' });
+            expect(trc.status).toBe(200);
+            expect(trc.body.withdrawal.payoutMethod).toBe('EXTERNAL_WALLET');
+            expect(trc.body.withdrawal.network).toBe('TRC20');
+            // Persisted rows agree with the response (dispatch evidence, not just the echo).
+            const rows = await prisma.withdrawal.findMany({ where: { userId: user.id }, select: { payoutMethod: true, network: true, destination: true } });
+            expect(rows.map(r => r.payoutMethod).sort()).toEqual(['BINANCE_ID', 'EXTERNAL_WALLET', 'MOMO']);
+        } finally {
+            mockAuthUserId = prevAuth;
+        }
+    });
+
+    test('1m-3: KNOWN CONTRACT GAP — a 10-digit MoMo-style number dispatches as BINANCE_ID (pinned, reported to the owner)', async () => {
+        // The 8-12 digit numeric window is inherently ambiguous between a
+        // Ghana MoMo number and a Binance Pay ID under the current request
+        // contract ({ destination, networkPref }). The dispatcher has always
+        // resolved it as BINANCE_ID, so the gate follows the SAME rule. A
+        // durable fix needs an explicit destination-type request field (a
+        // contract change requiring product approval) — pinned here so the
+        // ambiguity is visible and cannot silently drift.
+        await setFreshRate();
+        const { seedUser } = require('./helpers/factories');
+        const prisma = app.get('prisma');
+        const prevAuth = mockAuthUserId;
+        const user = await seedUser(prisma, { availableBalance: 50 });
+        mockAuthUserId = user.id;
+        try {
+            const res = await request(app).post('/api/wallet/withdraw')
+                .set('idempotency-key', 'blk-a-gap-1')
+                .send({ amount: 5, destination: '0244000000' });
+            expect(res.status).toBe(200);
+            expect(res.body.withdrawal.payoutMethod).toBe('BINANCE_ID');
+        } finally {
+            mockAuthUserId = prevAuth;
+        }
     });
 
     test('1c-m: stack pin — the conditional gate on /api/wallet/withdraw sits after guards, before idempotency', async () => {
@@ -389,16 +478,40 @@ describe('Universal USDC transaction gate — route-level pin (real PostgreSQL)'
     });
 
     test('5: a gate refusal NEVER claims an idempotency key — the same key reaches the controller after recovery', async () => {
-        const KEY = 'gate-idempotency-probe-1';
-        await setStaleRate();
-        const refused = await request(app).post('/api/savings/goals/1/deposit').set('x-idempotency-key', KEY).send({ amount: 5 });
-        expect(refused.status).toBe(503);
+        // The idempotency authority persists FinancialOperation rows keyed by
+        // the REAL integer userId — the claim path is genuinely exercised
+        // (the earlier x-idempotency-key header never engaged it, so this
+        // test used to pass vacuously). A real user makes the replay's claim
+        // write succeed and the controller's own validation answer.
+        const { seedUser } = require('./helpers/factories');
+        const prevAuth = mockAuthUserId;
+        const user = await seedUser(prisma, { availableBalance: 50 });
+        mockAuthUserId = user.id;
+        try {
+            const KEY = 'gate-idempotency-probe-1';
+            await setStaleRate();
+            const refused = await request(app).post('/api/savings/goals/1/deposit').set('idempotency-key', KEY).send({ amount: 5 });
+            expect(refused.status).toBe(503);
 
-        await setFreshRate();
-        const replay = await request(app).post('/api/savings/goals/1/deposit').set('x-idempotency-key', KEY).send({ amount: 5 });
-        // If the refusal had claimed the key, the replay would be the byte-
-        // identical 503. Reaching anything else proves no claim was made.
-        expect(replay.status).not.toBe(503);
+            await setFreshRate();
+            const replay = await request(app).post('/api/savings/goals/1/deposit').set('idempotency-key', KEY).send({ amount: 5 });
+            // If the refusal had claimed the key, the replay would be the byte-
+            // identical 503 gate refusal. Reaching the controller's own
+            // validation (savings goal 1 does not exist for this user → 4xx)
+            // proves no claim was made and the idempotency authority is live.
+            expect(replay.status).not.toBe(503);
+            expect(replay.body.code).not.toBe('IDEMPOTENCY_UNAVAILABLE');
+            expect(replay.body.code).not.toBe('IDEMPOTENCY_KEY_REQUIRED');
+            // No durable claim was poisoned by the refused request.
+            const claims = await prisma.financialOperation.count({ where: { key: KEY } });
+            if (claims > 0) {
+                const claim = await prisma.financialOperation.findFirst({ where: { key: KEY } });
+                expect(claim.status).not.toBe('IN_PROGRESS');
+                expect(claim.status).toBe('COMMITTED');
+            }
+        } finally {
+            mockAuthUserId = prevAuth;
+        }
     });
 
     test('6: SETTLEMENT PROTECTION — lifecycle/settlement routes are never gated by the stale-rate refusal', async () => {

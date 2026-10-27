@@ -17,10 +17,13 @@ const { idempotency } = require('../middleware/idempotency');
 const { require2FA } = require('../middleware/require2FA');
 const { protectActive }        = require('../middleware/banGuardMiddleware');
 
-// FX-balance workstream — MoMo/GHS payout detection for the conditional
-// FX gate on /withdraw. Mirrors walletController's payoutMethod detection
-// (numeric destination, >= 9 digits → MOMO): the USDC⇄GHS conversion at
-// dispatch makes exactly these requests FX-dependent.
+// Route-specific FX gate (AZM-Planning #75 — PROPOSED, pending owner
+// approval): the wallet withdrawal is FX-dependent exactly when the
+// destination dispatches a GHS MoMo payout. Destination classification is
+// the SINGLE shared contract (services/payoutDestinationClassification.js)
+// used by both this gate and the payout dispatch in walletController — the
+// gate decision and the provider dispatch classification are identical by
+// construction (financial-core blocker A).
 const { requireFreshFxRate } = require('../middleware/fxTransactionGateMiddleware');
 
 
@@ -30,12 +33,11 @@ const { requireFreshFxRate } = require('../middleware/fxTransactionGateMiddlewar
 // request path (payout workers own dispatch), so the response is honest
 // post-commit; 4xx/5xx responses prove the reservation rolled back and
 // release the claim for retry (same disposition contract as /api/withdraw/*).
-// FX-balance workstream — universal transaction gate (supersedes the
-// earlier conditional MoMo-only scope). Crypto wallet dispatches and
-// MoMo/GHS payouts are BOTH new USDC-enabled transaction authorizations —
-// every destination now demands a FRESH canonical rate and is refused 503
-// BEFORE the idempotency claim. A saved/demo fallback rate never opens
-// the gate. (The former isMomoPayoutDestination predicate is retired.)
+// Route-specific FX gate (PROPOSED): MoMo/GHS payout destinations demand
+// a FRESH canonical rate and are refused 503 BEFORE the idempotency claim;
+// Binance Pay IDs, TRC20 and EVM wallet addresses are same-asset USDC
+// dispatches and are NOT FX-gated. A saved/demo fallback rate never opens
+// the gate. Classification is shared — see the module comment above.
 router.post('/withdraw',
     protectActive, require2FA(),
     requireFreshFxRate({ when: 'MOMO_PAYOUT_DESTINATION' }),
