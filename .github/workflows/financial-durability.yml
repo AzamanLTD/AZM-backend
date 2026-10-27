@@ -120,6 +120,9 @@ jobs:
         # guards. Mirrors the release chain (npm run release). The demo rate
         # seed self-suppresses off disposable test DBs.
         run: node infra/install-ghs-wallet-overlay.js
+
+      - name: Install native-GHS settlement overlay
+        run: node infra/install-native-ghs-settlement-overlay.js
       - name: Install standalone payment requests overlay
         # PaymentRequest table (server-owned request resource behind
         # /api/payment-requests). Mirrors the release chain (npm run release)
