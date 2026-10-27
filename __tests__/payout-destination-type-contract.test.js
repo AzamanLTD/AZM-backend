@@ -144,6 +144,15 @@ if (hasDb) describe('Payout destinationType contract — route level (real Postg
         const { PrismaClient } = require('@prisma/client');
         prisma = new PrismaClient();
 
+        // Hermeticity on a PERSISTENT test DB: LedgerTransaction is not
+        // truncated by afterEach, and the withdrawal ledger keys are derived
+        // from the row id (`ledger:wallet:withdrawal:{id}`), which restarts
+        // after a truncate. Stale postings from a previous run would
+        // replay-refuse this run's first withdrawal. Purge them (the
+        // JournalEntry lines FK to LedgerTransaction — delete children first).
+        await prisma.$executeRaw`DELETE FROM "JournalEntry" WHERE "ledgerTransactionId" IN (
+            SELECT id FROM "LedgerTransaction" WHERE "idempotencyKey" LIKE 'ledger:wallet:withdrawal:%')`;
+        await prisma.$executeRaw`DELETE FROM "LedgerTransaction" WHERE "idempotencyKey" LIKE 'ledger:wallet:withdrawal:%'`;
         app = express();
         app.use(express.json());
         app.set('prisma', prisma);
