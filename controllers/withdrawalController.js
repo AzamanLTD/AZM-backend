@@ -1093,6 +1093,29 @@ exports.fiatWithdrawal = async (req, res) => {
             });
         }
 
+        // DUST-SETTLEMENT GUARD (owner policy on #369): honest verdicts for
+        // the two pre-economics refusals finance.service can throw. A missing
+        // rate is server state (503, retryable, nothing deducted); dust is a
+        // client-amount verdict (400, with the payable minimum so the client
+        // can self-correct). Neither may surface as the generic internal
+        // error — the user could not tell an amount fix from a retry.
+        if (error.code === 'FIAT_RATE_UNAVAILABLE') {
+            return res.status(503).json({
+                success: false,
+                code:    'FIAT_RATE_UNAVAILABLE',
+                message: 'Current USDC/GHS retail exchange rate is unavailable. Nothing was deducted and no payout was created. Please try again shortly.',
+                retryable: true
+            });
+        }
+        if (error.code === 'DUST_SETTLEMENT') {
+            return res.status(400).json({
+                success: false,
+                code:    'DUST_SETTLEMENT',
+                message: error.message,
+                data:    { minAmountUsdc: error.minAmountUsdc || null }
+            });
+        }
+
         // r42 WAVE-2: with the accepted response sent AT the commit boundary
         // and the post-response phase fully shielded above, an error reaching
         // THIS catch is provably PRE-COMMIT: the reservation transaction rolled

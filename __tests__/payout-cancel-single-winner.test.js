@@ -351,7 +351,7 @@ const MARK = `swp-${Date.now()}`;
     // 3 + 4: susu payout single-winner + payout-pair rate honesty
     // ────────────────────────────────────────────────────────────────────
     describe('Cross-border susu payout — single-winner + fresh payout-pair rate', () => {
-        const setupCycle = async (n, payoutUserId, baseCurrency = 'GHS') => {
+        const setupCycle = async (n, payoutUserId, baseCurrency = 'GHS', payoutAmount = 100) => {
             const group = await prisma.susuGroup.create({
                 data: { contributionUsdc: 10, totalCycles: 1, contractRequiredCount: 1, startDate: new Date(), rotationSnapshot: [], frequency: 'WEEKLY' },
             });
@@ -360,7 +360,7 @@ const MARK = `swp-${Date.now()}`;
                 data: { susuGroupId: group.id, baseCurrency, memberCountries: [], createdBy: payoutUserId },
             });
             const cycle = await prisma.susuCycle.create({
-                data: { susuGroupId: group.id, cycleNumber: 1, collectionDate: new Date(), payoutAmount: 100, payoutUserId, status: 'COLLECTING_GRACE' },
+                data: { susuGroupId: group.id, cycleNumber: 1, collectionDate: new Date(), payoutAmount, payoutUserId, status: 'COLLECTING_GRACE' },
             });
             // FUNDING PROOF (review fix): the payout now requires the
             // cycle's PAID contributions to cover payoutAmount, so the
@@ -433,6 +433,39 @@ const MARK = `swp-${Date.now()}`;
         expect(row.paidOutAt).toBeNull();
         const snapshots = await prisma.crossBorderFxSnapshot.count({ where: { cycleId: cycle.id, userId: user.id } });
         expect(snapshots).toBe(0); // no FX snapshot written
+    });
+
+    // ────────────────────────────────────────────────────────────────
+    // DUST-SETTLEMENT GUARD (owner policy on #369): a live rate and a real
+    // payout amount can still quantize to 0.00 minor units — a payout that
+    // cannot exist. The leg refuses with an honest DUST_SETTLEMENT verdict
+    // BEFORE the single-winner transition; the cycle stays collectable and
+    // NOTHING is credited. The old behavior conflated this with rate
+    // unavailability (or settled it as zero-value PAID_OUT).
+    // ────────────────────────────────────────────────────────────────
+    test('payout that would settle to 0.00 → honest 400 DUST_SETTLEMENT, cycle never transitions', async () => {
+        await upsertFxRate('GHS', 'USD', 0.08, new Date());
+        const user = await mkUser(52);
+        seeded.userIds.push(user.id);
+        await prisma.currencyWallet.create({ data: { userId: user.id, currency: 'USD', balance: 0 } });
+        // 0.01 GHS * 0.08 = 0.0008 USD → quantizes to 0.00 at fiat 2dp.
+        const cycle = await setupCycle(7, user.id, 'GHS', 0.01);
+
+        mockAuthUserId = user.id;
+        const res = await request(app).post('/api/cross-border-susu/payout')
+            .set('idempotency-key', `${MARK}-dust`).send({ cycleId: cycle.id, targetCurrency: 'USD' });
+        expect(res.status).toBe(400);
+        expect(res.body.code).toBe('DUST_SETTLEMENT');
+        expect(res.body.message).toContain('0.00 USD');
+
+        // Nothing moved: no credit, no transition, no snapshot.
+        const wallet = await prisma.currencyWallet.findUnique({ where: { userId_currency: { userId: user.id, currency: 'USD' } } });
+        expect(parseFloat(wallet.balance)).toBeCloseTo(0, 6);
+        const row = await prisma.susuCycle.findUnique({ where: { id: cycle.id } });
+        expect(row.status).toBe('COLLECTING_GRACE'); // payout refused, cycle intact
+        expect(row.paidOutAt).toBeNull();
+        const snaps = await prisma.crossBorderFxSnapshot.count({ where: { cycleId: cycle.id, userId: user.id } });
+        expect(snaps).toBe(0);
     });
 
     test('contribution with an UNSUPPORTED DB-origin baseCurrency is refused with no debit', async () => {
@@ -795,7 +828,13 @@ const MARK = `swp-${Date.now()}`;
             expect(snapshot.rate.toString()).toBe('1234.56789123');
         });
 
-        test('a dust payout settles to an honest fixed-notation zero — never an exponential credit', async () => {
+        // DUST-SETTLEMENT GUARD supersedes the original pinned behavior
+        // here (owner policy on #369): a payout below the target currency's
+        // settlement precision no longer COMPLETES as a zero-value PAID_OUT
+        // — it is refused with 400 DUST_SETTLEMENT before the transition.
+        // Refusing subsumes the original serialization guarantee: a payout
+        // that never executes can never credit an exponential value.
+        test('a dust payout is refused outright — never settles, never credits scientific notation', async () => {
             await upsertFxRate('GHS', 'USD', 0.08, new Date());
             const user = await mkUser(34);
             seeded.userIds.push(user.id);
@@ -811,18 +850,17 @@ const MARK = `swp-${Date.now()}`;
             const res = await request(app).post('/api/cross-border-susu/payout')
                 .set('idempotency-key', `${MARK}-scale-5`)
                 .send({ cycleId: cycle.id, targetCurrency: 'USD' });
-            expect(res.status).toBe(200);
+            expect(res.status).toBe(400);
+            expect(res.body.code).toBe('DUST_SETTLEMENT');
             // 0.00000001 GHS * 0.08 = 8e-10 USD — below USD settlement
-            // precision. The honest settled value is "0.00" in FIXED
-            // notation (Decimal.toString would render "8e-10"), and the
-            // snapshot row, wallet and response all agree on it.
-            expect(res.body.payout.targetAmount).toBe('0.00');
+            // precision, so it is dust: no credit, no snapshot, no
+            // transition. The cycle stays collectable.
+            const wallet = await prisma.currencyWallet.findUnique({ where: { userId_currency: { userId: user.id, currency: 'USD' } } });
+            expect(parseFloat(wallet.balance)).toBeCloseTo(0, 6);
             const snapshot = await prisma.crossBorderFxSnapshot.findFirst({ where: { cycleId: cycle.id, userId: user.id } });
-            // Postgres normalizes numeric 0.00 to 0 on the way back; the
-            // pinned contract is that the persisted value EQUALS the
-            // settled response amount (0) — and the response itself never
-            // leaks scientific notation.
-            expect(Number(snapshot.baseAmount)).toBe(0);
+            expect(snapshot).toBeNull();
+            const row = await prisma.susuCycle.findUnique({ where: { id: cycle.id } });
+            expect(row.status).toBe('COLLECTING_GRACE');
         });
     });
 

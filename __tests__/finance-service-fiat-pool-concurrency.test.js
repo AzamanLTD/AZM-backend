@@ -84,6 +84,40 @@ describe('processFiatWithdrawal fiat-pool concurrency guard', () => {
     expect(result.reference).toBe('REF-1');
   });
 
+  // ── DUST-SETTLEMENT GUARD (owner policy on #369) ──────────────────────
+  // A live rate and a payout that quantizes to 0.00 pesewas is CLIENT dust:
+  // refused with DUST_SETTLEMENT and the payable minimum — NEVER the
+  // rate-unavailable verdict the old conflated check threw. A missing rate
+  // keeps FIAT_RATE_UNAVAILABLE. Neither may reach the reservation
+  // transaction (no debit, no canonical row, no pool claim).
+  test('dust amount (live rate, payout rounds to 0.00 GHS) → DUST_SETTLEMENT with payable minimum, no mutation', async () => {
+    const { prisma, tx } = buildPrisma();
+
+    // 0.0001 USDC * 13 = 0.0013 GHS → rounds to 0.00 at the pesewa authority.
+    await expect(processFiatWithdrawal(prisma, 7, '0.0001', { reference: 'REF-DUST' }))
+      .rejects.toMatchObject({ code: 'DUST_SETTLEMENT' });
+
+    // Minimum advertised: ceil(0.005 / 13, 8dp) — payable at the same rate.
+    await expect(processFiatWithdrawal(prisma, 7, '0.0001', { reference: 'REF-DUST' }))
+      .rejects.toMatchObject({ minAmountUsdc: '0.00038462' });
+
+    // Fail-fast: nothing was attempted — no reservation transaction ran,
+    // no debit, no pool claim, no canonical row.
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+    expect(tx.user.updateMany).not.toHaveBeenCalled();
+    expect(tx.systemFiatPool.updateMany).not.toHaveBeenCalled();
+    expect(tx.transactionHistory.create).not.toHaveBeenCalled();
+  });
+
+  test('a genuinely unavailable rate stays FIAT_RATE_UNAVAILABLE — distinct verdict from dust', async () => {
+    const { prisma } = buildPrisma();
+    prisma.globalSettings.findUnique.mockResolvedValue({ liveRetailRate: 0, liveRateSource: 'KOTANI_PAY' });
+
+    await expect(processFiatWithdrawal(prisma, 7, 10, { reference: 'REF-NORATE' }))
+      .rejects.toMatchObject({ code: 'FIAT_RATE_UNAVAILABLE' });
+    expect(prisma.$transaction).not.toHaveBeenCalled();
+  });
+
   test('fails with a stable liquidity error when another withdrawal wins the race', async () => {
     const { prisma, tx } = buildPrisma({ poolClaimCount: 0 });
 

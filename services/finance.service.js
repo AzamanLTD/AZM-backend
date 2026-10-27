@@ -142,9 +142,33 @@ const processFiatWithdrawal = async (prisma, userId, amountIn, opts = {}) => {
     // inherits a MOCK-echo or admin-fabricated stamp.
     const rateAsOf = settings?.lastExternalSync || settings?.lastRateSync || new Date();
 
-    if (!(retailRateExact.gt(0)) || !(payoutGhs.gt(0))) {
+    // DUST-SETTLEMENT GUARD (owner policy on #369): these are TWO distinct
+    // verdicts and must never share a code or message. A missing/zero rate is
+    // SERVER state — retryable, FIAT_RATE_UNAVAILABLE, nothing was the
+    // client's fault. A rate that IS live but a payout that quantizes to
+    // 0.00 pesewas is CLIENT dust — the amount is too small to exist as GHS
+    // at any valid rate. Previously both threw FIAT_RATE_UNAVAILABLE, telling
+    // a dust client the rate was down — an honest refusal with the wrong
+    // verdict, so the client could not self-correct.
+    if (!(retailRateExact.gt(0))) {
         const err = new Error('Current USDC/GHS retail exchange rate is unavailable. No fiat payout was created.');
         err.code = 'FIAT_RATE_UNAVAILABLE';
+        throw err;
+    }
+    if (!(payoutGhs.gt(0))) {
+        // Smallest amount that still settles to >= 0.01 GHS at the live
+        // rate (0.005 GHS is the HALF_UP rounding midpoint): ceil to the
+        // USDC settlement scale (8dp) so the advertised minimum is itself
+        // payable.
+        const minAmountUsdc = new Prisma.Decimal('0.005')
+            .div(retailRateExact)
+            .toDecimalPlaces(8, Prisma.Decimal.ROUND_CEIL);
+        const err = new Error(
+            'This amount would settle to 0.00 GHS. The minimum withdrawable at the current rate is ' +
+            minAmountUsdc.toFixed(8) + ' USDC. No payout was created.'
+        );
+        err.code = 'DUST_SETTLEMENT';
+        err.minAmountUsdc = minAmountUsdc.toFixed(8);
         throw err;
     }
 

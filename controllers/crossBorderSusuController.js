@@ -398,6 +398,19 @@ async function payoutLocalCurrency(req, res) {
       targetCurr
     );
 
+    // DUST-SETTLEMENT GUARD (owner policy on #369): a live rate and a real
+    // payout amount can still produce a settlement that quantizes to zero
+    // minor units — a payout that cannot exist on the target wallet. Refuse
+    // BEFORE the single-winner transition and any wallet credit; the cycle
+    // stays COLLECTING and the honest verdict tells the beneficiary why.
+    if (!(targetAmount.gt(0))) {
+      return res.status(400).json({
+        success: false,
+        code: 'DUST_SETTLEMENT',
+        message: `This payout would settle to 0.00 ${targetCurr}. The payout amount is too small at the current rate. Nothing was paid out.`,
+      });
+    }
+
     // Resolve the target wallet for the 404 verdict; the wallet is created
     // inside the transaction.
     const wallet = await prisma.currencyWallet.findUnique({
