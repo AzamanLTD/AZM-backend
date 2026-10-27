@@ -169,6 +169,6 @@ Legacy fields (`availableBalance`, `totalBalance`, `currency:'USDC'`, ...) untou
 2. **USDC settlement invariant preserved**: USDC remains the authoritative settlement unit; GHS adds a real distinct balance, it does not reclassify anything.
 3. **Fail-closed everywhere**: no fresh canonical rate → FX-dependent routes 503 BEFORE any claim/money/provider; display falls back honestly (saved → demo → honest unavailability) and never fabricates.
 4. **Demo artifacts can never leak into production**: DB CHECKs + install gating + read gating + explicit labelling (§7).
-5. **Exact-decimal discipline**: Prisma Decimals end-to-end; JS numbers only at the presentation boundary (dual-serialized `*Exact`).
+5. **Exact-decimal discipline**: Prisma Decimals end-to-end; the wire carries the authoritative exact-decimal STRING inside the money object `{ exact, value }` (§2 wire shape) — JS numbers only as the presentation-only `value` projection.
 6. **Ledger-backed, reconcilable**: nativeGhsBalance is a projection of a real double-entry liability account with an exposed reconciliation read; residuals are flagged, never auto-patched.
 7. **Full evidence**: 4 new suites against real PostgreSQL + the complete existing gate (run with `--runInBand`, see r25 lesson) in CI before merge.
