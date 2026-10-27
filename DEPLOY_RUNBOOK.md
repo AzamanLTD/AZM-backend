@@ -36,7 +36,7 @@ paths are:
   inventory-restock, reservation-capacity). It does NOT include the other
   fifteen installers of the release chain.
 - **Pre-Deploy Command**: `npm run release` is CONFIGURED but the Free plan
-  does NOT execute it. The full 18-installer release chain therefore does
+  does NOT execute it. The full 19-installer release chain therefore does
   not run on deploys.
 - **Start Command**: `node index.js` → `server.js` → `bootTreasury(app, prisma)`
   → `infra/autoRelease.js` — the boot-time auto-release path runs at EVERY
@@ -54,7 +54,11 @@ paths are:
      DEFAULT ARRAY[]::"BusinessCategory"[]`, the exact `db push` shape) if
      absent and fail-closed validates the shape via pg_catalog
      (enum-array element type, NOT NULL, empty-array default).
-  9. treasury lookup — the susu-foundation seed and id-number encryption
+  9. **Notification dismissal overlay (marketplace personalisation,
+     Backend E)** — adds `Notification.isDismissed` (BOOLEAN NOT NULL
+     DEFAULT false), `Notification.dismissedAt` (TIMESTAMP(3) NULL) and the
+     `(userId, isDismissed)` index, fail-closed validated.
+ 10. treasury lookup — the susu-foundation seed and id-number encryption
      run ONLY when the treasury row is missing or a forced release is
      requested; otherwise autoRelease skips both and finishes early.
   Separately, AFTER `autoRelease()` completes, `bootTreasury()` runs the

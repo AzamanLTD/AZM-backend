@@ -369,6 +369,9 @@ class NotificationService {
         const { page = 1, limit = 20, unreadOnly = false, cursor = null, category = null } = opts;
 
         const where = { userId: parsedUserId };
+        // Backend E: dismissed notifications are hidden from the owner's
+        // list in ALL modes (the event record itself is preserved).
+        where.isDismissed = false;
         if (unreadOnly) where.isRead = false;
         if (category) where.category = String(category).toUpperCase();
 
@@ -429,7 +432,36 @@ class NotificationService {
 
     async getUnreadCount(userId) {
         return this.prisma.notification.count({
-            where: { userId: parseInt(userId, 10), isRead: false }
+            where: { userId: parseInt(userId, 10), isRead: false, isDismissed: false }
+        });
+    }
+
+    // =========================================================================
+    // BACKEND E — OWNER-SCOPED SOFT DISMISSAL
+    // =========================================================================
+    // Hides a notification from the owner's list and unread count WITHOUT
+    // deleting it: financial/security/dispute event records and their
+    // audit trails keep their Notification rows. Idempotent by the flag;
+    // converges safely with concurrent markAsRead (independent columns).
+    async dismissNotification(notificationId, userId) {
+        const parsedUserId = parseInt(userId, 10);
+        // Owner-scoped mutation: the row is fetched (and later updated)
+        // keyed by BOTH id and owner. A notification that belongs to another
+        // user is indistinguishable from one that does not exist — same
+        // honest 404, no existence disclosure through a 403.
+        const notification = await this.prisma.notification.findFirst({
+            where: { id: notificationId, userId: parsedUserId }
+        });
+        if (!notification) throw new Error('Notification not found');
+
+        // Idempotent: re-dismissing an already-dismissed row preserves the
+        // FIRST dismissal timestamp (audit field is write-once) and only
+        // re-asserts the flag; read state is never touched by dismissal.
+        const data = { isDismissed: true };
+        if (!notification.isDismissed) data.dismissedAt = new Date();
+        return this.prisma.notification.update({
+            where: { id: notification.id },
+            data
         });
     }
 

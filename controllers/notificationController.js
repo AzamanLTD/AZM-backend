@@ -91,6 +91,51 @@ exports.markAsRead = async (req, res) => {
     }
 };
 
+// Backend E: soft dismissal — hides the notification from the owner's list
+// and unread count. NEVER deletes the record (financial/security/dispute
+// event history and audit trails keep their rows). Idempotent; converges
+// with concurrent mark-read (independent columns). Emits the same
+// multi-device sync event family so other sessions drop the item and
+// refresh the badge instead of making it reappear.
+exports.dismissNotification = async (req, res) => {
+    try {
+        const { id } = req.params;
+        const userId = req.user.id;
+        const dismissed = await getService(req).dismissNotification(id, userId);
+
+        try {
+            const io = req.app.get('socketio');
+            if (io) {
+                io.to(`user_${userId}`).emit('notifications_updated', {
+                    type: 'DISMISSED',
+                    notificationId: id
+                });
+            }
+        } catch (sockErr) {
+            logger.error(`[dismissNotification] socket emit non-fatal: ${sockErr.message}`);
+        }
+
+        res.status(200).json({
+            success: true,
+            notification: {
+                id: dismissed.id,
+                isRead: dismissed.isRead,
+                isDismissed: dismissed.isDismissed,
+                dismissedAt: dismissed.dismissedAt
+            }
+        });
+    } catch (error) {
+        logger.error({ err: error }, 'dismissNotification error');
+        if (error.message === 'Notification not found') {
+            return res.status(404).json({ success: false, message: error.message });
+        }
+        if (error.message === 'Not authorized') {
+            return res.status(403).json({ success: false, message: error.message });
+        }
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
 exports.markAllAsRead = async (req, res) => {
     try {
         const userId = req.user.id;
