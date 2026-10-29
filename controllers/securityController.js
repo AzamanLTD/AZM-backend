@@ -409,14 +409,48 @@ exports.sendPhoneOtp = async (req, res) => {
 
         const result = await smsService.sendOTP(phoneNumber, 6, 5);
 
+        // A 200 here must mean the provider ACCEPTED the message. The old
+        // handler returned success unconditionally, so a mock or a refused
+        // provider still told the user "OTP sent".
+        if (!result || result.success !== true) {
+            logger.error({ provider: result?.provider }, '[sendPhoneOtp] provider did not accept the message');
+            return res.status(502).json({
+                success: false,
+                code: 'SMS_SEND_FAILED',
+                message: 'Could not send the verification code. Try again shortly.'
+            });
+        }
+
         return res.status(200).json({
             success: true,
             message: 'OTP sent successfully. Check your phone.',
             expiresAt: result.expiresAt,
-            // In test/dev mode, surface the OTP for easy testing
-            ...(result.otp ? { testOtp: result.otp } : {})
+            // Only a genuine non-production mock surfaces the code, and the
+            // client is told the message was mocked rather than delivered.
+            ...(result.mocked ? { mocked: true } : {}),
+            ...(result.mocked && result.otp ? { testOtp: result.otp } : {})
         });
     } catch (error) {
+        const code = error && error.code;
+        if (code === 'SMS_PROVIDER_MISCONFIGURED' || code === 'OTP_STORE_UNAVAILABLE') {
+            logger.error({ err: error, code }, '[sendPhoneOtp] refusing: verification transport unavailable');
+            return res.status(503).json({
+                success: false,
+                code,
+                message: 'Phone verification is temporarily unavailable. Try again later.'
+            });
+        }
+        if (code === 'OTP_RESEND_TOO_SOON' || code === 'OTP_SEND_LIMIT_EXCEEDED') {
+            return res.status(429).json({
+                success: false,
+                code,
+                message: error.message,
+                ...(error.retryAfterMs ? { retryAfterMs: error.retryAfterMs } : {})
+            });
+        }
+        if (code === 'SMS_SEND_FAILED') {
+            return res.status(502).json({ success: false, code, message: 'Could not send the verification code. Try again shortly.' });
+        }
         logger.error({ err: error }, '[sendPhoneOtp] error');
         return res.status(500).json({ success: false, message: 'Failed to send OTP.' });
     }

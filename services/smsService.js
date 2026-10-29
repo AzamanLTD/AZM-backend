@@ -12,7 +12,21 @@ const axios  = require('axios');
 class SMSService {
     constructor() {
         this.apiKey = process.env.SMS_API_KEY || 'mock_sms_api_key';
-        this.provider = process.env.SMS_PROVIDER || 'mock';
+
+        // ── SAFETY CONTRACT ──────────────────────────────────────────────────
+        // Production must NEVER report a delivery it did not make. A missing
+        // provider or an explicit 'mock' in production is a misconfiguration:
+        // sends fail closed (SMS_PROVIDER_MISCONFIGURED) instead of returning
+        // mock success. Mock stays available in test/development only.
+        this.isProduction = process.env.NODE_ENV === 'production';
+        this.provider = String(process.env.SMS_PROVIDER || '').trim().toLowerCase() || 'mock';
+        this.misconfigured = this.isProduction && this.provider === 'mock';
+        if (this.misconfigured) {
+            logger.error(
+                { provider: this.provider },
+                '[SMSService] SMS_PROVIDER is missing or "mock" in production — sends will be refused (no mock success)'
+            );
+        }
 
         // ── Moolre SMS (VAS) configuration ────────────────────────────────────
         // Resolved once in the constructor so _sendViaMoolre stays stateless per
@@ -50,13 +64,29 @@ class SMSService {
                 });
                 logger.info('[SMSService] OTP store: Redis' + (isTLS ? ' (TLS/Upstash)' : ''));
             } catch (e) {
-                logger.warn('[SMSService] Could not init Redis OTP store, falling back to Map:', e.message);
+                if (this.isProduction) {
+                    // Fail closed: an in-process Map cannot serve multiple
+                    // instances and would let a code "verify" on the wrong box.
+                    logger.error({ err: e }, '[SMSService] Redis OTP store init failed in production — OTP will be REFUSED, not stored in memory');
+                } else {
+                    logger.warn('[SMSService] Could not init Redis OTP store, falling back to Map:', e.message);
+                }
                 this._redisClient = null;
             }
         } else {
-            logger.warn('[SMSService] REDIS_URL not set — OTP codes stored in-process memory (not safe for multi-instance).');
+            if (this.isProduction) {
+                logger.error('[SMSService] REDIS_URL not set in production — OTP storage will fail closed (no multi-instance-safe store).');
+            } else {
+                logger.warn('[SMSService] REDIS_URL not set — OTP codes stored in-process memory (development/test only).');
+            }
         }
-        this.otpStore = new Map(); // fallback for when Redis is unavailable
+        this.otpStore = new Map(); // development/test fallback only
+        this._sendThrottle = new Map(); // development/test throttle state
+        // Send throttles (per phone): a resend storm is both a cost and an
+        // abuse vector, so it is bounded even in mock mode.
+        this._sendMinIntervalMs = 30 * 1000;
+        this._sendWindowMs = 60 * 60 * 1000;
+        this._sendMaxPerWindow = 5;
     }
 
     /**
@@ -67,22 +97,35 @@ class SMSService {
      * @returns {Promise<Object>} SMS sending result
      */
     async sendSMS(phoneNumber, message, sender = 'AZAMAN') {
-        logger.info(`📱 SMS Service: Sending SMS to ${phoneNumber}`);
-        logger.info(`📝 Message: ${message}`);
-        
-        if (this.isTestMode || this.provider === 'mock') {
-            // Mock implementation - log to console and return success
+        // Never log the recipient in full or the body (OTP codes live in it).
+        logger.info(
+            { phone: this._maskPhone(phoneNumber), bodyLength: String(message || '').length, provider: this.provider },
+            '[SMSService] sending'
+        );
+
+        if (this.misconfigured) {
+            const err = new Error(
+                'SMS provider is not configured for this environment (SMS_PROVIDER missing or "mock"). '
+                + 'Refusing to report a delivery that did not happen.'
+            );
+            err.code = 'SMS_PROVIDER_MISCONFIGURED';
+            throw err;
+        }
+
+        if (this.provider === 'mock') {
+            // Development/test only (production is refused above).
             const messageId = this._generateMessageId();
-            
-            logger.info(`✅ [MOCK SMS] Sent to ${phoneNumber}: ${message}`);
-            logger.info(`📋 Message ID: ${messageId}`);
-            
+            logger.info(
+                { phone: this._maskPhone(phoneNumber), messageId, env: process.env.NODE_ENV || 'development' },
+                '[SMSService] MOCK delivery (no provider configured) — not a real send'
+            );
             return {
                 success: true,
                 messageId: messageId,
                 provider: 'mock',
+                mocked: true,          // explicit to the caller
                 cost: 0.0,
-                status: 'delivered',
+                status: 'mocked',      // never "delivered"
                 timestamp: new Date().toISOString()
             };
         }
@@ -112,10 +155,14 @@ class SMSService {
      * @returns {Promise<Object>} OTP sending result
      */
     async sendOTP(phoneNumber, length = 6, expiryMinutes = 5) {
+        // Resolve the store BEFORE generating/burning anything: in production a
+        // missing durable store is a hard refusal, never a silent Map fallback.
+        const durable = this._requireDurableOtpStore();
+        await this._enforceSendThrottle(phoneNumber);
+
         const otp = this._generateOTP(length);
         const expiresAt = new Date(Date.now() + expiryMinutes * 60 * 1000);
-        
-        // Store OTP for verification (Redis if available, else in-memory Map)
+
         const otpPayload = JSON.stringify({
             code: otp,
             expiresAt: expiresAt.toISOString(),
@@ -123,21 +170,114 @@ class SMSService {
             maxAttempts: 3
         });
         const otpKey = `otp:${phoneNumber}`;
-        if (this._redisClient) {
+        if (durable) {
             await this._redisClient.set(otpKey, otpPayload, 'EX', expiryMinutes * 60);
         } else {
             this.otpStore.set(phoneNumber, { code: otp, expiresAt, attempts: 0, maxAttempts: 3 });
         }
 
         const message = `Your Azaman verification code is: ${otp}. Valid for ${expiryMinutes} minutes. Do not share this code.`;
-        
-        const result = await this.sendSMS(phoneNumber, message);
-        
+
+        let result;
+        try {
+            result = await this.sendSMS(phoneNumber, message);
+        } catch (err) {
+            // A provider refusal must not leave a verifiable code behind.
+            await this._deleteOtp(phoneNumber);
+            throw err;
+        }
+
+        if (!result || result.success !== true) {
+            await this._deleteOtp(phoneNumber);
+            const err = new Error(result?.message || 'SMS provider did not accept the message');
+            err.code = 'SMS_SEND_FAILED';
+            throw err;
+        }
+
         return {
             ...result,
-            otp: this.isTestMode ? otp : undefined, // Only return OTP in test mode
+            // Only a genuine mock in a non-production run may surface the code.
+            otp: result.mocked ? otp : undefined,
             expiresAt: expiresAt.toISOString()
         };
+    }
+
+    // ---------------------------------------------------------------------
+    // OTP store contract
+    // ---------------------------------------------------------------------
+    /** @returns {boolean} true when a durable (shared) store is in use. */
+    _requireDurableOtpStore() {
+        if (this._redisClient) return true;
+        if (this.isProduction) {
+            const err = new Error(
+                'Durable OTP store unavailable (REDIS_URL unset or Redis failed to initialise). '
+                + 'Refusing to store verification codes in process memory in production.'
+            );
+            err.code = 'OTP_STORE_UNAVAILABLE';
+            throw err;
+        }
+        return false; // development/test: in-process Map is acceptable
+    }
+
+    async _deleteOtp(phoneNumber) {
+        const key = `otp:${phoneNumber}`;
+        if (this._redisClient) await this._redisClient.del(key);
+        else this.otpStore.delete(phoneNumber);
+    }
+
+    /** Bounded resend: min interval + hourly cap, per phone. */
+    async _enforceSendThrottle(phoneNumber) {
+        const now = Date.now();
+        const key = `otp:throttle:${phoneNumber}`;
+        if (this._redisClient) {
+            const raw = await this._redisClient.get(key);
+            const state = raw ? JSON.parse(raw) : { last: 0, count: 0 };
+            if (now - state.last < this._sendMinIntervalMs) {
+                const err = new Error('Please wait before requesting another code.');
+                err.code = 'OTP_RESEND_TOO_SOON';
+                err.retryAfterMs = this._sendMinIntervalMs - (now - state.last);
+                throw err;
+            }
+            const count = now - state.last > this._sendWindowMs ? 1 : state.count + 1;
+            if (count > this._sendMaxPerWindow) {
+                const err = new Error('Too many verification codes requested for this number. Try again later.');
+                err.code = 'OTP_SEND_LIMIT_EXCEEDED';
+                throw err;
+            }
+            await this._redisClient.set(
+                key,
+                JSON.stringify({ last: now, count }),
+                'EX',
+                Math.ceil(this._sendWindowMs / 1000)
+            );
+            return;
+        }
+        const state = this._sendThrottle.get(phoneNumber) || { last: 0, count: 0 };
+        if (now - state.last < this._sendMinIntervalMs) {
+            const err = new Error('Please wait before requesting another code.');
+            err.code = 'OTP_RESEND_TOO_SOON';
+            err.retryAfterMs = this._sendMinIntervalMs - (now - state.last);
+            throw err;
+        }
+        const count = now - state.last > this._sendWindowMs ? 1 : state.count + 1;
+        if (count > this._sendMaxPerWindow) {
+            const err = new Error('Too many verification codes requested for this number. Try again later.');
+            err.code = 'OTP_SEND_LIMIT_EXCEEDED';
+            throw err;
+        }
+        this._sendThrottle.set(phoneNumber, { last: now, count });
+    }
+
+    /** +233241234567 -> +233*****4567 (enough to correlate, not to identify). */
+    _maskPhone(phoneNumber) {
+        const raw = String(phoneNumber || '');
+        if (raw.length <= 4) return '****';
+        return `${raw.slice(0, 3)}${'*'.repeat(Math.max(0, raw.length - 7))}${raw.slice(-4)}`;
+    }
+
+    /** Strip anything that looks like a verification code from log text. */
+    _redactSecrets(text) {
+        return String(text || '').replace(/\b\d{4,8}\b/g, '«redacted»');
     }
 
     /**
@@ -147,6 +287,7 @@ class SMSService {
      * @returns {Object} Verification result
      */
     async verifyOTP(phoneNumber, code) {
+        this._requireDurableOtpStore();
         const otpKey = `otp:${phoneNumber}`;
         let otpData;
 
@@ -178,7 +319,9 @@ class SMSService {
 
         otpData.attempts++;
 
-        if (otpData.code !== code) {
+        // Constant-time comparison: a code is a credential, so its comparison
+        // must not leak length/prefix information through timing.
+        if (!this._safeEqual(String(otpData.code), String(code))) {
             if (this._redisClient) {
                 const ttl = await this._redisClient.ttl(otpKey);
                 await this._redisClient.set(otpKey, JSON.stringify(otpData), 'EX', Math.max(ttl, 1));
@@ -283,6 +426,21 @@ class SMSService {
             otp += digits[Math.floor(Math.random() * digits.length)];
         }
         return otp;
+    }
+
+    /**
+     * Constant-time string comparison. A verification code is a credential, so
+     * its comparison must not leak prefix/length information through timing.
+     * Mismatched lengths still perform one comparison before failing.
+     */
+    _safeEqual(a, b) {
+        const bufA = Buffer.from(String(a), 'utf8');
+        const bufB = Buffer.from(String(b), 'utf8');
+        if (bufA.length !== bufB.length) {
+            crypto.timingSafeEqual(bufA, bufA);
+            return false;
+        }
+        return crypto.timingSafeEqual(bufA, bufB);
     }
 
     _generateMessageId() {
@@ -441,7 +599,7 @@ class SMSService {
             if (envelope && Number(envelope.status) === 1) {
                 const data = envelope.data || {};
                 const messageId = data?.id || data?.messageid || data?.transactionid || null;
-                logger.info(`✅ [Moolre] SMS sent to ${phoneNumber} (id: ${messageId})`);
+                logger.info({ phone: this._maskPhone(phoneNumber), messageId }, '[Moolre] SMS accepted');
                 return {
                     success:   true,
                     messageId,
