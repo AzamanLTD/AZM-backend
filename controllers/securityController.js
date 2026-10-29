@@ -432,7 +432,12 @@ exports.sendPhoneOtp = async (req, res) => {
         });
     } catch (error) {
         const code = error && error.code;
-        if (code === 'SMS_PROVIDER_MISCONFIGURED' || code === 'OTP_STORE_UNAVAILABLE') {
+        if (
+            code === 'SMS_PROVIDER_MISCONFIGURED'
+            || code === 'SMS_PROVIDER_UNSUPPORTED'
+            || code === 'OTP_STORE_UNAVAILABLE'
+            || code === 'OTP_HASH_SECRET_MISSING'
+        ) {
             logger.error({ err: error, code }, '[sendPhoneOtp] refusing: verification transport unavailable');
             return res.status(503).json({
                 success: false,

@@ -9,6 +9,71 @@ const logger = require('../src/config/logger');
 const crypto = require('crypto');
 const axios  = require('axios');
 
+// ---------------------------------------------------------------------------
+// ATOMIC OTP PRIMITIVES
+//
+// The old flow read, decided and wrote in three separate round trips, so two
+// concurrent requests could both pass a limit check or both consume one code.
+// Redis executes a script as a single atomic step, so the decision and the
+// mutation cannot interleave.
+// ---------------------------------------------------------------------------
+
+// Reserves a send slot: min-interval key + hourly counter, both in one step.
+const OTP_RESERVE_LUA = `
+local interval = tonumber(ARGV[1])
+local window   = tonumber(ARGV[2])
+local cap      = tonumber(ARGV[3])
+local now      = tonumber(ARGV[4])
+local ok = redis.call('SET', KEYS[1], now, 'PX', interval, 'NX')
+if not ok then
+  local last = tonumber(redis.call('GET', KEYS[1]) or '0')
+  return {0, 'TOO_SOON', tostring(interval - (now - last))}
+end
+local count = redis.call('INCR', KEYS[2])
+if count == 1 then redis.call('PEXPIRE', KEYS[2], window) end
+if count > cap then
+  redis.call('DEL', KEYS[1])
+  return {0, 'LIMIT', '0'}
+end
+return {1, 'RESERVED', tostring(count)}
+`;
+
+// Verifies, counts the attempt and consumes the code in one step. Passing the
+// digest (not the code) means the plaintext never reaches the store.
+const OTP_VERIFY_LUA = `
+local raw = redis.call('GET', KEYS[1])
+if not raw then return {0, 'NOTFOUND', '0'} end
+local rec = cjson.decode(raw)
+local ttl = redis.call('PTTL', KEYS[1])
+if ttl < 0 then ttl = 0 end
+if tonumber(rec.expiresAtMs) < tonumber(ARGV[2]) then
+  redis.call('DEL', KEYS[1])
+  return {0, 'EXPIRED', '0'}
+end
+local max = tonumber(rec.maxAttempts)
+if tonumber(rec.attempts) >= max then
+  redis.call('DEL', KEYS[1])
+  return {0, 'LOCKED', '0'}
+end
+if rec.codeHash == ARGV[1] then
+  redis.call('DEL', KEYS[1])
+  return {1, 'OK', '0'}
+end
+rec.attempts = tonumber(rec.attempts) + 1
+if rec.attempts >= max then
+  redis.call('DEL', KEYS[1])
+  return {0, 'LOCKED', '0'}
+end
+redis.call('SET', KEYS[1], cjson.encode(rec), 'PX', math.max(ttl, 1))
+return {0, 'WRONG', tostring(max - rec.attempts)}
+`;
+
+// Provider adapters that are GENUINELY implemented against a documented
+// contract. Anything else (today: twilio, aws_sns, hubtel) is a placeholder
+// that must never be able to answer 'success'.
+const IMPLEMENTED_SMS_PROVIDERS = new Set(['moolre', 'arkesel']);
+const PLACEHOLDER_SMS_PROVIDERS = new Set(['twilio', 'aws_sns', 'hubtel']);
+
 class SMSService {
     constructor() {
         this.apiKey = process.env.SMS_API_KEY || 'mock_sms_api_key';
@@ -38,6 +103,22 @@ class SMSService {
         this.moolreApiUser  = process.env.MOOLRE_API_USER || null;
         this.moolreVasKey   = process.env.MOOLRE_VAS_KEY  || process.env.MOOLRE_API_KEY || null;
         this.moolreSenderId = process.env.MOOLRE_SMS_SENDER_ID || 'AZAMAN';
+        // Production must not fall back to the sandbox endpoint, and an adapter
+        // with no documented-contract verification is not production-ready.
+        // Both are refused at send time (SMS_PROVIDER_MISCONFIGURED) rather than
+        // discovered by a customer who never receives an OTP.
+        this.moolreEnvIsProd = moolreUseProd;
+        this.moolreUsesSandbox = !/^https:\/\/api\.moolre\.com/i.test(this.moolreBaseUrl);
+        this.moolreConfigError = null;
+        if (process.env.NODE_ENV === 'production' && (process.env.SMS_PROVIDER || '').toLowerCase() === 'moolre') {
+            if (!moolreUseProd) {
+                this.moolreConfigError = 'MOOLRE_ENV is not set to production';
+            } else if (this.moolreUsesSandbox) {
+                this.moolreConfigError = 'Moolre base URL is not the production endpoint';
+            } else if (!this.moolreApiUser || !this.moolreVasKey) {
+                this.moolreConfigError = 'MOOLRE_API_USER / MOOLRE_VAS_KEY missing';
+            }
+        }
         // isTestMode normally forces MOCK in any non-production env. That is the
         // right default, but it also blocks testing a REAL provider (e.g. Moolre)
         // against its sandbox from a dev/staging box. SMS_FORCE_LIVE=true lets a
@@ -81,6 +162,7 @@ class SMSService {
             }
         }
         this.otpStore = new Map(); // development/test fallback only
+        this._otpMaxAttempts = Math.max(1, Number(process.env.OTP_MAX_ATTEMPTS || 3));
         this._sendThrottle = new Map(); // development/test throttle state
         // Send throttles (per phone): a resend storm is both a cost and an
         // abuse vector, so it is bounded even in mock mode.
@@ -130,14 +212,21 @@ class SMSService {
             };
         }
 
-        // Real SMS provider integration would go here
+        // PLACEHOLDER REFUSAL comes before dispatch so no configured-but-unbuilt
+        // adapter can ever answer success.
+        if (PLACEHOLDER_SMS_PROVIDERS.has(this.provider)) {
+            const err = new Error("SMS provider '" + this.provider + "' is not implemented (placeholder adapter). Configure an implemented provider: " + [...IMPLEMENTED_SMS_PROVIDERS].join(', ') + ".");
+            err.code = 'SMS_PROVIDER_UNSUPPORTED';
+            logger.error({ provider: this.provider, phone: this._maskPhone(phoneNumber) }, '[SMSService] refusing placeholder provider');
+            throw err;
+        }
+        if (!IMPLEMENTED_SMS_PROVIDERS.has(this.provider)) {
+            const err = new Error("SMS provider '" + this.provider + "' is not a recognised implemented adapter.");
+            err.code = 'SMS_PROVIDER_UNSUPPORTED';
+            throw err;
+        }
+
         switch (this.provider.toLowerCase()) {
-            case 'twilio':
-                return await this._sendViaTwilio(phoneNumber, message, sender);
-            case 'aws_sns':
-                return await this._sendViaAWS(phoneNumber, message);
-            case 'hubtel':
-                return await this._sendViaHubtel(phoneNumber, message, sender);
             case 'arkesel':
                 return await this._sendViaArkesel(phoneNumber, message, sender);
             case 'moolre':
@@ -163,17 +252,17 @@ class SMSService {
         const otp = this._generateOTP(length);
         const expiresAt = new Date(Date.now() + expiryMinutes * 60 * 1000);
 
-        const otpPayload = JSON.stringify({
-            code: otp,
-            expiresAt: expiresAt.toISOString(),
+        const record = {
+            codeHash: this._hashCode(phoneNumber, otp),
+            expiresAtMs: expiresAt.getTime(),
+            maxAttempts: this._otpMaxAttempts || 3,
             attempts: 0,
-            maxAttempts: 3
-        });
+        };
         const otpKey = `otp:${phoneNumber}`;
         if (durable) {
-            await this._redisClient.set(otpKey, otpPayload, 'EX', expiryMinutes * 60);
+            await this._redisClient.set(otpKey, JSON.stringify(record), 'EX', expiryMinutes * 60);
         } else {
-            this.otpStore.set(phoneNumber, { code: otp, expiresAt, attempts: 0, maxAttempts: 3 });
+            this.otpStore.set(phoneNumber, { ...record });
         }
 
         const message = `Your Azaman verification code is: ${otp}. Valid for ${expiryMinutes} minutes. Do not share this code.`;
@@ -225,47 +314,97 @@ class SMSService {
         else this.otpStore.delete(phoneNumber);
     }
 
-    /** Bounded resend: min interval + hourly cap, per phone. */
+    /**
+     * Bounded resend: min interval + hourly cap, per phone.
+     *
+     * Redis path is ONE atomic script, so N simultaneous requests reserve
+     * exactly one slot. The Map path is synchronous JavaScript, which is also
+     * uninterruptible between its check and its write — the same guarantee from
+     * the same single-threaded ordering, not a weaker one.
+     */
     async _enforceSendThrottle(phoneNumber) {
         const now = Date.now();
-        const key = `otp:throttle:${phoneNumber}`;
+        const intervalKey = `otp:rl:i:${phoneNumber}`;
+        const windowKey = `otp:rl:w:${phoneNumber}`;
+
         if (this._redisClient) {
-            const raw = await this._redisClient.get(key);
-            const state = raw ? JSON.parse(raw) : { last: 0, count: 0 };
-            if (now - state.last < this._sendMinIntervalMs) {
+            const [ok, why, detail] = await this._redisClient.eval(
+                OTP_RESERVE_LUA, 2, intervalKey, windowKey,
+                String(this._sendMinIntervalMs), String(this._sendWindowMs),
+                String(this._sendMaxPerWindow), String(now)
+            );
+            if (Number(ok) !== 1) {
+                if (why === 'LIMIT') {
+                    const err = new Error('Too many verification codes requested for this number. Try again later.');
+                    err.code = 'OTP_SEND_LIMIT_EXCEEDED';
+                    throw err;
+                }
                 const err = new Error('Please wait before requesting another code.');
                 err.code = 'OTP_RESEND_TOO_SOON';
-                err.retryAfterMs = this._sendMinIntervalMs - (now - state.last);
+                err.retryAfterMs = Number(detail) > 0 ? Number(detail) : this._sendMinIntervalMs;
                 throw err;
             }
-            const count = now - state.last > this._sendWindowMs ? 1 : state.count + 1;
-            if (count > this._sendMaxPerWindow) {
-                const err = new Error('Too many verification codes requested for this number. Try again later.');
-                err.code = 'OTP_SEND_LIMIT_EXCEEDED';
-                throw err;
-            }
-            await this._redisClient.set(
-                key,
-                JSON.stringify({ last: now, count }),
-                'EX',
-                Math.ceil(this._sendWindowMs / 1000)
-            );
             return;
         }
-        const state = this._sendThrottle.get(phoneNumber) || { last: 0, count: 0 };
+
+        const state = this._sendThrottle.get(phoneNumber) || { last: 0, count: 0, windowStart: 0 };
         if (now - state.last < this._sendMinIntervalMs) {
             const err = new Error('Please wait before requesting another code.');
             err.code = 'OTP_RESEND_TOO_SOON';
             err.retryAfterMs = this._sendMinIntervalMs - (now - state.last);
             throw err;
         }
-        const count = now - state.last > this._sendWindowMs ? 1 : state.count + 1;
+        const inWindow = now - state.windowStart < this._sendWindowMs;
+        const count = inWindow ? state.count + 1 : 1;
         if (count > this._sendMaxPerWindow) {
             const err = new Error('Too many verification codes requested for this number. Try again later.');
             err.code = 'OTP_SEND_LIMIT_EXCEEDED';
             throw err;
         }
-        this._sendThrottle.set(phoneNumber, { last: now, count });
+        this._sendThrottle.set(phoneNumber, {
+            last: now,
+            count,
+            windowStart: inWindow ? state.windowStart : now,
+        });
+    }
+
+    /** Keyed digest of a code. The plaintext never reaches the store. */
+    _hashCode(phoneNumber, code) {
+        const secret = this._otpHashSecret();
+        return crypto.createHmac('sha256', secret).update(`${phoneNumber}:${code}`).digest('hex');
+    }
+
+    /**
+     * The digest key is a dedicated server-side secret. Production has no
+     * fallback: a missing key fails closed. Development/test derive a clearly
+     * labelled key so local flows keep working (and say so, loudly, once).
+     */
+    _otpHashSecret() {
+        const configured = process.env.OTP_HASH_SECRET;
+        if (configured && configured.length >= 16) return configured;
+        if (this.isProduction) {
+            const err = new Error('OTP_HASH_SECRET is required in production (dedicated secret for OTP digests).');
+            err.code = 'OTP_HASH_SECRET_MISSING';
+            throw err;
+        }
+        if (!this._warnedDevSecret) {
+            this._warnedDevSecret = true;
+            logger.warn('[SMSService] OTP_HASH_SECRET unset — using the documented DEVELOPMENT-ONLY digest key. Never deploy this.');
+        }
+        return 'azaman-development-only-otp-digest-key';
+    }
+
+    /**
+     * Bounded, redacted diagnostic text for provider errors. Digit runs long
+     * enough to be a code or a phone number are masked, and the result is
+     * capped so a provider that echoes the request cannot dump it into a log.
+     */
+    _scrubBody(text, maxLen = 160) {
+        if (text === undefined || text === null) return '';
+        let out = String(text);
+        out = out.replace(/\d[\d\s-]{3,}/g, '[redacted]');
+        out = out.replace(/[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+/g, '[email]');
+        return out.length > maxLen ? out.slice(0, maxLen) + '…' : out;
     }
 
     /** +233241234567 -> +233*****4567 (enough to correlate, not to identify). */
@@ -287,57 +426,68 @@ class SMSService {
      * @returns {Object} Verification result
      */
     async verifyOTP(phoneNumber, code) {
-        this._requireDurableOtpStore();
+        const durable = this._requireDurableOtpStore();
         const otpKey = `otp:${phoneNumber}`;
-        let otpData;
+        const digest = this._hashCode(phoneNumber, code);
+        const nowMs = Date.now();
 
-        if (this._redisClient) {
-            const raw = await this._redisClient.get(otpKey);
-            if (!raw) {
+        // ONE atomic step (Redis script, or the equally uninterruptible
+        // synchronous Map path). Two concurrent correct requests can therefore
+        // never both succeed: the second finds the key already consumed.
+        if (durable) {
+            const [ok, why, detail] = await this._redisClient.eval(
+                OTP_VERIFY_LUA, 1, otpKey, digest, String(nowMs)
+            );
+            return this._verifyOutcome(why, Number(detail));
+        }
+
+        const rec = this.otpStore.get(phoneNumber);
+        if (!rec) return this._verifyOutcome('NOTFOUND', 0);
+
+        const expired = rec.expiresAtMs !== undefined
+            ? Number(rec.expiresAtMs) < nowMs
+            : new Date(rec.expiresAt).getTime() < nowMs;
+        if (expired) {
+            this.otpStore.delete(phoneNumber);
+            return this._verifyOutcome('EXPIRED', 0);
+        }
+        const max = Number(rec.maxAttempts || this._otpMaxAttempts);
+        if (Number(rec.attempts || 0) >= max) {
+            this.otpStore.delete(phoneNumber);
+            return this._verifyOutcome('LOCKED', 0);
+        }
+        // Digest match is the contract; a planted legacy `code` is accepted for
+        // test fixtures only, compared in constant time.
+        const matched = rec.codeHash
+            ? this._safeEqual(rec.codeHash, digest)
+            : this._safeEqual(String(rec.code), String(code));
+        if (matched) {
+            this.otpStore.delete(phoneNumber);
+            return this._verifyOutcome('OK', 0);
+        }
+        rec.attempts = Number(rec.attempts || 0) + 1;
+        if (rec.attempts >= max) {
+            this.otpStore.delete(phoneNumber);
+            return this._verifyOutcome('LOCKED', 0);
+        }
+        this.otpStore.set(phoneNumber, rec);
+        return this._verifyOutcome('WRONG', max - rec.attempts);
+    }
+
+    /** Single place where a store verdict becomes an API verdict. */
+    _verifyOutcome(why, attemptsLeft) {
+        switch (why) {
+            case 'OK':
+                return { success: true, message: 'OTP verified successfully' };
+            case 'NOTFOUND':
                 return { success: false, message: 'No OTP found for this phone number' };
-            }
-            otpData = JSON.parse(raw);
-            otpData.expiresAt = new Date(otpData.expiresAt);
-        } else {
-            otpData = this.otpStore.get(phoneNumber);
-            if (!otpData) {
-                return { success: false, message: 'No OTP found for this phone number' };
-            }
+            case 'EXPIRED':
+                return { success: false, message: 'OTP has expired' };
+            case 'LOCKED':
+                return { success: false, message: 'Maximum verification attempts exceeded' };
+            default:
+                return { success: false, message: 'Invalid OTP code', attemptsLeft };
         }
-
-        if (new Date() > otpData.expiresAt) {
-            if (this._redisClient) await this._redisClient.del(otpKey);
-            else this.otpStore.delete(phoneNumber);
-            return { success: false, message: 'OTP has expired' };
-        }
-
-        if (otpData.attempts >= otpData.maxAttempts) {
-            if (this._redisClient) await this._redisClient.del(otpKey);
-            else this.otpStore.delete(phoneNumber);
-            return { success: false, message: 'Maximum verification attempts exceeded' };
-        }
-
-        otpData.attempts++;
-
-        // Constant-time comparison: a code is a credential, so its comparison
-        // must not leak length/prefix information through timing.
-        if (!this._safeEqual(String(otpData.code), String(code))) {
-            if (this._redisClient) {
-                const ttl = await this._redisClient.ttl(otpKey);
-                await this._redisClient.set(otpKey, JSON.stringify(otpData), 'EX', Math.max(ttl, 1));
-            } else {
-                this.otpStore.set(phoneNumber, otpData);
-            }
-            return { success: false, message: 'Invalid OTP code', attemptsLeft: otpData.maxAttempts - otpData.attempts };
-        }
-
-        // OTP verified successfully
-        if (this._redisClient) await this._redisClient.del(otpKey);
-        else this.otpStore.delete(phoneNumber);
-        return {
-            success: true,
-            message: 'OTP verified successfully'
-        };
     }
 
     /**
@@ -420,10 +570,13 @@ class SMSService {
     // Private helper methods
 
     _generateOTP(length) {
-        const digits = '0123456789';
+        // A verification code is a credential: Math.random() is predictable from
+        // engine state and must not generate it. crypto.randomInt is uniform and
+        // CSPRNG-backed. Digits are appended one at a time so a leading zero is
+        // preserved (numeric generation would drop it and shorten the code).
         let otp = '';
-        for (let i = 0; i < length; i++) {
-            otp += digits[Math.floor(Math.random() * digits.length)];
+        for (let i = 0; i < length; i += 1) {
+            otp += crypto.randomInt(0, 10).toString();
         }
         return otp;
     }
@@ -431,7 +584,6 @@ class SMSService {
     /**
      * Constant-time string comparison. A verification code is a credential, so
      * its comparison must not leak prefix/length information through timing.
-     * Mismatched lengths still perform one comparison before failing.
      */
     _safeEqual(a, b) {
         const bufA = Buffer.from(String(a), 'utf8');
@@ -450,46 +602,31 @@ class SMSService {
     // Placeholder methods for real SMS providers
     // Replace these with actual API calls
 
-    async _sendViaTwilio(phoneNumber, message, sender) {
-        // TODO: Implement Twilio SMS API integration
-        // const twilio = require('twilio');
-        // const client = twilio(accountSid, authToken);
-        
-        logger.info('🔧 [PLACEHOLDER] Twilio SMS integration - Replace with real API');
-        
-        return {
-            success: true,
-            messageId: this._generateMessageId(),
-            provider: 'twilio_placeholder',
-            cost: 0.05, // Estimated cost
-            status: 'queued'
-        };
+    async _sendViaTwilio() {
+        // NOT IMPLEMENTED. This adapter once returned { success: true },
+        // which let a configured-but-unbuilt provider report a delivery
+        // that never happened. It fails with a stable code instead.
+        const err = new Error('SMS provider "twilio" is not implemented; refusing to simulate a send.');
+        err.code = 'SMS_PROVIDER_UNSUPPORTED';
+        throw err;
     }
 
-    async _sendViaAWS(phoneNumber, message) {
-        // TODO: Implement AWS SNS SMS integration
-        logger.info('🔧 [PLACEHOLDER] AWS SNS SMS integration - Replace with real API');
-        
-        return {
-            success: true,
-            messageId: this._generateMessageId(),
-            provider: 'aws_sns_placeholder',
-            cost: 0.008,
-            status: 'sent'
-        };
+    async _sendViaAWS() {
+        // NOT IMPLEMENTED. This adapter once returned { success: true },
+        // which let a configured-but-unbuilt provider report a delivery
+        // that never happened. It fails with a stable code instead.
+        const err = new Error('SMS provider "aws_sns" is not implemented; refusing to simulate a send.');
+        err.code = 'SMS_PROVIDER_UNSUPPORTED';
+        throw err;
     }
 
-    async _sendViaHubtel(phoneNumber, message, sender) {
-        // TODO: Implement Hubtel SMS API (Ghana)
-        logger.info('🔧 [PLACEHOLDER] Hubtel SMS integration - Replace with real API');
-        
-        return {
-            success: true,
-            messageId: this._generateMessageId(),
-            provider: 'hubtel_placeholder',
-            cost: 0.02,
-            status: 'delivered'
-        };
+    async _sendViaHubtel() {
+        // NOT IMPLEMENTED. This adapter once returned { success: true },
+        // which let a configured-but-unbuilt provider report a delivery
+        // that never happened. It fails with a stable code instead.
+        const err = new Error('SMS provider "hubtel" is not implemented; refusing to simulate a send.');
+        err.code = 'SMS_PROVIDER_UNSUPPORTED';
+        throw err;
     }
 
     async _sendViaArkesel(phoneNumber, message, sender) {
@@ -516,7 +653,7 @@ class SMSService {
 
             if (response.ok && data.status === 'success') {
                 const messageId = data.data?.[0]?.id || this._generateMessageId();
-                logger.info(`✅ [Arkesel] SMS sent to ${phoneNumber} (id: ${messageId})`);
+                logger.info({ phone: this._maskPhone(phoneNumber), messageId, provider: 'arkesel' }, '[Arkesel] SMS accepted by provider');
                 return {
                     success: true,
                     messageId,
@@ -526,7 +663,16 @@ class SMSService {
                 };
             }
 
-            logger.error(`❌ [Arkesel] Failed (${response.status}): ${JSON.stringify(data)}`);
+            // Never serialise the provider payload: it can echo the recipient,
+            // the message body or an OTP back at us. Status + a bounded scrubbed
+            // reason is enough to diagnose a failure.
+            logger.error(
+                {
+                    status: response.status,
+                    reason: this._scrubBody(data && (data.message || data.error || '')),
+                },
+                '[Arkesel] provider refused the send'
+            );
             return {
                 success: false,
                 provider: 'arkesel',
@@ -534,12 +680,25 @@ class SMSService {
                 error: data.message || 'Unknown Arkesel error'
             };
         } catch (error) {
-            logger.error(`❌ [Arkesel] Network error: ${error.message}`);
+            logger.error(
+                { reason: this._scrubBody(error && error.message) },
+                '[Arkesel] network error (no code/recipient logged)'
+            );
             return { success: false, provider: 'arkesel', status: 'error', error: error.message };
         }
     }
 
     async _sendViaMoolre(phoneNumber, message, sender) {
+        if (this.moolreConfigError) {
+            const err = new Error('Moolre SMS is not usable in production: ' + this.moolreConfigError + '. Refusing to send.');
+            err.code = 'SMS_PROVIDER_MISCONFIGURED';
+            logger.error(
+                { provider: 'moolre', reason: this.moolreConfigError, phone: this._maskPhone(phoneNumber) },
+                '[Moolre] refusing send on unusable production configuration'
+            );
+            throw err;
+        }
+
         // Moolre SMS API (Value-Added Services).
         //
         // Auth: STATIC headers (no OAuth). Per Moolre's reference, SMS/USSD use
