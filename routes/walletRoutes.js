@@ -16,6 +16,7 @@ const { protect }              = require('../middleware/authMiddleware');
 const { idempotency } = require('../middleware/idempotency');
 const { require2FA } = require('../middleware/require2FA');
 const { protectActive }        = require('../middleware/banGuardMiddleware');
+const { requireKyc }           = require('../middleware/requireKyc');
 
 // Withdrawals — r42 WAVE-2: the claim commits INSIDE the withdrawal
 // reservation transaction (see walletController.requestWithdrawal) with the
@@ -23,7 +24,12 @@ const { protectActive }        = require('../middleware/banGuardMiddleware');
 // request path (payout workers own dispatch), so the response is honest
 // post-commit; 4xx/5xx responses prove the reservation rolled back and
 // release the claim for retry (same disposition contract as /api/withdraw/*).
-router.post('/withdraw',       protectActive, require2FA(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), walletController.requestWithdrawal);
+// IDENTITY GATE — this is the SECOND withdrawal surface (the first is
+// /api/withdrawals/{fiat,crypto}). Same action, same money, same policy, so an
+// unverified account must not reach it either. Mounted after protectActive (it
+// needs the live req.user) and BEFORE require2FA/idempotency so a refusal costs
+// no idempotency key and never reaches provider dispatch.
+router.post('/withdraw',       protectActive, requireKyc('withdraw'), require2FA(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), walletController.requestWithdrawal);
 
 // Read-only history (banned users still need to see their own history)
 router.get('/history',         protect,       walletController.getWithdrawalHistory);
