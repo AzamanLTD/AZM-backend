@@ -35,7 +35,13 @@
 
 const logger = require('../src/config/logger');
 
-const DEFAULT_GATED_ACTIONS = 'withdraw';
+// The BASELINE the product requires: identity is not demanded at first login,
+// but it IS required the moment a user starts a money-moving action - funding
+// included, not only withdrawal. An env override may ADD action names; it can
+// never remove one from this set (see gatedActions), so an unset or partial
+// KYC_GATED_ACTIONS cannot silently under-enforce the policy.
+const REQUIRED_GATED_ACTIONS = ['withdraw', 'deposit', 'p2p', 'trade', 'susu'];
+const DEFAULT_GATED_ACTIONS = REQUIRED_GATED_ACTIONS.join(',');
 
 /**
  * The gated action names, parsed per call so a changed env var takes effect
@@ -44,15 +50,12 @@ const DEFAULT_GATED_ACTIONS = 'withdraw';
  */
 function gatedActions() {
     const raw = process.env.KYC_GATED_ACTIONS;
-    const list = (typeof raw === 'string' && raw.trim().length > 0)
-        ? raw
-        : DEFAULT_GATED_ACTIONS;
-    return new Set(
-        list
-            .split(',')
-            .map((a) => a.trim().toLowerCase())
-            .filter((a) => a.length > 0),
-    );
+    const configured = (typeof raw === 'string' && raw.trim().length > 0)
+        ? raw.split(',').map((a) => a.trim().toLowerCase()).filter((a) => a.length > 0)
+        : [];
+    // UNION, never replacement: the required baseline always holds, so an env
+    // value can add coverage but cannot weaken what the product requires.
+    return new Set([...REQUIRED_GATED_ACTIONS, ...configured]);
 }
 
 /**
@@ -161,4 +164,4 @@ function requireKyc(action) {
     };
 }
 
-module.exports = { requireKyc, gatedActions, DEFAULT_GATED_ACTIONS };
+module.exports = { requireKyc, gatedActions, DEFAULT_GATED_ACTIONS, REQUIRED_GATED_ACTIONS };

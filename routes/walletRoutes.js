@@ -47,7 +47,7 @@ router.get('/saved',           protect,       walletController.getSavedWallets);
 router.delete('/saved/:id',    protectActive, walletController.deleteSavedWallet);
 
 // Fiat deposit gateway (initialize)
-router.post('/deposit/initialize', protectActive, idempotency(), walletController.initializeFiatDeposit);
+router.post('/deposit/initialize', protectActive, requireKyc('deposit'), idempotency(), walletController.initializeFiatDeposit);
 
 // Polygon deposit address (Phase C: Tatum HD wallet derivation)
 router.get('/deposit-address/polygon', protect, walletController.getPolygonDepositAddress);
@@ -96,7 +96,7 @@ router.get('/pool-withdrawal-preview', protect, async (req, res) => {
 
 // POST /api/wallet/internal-transfer
 // Body: { direction: 'TO_POOL' | 'FROM_POOL', amount: number }
-router.post('/internal-transfer', protectActive, require2FA(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), async (req, res) => {
+router.post('/internal-transfer', protectActive, requireKyc('p2p'), require2FA(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), async (req, res) => {
     const prisma = req.app.get('prisma');
     const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
 

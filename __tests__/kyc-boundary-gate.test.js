@@ -38,16 +38,28 @@ describe('requireKyc — scope', () => {
         else process.env.KYC_GATED_ACTIONS = ORIGINAL;
     });
 
-    test('defaults to gating withdrawals only', () => {
+    test('defaults to the required money-moving baseline', () => {
+        // The old default gated withdrawals only, which left deposit, P2P,
+        // trade and susu starts open — narrower than the product requirement.
         delete process.env.KYC_GATED_ACTIONS;
-        expect([...gatedActions()]).toEqual([DEFAULT_GATED_ACTIONS]);
         expect(gatedActions().has('withdraw')).toBe(true);
-        expect(gatedActions().has('trade')).toBe(false);
+        expect(gatedActions().has('deposit')).toBe(true);
+        expect(gatedActions().has('p2p')).toBe(true);
+        expect(gatedActions().has('trade')).toBe(true);
+        expect(gatedActions().has('susu')).toBe(true);
+        expect(DEFAULT_GATED_ACTIONS).toBe('withdraw,deposit,p2p,trade,susu');
     });
 
-    test('scope is configurable and case/space tolerant', () => {
-        process.env.KYC_GATED_ACTIONS = ' Withdraw , TRADE ,susu ';
-        expect([...gatedActions()].sort()).toEqual(['susu', 'trade', 'withdraw']);
+    test('scope is additive, case and space tolerant, never subtractive', () => {
+        // A narrowed env may only ADD: the required baseline survives it.
+        process.env.KYC_GATED_ACTIONS = ' Withdraw , SAVINGS ';
+        const set = gatedActions();
+        expect(set.has('withdraw')).toBe(true);
+        expect(set.has('savings')).toBe(true);
+        expect(set.has('deposit')).toBe(true);
+        expect(set.has('p2p')).toBe(true);
+        expect(set.has('trade')).toBe(true);
+        expect(set.has('susu')).toBe(true);
     });
 
     test('an action outside the configured scope passes WITHOUT touching the database', async () => {
@@ -56,7 +68,8 @@ describe('requireKyc — scope', () => {
         const res = makeRes();
         const next = jest.fn();
 
-        await requireKyc('trade')(req, res, next);
+        // 'browse' is genuinely outside the money-moving matrix; trade is not.
+        await requireKyc('browse')(req, res, next);
 
         expect(next).toHaveBeenCalledWith();
         expect(req._prisma.user.findUnique).not.toHaveBeenCalled();
