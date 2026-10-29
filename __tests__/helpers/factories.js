@@ -41,6 +41,12 @@ async function seedUser(prisma, overrides = {}) {
             escrowLockedBalance: escrowLockedBalance ?? 0.0,
             disputeEscrowBalance: disputeEscrowBalance ?? 0.0,
             azamanId: azamanId || `AZM-TEST-${id}`,
+            // Financial fixtures represent an identity-verified account: since
+            // requireKyc gates deposit/withdraw/p2p/trade/susu by default, a
+            // fixture left at the schema default (UNVERIFIED) would be refused
+            // before reaching the logic under test. KYC refusal itself is
+            // covered by __tests__/kyc-*.test.js.
+            kycStatus: 'VERIFIED',
             ...rest,
         },
     });
