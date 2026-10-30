@@ -595,6 +595,161 @@ class SMSService {
         return crypto.timingSafeEqual(bufA, bufB);
     }
 
+    // =====================================================================
+    // APP-UNLOCK CHALLENGES (purpose-bound)
+    //
+    // These are deliberately NOT sendOTP/verifyOTP. A phone-verification OTP is
+    // stored at `otp:<phone>`; an unlock challenge lives at
+    // `otp:APP_UNLOCK:<userId>:<challengeId>`. Different key space, different
+    // purpose, different subject in the digest, so neither can be replayed as
+    // the other. Nothing here writes phoneNumber, phoneVerified or the identity
+    // phone hash.
+    // =====================================================================
+
+    _unlockKey(userId, challengeId) {
+        return `otp:APP_UNLOCK:${userId}:${challengeId}`;
+    }
+
+    /**
+     * Can this deployment actually deliver an SMS right now?
+     * @returns {{available: boolean, reason: string|null}}
+     */
+    unlockDeliverability() {
+        const provider = String(this.provider || '').toLowerCase();
+        if (this.misconfigured) {
+            return { available: false, reason: 'SMS_PROVIDER_MISCONFIGURED' };
+        }
+        if (provider === 'mock' || this.isTestMode) {
+            return { available: false, reason: 'MOCK_PROVIDER' };
+        }
+        if (!IMPLEMENTED_SMS_PROVIDERS.has(provider)) {
+            return { available: false, reason: 'SMS_PROVIDER_UNSUPPORTED' };
+        }
+        if (provider === 'moolre' && this.moolreConfigError) {
+            return { available: false, reason: 'SMS_PROVIDER_MISCONFIGURED' };
+        }
+        if (this.isProduction && !this._redisClient) {
+            return { available: false, reason: 'OTP_STORE_UNAVAILABLE' };
+        }
+        return { available: true, reason: null };
+    }
+
+    /**
+     * Reserve a send slot, mint a code and store a keyed digest bound to
+     * userId + challengeId + purpose. A provider failure removes the challenge
+     * so nothing verifiable is left behind.
+     */
+    async issueUnlockChallenge({ userId, phoneNumber, purpose, ttlSeconds = 300, length = 6 }) {
+        if (purpose !== 'APP_UNLOCK') {
+            const err = new Error(`Unsupported challenge purpose: ${purpose}`);
+            err.code = 'CHALLENGE_PURPOSE_UNSUPPORTED';
+            throw err;
+        }
+        const durability = this._requireDurableOtpStore();
+        // Per-user throttle, in its own namespace so a phone-verification
+        // resend never consumes the unlock budget (or vice versa).
+        await this._enforceSendThrottle(`APP_UNLOCK:${userId}`);
+
+        const code = this._generateOTP(length);
+        const challengeId = crypto.randomUUID();
+        const key = this._unlockKey(userId, challengeId);
+        const expiresAtMs = Date.now() + ttlSeconds * 1000;
+        const record = {
+            purpose,
+            userId,
+            challengeId,
+            // Bound to the account AND the challenge: a digest from another
+            // user's challenge, or from phone verification, cannot match.
+            codeHash: this._hashCode(`${purpose}:${userId}:${challengeId}`, code),
+            expiresAtMs,
+            attempts: 0,
+            maxAttempts: this._otpMaxAttempts || 3,
+        };
+
+        if (durability) {
+            await this._redisClient.set(key, JSON.stringify(record), 'PX', ttlSeconds * 1000);
+        } else {
+            this.otpStore.set(key, record);
+        }
+
+        const body = `Your Azaman unlock code is ${code}. Valid for ${Math.round(ttlSeconds / 60)} minutes. Never share it.`;
+        let result;
+        try {
+            result = await this.sendSMS(phoneNumber, body);
+        } catch (err) {
+            await this._deleteUnlockChallenge(userId, challengeId);
+            throw err;
+        }
+        if (!result || result.success !== true) {
+            await this._deleteUnlockChallenge(userId, challengeId);
+            const err = new Error('SMS provider did not accept the unlock message.');
+            err.code = 'SMS_SEND_FAILED';
+            throw err;
+        }
+
+        return {
+            challengeId,
+            maskedPhone: this._maskPhone(phoneNumber),
+            expiresAt: new Date(expiresAtMs).toISOString(),
+            mocked: result.mocked === true,
+        };
+    }
+
+    async _deleteUnlockChallenge(userId, challengeId) {
+        const key = this._unlockKey(userId, challengeId);
+        if (this._redisClient) await this._redisClient.del(key);
+        else this.otpStore.delete(key);
+    }
+
+    /**
+     * Atomically consume a challenge. Single Lua step in Redis: only one
+     * concurrent correct verification can win, and the attempt budget cannot be
+     * bypassed by concurrency.
+     * @returns {{outcome: 'OK'|'NOTFOUND'|'EXPIRED'|'LOCKED'|'WRONG', attemptsLeft?: number}}
+     */
+    async consumeUnlockChallenge({ userId, phoneNumber, purpose, challengeId, code }) {
+        if (purpose !== 'APP_UNLOCK') {
+            return { outcome: 'NOTFOUND' };
+        }
+        const durable = this._requireDurableOtpStore();
+        const key = this._unlockKey(userId, challengeId);
+        const digest = this._hashCode(`${purpose}:${userId}:${challengeId}`, String(code));
+
+        if (durable) {
+            const [ok, outcome, left] = await this._redisClient.eval(
+                OTP_VERIFY_LUA, 1, key, digest, String(Date.now()),
+            );
+            return {
+                outcome,
+                attemptsLeft: Number(ok) === 1 || outcome !== 'WRONG' ? undefined : Number(left),
+            };
+        }
+
+        const rec = this.otpStore.get(key);
+        if (!rec) return { outcome: 'NOTFOUND' };
+        if (rec.userId !== userId || rec.purpose !== purpose) return { outcome: 'NOTFOUND' };
+        if (Number(rec.expiresAtMs) < Date.now()) {
+            this.otpStore.delete(key);
+            return { outcome: 'EXPIRED' };
+        }
+        const max = Number(rec.maxAttempts || this._otpMaxAttempts || 3);
+        if (Number(rec.attempts) >= max) {
+            this.otpStore.delete(key);
+            return { outcome: 'LOCKED' };
+        }
+        if (this._safeEqual(rec.codeHash, digest)) {
+            this.otpStore.delete(key);
+            return { outcome: 'OK' };
+        }
+        rec.attempts = Number(rec.attempts) + 1;
+        if (rec.attempts >= max) {
+            this.otpStore.delete(key);
+            return { outcome: 'LOCKED' };
+        }
+        this.otpStore.set(key, rec);
+        return { outcome: 'WRONG', attemptsLeft: max - rec.attempts };
+    }
+
     _generateMessageId() {
         return 'msg_' + crypto.randomUUID();
     }
