@@ -320,11 +320,26 @@ class AppUnlockService {
             const typed = ['OTP_STORE_UNAVAILABLE', 'SMS_PROVIDER_MISCONFIGURED', 'SMS_PROVIDER_UNSUPPORTED',
                 'OTP_RESEND_TOO_SOON', 'OTP_SEND_FAILED'];
             if (err && typed.includes(err.code)) {
-                return err.code === 'OTP_RESEND_TOO_SOON'
-                    ? { ok: false, code: 'CHALLENGE_THROTTLED', status: 429, retryAfterMs: err.retryAfterMs }
-                    : { ok: false, code: err.code, status: 503 };
+                if (err.code === 'OTP_RESEND_TOO_SOON') {
+                    return { ok: false, code: 'CHALLENGE_THROTTLED', status: 429, retryAfterMs: err.retryAfterMs };
+                }
+                if (err.code === 'OTP_SEND_FAILED') {
+                    // Provider refused: no challenge survives, and the caller
+                    // learns the send failed rather than a store problem.
+                    return { ok: false, code: 'CHALLENGE_SEND_FAILED', status: 502 };
+                }
+                return { ok: false, code: err.code, status: 503 };
             }
-            logger.error({ userId: user && user.id, reason: err && err.name }, '[appUnlock] challenge store unavailable');
+            const name = String((err && err.name) || '');
+            const msg = String((err && err.message) || '');
+            const storeish = /MaxRetries|Connection|ECONNREFUSED|ETIMEDOUT|Cluster|ReplyError/i.test(name + ' ' + msg);
+            if (!storeish) {
+                // A provider or logic failure: surface it. The inner call has
+                // already deleted the challenge, so nothing verifiable survives.
+                logger.error({ userId: user && user.id, reason: name }, '[appUnlock] challenge send failed');
+                throw err;
+            }
+            logger.error({ userId: user && user.id, reason: name }, '[appUnlock] challenge store unavailable');
             return { ok: false, code: 'OTP_STORE_UNAVAILABLE', status: 503 };
         }
     }
