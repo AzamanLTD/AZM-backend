@@ -7410,6 +7410,7 @@ model SavedServiceAccount {
 
   accountDataCiphertext String    @db.Text
   accountDataKeyVersion String    @db.VarChar(16)
+  serviceTemplateVersion String @db.VarChar(16) @default("1") // registry schemaVersion that validated the fields
   accountFingerprint    String    @db.Char(64)
   accountMask           String    @db.VarChar(32)
 

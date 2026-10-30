@@ -7,7 +7,7 @@
 // safely while the commercial integration is still being negotiated.
 // =============================================================================
 
-const { getService } = require('./serviceRegistry');
+const { getService, schemaVersion: TEMPLATE_SCHEMA_VERSION } = require('./serviceRegistry');
 const {
     encryptAccountData,
     decryptAccountData,
@@ -111,6 +111,7 @@ function toPublicAccount(record, service) {
         label: service ? service.label : null,
         nickname: record.nickname,
         accountMask: record.accountMask,
+        serviceTemplateVersion: record.serviceTemplateVersion,
         verificationStatus: record.verificationStatus,
         verifiedAt: record.verifiedAt,
         isPrimary: record.isPrimary,
@@ -169,6 +170,9 @@ function createService({ prisma }) {
                         nickname,
                         accountDataCiphertext,
                         accountDataKeyVersion: require('./savedServiceCrypto').keyVersion(),
+                        // The field schema this account was validated against,
+                        // so a later registry change can be handled, not guessed.
+                        serviceTemplateVersion: TEMPLATE_SCHEMA_VERSION,
                         accountFingerprint: fingerprint,
                         accountMask: maskIdentity(identity),
                         // Saving is not verifying. Only a provider lookup may

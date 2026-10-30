@@ -49,6 +49,43 @@ function fingerprintKey() {
     return _decodeKey(process.env.SAVED_SERVICE_FINGERPRINT_KEY, 'SAVED_SERVICE_FINGERPRINT_KEY');
 }
 
+/**
+ * Key ring: the configured key is the CURRENT version, and older versions may
+ * be supplied as JSON so ciphertext written before a rotation still opens.
+ * Format: SAVED_SERVICE_ENCRYPTION_KEYS_JSON={"0":"<hex or base64 32B>"}
+ */
+function keyRing() {
+    const ring = {};
+    ring[keyVersion()] = encryptionKey();
+    const extra = process.env.SAVED_SERVICE_ENCRYPTION_KEYS_JSON;
+    if (extra) {
+        let parsed;
+        try {
+            parsed = JSON.parse(extra);
+        } catch (_e) {
+            const err = new Error('SAVED_SERVICE_ENCRYPTION_KEYS_JSON is not valid JSON.');
+            err.code = 'SAVED_SERVICE_KEY_INVALID';
+            throw err;
+        }
+        for (const [version, material] of Object.entries(parsed || {})) {
+            ring[String(version).slice(0, 16)] = _decodeKey(material, `keys.${version}`);
+        }
+    }
+    return ring;
+}
+
+function resolveKey(version) {
+    const key = keyRing()[String(version)];
+    if (!key) {
+        // Fail closed: an unknown version is a rotation mistake, never a
+        // reason to try the current key and hope.
+        const err = new Error(`No saved-service key for version ${version}.`);
+        err.code = 'SAVED_SERVICE_KEY_VERSION_UNKNOWN';
+        throw err;
+    }
+    return key;
+}
+
 function keyVersion() {
     return String(process.env.SAVED_SERVICE_ENCRYPTION_KEY_VERSION || '1').trim().slice(0, 16);
 }
@@ -89,7 +126,7 @@ function decryptAccountData(envelope) {
         err.code = 'SAVED_SERVICE_CIPHERTEXT_INVALID';
         throw err;
     }
-    const key = encryptionKey();
+    const key = resolveKey(parsed.keyVersion);
     try {
         const decipher = crypto.createDecipheriv(ALGO, key, Buffer.from(parsed.iv, 'base64'));
         decipher.setAuthTag(Buffer.from(parsed.tag, 'base64'));
@@ -122,8 +159,14 @@ function accountFingerprint({ userId, serviceCode, providerCode, identity }) {
  */
 function maskIdentity(identity) {
     const value = String(identity);
+    // Short identifiers are masked ENTIRELY. Keeping a 4-character tail of a
+    // 4-character reference returns the reference itself, which is a leak, not
+    // a mask. Only genuinely long identifiers keep a tail.
+    if (value.length < 10) {
+        return '•'.repeat(Math.max(3, value.length)).slice(0, 32);
+    }
     const tail = value.slice(-4);
-    const dots = '•'.repeat(Math.max(0, Math.min(8, value.length - tail.length)));
+    const dots = '•'.repeat(Math.max(4, Math.min(8, value.length - tail.length)));
     return `${dots}${tail}`.slice(0, 32);
 }
 
@@ -146,6 +189,8 @@ module.exports = {
     maskIdentity,
     isConfigured,
     keyVersion,
+    keyRing,
+    resolveKey,
     ENVELOPE_PREFIX,
     ENVELOPE_VERSION,
 };

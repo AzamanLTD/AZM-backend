@@ -314,3 +314,79 @@ describe('provider honesty', () => {
         expect(publicTemplates().schemaVersion).toBe('1');
     });
 });
+
+describe('masking never round-trips a short identifier', () => {
+    const { maskIdentity } = require('../services/bills/savedServiceCrypto');
+
+    test.each(['7', '42', '913', '4451', '88231', '100200'])(
+        'a %s-character identifier is fully masked', (value) => {
+            const masked = maskIdentity(value);
+            expect(masked).not.toContain(value);
+            expect(masked.replace(/[^•]/g, '')).toHaveLength(masked.length);
+            expect(masked.length).toBeGreaterThanOrEqual(Math.min(3, value.length));
+        });
+
+    test('a long meter number keeps only a tail', () => {
+        const masked = maskIdentity('0123456789012');
+        expect(masked).toMatch(/^•+9012$/);
+        expect(masked).not.toContain('0123456789012');
+    });
+
+    test('the API list response never returns a 4-character reference in full', async () => {
+        jest.resetModules();
+        process.env.SAVED_SERVICE_ENCRYPTION_KEY = KEY;
+        process.env.SAVED_SERVICE_FINGERPRINT_KEY = FP_KEY;
+        const prisma = fakePrisma([]);
+        const { createService } = require('../services/bills/savedServiceAccountService');
+        const svc = createService({ prisma });
+
+        await svc.createAccount({
+            userId: 1,
+            serviceCode: 'BROADBAND',
+            providerCode: 'GENERIC_BROADBAND',
+            nickname: 'Home',
+            accountFields: { serviceReference: 'AB12' },
+        });
+        const rows = await svc.listAccounts(1);
+        expect(JSON.stringify(rows)).not.toContain('AB12');
+        expect(rows[0].accountMask.replace(/[^•]/g, '')).toHaveLength(rows[0].accountMask.length);
+    });
+});
+
+describe('key ring and rotation', () => {
+    const c = require('../services/bills/savedServiceCrypto');
+
+    test('ciphertext records the key version that produced it', () => {
+        const envelope = c.encryptAccountData({ meterNumber: '1234567890' });
+        expect(c.parseEnvelope(envelope).keyVersion).toBe(c.keyVersion());
+    });
+
+    test('a rotated current key cannot open ciphertext from the previous version', () => {
+        const envelope = c.encryptAccountData({ meterNumber: '1234567890' });
+        const previous = process.env.SAVED_SERVICE_ENCRYPTION_KEY;
+        process.env.SAVED_SERVICE_ENCRYPTION_KEY_VERSION = '2';
+        process.env.SAVED_SERVICE_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('hex');
+        let code;
+        try { c.decryptAccountData(envelope); } catch (e) { code = e.code; }
+        process.env.SAVED_SERVICE_ENCRYPTION_KEY = previous;
+        process.env.SAVED_SERVICE_ENCRYPTION_KEY_VERSION = '1';
+        expect(code).toBe('SAVED_SERVICE_KEY_VERSION_UNKNOWN');
+    });
+
+    test('an old key supplied in the ring still decrypts old ciphertext', () => {
+        const envelope = c.encryptAccountData({ meterNumber: '1234567890' });
+        const current = process.env.SAVED_SERVICE_ENCRYPTION_KEY;
+        const oldMaterial = Buffer.alloc(32, 3).toString('hex');
+
+        process.env.SAVED_SERVICE_ENCRYPTION_KEY_VERSION = '2';
+        process.env.SAVED_SERVICE_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('hex');
+        process.env.SAVED_SERVICE_ENCRYPTION_KEYS_JSON = JSON.stringify({ 1: current });
+
+        const opened = c.decryptAccountData(envelope);
+        delete process.env.SAVED_SERVICE_ENCRYPTION_KEYS_JSON;
+        process.env.SAVED_SERVICE_ENCRYPTION_KEY = current;
+        process.env.SAVED_SERVICE_ENCRYPTION_KEY_VERSION = '1';
+        expect(opened.meterNumber).toBe('1234567890');
+        expect(oldMaterial).toHaveLength(64);
+    });
+});
