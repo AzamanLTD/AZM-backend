@@ -134,3 +134,36 @@ exports.removePin = async (req, res) => {
         return res.status(503).json({ success: false, code: 'PIN_REMOVAL_UNAVAILABLE' });
     }
 };
+
+/**
+ * POST /api/security/pin/set
+ *
+ * Replaces the old handler, which accepted { pin } and overwrote an existing
+ * hash with no proof of ownership. Enrolling a first PIN is allowed; rotating
+ * one requires the current PIN.
+ */
+exports.setPinSecure = wrap(async function setPinSecure(req, res) {
+    const prisma = req.app.get('prisma');
+    try {
+        const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+        if (!user) return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'User not found.' });
+
+        const body = req.body || {};
+        const result = await serviceFor({ app: { get: () => prisma } })
+            .setPin(user, { newPin: body.pin, currentPin: body.currentPin });
+
+        if (!result.ok) {
+            return res.status(result.status || 400).json({
+                success: false,
+                code: result.code,
+                message: result.code === 'PIN_FORMAT_INVALID'
+                    ? 'PIN must be 4-8 numeric digits.'
+                    : 'PIN change was refused.',
+                ...(result.attemptsLeft !== undefined ? { attemptsLeft: result.attemptsLeft } : {}),
+            });
+        }
+        return res.status(200).json({ success: true, message: 'PIN updated.' });
+    } catch (err) {
+        return res.status(500).json({ success: false, code: 'PIN_SET_FAILED', message: 'Request failed.' });
+    }
+});

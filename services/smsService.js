@@ -76,7 +76,9 @@ const PLACEHOLDER_SMS_PROVIDERS = new Set(['twilio', 'aws_sns', 'hubtel']);
 
 class SMSService {
     constructor() {
-        this.apiKey = process.env.SMS_API_KEY || 'mock_sms_api_key';
+        // No placeholder fallback: a missing key must read as missing, not as
+        // a literal that can be sent to a provider.
+        this.apiKey = process.env.SMS_API_KEY || null;
 
         // ── SAFETY CONTRACT ──────────────────────────────────────────────────
         // Production must NEVER report a delivery it did not make. A missing
@@ -614,6 +616,24 @@ class SMSService {
      * Can this deployment actually deliver an SMS right now?
      * @returns {{available: boolean, reason: string|null}}
      */
+    /**
+     * Real-credential check, per provider. Presence of a provider NAME is not
+     * readiness: a placeholder key, a missing sender or a sandbox-only config
+     * must all read as unavailable rather than being advertised to the client.
+     * Values are never returned, only a reason code.
+     */
+    arkeselCredentialProblem() {
+        const key = process.env.ARKESEL_API_KEY || this.apiKey;
+        if (!key || key === 'mock_sms_api_key' || /^mock/i.test(String(key)) || String(key).length < 16) {
+            return 'ARKESEL_KEY_MISSING';
+        }
+        const sender = process.env.ARKESEL_SENDER_ID || process.env.SMS_SENDER_ID;
+        if (!sender || String(sender).trim().length < 2) {
+            return 'ARKESEL_SENDER_MISSING';
+        }
+        return null;
+    }
+
     unlockDeliverability() {
         const provider = String(this.provider || '').toLowerCase();
         if (this.misconfigured) {
@@ -627,6 +647,10 @@ class SMSService {
         }
         if (provider === 'moolre' && this.moolreConfigError) {
             return { available: false, reason: 'SMS_PROVIDER_MISCONFIGURED' };
+        }
+        if (provider === 'arkesel') {
+            const problem = this.arkeselCredentialProblem();
+            if (problem) return { available: false, reason: problem };
         }
         if (this.isProduction && !this._redisClient) {
             return { available: false, reason: 'OTP_STORE_UNAVAILABLE' };

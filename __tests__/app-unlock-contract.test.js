@@ -214,8 +214,11 @@ describe('SMS unlock challenge', () => {
     const res = await service.sendSmsChallenge(user);
     expect(res.ok).toBe(true);
     expect(spy).toHaveBeenCalledWith(PHONE, expect.stringContaining('unlock code'));
-    // Nothing resembling the code is returned to the caller.
-    expect(JSON.stringify(res)).not.toMatch(/\d{6}/);
+    // The actual code is never returned to the caller. A digit-run heuristic
+    // would trip on the ISO timestamp, so compare against the real value.
+    const sentCode = (String(spy.mock.calls[0][1]).match(/\b(\d{6})\b/) || [])[1];
+    expect(sentCode).toMatch(/^\d{6}$/);
+    expect(JSON.stringify(res)).not.toContain(sentCode);
     expect(res.data.maskedPhone).not.toBe(PHONE);
   });
 

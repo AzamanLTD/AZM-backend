@@ -24,7 +24,8 @@ const protect = authMiddleware.protect;
 router.post('/2fa/setup', protect, securityController.setup2FA);
 router.post('/2fa/verify', protect, validate(verify2FASchema, 'singleMessage'), securityController.verify2FA);
 router.post('/2fa/disable', protect, validate(disable2FASchema, 'singleMessage'), securityController.disable2FA);
-router.post('/pin/set', protect, validate(setPinSchema, 'singleMessage'), securityController.setPin);
+// Rotation requires the current PIN once one exists (validated in service).
+router.post('/pin/set', protect, appUnlockController.setPinSecure);
 router.post('/pin/verify', protect, validate(verifyPinSchema, 'singleMessage'), securityController.verifyPin);
 router.post('/change-password', protect, validate(changePasswordSchema, 'singleMessage'), securityController.changePassword);
 

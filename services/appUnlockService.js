@@ -35,6 +35,8 @@ const PURPOSES = Object.freeze({
 
 /** Unlock attempt budgets. Deliberately stricter than a login. */
 const PIN_MAX_ATTEMPTS = Number(process.env.APP_UNLOCK_PIN_MAX_ATTEMPTS || 5);
+const TOTP_MAX_ATTEMPTS = Number(process.env.APP_UNLOCK_TOTP_MAX_ATTEMPTS || 5);
+const TOTP_WINDOW_MS = Number(process.env.APP_UNLOCK_TOTP_WINDOW_MS || 15 * 60 * 1000);
 const PIN_WINDOW_MS = Number(process.env.APP_UNLOCK_PIN_WINDOW_MS || 15 * 60 * 1000);
 const TOTP_WINDOW_SECONDS = Number(process.env.APP_UNLOCK_TOTP_REPLAY_TTL || 90);
 
@@ -208,12 +210,55 @@ class AppUnlockService {
      * enrollment state, and refuses a code that has already been used for an
      * unlock inside its validity window (replay guard).
      */
+    /**
+     * Per-user TOTP attempt budget. A global IP limiter does not stop targeted
+     * abuse of one account, so this is its own counter in the shared store with
+     * the same atomic INCR+PEXPIRE script the PIN path uses.
+     */
+    async _totpAttemptsLeft(userId) {
+        const key = `appunlock:totp:attempts:${userId}`;
+        if (this._redis) {
+            const raw = await this._redis.get(key);
+            return Math.max(0, TOTP_MAX_ATTEMPTS - Number(raw || 0));
+        }
+        const rec = _memoryCounters.get(key);
+        if (!rec || Date.now() >= rec.resetAt) return TOTP_MAX_ATTEMPTS;
+        return Math.max(0, TOTP_MAX_ATTEMPTS - rec.n);
+    }
+
+    async _bumpTotpAttempts(userId) {
+        const key = `appunlock:totp:attempts:${userId}`;
+        if (this._redis) {
+            return Number(await this._redis.eval(PIN_ATTEMPT_LUA, 1, key, String(TOTP_WINDOW_MS)));
+        }
+        const now = Date.now();
+        const rec = _memoryCounters.get(key);
+        if (!rec || now >= rec.resetAt) {
+            const fresh = { n: 1, resetAt: now + TOTP_WINDOW_MS };
+            _memoryCounters.set(key, fresh);
+            return 1;
+        }
+        rec.n += 1;
+        return rec.n;
+    }
+
+    async _clearTotpAttempts(userId) {
+        const key = `appunlock:totp:attempts:${userId}`;
+        if (this._redis) await this._redis.eval(PIN_RESET_LUA, 1, key);
+        else _memoryCounters.delete(key);
+    }
+
     async verifyTotp(user, token) {
         if (typeof token !== 'string' || token.trim().length === 0) {
             return { ok: false, code: 'TOTP_REQUIRED', status: 400 };
         }
         if (user.isTwoFactorEnabled !== true || !user.twoFactorSecret) {
             return { ok: false, code: 'TOTP_NOT_CONFIGURED', status: 409 };
+        }
+
+        const left = await this._totpAttemptsLeft(user.id);
+        if (left <= 0) {
+            return { ok: false, code: 'TOTP_LOCKED', status: 429, attemptsLeft: 0 };
         }
 
         const valid = speakeasy.totp.verify({
@@ -223,9 +268,18 @@ class AppUnlockService {
             window: 1,
         });
         if (!valid) {
-            logger.warn({ userId: user.id }, '[appUnlock] TOTP refused');
-            return { ok: false, code: 'TOTP_INVALID', status: 401 };
+            const used = await this._bumpTotpAttempts(user.id);
+            const remaining = Math.max(0, TOTP_MAX_ATTEMPTS - used);
+            logger.warn({ userId: user.id, attemptsLeft: remaining }, '[appUnlock] TOTP refused');
+            return {
+                ok: false,
+                code: remaining > 0 ? 'TOTP_INVALID' : 'TOTP_LOCKED',
+                status: remaining > 0 ? 401 : 429,
+                attemptsLeft: remaining,
+            };
         }
+
+        await this._clearTotpAttempts(user.id);
 
         const claimed = await this._claimTotpCode(user.id, token.trim());
         if (!claimed) {
