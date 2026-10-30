@@ -12,6 +12,7 @@
 
 const logger = require('../src/config/logger');
 const { AppUnlockService } = require('../services/appUnlockService');
+const { wrap } = require('../utils/catchAsync');
 
 function _service(req) {
     const prisma = req.app.get('prisma');
