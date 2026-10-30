@@ -311,6 +311,25 @@ class AppUnlockService {
      * authenticated account. No destination is accepted from the request.
      */
     async sendSmsChallenge(user) {
+        // A store that cannot be reached must refuse the challenge, not throw a
+        // driver error and leave the caller guessing. No code is ever issued
+        // without a durable home for it.
+        try {
+            return await this._sendSmsChallengeInner(user);
+        } catch (err) {
+            const typed = ['OTP_STORE_UNAVAILABLE', 'SMS_PROVIDER_MISCONFIGURED', 'SMS_PROVIDER_UNSUPPORTED',
+                'OTP_RESEND_TOO_SOON', 'OTP_SEND_FAILED'];
+            if (err && typed.includes(err.code)) {
+                return err.code === 'OTP_RESEND_TOO_SOON'
+                    ? { ok: false, code: 'CHALLENGE_THROTTLED', status: 429, retryAfterMs: err.retryAfterMs }
+                    : { ok: false, code: err.code, status: 503 };
+            }
+            logger.error({ userId: user && user.id, reason: err && err.name }, '[appUnlock] challenge store unavailable');
+            return { ok: false, code: 'OTP_STORE_UNAVAILABLE', status: 503 };
+        }
+    }
+
+    async _sendSmsChallengeInner(user) {
         if (user.phoneVerified !== true || !user.phoneNumber) {
             return { ok: false, code: 'PHONE_UNVERIFIED', status: 409 };
         }
