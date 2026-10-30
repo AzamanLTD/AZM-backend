@@ -145,14 +145,18 @@ class AppUnlockService {
             return { ok: false, code: 'PIN_NOT_CONFIGURED', status: 409 };
         }
 
-        const left = await this._attemptsLeft(user.id);
-        if (left <= 0) {
+        // Reserve the attempt BEFORE the comparison. A read-then-compare check
+        // lets concurrent callers all pass the budget and only charge the
+        // failure afterwards, so parallel guesses each get bcrypt work for free.
+        // The reservation IS the charge; it is never applied twice.
+        const used = await this._bumpAttempts(user.id);
+        if (used > PIN_MAX_ATTEMPTS) {
+            logger.warn({ userId: user.id, attemptsLeft: 0 }, '[appUnlock] PIN budget exhausted');
             return { ok: false, code: 'PIN_LOCKED', status: 429, attemptsLeft: 0 };
         }
 
         const match = await bcrypt.compare(pin, user.pinHash);
         if (!match) {
-            const used = await this._bumpAttempts(user.id);
             const remaining = Math.max(0, PIN_MAX_ATTEMPTS - used);
             logger.warn({ userId: user.id, attemptsLeft: remaining }, '[appUnlock] PIN refused');
             return {
@@ -173,6 +177,12 @@ class AppUnlockService {
             return { ok: false, code: 'PIN_FORMAT_INVALID', status: 400 };
         }
         if (user.pinHash) {
+            // A caller that omits the proof gets a distinct code: "you did not
+            // supply the current PIN" is a different situation from "the new
+            // PIN is missing", and the client needs to prompt for the right one.
+            if (typeof currentPin !== 'string' || currentPin.length === 0) {
+                return { ok: false, code: 'PIN_CURRENT_REQUIRED', status: 400 };
+            }
             const proof = await this.verifyPin(user, currentPin);
             if (!proof.ok) return proof;
         }
@@ -256,8 +266,10 @@ class AppUnlockService {
             return { ok: false, code: 'TOTP_NOT_CONFIGURED', status: 409 };
         }
 
-        const left = await this._totpAttemptsLeft(user.id);
-        if (left <= 0) {
+        // Reserved up front for the same reason as verifyPin.
+        const used = await this._bumpTotpAttempts(user.id);
+        if (used > TOTP_MAX_ATTEMPTS) {
+            logger.warn({ userId: user.id, attemptsLeft: 0 }, '[appUnlock] TOTP budget exhausted');
             return { ok: false, code: 'TOTP_LOCKED', status: 429, attemptsLeft: 0 };
         }
 
@@ -268,7 +280,6 @@ class AppUnlockService {
             window: 1,
         });
         if (!valid) {
-            const used = await this._bumpTotpAttempts(user.id);
             const remaining = Math.max(0, TOTP_MAX_ATTEMPTS - used);
             logger.warn({ userId: user.id, attemptsLeft: remaining }, '[appUnlock] TOTP refused');
             return {

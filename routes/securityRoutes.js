@@ -10,6 +10,7 @@ const {
     verify2FASchema,
     disable2FASchema,
     setPinSchema,
+    setPinRotationSchema,
     verifyPinSchema,
     sendPhoneOtpSchema,
     verifyPhoneOtpSchema,
@@ -25,7 +26,7 @@ router.post('/2fa/setup', protect, securityController.setup2FA);
 router.post('/2fa/verify', protect, validate(verify2FASchema, 'singleMessage'), securityController.verify2FA);
 router.post('/2fa/disable', protect, validate(disable2FASchema, 'singleMessage'), securityController.disable2FA);
 // Rotation requires the current PIN once one exists (validated in service).
-router.post('/pin/set', protect, appUnlockController.setPinSecure);
+router.post('/pin/set', protect, validate(setPinRotationSchema, 'singleMessage'), appUnlockController.setPinSecure);
 router.post('/pin/verify', protect, validate(verifyPinSchema, 'singleMessage'), securityController.verifyPin);
 router.post('/change-password', protect, validate(changePasswordSchema, 'singleMessage'), securityController.changePassword);
 

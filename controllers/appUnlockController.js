@@ -150,8 +150,8 @@ exports.setPinSecure = wrap(async function setPinSecure(req, res) {
         if (!user) return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'User not found.' });
 
         const body = req.body || {};
-        const result = await serviceFor({ app: { get: () => prisma } })
-            .setPin(user, { newPin: body.pin, currentPin: body.currentPin });
+        const { service } = _service(req);
+        const result = await service.setPin(user, { newPin: body.pin, currentPin: body.currentPin });
 
         if (!result.ok) {
             return res.status(result.status || 400).json({

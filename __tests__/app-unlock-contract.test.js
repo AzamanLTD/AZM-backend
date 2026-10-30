@@ -207,6 +207,22 @@ describe('authenticator unlock', () => {
 });
 
 // ---------------------------------------------------------------------- SMS
+describe('authenticator attempt reservation', () => {
+    test('concurrent invalid codes only buy as many verification passes as the budget', async () => {
+        const secret = speakeasy.generateSecret({ length: 20 }).base32;
+        const user = { id: 'res-1', isTwoFactorEnabled: true, twoFactorSecret: secret };
+        const { service } = build();
+        const spy = jest.spyOn(speakeasy.totp, 'verify');
+
+        // Budget is 5; nine parallel wrong codes must not all reach the
+        // verifier. A check-then-increment path would let every one through.
+        await Promise.all(Array.from({ length: 9 }, () => service.verifyTotp(user, '000000')));
+
+        expect(spy.mock.calls.length).toBeLessThanOrEqual(5);
+        spy.mockRestore();
+    });
+});
+
 describe('SMS unlock challenge', () => {
   test('sends only to the persisted verified phone', async () => {
     const { service, user, smsService } = build();
