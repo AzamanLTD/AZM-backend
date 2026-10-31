@@ -44,6 +44,11 @@ function makePrisma(user) {
     user: {
       findUnique: jest.fn(async () => user),
       update: jest.fn(async ({ data }) => ({ ...user, ...data })),
+      updateMany: jest.fn(async ({ where, data }) => {
+        if ('pinHash' in where && where.pinHash !== (user.pinHash ?? null)) return { count: 0 };
+        Object.assign(user, data);
+        return { count: 1 };
+      }),
     },
   };
 }
@@ -90,7 +95,7 @@ describe('PIN unlock', () => {
     const verdict = await service.verifyPin(user, '4321');
     expect(verdict).toMatchObject({ ok: true, code: 'PIN_OK', status: 200 });
     // A correct unlock writes nothing: no session, no token, no DB mutation.
-    expect(prisma.user.update).not.toHaveBeenCalled();
+    expect(prisma.user.updateMany).not.toHaveBeenCalled();
   });
 
   test('a wrong PIN is refused and reports what is left', async () => {
@@ -141,18 +146,18 @@ describe('PIN unlock', () => {
     const { service, user, prisma } = build({ pinHash });
     const refused = await service.setPin(user, { newPin: '87654321' });
     expect(refused.ok).toBe(false);
-    expect(prisma.user.update).not.toHaveBeenCalled();
+    expect(prisma.user.updateMany).not.toHaveBeenCalled();
 
     const accepted = await service.setPin(user, { newPin: '8765', currentPin: '4321' });
     expect(accepted.ok).toBe(true);
-    expect(prisma.user.update).toHaveBeenCalledTimes(1);
+    expect(prisma.user.updateMany).toHaveBeenCalledTimes(1);
   });
 
   test('setting a first PIN needs no proof', async () => {
     const { service, user, prisma } = build({ pinHash: null });
     const res = await service.setPin(user, { newPin: '1234' });
     expect(res.ok).toBe(true);
-    expect(prisma.user.update).toHaveBeenCalledWith(
+    expect(prisma.user.updateMany).toHaveBeenCalledWith(
       expect.objectContaining({ data: expect.objectContaining({ pinHash: expect.any(String) }) }),
     );
   });
@@ -162,11 +167,11 @@ describe('PIN unlock', () => {
     const { service, user, prisma } = build({ pinHash });
 
     await expect(service.removePin(user, {})).resolves.toMatchObject({ ok: false, code: 'PROOF_REQUIRED' });
-    expect(prisma.user.update).not.toHaveBeenCalled();
+    expect(prisma.user.updateMany).not.toHaveBeenCalled();
 
     const wrong = await service.removePin(user, { currentPin: '0000' });
     expect(wrong.ok).toBe(false);
-    expect(prisma.user.update).not.toHaveBeenCalled();
+    expect(prisma.user.updateMany).not.toHaveBeenCalled();
 
     const ok = await service.removePin(user, { currentPin: '4321' });
     expect(ok.ok).toBe(true);
@@ -190,7 +195,7 @@ describe('authenticator unlock', () => {
     const verdict = await service.verifyTotp(user, validCode());
     expect(verdict).toMatchObject({ ok: true, code: 'TOTP_OK' });
     // Unlocking must never touch enrolment state.
-    expect(prisma.user.update).not.toHaveBeenCalled();
+    expect(prisma.user.updateMany).not.toHaveBeenCalled();
   });
 
   test('a disabled authenticator is refused', async () => {
@@ -316,7 +321,7 @@ describe('SMS unlock challenge', () => {
     const issued = await service.sendSmsChallenge(user);
     const code = String(captured).match(/\b(\d{6})\b/)[1];
     await service.verifySmsChallenge(user, { challengeId: issued.data.challengeId, code });
-    expect(prisma.user.update).not.toHaveBeenCalled();
+    expect(prisma.user.updateMany).not.toHaveBeenCalled();
   });
 
   test('the attempt budget locks the challenge', async () => {
@@ -417,7 +422,7 @@ describe('capabilities', () => {
     expect(dump).not.toContain(secret);
     expect(dump).not.toContain(PHONE);
     // Read-only: no writes.
-    expect(prisma.user.update).not.toHaveBeenCalled();
+    expect(prisma.user.updateMany).not.toHaveBeenCalled();
   });
 
   test('a secret without verified enrolment is not "configured"', async () => {

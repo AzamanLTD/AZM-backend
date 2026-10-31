@@ -173,7 +173,7 @@ class AppUnlockService {
 
     /** Setting a PIN when one already exists requires proof of the current PIN. */
     async setPin(user, { newPin, currentPin }) {
-        if (typeof newPin !== 'string' || !/^\d{4,8}$/.test(newPin)) {
+        if (typeof newPin !== 'string' || !/^\d{4}$/.test(newPin)) {
             return { ok: false, code: 'PIN_FORMAT_INVALID', status: 400 };
         }
         if (user.pinHash) {
@@ -187,7 +187,16 @@ class AppUnlockService {
             if (!proof.ok) return proof;
         }
         const pinHash = await bcrypt.hash(newPin, 10);
-        await this.prisma.user.update({ where: { id: user.id }, data: { pinHash } });
+        // Atomic compare-and-swap against the hash we validated. A rotation
+        // that raced another one now matches nothing and is refused instead of
+        // silently clobbering the winner.
+        const swapped = await this.prisma.user.updateMany({
+            where: { id: user.id, pinHash: user.pinHash ?? null },
+            data: { pinHash },
+        });
+        if (!swapped || swapped.count !== 1) {
+            return { ok: false, code: 'PIN_ROTATION_CONFLICT', status: 409 };
+        }
         return { ok: true, code: 'PIN_SET', status: 200 };
     }
 

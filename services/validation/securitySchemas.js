@@ -91,7 +91,7 @@ const setPinRotationSchema = passthrough().superRefine((data, ctx) => {
     ctx.addIssue({ code: 'custom', path: ['pin'], message: 'PIN must be 4-8 numeric digits.' });
   }
   if (currentPin !== undefined && currentPin !== null) {
-    if (typeof currentPin !== 'string' || !/^\d{4,8}$/.test(currentPin)) {
+    if (typeof currentPin !== 'string' || !/^\d{4}$/.test(currentPin)) {
       ctx.addIssue({ code: 'custom', path: ['currentPin'], message: 'Current PIN must be 4-8 numeric digits.' });
     }
   }

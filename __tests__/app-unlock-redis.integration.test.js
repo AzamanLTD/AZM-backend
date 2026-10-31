@@ -81,6 +81,26 @@ describe('app unlock against real Redis', () => {
         expect(left).toBeLessThanOrEqual(0);
     });
 
+    test('parallel wrong PINs execute at most PIN_MAX bcrypt comparisons', async () => {
+        const bcrypt = require('bcryptjs');
+        const hash = await bcrypt.hash('1234', 10);
+        const user = { id: 9911, pinHash: hash };
+        const { AppUnlockService } = require('../services/appUnlockService');
+        const svc = new AppUnlockService({ prisma: {}, smsService });
+        const spy = jest.spyOn(bcrypt, 'compare');
+
+        // Budget is 5. Twelve parallel guesses must buy five comparisons, not
+        // twelve. Counting the Redis counter alone would not prove this.
+        const results = await Promise.all(
+            Array.from({ length: 12 }, () => svc.verifyPin(user, '9999')),
+        );
+
+        expect(spy.mock.calls.length).toBeLessThanOrEqual(5);
+        const refused = results.filter((r) => r.code === 'PIN_LOCKED');
+        expect(refused.length).toBeGreaterThan(0);
+        spy.mockRestore();
+    });
+
     test('a TOTP code is claimed once across processes', async () => {
         const secret = speakeasy.generateSecret({ length: 20 }).base32;
         const u = user({ id: 903, twoFactorSecret: secret });
