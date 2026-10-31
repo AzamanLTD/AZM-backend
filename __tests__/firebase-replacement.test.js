@@ -6,7 +6,8 @@ jest.mock('../src/config/logger', () => ({ info: jest.fn(), warn: jest.fn(), err
 
 const crypto = require('crypto');
 const {
-    verifyIdToken, createKeyResolver, createDefaultFetcher, maxAgeFromCacheControl, CLOCK_SKEW_SECONDS,
+    verifyIdToken, createKeyResolver, createDefaultFetcher, maxAgeFromCacheControl,
+    EXP_SKEW_SECONDS, IAT_TOLERANCE_SECONDS,
 } = require('../services/firebase/idTokenVerifier');
 const {
     createFcmClient, buildAssertion, classifySendFailure, parseRetryAfter,
@@ -95,23 +96,30 @@ describe('ID token: project binding', () => {
 });
 
 describe('ID token: time claims and skew parity', () => {
-    test('clock skew matches firebase-admin at 300 seconds', () => {
-        expect(CLOCK_SKEW_SECONDS).toBe(300);
+    test('expiry tolerance matches firebase-admin exactly: zero skew', () => {
+        // firebase-admin 14.3.0 delegates to jsonwebtoken with no options, and
+        // jsonwebtoken's default clockTolerance is 0. Verified in the installed
+        // library, so this constant must stay 0 for parity.
+        expect(EXP_SKEW_SECONDS).toBe(0);
     });
 
-    test('an expired token is refused', async () => {
-        await expect(verify(mint({ claims: { exp: SEC - 301 } })))
+    test('a token that expired one second ago is refused', async () => {
+        await expect(verify(mint({ claims: { exp: SEC - 1 } })))
             .rejects.toMatchObject({ code: 'ID_TOKEN_EXPIRED' });
     });
 
-    test('a token inside the 300s skew window is still accepted', async () => {
-        await expect(verify(mint({ claims: { exp: SEC - 100 } }))).resolves.toBeTruthy();
+    test('a token expiring in the future is accepted', async () => {
+        await expect(verify(mint({ claims: { exp: SEC + 1 } }))).resolves.toBeTruthy();
     });
 
-    test('rejects iat beyond the skew window, accepts inside it', async () => {
-        await expect(verify(mint({ claims: { iat: SEC + 301 } })))
+    test('iat is our own guard, so it keeps a tolerance firebase-admin does not have', () => {
+        expect(IAT_TOLERANCE_SECONDS).toBeGreaterThan(0);
+    });
+
+    test('rejects iat beyond the tolerance, accepts inside it', async () => {
+        await expect(verify(mint({ claims: { iat: SEC + IAT_TOLERANCE_SECONDS + 1 } })))
             .rejects.toMatchObject({ code: 'ID_TOKEN_BAD_ISSUED_AT' });
-        await expect(verify(mint({ claims: { iat: SEC + 299 } }))).resolves.toBeTruthy();
+        await expect(verify(mint({ claims: { iat: SEC + IAT_TOLERANCE_SECONDS - 1 } }))).resolves.toBeTruthy();
     });
 
     test('auth_time is required', async () => {
@@ -126,6 +134,8 @@ describe('ID token: time claims and skew parity', () => {
 
     test('auth_time in the future is refused', async () => {
         await expect(verify(mint({ claims: { auth_time: SEC + 600 } })))
+            .rejects.toMatchObject({ code: 'ID_TOKEN_AUTH_TIME_FUTURE' });
+        await expect(verify(mint({ claims: { auth_time: SEC + IAT_TOLERANCE_SECONDS + 1 } })))
             .rejects.toMatchObject({ code: 'ID_TOKEN_AUTH_TIME_FUTURE' });
     });
 

@@ -8,28 +8,45 @@
 // (wanted by the audit solely through firestore -> google-gax -> rimraf -> glob)
 // can eventually leave the tree.
 //
-// PARITY WITH FIREBASE ADMIN, stated explicitly rather than assumed:
-//   - Algorithm: RS256 only, pinned BEFORE any key lookup. firebase-admin pins
-//     the same value and refuses everything else, including 'none' and HS*.
-//   - Clock skew: 300 seconds, matching firebase-admin's CLOCK_SKEW_SECS. A
-//     tighter window (this file previously used 60s) would reject logins that
-//     production accepts today on a device with a slow clock, so parity wins.
-//   - Claims: iss is https://securetoken.google.com/{project}, aud is the
-//     project id, sub is 1..128 characters, exp must not be in the past.
-//   - auth_time: firebase-admin only rejects auth_time that is a *number* in
-//     the future and tolerates its absence. This file REQUIRES it (owner
-//     requirement) and additionally requires it not to be in the future. That
-//     is a deliberate, documented divergence: stricter, never looser.
+// PARITY WITH FIREBASE ADMIN 14.3.0 - verified by reading the installed
+// library, not assumed (node_modules/firebase-admin/lib/auth/token-verifier.js
+// and lib/utils/jwt.js):
+//   - alg: RS256 only, refused otherwise, pinned BEFORE any key lookup. Same
+//     as firebase-admin (token-verifier.js:213). Covers 'none' and HS*.
+//   - kid: required on every non-emulator token (token-verifier.js:197).
+//   - aud: must equal the project id (token-verifier.js:219).
+//   - iss: must equal https://securetoken.google.com/{project} (:230).
+//   - sub: a non-empty string of at most 128 characters (:237-243).
+//   - exp: delegated to jsonwebtoken's jwt.verify with NO options, so
+//     clockTolerance is jsonwebtoken's default of ZERO (lib/utils/jwt.js:258).
+//     Production therefore tolerates no clock skew at all and this file matches
+//     that exactly (EXP_SKEW_SECONDS = 0). An earlier draft of this file used a
+//     300s window on the mistaken belief that firebase-admin set
+//     CLOCK_SKEW_SECS; that constant does not exist in 14.3.0.
+//   - iat and auth_time: firebase-admin checks NEITHER (zero occurrences of
+//     auth_time in token-verifier.js). Both checks here are additions, i.e.
+//     strictly stricter than production, documented as such:
+//       * auth_time is mandatory and must not be in the future (owner rule),
+//         with IAT_TOLERANCE_SECONDS of slack so ordinary clock drift on an
+//         issuing device cannot cause a false rejection.
+//       * iat must not be in the future beyond the same tolerance.
+//   - Emulator bypass: firebase-admin skips the alg and kid checks when
+//     FIREBASE_AUTH_EMULATOR_HOST is set. This file has no such bypass; a
+//     production cutover must never run against an emulator origin.
 //   - getAuth().verifyIdToken(idToken, true) (revocation check) is NOT
-//     replicated. It needs a live identitytoolkit call. Callers relying on it
+//     replicated: it needs a live identitytoolkit call. Callers relying on it
 //     must keep doing so.
 // =============================================================================
 
 const crypto = require('crypto');
 
 const GOOGLE_JWKS_URL = 'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com';
-// firebase-admin: CLOCK_SKEW_SECS = 300.
-const CLOCK_SKEW_SECONDS = 300;
+// Expiry parity: jsonwebtoken's default clockTolerance is 0 and firebase-admin
+// passes no options, so production accepts no skew. Verified, not assumed.
+const EXP_SKEW_SECONDS = 0;
+// Added by this file (firebase-admin checks neither claim). Slack for ordinary
+// clock drift, never a bypass: a token from the future beyond this is refused.
+const IAT_TOLERANCE_SECONDS = 60;
 // Fallback only. Google's Cache-Control max-age governs the real lifetime.
 const DEFAULT_JWKS_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_JWKS_TIMEOUT_MS = 5000;
@@ -205,7 +222,6 @@ async function verifyIdToken(idToken, { projectId, resolveKey, now = () => Date.
     const jwk = await resolveKey(header.kid);
     verifySignature(parts, jwk);
 
-    const skew = CLOCK_SKEW_SECONDS;
     const nowSec = Math.floor(now() / 1000);
 
     if (claims.aud !== projectId) {
@@ -214,17 +230,17 @@ async function verifyIdToken(idToken, { projectId, resolveKey, now = () => Date.
     if (claims.iss !== 'https://securetoken.google.com/' + projectId) {
         throw new IdTokenError('ID_TOKEN_BAD_ISSUER', 'Token issuer is a different project.');
     }
-    if (typeof claims.exp !== 'number' || claims.exp <= nowSec - skew) {
+    if (typeof claims.exp !== 'number' || claims.exp <= nowSec - EXP_SKEW_SECONDS) {
         throw new IdTokenError('ID_TOKEN_EXPIRED', 'Token is expired.');
     }
-    if (typeof claims.iat !== 'number' || claims.iat > nowSec + skew) {
+    if (typeof claims.iat !== 'number' || claims.iat > nowSec + IAT_TOLERANCE_SECONDS) {
         throw new IdTokenError('ID_TOKEN_BAD_ISSUED_AT', 'Token was issued in the future.');
     }
     // Owner requirement: auth_time is mandatory and must be in the past.
     if (typeof claims.auth_time !== 'number' || !Number.isFinite(claims.auth_time)) {
         throw new IdTokenError('ID_TOKEN_NO_AUTH_TIME', 'auth_time is required and must be a number.');
     }
-    if (claims.auth_time > nowSec + skew) {
+    if (claims.auth_time > nowSec + IAT_TOLERANCE_SECONDS) {
         throw new IdTokenError('ID_TOKEN_AUTH_TIME_FUTURE', 'auth_time is in the future.');
     }
     if (typeof claims.sub !== 'string' || claims.sub.length === 0 || claims.sub.length > 128) {
@@ -245,5 +261,6 @@ module.exports = {
     IdTokenError,
     GOOGLE_JWKS_URL,
     ACCEPTED_ALG,
-    CLOCK_SKEW_SECONDS,
+    EXP_SKEW_SECONDS,
+    IAT_TOLERANCE_SECONDS,
 };
