@@ -43,6 +43,17 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      # Disposable Redis for the app-unlock atomicity proofs. Temporary and
+      # local to this job; no external credentials are involved.
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
 
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
@@ -187,6 +198,14 @@ jobs:
           docker exec "$CONTAINER" psql -U postgres -d azm_test \
             -c "ALTER SYSTEM SET synchronous_commit = off" \
             -c "SELECT pg_reload_conf();"
+
+      - name: App unlock against real Redis
+        # Scoped deliberately: a global REDIS_URL switches unrelated suites onto
+        # shared limiter/idempotency state that they were not written for. Only
+        # the app-unlock atomicity proof needs the real store.
+        run: npx jest __tests__/app-unlock-redis --runInBand --forceExit
+        env:
+          REDIS_URL: redis://localhost:6379
 
       - name: Run tests
         # DB-backed suites share one disposable database and truncate between

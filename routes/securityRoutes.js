@@ -2,6 +2,7 @@ const logger = require('../src/config/logger');
 const express = require('express');
 const router = express.Router();
 const securityController = require('../controllers/securityController');
+const appUnlockController = require('../controllers/appUnlockController');
 const authMiddleware = require('../middleware/authMiddleware.js');
 const { validate } = require('../middleware/validate');
 const {
@@ -9,6 +10,7 @@ const {
     verify2FASchema,
     disable2FASchema,
     setPinSchema,
+    setPinRotationSchema,
     verifyPinSchema,
     sendPhoneOtpSchema,
     verifyPhoneOtpSchema,
@@ -23,7 +25,8 @@ const protect = authMiddleware.protect;
 router.post('/2fa/setup', protect, securityController.setup2FA);
 router.post('/2fa/verify', protect, validate(verify2FASchema, 'singleMessage'), securityController.verify2FA);
 router.post('/2fa/disable', protect, validate(disable2FASchema, 'singleMessage'), securityController.disable2FA);
-router.post('/pin/set', protect, validate(setPinSchema, 'singleMessage'), securityController.setPin);
+// Rotation requires the current PIN once one exists (validated in service).
+router.post('/pin/set', protect, validate(setPinRotationSchema, 'singleMessage'), appUnlockController.setPinSecure);
 router.post('/pin/verify', protect, validate(verifyPinSchema, 'singleMessage'), securityController.verifyPin);
 router.post('/change-password', protect, validate(changePasswordSchema, 'singleMessage'), securityController.changePassword);
 
@@ -57,3 +60,22 @@ router.post('/webauthn/login/finish', webauthnController.finishLogin);
 // Credential management (requires auth)
 router.get('/webauthn/credentials', protect, webauthnController.listCredentials);
 router.delete('/webauthn/credentials/:id', protect, webauthnController.deleteCredential);
+
+// =============================================================================
+// MEMBER APP UNLOCK (server-managed factors)
+//
+// Separate purpose from enrolment and from phone verification. `/2fa/verify`
+// ENROLLS the authenticator; `/phone/verify-otp` MUTATES phone identity. Neither
+// may be used to unlock, and nothing here touches either. Device biometrics are
+// handled locally by local_auth and never reach these routes.
+// =============================================================================
+router.get('/app-unlock/capabilities',   protect, appUnlockController.getAppUnlockCapabilities);
+router.post('/app-unlock/pin/verify',    protect, appUnlockController.verifyAppUnlockPin);
+router.post('/app-unlock/totp/verify',   protect, appUnlockController.verifyAppUnlockTotp);
+router.post('/app-unlock/sms/send',      protect, appUnlockController.sendAppUnlockOtp);
+router.post('/app-unlock/sms/verify',    protect, appUnlockController.verifyAppUnlockOtp);
+
+// PIN removal with fresh proof. The client must not say "removed" until this
+// returns 200 — the handler writes the null hash before responding.
+router.delete('/pin',                    protect, appUnlockController.removePin);
+
