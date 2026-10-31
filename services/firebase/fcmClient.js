@@ -2,15 +2,22 @@
 // =============================================================================
 // Firebase Cloud Messaging (HTTP v1) WITHOUT firebase-admin.
 //
-// PROOF OF CONCEPT - isolated branch only. Not wired into production routes.
+// PROOF OF CONCEPT - isolated branch only. Not wired into any production route.
 //
-// Replaces getMessaging().send(). Two calls, both explicit:
-//   1. sign a JWT assertion with the service-account private key (RS256)
-//   2. exchange it at the token endpoint for an OAuth2 access token
-//   3. POST the message to projects/{project}/messages:send
+// Replaces getMessaging().send(). The HTTP client is injected so tests never
+// touch the network.
 //
-// The http() dependency is injected so tests never touch the network and the
-// production caller cannot accidentally receive a stub.
+// ERROR CLASSIFICATION - the important part, and previously wrong here:
+// a bare HTTP 404 is NOT proof that a device token is dead. A 404 can mean a
+// wrong project, a bad path or a mistyped resource. Only FCM's own structured
+// error (`details[].errorCode === 'UNREGISTERED'`) is evidence that the token
+// should be revoked. Everything else stays a distinct failure so a caller never
+// silently deletes a live device.
+//
+// NO AUTOMATIC RETRY: a failed send is not proof the message was not delivered.
+// FCM can accept a request and fail the response, so retrying blind risks
+// double-delivery. Retryable failures surface `retryable` and `retryAfterMs`
+// and the caller decides.
 // =============================================================================
 
 const crypto = require('crypto');
@@ -18,13 +25,19 @@ const crypto = require('crypto');
 const TOKEN_URI = 'https://oauth2.googleapis.com/token';
 const SCOPE = 'https://www.googleapis.com/auth/firebase.messaging';
 const DEFAULT_TOKEN_TTL_SECONDS = 3600;
+const DEFAULT_HTTP_TIMEOUT_MS = 10000;
+const FCM_ERROR_TYPE = 'type.googleapis.com/google.firebase.fcm.v1.FcmError';
 
 class FcmError extends Error {
-    constructor(code, message, detail) {
+    constructor(code, message, meta) {
         super(message || code);
         this.name = 'FcmError';
         this.code = code;
-        if (detail) this.detail = detail;
+        const m = meta || {};
+        this.status = m.status;
+        this.fcmErrorCode = m.fcmErrorCode || null;
+        this.retryable = Boolean(m.retryable);
+        this.retryAfterMs = typeof m.retryAfterMs === 'number' ? m.retryAfterMs : null;
     }
 }
 
@@ -35,8 +48,6 @@ function base64url(input) {
 function assertServiceAccount(sa) {
     const missing = ['client_email', 'private_key', 'project_id'].filter((f) => !sa || !sa[f]);
     if (missing.length > 0) {
-        // Field NAMES only. The values are credentials and must never surface
-        // in a message, a log line or a stack trace.
         throw new FcmError('FCM_CREDENTIAL_INCOMPLETE', 'Service account is missing: ' + missing.join(', '));
     }
     if (!String(sa.private_key).includes('BEGIN PRIVATE KEY')) {
@@ -44,10 +55,16 @@ function assertServiceAccount(sa) {
     }
 }
 
-/**
- * Build the signed JWT assertion Google's token endpoint expects.
- * Exported so the tests can inspect the claims directly.
- */
+/** Retry-After is either delta-seconds or an HTTP date. Both become ms. */
+function parseRetryAfter(value, now = () => Date.now()) {
+    if (value === undefined || value === null || value === '') return null;
+    const raw = String(value).trim();
+    if (/^\d+$/.test(raw)) return Number(raw) * 1000;
+    const when = Date.parse(raw);
+    if (Number.isNaN(when)) return null;
+    return Math.max(0, when - now());
+}
+
 function buildAssertion(sa, { now = () => Date.now(), ttlSeconds = DEFAULT_TOKEN_TTL_SECONDS } = {}) {
     assertServiceAccount(sa);
     const iat = Math.floor(now() / 1000);
@@ -70,9 +87,65 @@ function buildAssertion(sa, { now = () => Date.now(), ttlSeconds = DEFAULT_TOKEN
 }
 
 /**
- * Fetch an access token. Cached until 60s before expiry so a burst of pushes
- * does not mint a token per message.
+ * The only place an error body is interpreted. Structured `errorCode` values
+ * are the evidence; HTTP status alone is not.
  */
+function classifySendFailure(res, { expectedProjectId, now = () => Date.now() } = {}) {
+    const status = res && res.status;
+    const err = (res && res.json && res.json.error) || {};
+    const details = Array.isArray(err.details) ? err.details : [];
+    const fcmDetail = details.find(
+        (d) => d && typeof d.errorCode === 'string' && (!d['@type'] || d['@type'] === FCM_ERROR_TYPE),
+    );
+    const fcmCode = fcmDetail ? fcmDetail.errorCode : null;
+    const retryAfterMs = parseRetryAfter(res && res.headers && res.headers['retry-after'], now);
+
+    // Confirmed dead token: FCM itself said the registration is gone.
+    if (fcmCode === 'UNREGISTERED') {
+        return new FcmError('FCM_UNREGISTERED', 'Device token is no longer registered.',
+            { status, fcmErrorCode: fcmCode });
+    }
+    // Wrong project / credential-project mismatch. Configuration, not a device.
+    if (fcmCode === 'SENDER_ID_MISMATCH') {
+        return new FcmError('FCM_PROJECT_MISMATCH',
+            'Message targeted a project this credential cannot send for.',
+            { status, fcmErrorCode: fcmCode });
+    }
+    if (fcmCode === 'THIRD_PARTY_AUTH_ERROR') {
+        return new FcmError('FCM_THIRD_PARTY_AUTH', 'Provider rejected APNs or web-push credentials.',
+            { status, fcmErrorCode: fcmCode });
+    }
+    if (fcmCode === 'INVALID_ARGUMENT') {
+        return new FcmError('FCM_INVALID_ARGUMENT', 'Message was rejected as malformed.',
+            { status, fcmErrorCode: fcmCode });
+    }
+    if (fcmCode === 'QUOTA_EXCEEDED' || fcmCode === 'UNAVAILABLE' || fcmCode === 'INTERNAL') {
+        return new FcmError('FCM_RETRYABLE', 'Provider is throttling or unavailable.',
+            { status, fcmErrorCode: fcmCode, retryable: true, retryAfterMs });
+    }
+
+    // No FCM detail. Status alone decides, and 404 stays "not found", never
+    // "unregistered": the device may be perfectly alive.
+    if (status === 404) {
+        return new FcmError('FCM_NOT_FOUND', 'Send endpoint or resource not found.',
+            { status, fcmErrorCode: fcmCode });
+    }
+    if (status === 429) {
+        return new FcmError('FCM_RETRYABLE', 'Provider is throttling.',
+            { status, retryable: true, retryAfterMs });
+    }
+    if (status >= 500 && status < 600) {
+        return new FcmError('FCM_RETRYABLE', 'Provider is unavailable.',
+            { status, retryable: true, retryAfterMs });
+    }
+    if (status === 401 || status === 403) {
+        return new FcmError('FCM_UNAUTHORIZED', 'Provider rejected the credential.',
+            { status, fcmErrorCode: fcmCode });
+    }
+    return new FcmError('FCM_SEND_FAILED', 'Message was not accepted.',
+        { status, fcmErrorCode: fcmCode });
+}
+
 function createTokenProvider({ serviceAccount, http, now = () => Date.now(), skewMs = 60000 }) {
     let token = null;
     let expiresAt = 0;
@@ -87,6 +160,7 @@ function createTokenProvider({ serviceAccount, http, now = () => Date.now(), ske
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: 'grant_type=' + encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer')
                 + '&assertion=' + encodeURIComponent(assertion),
+            timeoutMs: DEFAULT_HTTP_TIMEOUT_MS,
         });
         if (!res || res.status !== 200 || !res.json || !res.json.access_token) {
             throw new FcmError('FCM_TOKEN_FAILED', 'Token exchange did not return an access token.',
@@ -99,14 +173,9 @@ function createTokenProvider({ serviceAccount, http, now = () => Date.now(), ske
     };
 }
 
-/**
- * Send one notification to one device token.
- *
- * Shape mirrors the existing sendPushNotification call site: title + body +
- * optional data payload.
- */
 function createFcmClient({ serviceAccount, http, now = () => Date.now() }) {
     assertServiceAccount(serviceAccount);
+    const projectId = serviceAccount.project_id;
     const getAccessToken = createTokenProvider({ serviceAccount, http, now });
 
     async function send({ token, title, body, data, imageUrl }) {
@@ -114,47 +183,44 @@ function createFcmClient({ serviceAccount, http, now = () => Date.now() }) {
             throw new FcmError('FCM_NO_TOKEN', 'A device token is required.');
         }
         const accessToken = await getAccessToken();
+        const notification = { title: title || '', body: body || '' };
+        if (imageUrl) notification.image = imageUrl;
+
         const message = {
             message: {
                 token,
-                notification: { title: title || '', body: body || '' },
-                ...(imageUrl ? { notification: { title: title || '', body: body || '', image: imageUrl } } : {}),
+                notification,
                 ...(data ? { data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])) } : {}),
             },
         };
 
         const res = await http({
-            url: 'https://fcm.googleapis.com/v1/projects/' + serviceAccount.project_id + '/messages:send',
+            url: 'https://fcm.googleapis.com/v1/projects/' + projectId + '/messages:send',
             method: 'POST',
             headers: {
                 Authorization: 'Bearer ' + accessToken,
                 'Content-Type': 'application/json',
             },
             body: JSON.stringify(message),
+            timeoutMs: DEFAULT_HTTP_TIMEOUT_MS,
         });
 
         if (res && res.status === 200) {
             return { ok: true, name: (res.json && res.json.name) || null };
         }
-
-        const status = res && res.status;
-        const errorCode = res && res.json && res.json.error && res.json.error.status;
-        // UNREGISTERED / NOT_FOUND mean the device token is dead. That is a
-        // normal lifecycle event the caller must be able to prune on, not a
-        // provider outage.
-        if (status === 404 || errorCode === 'NOT_FOUND' || errorCode === 'UNREGISTERED') {
-            throw new FcmError('FCM_UNREGISTERED', 'Device token is no longer registered.', { status });
-        }
-        if (status === 401 || status === 403) {
-            throw new FcmError('FCM_UNAUTHORIZED', 'Provider rejected the credential.', { status });
-        }
-        if (status === 429 || (status >= 500 && status < 600)) {
-            throw new FcmError('FCM_RETRYABLE', 'Provider is throttling or unavailable.', { status });
-        }
-        throw new FcmError('FCM_SEND_FAILED', 'Message was not accepted.', { status, errorCode });
+        throw classifySendFailure(res, { expectedProjectId: projectId, now });
     }
 
     return { send, getAccessToken };
 }
 
-module.exports = { createFcmClient, createTokenProvider, buildAssertion, FcmError, SCOPE, TOKEN_URI };
+module.exports = {
+    createFcmClient,
+    createTokenProvider,
+    buildAssertion,
+    classifySendFailure,
+    parseRetryAfter,
+    FcmError,
+    SCOPE,
+    TOKEN_URI,
+};

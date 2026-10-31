@@ -2,29 +2,37 @@
 // =============================================================================
 // Firebase ID token verification WITHOUT firebase-admin.
 //
-// PROOF OF CONCEPT - isolated branch only. Not wired into production routes.
+// PROOF OF CONCEPT - isolated branch only. Not wired into any production route.
 //
-// firebase-admin is wanted by the dependency audit only because of its
-// transitive chain firestore -> google-gax -> rimraf -> glob -> minimatch. The
-// backend uses two Admin capabilities, and only two:
+// Replaces getAuth().verifyIdToken(idToken) so the firebase-admin dependency
+// (wanted by the audit solely through firestore -> google-gax -> rimraf -> glob)
+// can eventually leave the tree.
 //
-//   1. getAuth().verifyIdToken(idToken)   <- this file
-//   2. getMessaging().send(message)       <- ./fcmClient.js
-//
-// This module replaces (1). Verification is explicit rather than delegated:
-// every check is a named step, so a missing check is a visible omission rather
-// than a silent library default.
-//
-// Threat model: an attacker can mint any JWT they like. Only a signature that
-// validates against the current Google key for the expected project may be
-// accepted. Everything else is refused.
+// PARITY WITH FIREBASE ADMIN, stated explicitly rather than assumed:
+//   - Algorithm: RS256 only, pinned BEFORE any key lookup. firebase-admin pins
+//     the same value and refuses everything else, including 'none' and HS*.
+//   - Clock skew: 300 seconds, matching firebase-admin's CLOCK_SKEW_SECS. A
+//     tighter window (this file previously used 60s) would reject logins that
+//     production accepts today on a device with a slow clock, so parity wins.
+//   - Claims: iss is https://securetoken.google.com/{project}, aud is the
+//     project id, sub is 1..128 characters, exp must not be in the past.
+//   - auth_time: firebase-admin only rejects auth_time that is a *number* in
+//     the future and tolerates its absence. This file REQUIRES it (owner
+//     requirement) and additionally requires it not to be in the future. That
+//     is a deliberate, documented divergence: stricter, never looser.
+//   - getAuth().verifyIdToken(idToken, true) (revocation check) is NOT
+//     replicated. It needs a live identitytoolkit call. Callers relying on it
+//     must keep doing so.
 // =============================================================================
 
 const crypto = require('crypto');
 
 const GOOGLE_JWKS_URL = 'https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com';
-const DEFAULT_CLOCK_SKEW_SECONDS = 60;
+// firebase-admin: CLOCK_SKEW_SECS = 300.
+const CLOCK_SKEW_SECONDS = 300;
+// Fallback only. Google's Cache-Control max-age governs the real lifetime.
 const DEFAULT_JWKS_TTL_MS = 60 * 60 * 1000;
+const DEFAULT_JWKS_TIMEOUT_MS = 5000;
 const ACCEPTED_ALG = 'RS256';
 
 class IdTokenError extends Error {
@@ -67,10 +75,54 @@ function splitToken(idToken) {
     return { headerB64: parts[0], payloadB64: parts[1], signatureB64: parts[2] };
 }
 
+/** Parse Cache-Control max-age into milliseconds. null means "do not cache". */
+function maxAgeFromCacheControl(cacheControl) {
+    if (typeof cacheControl !== 'string' || cacheControl.length === 0) return undefined;
+    const lower = cacheControl.toLowerCase();
+    if (/(^|,)\s*no-store\s*(,|$)/.test(lower) || /(^|,)\s*no-cache\s*(,|$)/.test(lower)) return null;
+    const match = /(^|,)\s*max-age\s*=\s*(\d+)/.exec(lower);
+    return match ? Number(match[2]) * 1000 : undefined;
+}
+
 /**
- * Caching JWKS resolver. An unknown `kid` triggers exactly one refetch, which
- * is how Google's key rotation is picked up without a redeploy. A second miss
- * fails closed instead of looping.
+ * Default JWKS fetcher: bounded by an AbortController so a hung TLS handshake
+ * cannot hold a login open indefinitely. Returns the JWKS plus Google's
+ * Cache-Control so the resolver can honour the real key lifetime.
+ */
+function createDefaultFetcher({ fetchImpl = global.fetch, timeoutMs = DEFAULT_JWKS_TIMEOUT_MS } = {}) {
+    return async function fetchJwks(url) {
+        if (typeof fetchImpl !== 'function') {
+            throw new IdTokenError('JWKS_UNAVAILABLE', 'No HTTP client is available to fetch signing keys.');
+        }
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const res = await fetchImpl(url, { signal: controller.signal, headers: { accept: 'application/json' } });
+            if (!res || res.ok === false) {
+                throw new IdTokenError('JWKS_UNAVAILABLE', 'Key set request failed with status ' + (res && res.status) + '.');
+            }
+            const body = await res.json();
+            const cacheControl = res.headers && typeof res.headers.get === 'function'
+                ? res.headers.get('cache-control')
+                : undefined;
+            return { keys: body && body.keys, cacheControl };
+        } catch (err) {
+            if (err instanceof IdTokenError) throw err;
+            if (err && (err.name === 'AbortError' || controller.signal.aborted)) {
+                throw new IdTokenError('JWKS_TIMEOUT', 'Key set request timed out after ' + timeoutMs + 'ms.');
+            }
+            throw new IdTokenError('JWKS_UNAVAILABLE', 'Key set request failed.');
+        } finally {
+            clearTimeout(timer);
+        }
+    };
+}
+
+/**
+ * Caching JWKS resolver.
+ *  - lifetime comes from Cache-Control max-age when present, else a 1h fallback
+ *  - concurrent callers share ONE in-flight fetch
+ *  - an unknown kid triggers exactly one refetch (Google rotation), then fails
  */
 function createKeyResolver({ jwksUrl = GOOGLE_JWKS_URL, fetcher, ttlMs = DEFAULT_JWKS_TTL_MS, now = () => Date.now() } = {}) {
     if (typeof fetcher !== 'function') {
@@ -78,23 +130,36 @@ function createKeyResolver({ jwksUrl = GOOGLE_JWKS_URL, fetcher, ttlMs = DEFAULT
     }
     let keys = [];
     let fetchedAt = 0;
+    let expiresAt = 0;
+    let inFlight = null;
 
-    async function load() {
-        const body = await fetcher(jwksUrl);
-        if (!body || !Array.isArray(body.keys)) {
-            throw new IdTokenError('JWKS_UNAVAILABLE', 'Key set response is not a JWKS document.');
+    async function fetchOnce() {
+        if (inFlight) return inFlight;
+        inFlight = (async () => {
+            const result = await fetcher(jwksUrl);
+            // Accept a bare JWKS document or {keys, cacheControl}.
+            const doc = result && Array.isArray(result.keys) ? result : null;
+            if (!doc) throw new IdTokenError('JWKS_UNAVAILABLE', 'Key set response is not a JWKS document.');
+            const cacheAge = maxAgeFromCacheControl(result.cacheControl);
+            keys = doc.keys.filter((k) => k && k.kty === 'RSA' && k.n && k.e && (!k.alg || k.alg === ACCEPTED_ALG));
+            fetchedAt = now();
+            expiresAt = cacheAge === null ? fetchedAt : fetchedAt + (cacheAge === undefined ? ttlMs : cacheAge);
+            return keys;
+        })();
+        try {
+            return await inFlight;
+        } finally {
+            inFlight = null;
         }
-        // Only RSA signing keys are usable here; everything else is dropped
-        // rather than allowed to reach crypto.verify.
-        keys = body.keys.filter((k) => k && k.kty === 'RSA' && k.n && k.e && (!k.alg || k.alg === ACCEPTED_ALG));
-        fetchedAt = now();
     }
 
+    const isStale = () => keys.length === 0 || now() >= expiresAt;
+
     return async function resolve(kid) {
-        if (keys.length === 0 || now() - fetchedAt > ttlMs) await load();
+        if (isStale()) await fetchOnce();
         let match = keys.find((k) => k.kid === kid);
         if (!match) {
-            await load();
+            await fetchOnce();
             match = keys.find((k) => k.kid === kid);
         }
         if (!match) throw new IdTokenError('ID_TOKEN_UNKNOWN_KEY', 'No signing key matches this token.');
@@ -130,8 +195,6 @@ async function verifyIdToken(idToken, { projectId, resolveKey, now = () => Date.
     const header = decodeSegment(parts.headerB64, 'Header');
     const claims = decodeSegment(parts.payloadB64, 'Payload');
 
-    // 1. Algorithm pinning BEFORE any key work, so 'none' and HS* can never
-    //    reach a comparison (the public key must not be usable as an HMAC key).
     if (header.alg !== ACCEPTED_ALG) {
         throw new IdTokenError('ID_TOKEN_BAD_ALG', 'Unsupported algorithm: ' + String(header.alg) + '.');
     }
@@ -139,13 +202,10 @@ async function verifyIdToken(idToken, { projectId, resolveKey, now = () => Date.
         throw new IdTokenError('ID_TOKEN_NO_KID', 'Token header has no key id.');
     }
 
-    // 2. Signature against the resolved Google key.
     const jwk = await resolveKey(header.kid);
     verifySignature(parts, jwk);
 
-    // 3. Claims. A valid signature is not identity: a correctly signed token
-    //    minted for a DIFFERENT Firebase project must still be refused.
-    const skew = DEFAULT_CLOCK_SKEW_SECONDS;
+    const skew = CLOCK_SKEW_SECONDS;
     const nowSec = Math.floor(now() / 1000);
 
     if (claims.aud !== projectId) {
@@ -154,17 +214,21 @@ async function verifyIdToken(idToken, { projectId, resolveKey, now = () => Date.
     if (claims.iss !== 'https://securetoken.google.com/' + projectId) {
         throw new IdTokenError('ID_TOKEN_BAD_ISSUER', 'Token issuer is a different project.');
     }
-    if (typeof claims.exp !== 'number' || claims.exp + skew <= nowSec) {
+    if (typeof claims.exp !== 'number' || claims.exp <= nowSec - skew) {
         throw new IdTokenError('ID_TOKEN_EXPIRED', 'Token is expired.');
     }
-    if (typeof claims.iat !== 'number' || claims.iat - skew > nowSec) {
+    if (typeof claims.iat !== 'number' || claims.iat > nowSec + skew) {
         throw new IdTokenError('ID_TOKEN_BAD_ISSUED_AT', 'Token was issued in the future.');
+    }
+    // Owner requirement: auth_time is mandatory and must be in the past.
+    if (typeof claims.auth_time !== 'number' || !Number.isFinite(claims.auth_time)) {
+        throw new IdTokenError('ID_TOKEN_NO_AUTH_TIME', 'auth_time is required and must be a number.');
+    }
+    if (claims.auth_time > nowSec + skew) {
+        throw new IdTokenError('ID_TOKEN_AUTH_TIME_FUTURE', 'auth_time is in the future.');
     }
     if (typeof claims.sub !== 'string' || claims.sub.length === 0 || claims.sub.length > 128) {
         throw new IdTokenError('ID_TOKEN_BAD_SUBJECT', 'Token subject is missing or too long.');
-    }
-    if (claims.auth_time !== undefined && typeof claims.auth_time !== 'number') {
-        throw new IdTokenError('ID_TOKEN_BAD_AUTH_TIME', 'auth_time is not a number.');
     }
     if (claims.user_id !== undefined && claims.user_id !== claims.sub) {
         throw new IdTokenError('ID_TOKEN_SUBJECT_MISMATCH', 'sub and user_id disagree.');
@@ -176,7 +240,10 @@ async function verifyIdToken(idToken, { projectId, resolveKey, now = () => Date.
 module.exports = {
     verifyIdToken,
     createKeyResolver,
+    createDefaultFetcher,
+    maxAgeFromCacheControl,
     IdTokenError,
     GOOGLE_JWKS_URL,
     ACCEPTED_ALG,
+    CLOCK_SKEW_SECONDS,
 };
