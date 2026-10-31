@@ -53,6 +53,23 @@ describe('app unlock against real Redis', () => {
         ...over,
     });
 
+    /**
+     * Deterministic delivery capture. The service generates the code itself and
+     * hands it to smsService.sendSMS; capturing that call means these tests
+     * never depend on a provider echoing the code and never return early,
+     * which would let a security assertion pass without testing anything.
+     */
+    function captureDelivery() {
+        const sent = [];
+        const original = smsService.sendSMS.bind(smsService);
+        jest.spyOn(smsService, 'sendSMS').mockImplementation(async (to, message) => {
+            const match = String(message).match(/\b(\d{6})\b/);
+            sent.push({ to, code: match ? match[1] : null });
+            return { success: true, mocked: true, provider: 'test' };
+        });
+        return { sent, restore: () => { smsService.sendSMS.mockRestore(); void original; } };
+    }
+
     test('two independent service instances share the PIN attempt budget', async () => {
         const hash = await bcrypt.hash('4321', 10);
         const u = user({ pinHash: hash });
@@ -132,14 +149,14 @@ describe('app unlock against real Redis', () => {
     test('only one of several concurrent consumptions succeeds', async () => {
         const svc = new AppUnlockService({ smsService, prisma: { user: {} } });
         const u = user({ id: 905 });
+        const capture = captureDelivery();
         const issued = await svc.sendSmsChallenge(u);
-        const code = issued.data.mocked ? issued.data.testCode : null;
+        const code = capture.sent[0] && capture.sent[0].code;
+        capture.restore();
 
-        if (!code) {
-            // A live provider means the code is only in the SMS, so this case
-            // cannot be exercised without intercepting delivery.
-            return;
-        }
+        // The capture must yield a code; a null here is a real failure, not a
+        // reason to skip the assertion.
+        expect(code).toMatch(/^\d{6}$/);
 
         const results = await Promise.all(Array.from({ length: 6 }, () => (
             svc.verifySmsChallenge(u, { challengeId: issued.data.challengeId, code })
@@ -150,10 +167,12 @@ describe('app unlock against real Redis', () => {
     test('another member cannot consume the challenge', async () => {
         const svc = new AppUnlockService({ smsService, prisma: { user: {} } });
         const owner = user({ id: 906 });
+        const capture = captureDelivery();
         const issued = await svc.sendSmsChallenge(owner);
-        const code = issued.data.testCode;
+        const code = capture.sent[0] && capture.sent[0].code;
+        capture.restore();
 
-        if (!code) return;
+        expect(code).toMatch(/^\d{6}$/);
 
         const other = user({ id: 907 });
         const attempt = await svc.verifySmsChallenge(other, {
