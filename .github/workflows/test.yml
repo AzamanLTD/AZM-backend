@@ -58,7 +58,6 @@ jobs:
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
-      REDIS_URL: redis://localhost:6379
       JWT_SECRET: test_secret_exactly_32_characters_long
       # Test-only AES key for fieldCipher/shareToken at-rest proofs
       # (64 hex chars = 32 bytes; never a production value).
@@ -199,6 +198,14 @@ jobs:
           docker exec "$CONTAINER" psql -U postgres -d azm_test \
             -c "ALTER SYSTEM SET synchronous_commit = off" \
             -c "SELECT pg_reload_conf();"
+
+      - name: App unlock against real Redis
+        # Scoped deliberately: a global REDIS_URL switches unrelated suites onto
+        # shared limiter/idempotency state that they were not written for. Only
+        # the app-unlock atomicity proof needs the real store.
+        run: npx jest __tests__/app-unlock-redis --runInBand --forceExit
+        env:
+          REDIS_URL: redis://localhost:6379
 
       - name: Run tests
         # DB-backed suites share one disposable database and truncate between

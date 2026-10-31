@@ -67,6 +67,16 @@ function build(userOverrides = {}, sms) {
   return { user, prisma, smsService, service };
 }
 
+// THIS SUITE RUNS IN-MEMORY BY DESIGN.
+//
+// CI exports REDIS_URL globally, which would silently switch these cases onto
+// shared Redis state: attempt counters, replay claims and throttle reservations
+// would then leak between cases and one test would spend another's budget. The
+// shared-store behaviour is proved by app-unlock-redis.integration.test.js,
+// which owns that concern and runs only when REDIS_URL is present. This file
+// proves the decision logic, so it pins itself to the in-process store.
+delete process.env.REDIS_URL;
+
 beforeEach(() => {
   jest.clearAllMocks();
   AppUnlockService._resetMemoryState();
