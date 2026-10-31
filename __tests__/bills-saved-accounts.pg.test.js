@@ -17,6 +17,22 @@ const path = require('path');
 const DSN = process.env.TEST_DATABASE_URL || process.env.DATABASE_URL;
 const hasDb = Boolean(DSN && /^postgres(ql)?:\/\//.test(DSN));
 
+/**
+ * This suite DROPS AND RECREATES tables. It must never be able to point at a
+ * production database by accident, so the target is checked before any SQL
+ * runs: local host only, and never a managed provider.
+ */
+function assertDisposable(uri) {
+    const u = new URL(uri);
+    const local = ['localhost', '127.0.0.1', '::1'].includes(u.hostname);
+    if (!local) {
+        throw new Error(`Refusing to run: ${u.hostname} is not a local disposable database.`);
+    }
+    if (/neon|render|aws|azure|gcp|supabase/i.test(u.hostname)) {
+        throw new Error('Refusing to run against a managed provider.');
+    }
+}
+
 const MIGRATIONS = [
     'prisma/migrations/20261030120000_saved_service_accounts/migration.sql',
     'prisma/migrations/20261030200000_saved_service_hardening/migration.sql',
@@ -31,6 +47,7 @@ const FP_KEY = 'b'.repeat(64);
     let svc;
 
     beforeAll(async () => {
+        assertDisposable(DSN);
         process.env.SAVED_SERVICE_ENCRYPTION_KEY = KEY;
         process.env.SAVED_SERVICE_FINGERPRINT_KEY = FP_KEY;
         process.env.SAVED_SERVICE_ENCRYPTION_KEY_VERSION = '1';
@@ -38,7 +55,26 @@ const FP_KEY = 'b'.repeat(64);
         ({ PrismaClient } = require('@prisma/client'));
         prisma = new PrismaClient({ datasources: { db: { url: DSN } } });
 
-        // Clean slate for the table under test.
+        // Self-contained baseline: no reliance on a previously prepared
+        // database. A copy of the schema with the new model removed is pushed
+        // to a clean database, which yields every pre-existing table the real
+        // base branch would provide.
+        const { execFileSync } = require('child_process');
+        const os = require('os');
+        const schema = fs.readFileSync(path.join(__dirname, '..', 'prisma', 'schema.prisma'), 'utf8');
+        const trimmed = schema
+            .replace(/model SavedServiceAccount \{[\s\S]*?\n\}\n/, '')
+            .replace(/^\s*savedServiceAccounts\s+SavedServiceAccount\[\]\s*$/m, '');
+        if (trimmed.includes('model SavedServiceAccount')) {
+            throw new Error('Baseline schema still contains the model under test.');
+        }
+        const tmpSchema = path.join(os.tmpdir(), `azm-base-${process.pid}.prisma`);
+        fs.writeFileSync(tmpSchema, trimmed);
+        execFileSync(process.execPath, [
+            path.join(__dirname, '..', 'node_modules', 'prisma', 'build', 'index.js'),
+            'db', 'push', '--schema', tmpSchema, '--skip-generate', '--force-reset', '--accept-data-loss',
+        ], { stdio: 'pipe', env: { ...process.env, DATABASE_URL: DSN }, timeout: 120000 });
+
         await prisma.$executeRawUnsafe('DROP TABLE IF EXISTS "SavedServiceAccount" CASCADE');
 
         for (const rel of MIGRATIONS) {
@@ -51,7 +87,7 @@ const FP_KEY = 'b'.repeat(64);
 
         const { createService } = require('../services/bills/savedServiceAccountService');
         svc = createService({ prisma });
-    }, 60000);
+    }, 240000);
 
     afterAll(async () => {
         if (prisma) await prisma.$disconnect();
