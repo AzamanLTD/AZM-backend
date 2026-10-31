@@ -158,7 +158,7 @@ exports.setPinSecure = wrap(async function setPinSecure(req, res) {
                 success: false,
                 code: result.code,
                 message: result.code === 'PIN_FORMAT_INVALID'
-                    ? 'PIN must be 4-8 numeric digits.'
+                    ? 'PIN must be exactly 4 digits.'
                     : 'PIN change was refused.',
                 ...(result.attemptsLeft !== undefined ? { attemptsLeft: result.attemptsLeft } : {}),
             });

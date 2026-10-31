@@ -85,14 +85,15 @@ const setPinRotationSchema = passthrough().superRefine((data, ctx) => {
   const { pin, currentPin } = data || {};
   if (!pin) {
     ctx.addIssue({ code: 'custom', path: ['pin'], message: 'PIN is required.' });
-  } else if (typeof pin !== 'string' || !/^\d{4,8}$/.test(pin)) {
-    // Matches AppUnlockService's accepted length exactly; the schema validates
-    // shape only and never stands in for current-PIN proof.
-    ctx.addIssue({ code: 'custom', path: ['pin'], message: 'PIN must be 4-8 numeric digits.' });
+  } else if (typeof pin !== 'string' || !/^\d{4}$/.test(pin)) {
+    // AppUnlockService.setPin requires exactly four digits, so the schema
+    // mirrors that instead of offering a wider shape the service would reject
+    // a moment later. Shape only: it never stands in for current-PIN proof.
+    ctx.addIssue({ code: 'custom', path: ['pin'], message: 'PIN must be exactly 4 digits.' });
   }
   if (currentPin !== undefined && currentPin !== null) {
     if (typeof currentPin !== 'string' || !/^\d{4}$/.test(currentPin)) {
-      ctx.addIssue({ code: 'custom', path: ['currentPin'], message: 'Current PIN must be 4-8 numeric digits.' });
+      ctx.addIssue({ code: 'custom', path: ['currentPin'], message: 'Current PIN must be exactly 4 digits.' });
     }
   }
 });
