@@ -435,3 +435,26 @@ describe('public template contract', () => {
         expect(water.verificationStatus).toBe('UNVERIFIED');
     });
 });
+
+describe('mask boundaries at every length', () => {
+    const { maskIdentity } = require('../services/bills/savedServiceCrypto');
+
+    test.each([1, 2, 3, 4, 5, 6, 7, 8, 9])('length %i is fully masked', (len) => {
+        const raw = '1'.repeat(len);
+        const mask = maskIdentity(raw);
+        expect(mask).not.toContain(raw);
+        expect(mask.replace(/[^•]/g, '')).toHaveLength(mask.length);
+    });
+
+    test('length 10 keeps a tail but hides the body', () => {
+        const raw = '1234567890';
+        const mask = maskIdentity(raw);
+        expect(mask).not.toBe(raw);
+        expect(mask.length).toBeLessThanOrEqual(32);
+        expect(mask.endsWith('7890')).toBe(true);
+    });
+
+    test('a long numeric meter shows only the last four', () => {
+        expect(maskIdentity('123456789012')).toBe('••••••••9012');
+    });
+});

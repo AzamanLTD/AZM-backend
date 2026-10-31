@@ -13,6 +13,22 @@
 // A single key for both would let a fingerprint leak become a decryption oracle.
 // =============================================================================
 
+/*
+ * FINGERPRINT-KEY ROTATION IS A SEPARATE PROBLEM FROM ENCRYPTION-KEY ROTATION.
+ *
+ * The encryption key ring above lets old ciphertext keep decrypting after a
+ * rotation. It does nothing for fingerprints: the fingerprint is an HMAC keyed
+ * by SAVED_SERVICE_FINGERPRINT_KEY, and changing that key changes every
+ * computed value. Existing rows keep their old fingerprints, so a re-saved
+ * account would no longer match its stored record, duplicate detection would
+ * silently stop working, and the same meter could be saved twice.
+ *
+ * Therefore: DO NOT rotate the fingerprint key on its own. A rotation requires
+ * a migration that recomputes every accountFingerprint from decrypted account
+ * data using the new key, inside a single transaction, with the old key still
+ * available. Until that migration exists and has been rehearsed, treat the
+ * fingerprint key as fixed.
+ */
 const crypto = require('crypto');
 
 const ALGO = 'aes-256-gcm';
