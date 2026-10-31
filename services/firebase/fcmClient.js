@@ -94,8 +94,11 @@ function classifySendFailure(res, { expectedProjectId, now = () => Date.now() } 
     const status = res && res.status;
     const err = (res && res.json && res.json.error) || {};
     const details = Array.isArray(err.details) ? err.details : [];
+    // The @type must match exactly. A 404 carrying errorCode UNREGISTERED under
+    // some other (or no) @type is not evidence from FCM's own error contract, so
+    // it must never justify revoking a device token.
     const fcmDetail = details.find(
-        (d) => d && typeof d.errorCode === 'string' && (!d['@type'] || d['@type'] === FCM_ERROR_TYPE),
+        (d) => d && d['@type'] === FCM_ERROR_TYPE && typeof d.errorCode === 'string',
     );
     const fcmCode = fcmDetail ? fcmDetail.errorCode : null;
     const retryAfterMs = parseRetryAfter(res && res.headers && res.headers['retry-after'], now);
@@ -146,13 +149,76 @@ function classifySendFailure(res, { expectedProjectId, now = () => Date.now() } 
         { status, fcmErrorCode: fcmCode });
 }
 
-function createTokenProvider({ serviceAccount, http, now = () => Date.now(), skewMs = 60000 }) {
+/**
+ * Concrete HTTP transport with an enforced abort. Passing timeoutMs through to
+ * an injected stub proves nothing; this is what actually bounds the call. It
+ * covers both the OAuth token exchange and the FCM send because both go
+ * through it. Errors are typed and never carry the request body, the assertion
+ * or the access token.
+ */
+function createHttpTransport({ fetchImpl = global.fetch, defaultTimeoutMs = DEFAULT_HTTP_TIMEOUT_MS } = {}) {
+    return async function http(req) {
+        if (typeof fetchImpl !== 'function') {
+            throw new FcmError('FCM_TRANSPORT_UNAVAILABLE', 'No HTTP client is available.');
+        }
+        const timeoutMs = typeof req.timeoutMs === 'number' ? req.timeoutMs : defaultTimeoutMs;
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        try {
+            const res = await fetchImpl(req.url, {
+                method: req.method || 'GET',
+                headers: req.headers,
+                body: req.body,
+                signal: controller.signal,
+            });
+            let text = '';
+            try {
+                text = await res.text();
+            } catch (err) {
+                throw new FcmError('FCM_TRANSPORT_FAILED', 'Response body could not be read.',
+                    { status: res && res.status, retryable: false });
+            }
+            let json = null;
+            if (text) {
+                try { json = JSON.parse(text); } catch (err) { json = null; }
+            }
+            const headers = {};
+            if (res.headers && typeof res.headers.forEach === 'function') {
+                res.headers.forEach((value, name) => { headers[String(name).toLowerCase()] = value; });
+            }
+            return { status: res.status, ok: res.ok !== false, headers, json };
+        } catch (err) {
+            if (err instanceof FcmError) throw err;
+            if (err && (err.name === 'AbortError' || controller.signal.aborted)) {
+                throw new FcmError('FCM_TIMEOUT', 'Request exceeded ' + timeoutMs + 'ms.', { retryable: true });
+            }
+            throw new FcmError('FCM_TRANSPORT_FAILED', 'Request failed before a response was received.',
+                { retryable: true });
+        } finally {
+            clearTimeout(timer);
+        }
+    };
+}
+
+function createTokenProvider({ serviceAccount, http, now = () => Date.now(), skewMs = 60000, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS }) {
     let token = null;
     let expiresAt = 0;
+    let inFlight = null;
 
+    // Simultaneous sends share one exchange. Without this, a burst of pushes
+    // would each mint its own OAuth token for the same service account.
     return async function getAccessToken() {
         if (token && now() < expiresAt - skewMs) return token;
+        if (inFlight) return inFlight;
+        inFlight = exchange();
+        try {
+            return await inFlight;
+        } finally {
+            inFlight = null;
+        }
+    };
 
+    async function exchange() {
         const { assertion } = buildAssertion(serviceAccount, { now });
         const res = await http({
             url: serviceAccount.token_uri || TOKEN_URI,
@@ -160,7 +226,7 @@ function createTokenProvider({ serviceAccount, http, now = () => Date.now(), ske
             headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
             body: 'grant_type=' + encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer')
                 + '&assertion=' + encodeURIComponent(assertion),
-            timeoutMs: DEFAULT_HTTP_TIMEOUT_MS,
+            timeoutMs,
         });
         if (!res || res.status !== 200 || !res.json || !res.json.access_token) {
             throw new FcmError('FCM_TOKEN_FAILED', 'Token exchange did not return an access token.',
@@ -170,13 +236,16 @@ function createTokenProvider({ serviceAccount, http, now = () => Date.now(), ske
         const lifetimeMs = (Number(res.json.expires_in) || DEFAULT_TOKEN_TTL_SECONDS) * 1000;
         expiresAt = now() + lifetimeMs;
         return token;
-    };
+    }
 }
 
-function createFcmClient({ serviceAccount, http, now = () => Date.now() }) {
+function createFcmClient({ serviceAccount, http, fetchImpl, timeoutMs = DEFAULT_HTTP_TIMEOUT_MS, now = () => Date.now() }) {
     assertServiceAccount(serviceAccount);
     const projectId = serviceAccount.project_id;
-    const getAccessToken = createTokenProvider({ serviceAccount, http, now });
+    // Default to a transport that actually aborts; an injected `http` is used
+    // as-is so tests stay network-free.
+    const transport = http || createHttpTransport({ fetchImpl, defaultTimeoutMs: timeoutMs });
+    const getAccessToken = createTokenProvider({ serviceAccount, http: transport, now, timeoutMs });
 
     async function send({ token, title, body, data, imageUrl }) {
         if (!token || typeof token !== 'string') {
@@ -194,7 +263,7 @@ function createFcmClient({ serviceAccount, http, now = () => Date.now() }) {
             },
         };
 
-        const res = await http({
+        const res = await transport({
             url: 'https://fcm.googleapis.com/v1/projects/' + projectId + '/messages:send',
             method: 'POST',
             headers: {
@@ -202,7 +271,7 @@ function createFcmClient({ serviceAccount, http, now = () => Date.now() }) {
                 'Content-Type': 'application/json',
             },
             body: JSON.stringify(message),
-            timeoutMs: DEFAULT_HTTP_TIMEOUT_MS,
+            timeoutMs,
         });
 
         if (res && res.status === 200) {
@@ -216,6 +285,7 @@ function createFcmClient({ serviceAccount, http, now = () => Date.now() }) {
 
 module.exports = {
     createFcmClient,
+    createHttpTransport,
     createTokenProvider,
     buildAssertion,
     classifySendFailure,

@@ -7,10 +7,10 @@ jest.mock('../src/config/logger', () => ({ info: jest.fn(), warn: jest.fn(), err
 const crypto = require('crypto');
 const {
     verifyIdToken, createKeyResolver, createDefaultFetcher, maxAgeFromCacheControl,
-    EXP_SKEW_SECONDS, IAT_TOLERANCE_SECONDS,
+    normalizeKeySet, EXP_SKEW_SECONDS, IAT_TOLERANCE_SECONDS,
 } = require('../services/firebase/idTokenVerifier');
 const {
-    createFcmClient, buildAssertion, classifySendFailure, parseRetryAfter,
+    createFcmClient, buildAssertion, classifySendFailure, parseRetryAfter, createHttpTransport,
 } = require('../services/firebase/fcmClient');
 
 const PROJECT = 'azaman-app';
@@ -229,7 +229,7 @@ describe('JWKS: cache lifetime, dedupe and rotation', () => {
 
     test('a genuine new RSA keypair signs a token that verifies, and the old key cannot', async () => {
         const rotated = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
-        const jwkNew = { ...rotated.publicKey.export({ format: 'jwk' }), kid: 'kid-new', alg: 'RS256' };
+        const jwkNew = { ...rotated.publicKey.export({ format: 'jwk' }), kid: 'kid-new', alg: 'RS256', use: 'sig' };
         const fetcher = async () => ({ keys: [jwk, jwkNew] });
         const resolve = createKeyResolver({ fetcher, now: nowFn });
 
@@ -423,4 +423,197 @@ describe('FCM send', () => {
         expect(() => createFcmClient({ serviceAccount: { client_email: 'x' }, http: httpStub(), now: nowFn }))
             .toThrow(/missing: private_key, project_id/);
     });
+});
+
+
+describe('JWKS: strict key-set validation', () => {
+  const base = () => ({ ...publicKey.export({ format: 'jwk' }), kid: KID, alg: 'RS256', use: 'sig' });
+
+  test('accepts a well-formed RS256 signing key', () => {
+    expect(normalizeKeySet([base()])).toHaveLength(1);
+  });
+
+  test('rejects a key with no kid', () => {
+    const k = base(); delete k.kid;
+    expect(() => normalizeKeySet([k])).toThrow(/JWKS_MALFORMED_KEY|no usable kid/);
+  });
+
+  test('rejects an empty or blank kid', () => {
+    expect(() => normalizeKeySet([{ ...base(), kid: '   ' }])).toThrow(/no usable kid/);
+  });
+
+  test('rejects a non-RSA key', () => {
+    expect(() => normalizeKeySet([{ ...base(), kty: 'EC' }])).toThrow(/not an RSA key/);
+  });
+
+  test('rejects a key with no modulus or exponent', () => {
+    const noN = base(); delete noN.n;
+    expect(() => normalizeKeySet([noN])).toThrow(/no usable modulus or exponent/);
+    const noE = base(); delete noE.e;
+    expect(() => normalizeKeySet([noE])).toThrow(/no usable modulus or exponent/);
+  });
+
+  test('rejects a key not published for signing', () => {
+    expect(() => normalizeKeySet([{ ...base(), use: 'enc' }])).toThrow(/not published for signing/);
+    const noUse = base(); delete noUse.use;
+    expect(() => normalizeKeySet([noUse])).toThrow(/not published for signing/);
+  });
+
+  test('rejects a key whose declared algorithm is not RS256', () => {
+    expect(() => normalizeKeySet([{ ...base(), alg: 'RS512' }])).toThrow(/not an RS256 key/);
+    const noAlg = base(); delete noAlg.alg;
+    expect(() => normalizeKeySet([noAlg])).toThrow(/not an RS256 key/);
+  });
+
+  test('rejects an RSA key below 2048 bits', () => {
+    const weak = crypto.generateKeyPairSync('rsa', { modulusLength: 1024 });
+    const jwkWeak = { ...weak.publicKey.export({ format: 'jwk' }), kid: 'weak', alg: 'RS256', use: 'sig' };
+    expect(() => normalizeKeySet([jwkWeak])).toThrow(/modulus below 2048 bits/);
+  });
+
+  test('rejects duplicate kids as ambiguous', () => {
+    expect(() => normalizeKeySet([base(), base()])).toThrow(/more than one key for kid/);
+  });
+
+  test('rejects an empty key set', () => {
+    expect(() => normalizeKeySet([])).toThrow(/JWKS_EMPTY|no keys/);
+  });
+
+  test('a malformed set fails the resolver closed instead of trusting the good key', () => {
+    const resolve = createKeyResolver({
+      fetcher: async () => ({ keys: [base(), { ...base(), kid: '', }] }),
+      now: nowFn,
+    });
+    return expect(resolve(KID)).rejects.toMatchObject({ code: 'JWKS_MALFORMED_KEY' });
+  });
+
+  test('an ambiguous set fails closed even when the wanted kid is present', async () => {
+    const resolve = createKeyResolver({
+      fetcher: async () => ({ keys: [base(), base()] }),
+      now: nowFn,
+    });
+    await expect(resolve(KID)).rejects.toMatchObject({ code: 'JWKS_AMBIGUOUS_KEY' });
+  });
+});
+
+describe('FCM: only the exact FCM error type proves a dead token', () => {
+  const TYPE = 'type.googleapis.com/google.firebase.fcm.v1.FcmError';
+
+  test('bare HTTP 404 is not unregistered', () => {
+    expect(classifySendFailure({ status: 404, json: {} }).code).toBe('FCM_NOT_FOUND');
+  });
+
+  test('NOT_FOUND with no FCM detail is not unregistered', () => {
+    const err = classifySendFailure({ status: 404, json: { error: { status: 'NOT_FOUND', message: 'nope' } } });
+    expect(err.code).toBe('FCM_NOT_FOUND');
+  });
+
+  test('UNREGISTERED with no @type is not unregistered', () => {
+    const err = classifySendFailure({ status: 404, json: { error: { details: [{ errorCode: 'UNREGISTERED' }] } } });
+    expect(err.code).toBe('FCM_NOT_FOUND');
+    expect(err.fcmErrorCode).toBeNull();
+  });
+
+  test('UNREGISTERED with an unrelated @type is not unregistered', () => {
+    const err = classifySendFailure({
+      status: 404,
+      json: { error: { details: [{ '@type': 'type.googleapis.com/google.rpc.ErrorInfo', errorCode: 'UNREGISTERED' }] } },
+    });
+    expect(err.code).toBe('FCM_NOT_FOUND');
+  });
+
+  test('UNREGISTERED with the exact FCM type is unregistered', () => {
+    const err = classifySendFailure({
+      status: 404,
+      json: { error: { details: [{ '@type': TYPE, errorCode: 'UNREGISTERED' }] } },
+    });
+    expect(err.code).toBe('FCM_UNREGISTERED');
+    expect(err.fcmErrorCode).toBe('UNREGISTERED');
+  });
+
+  test('a correctly typed but unrelated FCM code is not unregistered', () => {
+    const err = classifySendFailure({
+      status: 404,
+      json: { error: { details: [{ '@type': TYPE, errorCode: 'SOMETHING_ELSE' }] } },
+    });
+    expect(err.code).toBe('FCM_NOT_FOUND');
+  });
+});
+
+describe('FCM: bounded HTTP transport', () => {
+  const sa = {
+    client_email: 'sender@azaman-app.iam.gserviceaccount.com',
+    private_key: privateKey.export({ type: 'pkcs8', format: 'pem' }),
+    project_id: PROJECT,
+    token_uri: 'https://oauth2.googleapis.com/token',
+  };
+  const stall = () => (_url, { signal }) => new Promise((_res, rej) => {
+    signal.addEventListener('abort', () => {
+      const e = new Error('aborted'); e.name = 'AbortError'; rej(e);
+    });
+  });
+
+  test('the transport returns a normalized response', async () => {
+    const fetchImpl = async () => ({
+      status: 200, ok: true,
+      headers: { forEach: (cb) => cb('30', 'Retry-After') },
+      text: async () => '{"ok":true}',
+    });
+    const out = await createHttpTransport({ fetchImpl })({ url: 'https://x.invalid' });
+    expect(out.status).toBe(200);
+    expect(out.json).toEqual({ ok: true });
+    expect(out.headers['retry-after']).toBe('30');
+  });
+
+  test('a stalled token exchange aborts within the bound', async () => {
+    const client = createFcmClient({ serviceAccount: sa, fetchImpl: stall(), timeoutMs: 25, now: nowFn });
+    const started = Date.now();
+    await expect(client.send({ token: 'd', title: 'a', body: 'b' }))
+      .rejects.toMatchObject({ code: 'FCM_TIMEOUT', retryable: true });
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  test('a stalled send aborts within the bound and does not retry', async () => {
+    let calls = 0;
+    const fetchImpl = (url, opts) => {
+      calls += 1;
+      if (String(url).includes('oauth2')) {
+        return Promise.resolve({ status: 200, ok: true, headers: { forEach: () => {} },
+          text: async () => '{"access_token":"t","expires_in":3600}' });
+      }
+      return stall()(url, opts);
+    };
+    const client = createFcmClient({ serviceAccount: sa, fetchImpl, timeoutMs: 25, now: nowFn });
+    await expect(client.send({ token: 'd', title: 'a', body: 'b' }))
+      .rejects.toMatchObject({ code: 'FCM_TIMEOUT' });
+    expect(calls).toBe(2); // one exchange, one send attempt, no blind retry
+  });
+
+  test('timeout errors carry no request material', async () => {
+    const client = createFcmClient({ serviceAccount: sa, fetchImpl: stall(), timeoutMs: 15, now: nowFn });
+    const err = await client.send({ token: 'device-secret', title: 'a', body: 'b' }).catch((e) => e);
+    expect(err.message).not.toMatch(/device-secret/);
+    expect(err.message).not.toMatch(/PRIVATE KEY/);
+    expect(JSON.stringify(err, Object.getOwnPropertyNames(err))).not.toMatch(/device-secret/);
+  });
+
+  test('concurrent sends share one OAuth token exchange', async () => {
+    let exchanges = 0;
+    const fetchImpl = async (url) => {
+      if (String(url).includes('oauth2')) {
+        exchanges += 1;
+        await new Promise((r) => setTimeout(r, 10));
+        return { status: 200, ok: true, headers: { forEach: () => {} },
+          text: async () => '{"access_token":"t","expires_in":3600}' };
+      }
+      return { status: 200, ok: true, headers: { forEach: () => {} }, text: async () => '{"name":"x"}' };
+    };
+    const client = createFcmClient({ serviceAccount: sa, fetchImpl, now: nowFn });
+    await Promise.all([
+      client.send({ token: 'a', title: 't', body: 'b' }),
+      client.send({ token: 'b', title: 't', body: 'b' }),
+      client.send({ token: 'c', title: 't', body: 'b' }),
+    ]);
+    expect(exchanges).toBe(1);
+  });
 });

@@ -135,6 +135,68 @@ function createDefaultFetcher({ fetchImpl = global.fetch, timeoutMs = DEFAULT_JW
     };
 }
 
+// Google's own key sets are RS256 RSA keys of at least 2048 bits. Anything
+// else is either malformed or not a key this verifier should trust, and a set
+// containing such an entry is refused in full rather than partially trusted:
+// silently dropping entries could mean verifying against a reduced key set that
+// no longer represents what the issuer actually publishes.
+const MIN_RSA_MODULUS_BITS = 2048;
+const REQUIRED_USE = 'sig';
+
+function assertWellFormedKey(entry, index) {
+    const where = 'key[' + index + ']';
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+        throw new IdTokenError('JWKS_MALFORMED_KEY', where + ' is not an object.');
+    }
+    if (typeof entry.kid !== 'string' || entry.kid.trim().length === 0) {
+        throw new IdTokenError('JWKS_MALFORMED_KEY', where + ' has no usable kid.');
+    }
+    if (entry.kty !== 'RSA') {
+        throw new IdTokenError('JWKS_MALFORMED_KEY', where + ' is not an RSA key.');
+    }
+    if (typeof entry.n !== 'string' || typeof entry.e !== 'string' || entry.n.length === 0 || entry.e.length === 0) {
+        throw new IdTokenError('JWKS_MALFORMED_KEY', where + ' has no usable modulus or exponent.');
+    }
+    // Declared usage and algorithm must both be signing/RS256. A key published
+    // for encryption must never be used to check a login signature.
+    if (entry.use !== REQUIRED_USE) {
+        throw new IdTokenError('JWKS_MALFORMED_KEY', where + ' is not published for signing.');
+    }
+    if (entry.alg !== ACCEPTED_ALG) {
+        throw new IdTokenError('JWKS_MALFORMED_KEY', where + ' is not an RS256 key.');
+    }
+    let modulusBits;
+    try {
+        const key = crypto.createPublicKey({ key: { kty: entry.kty, n: entry.n, e: entry.e }, format: 'jwk' });
+        modulusBits = key.asymmetricKeyDetails && key.asymmetricKeyDetails.modulusLength;
+    } catch (err) {
+        throw new IdTokenError('JWKS_MALFORMED_KEY', where + ' is not a constructible RSA public key.');
+    }
+    if (typeof modulusBits !== 'number' || modulusBits < MIN_RSA_MODULUS_BITS) {
+        throw new IdTokenError('JWKS_MALFORMED_KEY', where + ' has a modulus below ' + MIN_RSA_MODULUS_BITS + ' bits.');
+    }
+    return entry;
+}
+
+/** Validates every entry, rejects duplicate kids, and refuses an empty set. */
+function normalizeKeySet(rawKeys) {
+    if (!Array.isArray(rawKeys) || rawKeys.length === 0) {
+        throw new IdTokenError('JWKS_EMPTY', 'Key set contains no keys.');
+    }
+    const seen = new Map();
+    const valid = rawKeys.map((entry, index) => {
+        const key = assertWellFormedKey(entry, index);
+        if (seen.has(key.kid)) {
+            // Two keys under one kid make the choice of verification key
+            // ambiguous, which is exactly what a substitution attack wants.
+            throw new IdTokenError('JWKS_AMBIGUOUS_KEY', 'Key set has more than one key for kid ' + key.kid + '.');
+        }
+        seen.set(key.kid, true);
+        return key;
+    });
+    return valid;
+}
+
 /**
  * Caching JWKS resolver.
  *  - lifetime comes from Cache-Control max-age when present, else a 1h fallback
@@ -158,7 +220,7 @@ function createKeyResolver({ jwksUrl = GOOGLE_JWKS_URL, fetcher, ttlMs = DEFAULT
             const doc = result && Array.isArray(result.keys) ? result : null;
             if (!doc) throw new IdTokenError('JWKS_UNAVAILABLE', 'Key set response is not a JWKS document.');
             const cacheAge = maxAgeFromCacheControl(result.cacheControl);
-            keys = doc.keys.filter((k) => k && k.kty === 'RSA' && k.n && k.e && (!k.alg || k.alg === ACCEPTED_ALG));
+            keys = normalizeKeySet(doc.keys);
             fetchedAt = now();
             expiresAt = cacheAge === null ? fetchedAt : fetchedAt + (cacheAge === undefined ? ttlMs : cacheAge);
             return keys;
@@ -258,6 +320,8 @@ module.exports = {
     createKeyResolver,
     createDefaultFetcher,
     maxAgeFromCacheControl,
+    normalizeKeySet,
+    MIN_RSA_MODULUS_BITS,
     IdTokenError,
     GOOGLE_JWKS_URL,
     ACCEPTED_ALG,
