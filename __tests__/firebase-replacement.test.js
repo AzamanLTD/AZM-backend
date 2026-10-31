@@ -167,6 +167,14 @@ describe('JWKS: cache lifetime, dedupe and rotation', () => {
         expect(maxAgeFromCacheControl(undefined)).toBeUndefined();
     });
 
+    test('parses the header Google actually sends today', () => {
+        // Captured from the live securetoken endpoint (no credential needed; it
+        // is a public key set). must-revalidate must not look like no-cache.
+        const real = 'public, max-age=22152, must-revalidate, no-transform';
+        expect(maxAgeFromCacheControl(real)).toBe(22_152_000);
+        expect(maxAgeFromCacheControl(real)).toBeGreaterThan(60 * 60 * 1000);
+    });
+
     test('honours Cache-Control max-age instead of assuming an hour', async () => {
         let clock = NOW;
         let calls = 0;
