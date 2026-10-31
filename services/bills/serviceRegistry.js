@@ -10,6 +10,18 @@
 // map icons, but it must not invent fields or validation of its own.
 // =============================================================================
 
+// FIELD VALIDATION POLICY
+//
+// These constraints are STRUCTURAL, not provider-authoritative. No signed
+// provider contract or official format specification exists for ECG, Ghana
+// Water, DStv, GOtv, StarTimes or broadband references, so enforcing an
+// assumed shape would reject legitimate identifiers. Each pattern enforces
+// only: required value, safe character set, and a conservative maximum size
+// for storage and abuse prevention.
+//
+// Passing a pattern does NOT mean the provider recognises the reference. No
+// account is ever reported as verified on the strength of a regex.
+
 const schemaVersion = '1';
 
 const NO_PROVIDER_CAPABILITIES = {
@@ -77,7 +89,7 @@ const categories = [
                     label: 'Meter number',
                     type: 'identifier',
                     required: true,
-                    pattern: '^\\d{6,20}$',
+                    pattern: '^\\d{6,24}$',
                     maxLength: 20,
                 },
             ]),
@@ -87,7 +99,7 @@ const categories = [
                     label: 'Account number',
                     type: 'identifier',
                     required: true,
-                    pattern: '^\\d{6,20}$',
+                    pattern: '^\\d{6,24}$',
                     maxLength: 20,
                 },
             ]),
@@ -103,7 +115,7 @@ const categories = [
                     label: 'Customer reference',
                     type: 'identifier',
                     required: true,
-                    pattern: '^\\d{6,20}$',
+                    pattern: '^\\d{6,24}$',
                     maxLength: 20,
                 },
             ]),
@@ -119,7 +131,7 @@ const categories = [
                     label: 'Smartcard number',
                     type: 'identifier',
                     required: true,
-                    pattern: '^\\d{10,14}$',
+                    pattern: '^\\d{8,16}$',
                     maxLength: 14,
                 },
             ]),
@@ -129,7 +141,7 @@ const categories = [
                     label: 'IUC number',
                     type: 'identifier',
                     required: true,
-                    pattern: '^\\d{10,14}$',
+                    pattern: '^\\d{8,16}$',
                     maxLength: 14,
                 },
             ]),
@@ -139,7 +151,7 @@ const categories = [
                     label: 'Smartcard number',
                     type: 'identifier',
                     required: true,
-                    pattern: '^\\d{9,14}$',
+                    pattern: '^\\d{8,16}$',
                     maxLength: 14,
                 },
             ]),
@@ -207,6 +219,9 @@ function publicTemplates() {
                 serviceCode: svc.serviceCode,
                 providerCode: svc.providerCode,
                 label: svc.label,
+                // The canonical identity key, so clients never infer it from
+                // field order. This is a schema key, not a display hint.
+                identityField: svc.identityField,
                 capabilities: { ...svc.capabilities },
                 providerAdapter: svc.providerAdapter,
                 fields: svc.fields.map((f) => assertKnownType({ ...f })),

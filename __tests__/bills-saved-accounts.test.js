@@ -390,3 +390,48 @@ describe('key ring and rotation', () => {
         expect(oldMaterial).toHaveLength(64);
     });
 });
+
+describe('public template contract', () => {
+    const { publicTemplates } = require('../services/bills/serviceRegistry');
+
+    test('every saveable service exposes its authoritative identity field', () => {
+        const t = publicTemplates();
+        for (const cat of t.categories) {
+            for (const svc of cat.services) {
+                expect(typeof svc.identityField).toBe('string');
+                expect(svc.fields.map((f) => f.key)).toContain(svc.identityField);
+                expect(svc.capabilities.payment).toBe(false);
+                expect(svc.capabilities.quote).toBe(false);
+                expect(svc.capabilities.lookupAccount).toBe(false);
+                expect(svc.providerAdapter).toBeNull();
+            }
+        }
+        expect(t.paymentsEnabled).toBe(false);
+    });
+
+    test('a plausible non-standard reference is not rejected by an assumed format', async () => {
+        // Widened structural bounds: a 12-digit DStv-style reference and a
+        // 22-digit water reference must save, because no provider contract
+        // establishes a tighter rule.
+        jest.resetModules();
+        process.env.SAVED_SERVICE_ENCRYPTION_KEY = KEY;
+        process.env.SAVED_SERVICE_FINGERPRINT_KEY = FP_KEY;
+        const prisma = fakePrisma([]);
+        const { createService } = require('../services/bills/savedServiceAccountService');
+        const svc = createService({ prisma });
+
+        const tv = await svc.createAccount({
+            userId: 1, serviceCode: 'DSTV', providerCode: 'DSTV', nickname: 'Lounge',
+            accountFields: { smartcardNumber: '703489162537' },
+        });
+        expect(tv.verificationStatus).toBe('UNVERIFIED');
+        expect(tv.serviceTemplateVersion).toBe('1');
+
+        const water = await svc.createAccount({
+            userId: 1, serviceCode: 'GHANA_WATER', providerCode: 'GHANA_WATER', nickname: 'Home',
+            accountFields: { customerReference: '100200300400500600' },
+        });
+        expect(water.accountMask).not.toBe('100200300400500600');
+        expect(water.verificationStatus).toBe('UNVERIFIED');
+    });
+});
