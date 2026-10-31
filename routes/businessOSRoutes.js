@@ -4483,7 +4483,7 @@ router.get("/group-stats", wrap(async (req, res) => {
 router.get('/export', requirePermission('settings.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = req.businessProfileId;
-    const archiver = require('archiver');
+    const { buildZipStream } = require('../utils/exportZip');
 
     // Fetch data
     const [orders, invoices, reviews, employees, products] = await Promise.all([
@@ -4525,24 +4525,7 @@ router.get('/export', requirePermission('settings.manage'), wrap(async (req, res
         return [header, ...lines].join('\n');
     }
 
-    const zip = archiver('zip', { zlib: { level: 5 } });
-
-    const bizName = (req.businessProfile?.name || 'business').replace(/[^a-zA-Z0-9]/g, '_');
-    const dateStr = new Date().toISOString().split('T')[0];
-    const filename = `${bizName}_export_${dateStr}.zip`;
-
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    zip.pipe(res);
-
-    zip.append(toCSV(orders), { name: 'orders.csv' });
-    zip.append(toCSV(invoices), { name: 'invoices.csv' });
-    zip.append(toCSV(reviews), { name: 'reviews.csv' });
-    zip.append(toCSV(employees), { name: 'employees.csv' });
-    zip.append(toCSV(products), { name: 'products.csv' });
-
-    // Also include a JSON manifest
-    zip.append(JSON.stringify({
+    const manifest = JSON.stringify({
         businessId: bpId,
         businessName: req.businessProfile?.name,
         exportDate: new Date().toISOString(),
@@ -4553,9 +4536,29 @@ router.get('/export', requirePermission('settings.manage'), wrap(async (req, res
             employees: employees.length,
             products: products.length,
         },
-    }, null, 2), { name: 'manifest.json' });
+    }, null, 2);
 
-    await zip.finalize();
+    // Same six documents, same names as before the archiver replacement.
+    const { stream } = buildZipStream([
+        { name: 'orders.csv', data: toCSV(orders) },
+        { name: 'invoices.csv', data: toCSV(invoices) },
+        { name: 'reviews.csv', data: toCSV(reviews) },
+        { name: 'employees.csv', data: toCSV(employees) },
+        { name: 'products.csv', data: toCSV(products) },
+        { name: 'manifest.json', data: manifest },
+    ]);
+
+    const bizName = (req.businessProfile?.name || 'business').replace(/[^a-zA-Z0-9]/g, '_');
+    const dateStr = new Date().toISOString().split('T')[0];
+    const filename = `${bizName}_export_${dateStr}.zip`;
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    stream.on('error', () => {
+        // Headers are already sent; end the response rather than hanging.
+        if (!res.writableEnded) res.end();
+    });
+    stream.pipe(res);
 }));
 
 // ── Missing routes found by route-checker ──────────────────────────────────
