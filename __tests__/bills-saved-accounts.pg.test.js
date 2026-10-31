@@ -50,6 +50,34 @@ function assertDisposable(uri) {
             `Refusing to run: database "${dbName}" is not named as a disposable test database.`,
         );
     }
+    // A "test" segment must not launder a production-looking name.
+    if (/(^|_)(prod|production|live|main|primary)(_|$)/i.test(dbName)) {
+        throw new Error(
+            `Refusing to run: database "${dbName}" looks like a production database.`,
+        );
+    }
+}
+
+
+/**
+ * The migration test runs `prisma db push --force-reset`. Sharing a database
+ * with DATABASE_URL would wipe the suite's own schema and overlay structures,
+ * so the two targets are compared before any reset.
+ */
+function assertDistinctFromSuiteDatabase(testUri, suiteUri) {
+    if (!suiteUri) return;
+    const norm = (raw) => {
+        const u = new URL(raw);
+        const db = decodeURIComponent((u.pathname || '').replace(/^\//, ''));
+        const schema = u.searchParams.get('schema') || 'public';
+        return `${u.hostname}:${u.port || '5432'}/${db}?schema=${schema}`;
+    };
+    if (norm(testUri) === norm(suiteUri)) {
+        throw new Error(
+            'Refusing to run: TEST_DATABASE_URL and DATABASE_URL point at the same database. '
+            + 'The migration test resets its target and would destroy the suite database.',
+        );
+    }
 }
 
 const MIGRATIONS = [
@@ -68,6 +96,7 @@ const FP_KEY = 'b'.repeat(64);
 
     beforeAll(async () => {
         assertDisposable(DSN);
+        assertDistinctFromSuiteDatabase(DSN, process.env.DATABASE_URL);
         process.env.SAVED_SERVICE_ENCRYPTION_KEY = KEY;
         process.env.SAVED_SERVICE_FINGERPRINT_KEY = FP_KEY;
         process.env.SAVED_SERVICE_ENCRYPTION_KEY_VERSION = '1';
@@ -300,6 +329,36 @@ describe('reset-target safety', () => {
     test('a non-test database name is refused even on localhost', () => {
         expect(() => assertFn('postgresql://postgres@localhost:5432/azaman_prod'))
             .toThrow(/not named as a disposable test database/);
+    });
+
+    test('an identical TEST_DATABASE_URL and DATABASE_URL are refused', () => {
+        const src = fs.readFileSync(__filename, 'utf8');
+        const distinctFn = eval(`(${src.match(/function assertDistinctFromSuiteDatabase\(testUri, suiteUri\)[\s\S]*?\n\}/)[0]})`);
+        const same = 'postgresql://postgres@localhost:5432/azm_test?schema=public';
+        expect(() => distinctFn(same, same)).toThrow(/same database/);
+        // Same database, different query string or host spelling: still refused.
+        expect(() => distinctFn(same, 'postgresql://postgres@127.0.0.1:5432/azm_test?schema=public'))
+            .not.toThrow(); // different host is a different server; allowed by design
+        expect(() => distinctFn(
+            'postgresql://postgres@localhost:5432/azm_test?schema=public',
+            'postgresql://postgres@localhost:5432/azm_test?schema=other',
+        )).not.toThrow(); // different schema is a different overlay namespace
+    });
+
+    test('a production-like name containing a test segment is refused', () => {
+        const src = fs.readFileSync(__filename, 'utf8');
+        const fn = eval(`(${src.match(/function assertDisposable\(uri\)[\s\S]*?\n\}/)[0]})`);
+        expect(() => fn('postgresql://postgres@localhost:5432/azam_prod_test'))
+            .toThrow(/looks like a production database/);
+        expect(() => fn('postgresql://postgres@localhost:5432/production_test_copy'))
+            .toThrow(/looks like a production database/);
+    });
+
+    test('the isolated saved-account database name is accepted', () => {
+        const src = fs.readFileSync(__filename, 'utf8');
+        const fn = eval(`(${src.match(/function assertDisposable\(uri\)[\s\S]*?\n\}/)[0]})`);
+        expect(() => fn('postgresql://postgres@localhost:5432/azm_saved_service_accounts_test'))
+            .not.toThrow();
     });
 
     test('a remote host is refused even when named as a test database', () => {
