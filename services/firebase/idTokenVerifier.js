@@ -142,6 +142,7 @@ function createDefaultFetcher({ fetchImpl = global.fetch, timeoutMs = DEFAULT_JW
 // no longer represents what the issuer actually publishes.
 const MIN_RSA_MODULUS_BITS = 2048;
 const REQUIRED_USE = 'sig';
+const REQUIRED_KEY_OP = 'verify';
 
 function assertWellFormedKey(entry, index) {
     const where = 'key[' + index + ']';
@@ -157,10 +158,21 @@ function assertWellFormedKey(entry, index) {
     if (typeof entry.n !== 'string' || typeof entry.e !== 'string' || entry.n.length === 0 || entry.e.length === 0) {
         throw new IdTokenError('JWKS_MALFORMED_KEY', where + ' has no usable modulus or exponent.');
     }
-    // Declared usage and algorithm must both be signing/RS256. A key published
-    // for encryption must never be used to check a login signature.
-    if (entry.use !== REQUIRED_USE) {
+    // `use` and `key_ops` are both optional in RFC 7517, and Google publishes
+    // key sets where they are absent. Absent means "no declared restriction";
+    // present means it must permit signature verification. A key declared for
+    // encryption must never be used to check a login signature, so a present
+    // but contradictory declaration is still rejected.
+    if (entry.use !== undefined && entry.use !== REQUIRED_USE) {
         throw new IdTokenError('JWKS_MALFORMED_KEY', where + ' is not published for signing.');
+    }
+    if (entry.key_ops !== undefined) {
+        if (!Array.isArray(entry.key_ops) || entry.key_ops.some((op) => typeof op !== 'string')) {
+            throw new IdTokenError('JWKS_MALFORMED_KEY', where + ' has a malformed key_ops.');
+        }
+        if (!entry.key_ops.includes(REQUIRED_KEY_OP)) {
+            throw new IdTokenError('JWKS_MALFORMED_KEY', where + ' does not permit signature verification.');
+        }
     }
     if (entry.alg !== ACCEPTED_ALG) {
         throw new IdTokenError('JWKS_MALFORMED_KEY', where + ' is not an RS256 key.');

@@ -453,10 +453,39 @@ describe('JWKS: strict key-set validation', () => {
     expect(() => normalizeKeySet([noE])).toThrow(/no usable modulus or exponent/);
   });
 
-  test('rejects a key not published for signing', () => {
+  test('rejects a key published for encryption', () => {
     expect(() => normalizeKeySet([{ ...base(), use: 'enc' }])).toThrow(/not published for signing/);
+  });
+
+  test('accepts a key that omits use, as RFC 7517 permits', () => {
     const noUse = base(); delete noUse.use;
-    expect(() => normalizeKeySet([noUse])).toThrow(/not published for signing/);
+    expect(normalizeKeySet([noUse])).toHaveLength(1);
+  });
+
+  test('accepts a key whose key_ops permits verification', () => {
+    const k = base(); delete k.use;
+    expect(normalizeKeySet([{ ...k, key_ops: ['verify'] }])).toHaveLength(1);
+    expect(normalizeKeySet([{ ...k, key_ops: ['sign', 'verify'] }])).toHaveLength(1);
+  });
+
+  test('rejects key_ops that excludes verification', () => {
+    const k = base();
+    expect(() => normalizeKeySet([{ ...k, key_ops: ['encrypt'] }])).toThrow(/does not permit signature verification/);
+    expect(() => normalizeKeySet([{ ...k, key_ops: [] }])).toThrow(/does not permit signature verification/);
+  });
+
+  test('rejects a malformed key_ops', () => {
+    const k = base();
+    expect(() => normalizeKeySet([{ ...k, key_ops: 'verify' }])).toThrow(/malformed key_ops/);
+    expect(() => normalizeKeySet([{ ...k, key_ops: [1] }])).toThrow(/malformed key_ops/);
+  });
+
+  test('rejects contradictory use and key_ops', () => {
+    const k = base();
+    expect(() => normalizeKeySet([{ ...k, use: 'enc', key_ops: ['verify'] }]))
+      .toThrow(/not published for signing/);
+    expect(() => normalizeKeySet([{ ...k, use: 'sig', key_ops: ['encrypt'] }]))
+      .toThrow(/does not permit signature verification/);
   });
 
   test('rejects a key whose declared algorithm is not RS256', () => {
@@ -585,7 +614,7 @@ describe('FCM: bounded HTTP transport', () => {
     };
     const client = createFcmClient({ serviceAccount: sa, fetchImpl, timeoutMs: 25, now: nowFn });
     await expect(client.send({ token: 'd', title: 'a', body: 'b' }))
-      .rejects.toMatchObject({ code: 'FCM_TIMEOUT' });
+      .rejects.toMatchObject({ code: 'FCM_SEND_OUTCOME_UNKNOWN', deliveryUnknown: true });
     expect(calls).toBe(2); // one exchange, one send attempt, no blind retry
   });
 
@@ -615,5 +644,150 @@ describe('FCM: bounded HTTP transport', () => {
       client.send({ token: 'c', title: 't', body: 'b' }),
     ]);
     expect(exchanges).toBe(1);
+  });
+});
+
+
+describe('JWKS: Google key-set shape', () => {
+  // Two RSA/RS256 keys where the second omits `use` and the first carries
+  // key_ops, which is the shape the Secure Token endpoint actually serves.
+  // Key material is generated per run, never pinned to a Google key.
+  const shape = () => {
+    const a = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+    const b = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+    return {
+      a, b,
+      keys: [
+        { ...a.publicKey.export({ format: 'jwk' }), kid: 'kid-with-use', alg: 'RS256', use: 'sig' },
+        { ...b.publicKey.export({ format: 'jwk' }), kid: 'kid-without-use', alg: 'RS256' },
+      ],
+    };
+  };
+
+  test('accepts a mixed set where one key omits use', () => {
+    const { keys } = shape();
+    const normalized = normalizeKeySet(keys);
+    expect(normalized).toHaveLength(2);
+    expect(normalized.map((k) => k.kid)).toEqual(['kid-with-use', 'kid-without-use']);
+  });
+
+  test('accepts the same set with key_ops on the key that omits use', () => {
+    const { keys } = shape();
+    delete keys[0].use;
+    keys[0].key_ops = ['verify'];
+    expect(normalizeKeySet(keys)).toHaveLength(2);
+  });
+
+  test('verifies against the key that omits use', async () => {
+    const { b, keys } = shape();
+    const resolve = createKeyResolver({ fetcher: async () => ({ keys }), now: nowFn });
+    const token = mint({ header: { kid: 'kid-without-use' }, key: b.privateKey });
+    const claims = await verifyIdToken(token, { projectId: PROJECT, resolveKey: resolve, now: nowFn });
+    expect(claims.sub).toBe('user-123');
+  });
+
+  test('the key without use cannot validate the other key signature', async () => {
+    const { a, keys } = shape();
+    const resolve = createKeyResolver({ fetcher: async () => ({ keys }), now: nowFn });
+    const token = mint({ header: { kid: 'kid-without-use' }, key: a.privateKey });
+    await expect(verifyIdToken(token, { projectId: PROJECT, resolveKey: resolve, now: nowFn }))
+      .rejects.toMatchObject({ code: 'ID_TOKEN_BAD_SIGNATURE' });
+  });
+
+  test('one contradictory key still fails the whole set', () => {
+    const { keys } = shape();
+    keys[1].use = 'enc';
+    expect(() => normalizeKeySet(keys)).toThrow(/not published for signing/);
+  });
+
+  test('one contradictory key_ops still fails the whole set', () => {
+    const { keys } = shape();
+    keys[1].key_ops = ['encrypt'];
+    expect(() => normalizeKeySet(keys)).toThrow(/does not permit signature verification/);
+  });
+
+  test('resolver rejects the set rather than trusting the valid half', async () => {
+    const { keys } = shape();
+    keys[1].use = 'enc';
+    const resolve = createKeyResolver({ fetcher: async () => ({ keys }), now: nowFn });
+    await expect(resolve('kid-with-use')).rejects.toMatchObject({ code: 'JWKS_MALFORMED_KEY' });
+  });
+});
+
+describe('FCM: a stalled body read is still a timeout', () => {
+  const sa = {
+    client_email: 'sender@azaman-app.iam.gserviceaccount.com',
+    private_key: privateKey.export({ type: 'pkcs8', format: 'pem' }),
+    project_id: PROJECT,
+    token_uri: 'https://oauth2.googleapis.com/token',
+  };
+  // fetch() resolves with headers; only the body read stalls.
+  const stallBody = () => (_url, { signal }) => Promise.resolve({
+    status: 200,
+    ok: true,
+    headers: { forEach: () => {} },
+    text: () => new Promise((_res, rej) => {
+      signal.addEventListener('abort', () => {
+        const e = new Error('aborted'); e.name = 'AbortError'; rej(e);
+      });
+    }),
+  });
+
+  test('a stalled token body is classified as a timeout, not a transport failure', async () => {
+    const client = createFcmClient({ serviceAccount: sa, fetchImpl: stallBody(), timeoutMs: 25, now: nowFn });
+    const err = await client.send({ token: 'd', title: 'a', body: 'b' }).catch((e) => e);
+    expect(err.code).toBe('FCM_TIMEOUT');
+    expect(err.phase).toBe('token');
+    expect(err.deliveryUnknown).toBe(false);
+    expect(err.retryable).toBe(true);
+    expect(err.retryPolicy).toBe('safe');
+  });
+
+  test('a stalled send body reports an unknown delivery outcome', async () => {
+    let sends = 0;
+    const fetchImpl = (url, opts) => {
+      if (String(url).includes('oauth2')) {
+        return Promise.resolve({ status: 200, ok: true, headers: { forEach: () => {} },
+          text: async () => '{"access_token":"t","expires_in":3600}' });
+      }
+      sends += 1;
+      return stallBody()(url, opts);
+    };
+    const client = createFcmClient({ serviceAccount: sa, fetchImpl, timeoutMs: 25, now: nowFn });
+    const err = await client.send({ token: 'd', title: 'a', body: 'b' }).catch((e) => e);
+    expect(err.code).toBe('FCM_SEND_OUTCOME_UNKNOWN');
+    expect(err.phase).toBe('send');
+    expect(err.deliveryUnknown).toBe(true);
+    expect(err.retryable).toBe(false);
+    expect(err.retryPolicy).toBe('reconcile-first');
+    expect(sends).toBe(1);
+  });
+
+  test('a send timeout never produces a second send attempt', async () => {
+    let sends = 0;
+    const fetchImpl = (url, opts) => {
+      if (String(url).includes('oauth2')) {
+        return Promise.resolve({ status: 200, ok: true, headers: { forEach: () => {} },
+          text: async () => '{"access_token":"t","expires_in":3600}' });
+      }
+      sends += 1;
+      return new Promise((_res, rej) => {
+        opts.signal.addEventListener('abort', () => {
+          const e = new Error('aborted'); e.name = 'AbortError'; rej(e);
+        });
+      });
+    };
+    const client = createFcmClient({ serviceAccount: sa, fetchImpl, timeoutMs: 20, now: nowFn });
+    await client.send({ token: 'd', title: 'a', body: 'b' }).catch(() => {});
+    await new Promise((r) => setTimeout(r, 60));
+    expect(sends).toBe(1);
+  });
+
+  test('a token exchange timeout stays safely retryable', async () => {
+    const client = createFcmClient({ serviceAccount: sa, fetchImpl: stallBody(), timeoutMs: 20, now: nowFn });
+    const err = await client.send({ token: 'd', title: 'a', body: 'b' }).catch((e) => e);
+    expect(err.deliveryUnknown).toBe(false);
+    expect(err.retryPolicy).toBe('safe');
+    expect(err.message).not.toMatch(/PRIVATE KEY|device/);
   });
 });

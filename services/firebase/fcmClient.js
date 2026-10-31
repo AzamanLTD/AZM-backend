@@ -37,6 +37,13 @@ class FcmError extends Error {
         this.status = m.status;
         this.fcmErrorCode = m.fcmErrorCode || null;
         this.retryable = Boolean(m.retryable);
+        this.phase = m.phase || null;
+        // A send that died after the request left us may still have been
+        // accepted by FCM. Retrying it can deliver the same push twice, so the
+        // outcome is recorded explicitly instead of being flattened to
+        // "retryable".
+        this.deliveryUnknown = Boolean(m.deliveryUnknown);
+        this.retryPolicy = m.retryPolicy || 'never';
         this.retryAfterMs = typeof m.retryAfterMs === 'number' ? m.retryAfterMs : null;
     }
 }
@@ -162,8 +169,17 @@ function createHttpTransport({ fetchImpl = global.fetch, defaultTimeoutMs = DEFA
             throw new FcmError('FCM_TRANSPORT_UNAVAILABLE', 'No HTTP client is available.');
         }
         const timeoutMs = typeof req.timeoutMs === 'number' ? req.timeoutMs : defaultTimeoutMs;
+        const phase = req.phase === 'send' ? 'send' : 'token';
         const controller = new AbortController();
         const timer = setTimeout(() => controller.abort(), timeoutMs);
+        // A send that timed out may have been accepted by FCM before the
+        // response was lost; the exchange has no such ambiguity.
+        const timeoutError = () => (phase === 'send'
+            ? new FcmError('FCM_SEND_OUTCOME_UNKNOWN',
+                'Send exceeded ' + timeoutMs + 'ms; FCM may have accepted the message.',
+                { phase, retryable: false, deliveryUnknown: true, retryPolicy: 'reconcile-first' })
+            : new FcmError('FCM_TIMEOUT', 'Token exchange exceeded ' + timeoutMs + 'ms.',
+                { phase, retryable: true, deliveryUnknown: false, retryPolicy: 'safe' }));
         try {
             const res = await fetchImpl(req.url, {
                 method: req.method || 'GET',
@@ -175,8 +191,13 @@ function createHttpTransport({ fetchImpl = global.fetch, defaultTimeoutMs = DEFA
             try {
                 text = await res.text();
             } catch (err) {
+                // The body read can be what stalls, and it aborts on the same
+                // signal. Classify it by phase rather than as a generic
+                // transport failure, otherwise a timeout is reported as
+                // something that never timed out.
+                if (controller.signal.aborted || (err && err.name === 'AbortError')) throw timeoutError();
                 throw new FcmError('FCM_TRANSPORT_FAILED', 'Response body could not be read.',
-                    { status: res && res.status, retryable: false });
+                    { status: res && res.status, phase, retryable: false, retryPolicy: 'never' });
             }
             let json = null;
             if (text) {
@@ -190,10 +211,12 @@ function createHttpTransport({ fetchImpl = global.fetch, defaultTimeoutMs = DEFA
         } catch (err) {
             if (err instanceof FcmError) throw err;
             if (err && (err.name === 'AbortError' || controller.signal.aborted)) {
-                throw new FcmError('FCM_TIMEOUT', 'Request exceeded ' + timeoutMs + 'ms.', { retryable: true });
+                throw timeoutError();
             }
             throw new FcmError('FCM_TRANSPORT_FAILED', 'Request failed before a response was received.',
-                { retryable: true });
+                phase === 'send'
+                    ? { phase, retryable: false, deliveryUnknown: true, retryPolicy: 'reconcile-first' }
+                    : { phase, retryable: true, retryPolicy: 'safe' });
         } finally {
             clearTimeout(timer);
         }
@@ -227,6 +250,7 @@ function createTokenProvider({ serviceAccount, http, now = () => Date.now(), ske
             body: 'grant_type=' + encodeURIComponent('urn:ietf:params:oauth:grant-type:jwt-bearer')
                 + '&assertion=' + encodeURIComponent(assertion),
             timeoutMs,
+            phase: 'token',
         });
         if (!res || res.status !== 200 || !res.json || !res.json.access_token) {
             throw new FcmError('FCM_TOKEN_FAILED', 'Token exchange did not return an access token.',
@@ -272,6 +296,7 @@ function createFcmClient({ serviceAccount, http, fetchImpl, timeoutMs = DEFAULT_
             },
             body: JSON.stringify(message),
             timeoutMs,
+            phase: 'send',
         });
 
         if (res && res.status === 200) {
