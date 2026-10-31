@@ -196,8 +196,18 @@ function createHttpTransport({ fetchImpl = global.fetch, defaultTimeoutMs = DEFA
                 // transport failure, otherwise a timeout is reported as
                 // something that never timed out.
                 if (controller.signal.aborted || (err && err.name === 'AbortError')) throw timeoutError();
-                throw new FcmError('FCM_TRANSPORT_FAILED', 'Response body could not be read.',
-                    { status: res && res.status, phase, retryable: false, retryPolicy: 'never' });
+                // The request was already delivered when a body read fails, so a
+                // send cannot be reported as a plain transport failure: FCM may
+                // well have accepted the message.
+                if (phase === 'send') {
+                    throw new FcmError('FCM_SEND_OUTCOME_UNKNOWN',
+                        'Response body could not be read after the send; FCM may have accepted the message.',
+                        { status: res && res.status, phase, retryable: false, deliveryUnknown: true,
+                          retryPolicy: 'reconcile-first' });
+                }
+                throw new FcmError('FCM_TRANSPORT_FAILED', 'Token response body could not be read.',
+                    { status: res && res.status, phase, retryable: false, deliveryUnknown: false,
+                      retryPolicy: 'never' });
             }
             let json = null;
             if (text) {

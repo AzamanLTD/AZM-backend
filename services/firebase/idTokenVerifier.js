@@ -143,6 +143,7 @@ function createDefaultFetcher({ fetchImpl = global.fetch, timeoutMs = DEFAULT_JW
 const MIN_RSA_MODULUS_BITS = 2048;
 const REQUIRED_USE = 'sig';
 const REQUIRED_KEY_OP = 'verify';
+const ENCRYPTION_KEY_OPS = ['encrypt', 'decrypt', 'wrapKey', 'unwrapKey', 'deriveKey', 'deriveBits'];
 
 function assertWellFormedKey(entry, index) {
     const where = 'key[' + index + ']';
@@ -173,8 +174,22 @@ function assertWellFormedKey(entry, index) {
         if (!entry.key_ops.includes(REQUIRED_KEY_OP)) {
             throw new IdTokenError('JWKS_MALFORMED_KEY', where + ' does not permit signature verification.');
         }
+        // RFC 7517 forbids repeating an operation, and a key that both verifies
+        // signatures and performs encryption operations contradicts itself.
+        if (new Set(entry.key_ops).size !== entry.key_ops.length) {
+            throw new IdTokenError('JWKS_MALFORMED_KEY', where + ' has duplicate key_ops entries.');
+        }
+        const encryptionOps = entry.key_ops.filter((op) => ENCRYPTION_KEY_OPS.includes(op));
+        if (encryptionOps.length > 0) {
+            throw new IdTokenError('JWKS_MALFORMED_KEY',
+                where + ' declares signature verification alongside encryption operations ('
+                + encryptionOps.join(', ') + ').');
+        }
     }
-    if (entry.alg !== ACCEPTED_ALG) {
+    // `alg` is an optional JWK annotation too. When present it must match, but
+    // the verifier pins RS256 itself from the JWT header, so a key set that
+    // omits the annotation is still usable and never widens what we accept.
+    if (entry.alg !== undefined && entry.alg !== ACCEPTED_ALG) {
         throw new IdTokenError('JWKS_MALFORMED_KEY', where + ' is not an RS256 key.');
     }
     let modulusBits;

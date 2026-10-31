@@ -480,6 +480,31 @@ describe('JWKS: strict key-set validation', () => {
     expect(() => normalizeKeySet([{ ...k, key_ops: [1] }])).toThrow(/malformed key_ops/);
   });
 
+  test('accepts a key that omits alg', () => {
+    const k = base(); delete k.alg;
+    expect(normalizeKeySet([k])).toHaveLength(1);
+  });
+
+  test('accepts an RS256 key', () => {
+    expect(normalizeKeySet([{ ...base(), alg: 'RS256' }])).toHaveLength(1);
+  });
+
+  test('rejects duplicate key_ops entries', () => {
+    const k = base(); delete k.use;
+    expect(() => normalizeKeySet([{ ...k, key_ops: ['verify', 'verify'] }]))
+      .toThrow(/duplicate key_ops entries/);
+  });
+
+  test('rejects key_ops mixing verification with encryption operations', () => {
+    const k = base(); delete k.use;
+    for (const op of ['encrypt', 'decrypt', 'wrapKey', 'unwrapKey', 'deriveKey', 'deriveBits']) {
+      expect(() => normalizeKeySet([{ ...k, key_ops: ['verify', op] }]))
+        .toThrow(/encryption operations/);
+    }
+    expect(() => normalizeKeySet([{ ...k, use: 'sig', key_ops: ['verify', 'decrypt'] }]))
+      .toThrow(/encryption operations/);
+  });
+
   test('rejects contradictory use and key_ops', () => {
     const k = base();
     expect(() => normalizeKeySet([{ ...k, use: 'enc', key_ops: ['verify'] }]))
@@ -489,9 +514,9 @@ describe('JWKS: strict key-set validation', () => {
   });
 
   test('rejects a key whose declared algorithm is not RS256', () => {
-    expect(() => normalizeKeySet([{ ...base(), alg: 'RS512' }])).toThrow(/not an RS256 key/);
-    const noAlg = base(); delete noAlg.alg;
-    expect(() => normalizeKeySet([noAlg])).toThrow(/not an RS256 key/);
+    for (const alg of ['RS512', 'HS256', 'ES256', 'none', 'PS256']) {
+      expect(() => normalizeKeySet([{ ...base(), alg }])).toThrow(/not an RS256 key/);
+    }
   });
 
   test('rejects an RSA key below 2048 bits', () => {
@@ -789,5 +814,84 @@ describe('FCM: a stalled body read is still a timeout', () => {
     expect(err.deliveryUnknown).toBe(false);
     expect(err.retryPolicy).toBe('safe');
     expect(err.message).not.toMatch(/PRIVATE KEY|device/);
+  });
+});
+
+
+describe('JWKS: optional alg never widens the verifier', () => {
+  test('the JWT header still has to be RS256 when the key omits alg', async () => {
+    const k = { ...jwk }; delete k.alg;
+    const resolve = async () => k;
+    const header = { alg: 'RS512', kid: KID };
+    const token = mint({ header, key: privateKey });
+    await expect(verifyIdToken(token, { projectId: PROJECT, resolveKey: resolve, now: nowFn }))
+      .rejects.toMatchObject({ code: 'ID_TOKEN_BAD_ALG' });
+  });
+
+  test('a key omitting alg still verifies an RS256 token', async () => {
+    const k = { ...jwk }; delete k.alg;
+    const resolve = async () => k;
+    const claims = await verifyIdToken(mint(), { projectId: PROJECT, resolveKey: resolve, now: nowFn });
+    expect(claims.sub).toBe('user-123');
+  });
+});
+
+describe('FCM: a generic body-read failure', () => {
+  const sa = {
+    client_email: 'sender@azaman-app.iam.gserviceaccount.com',
+    private_key: privateKey.export({ type: 'pkcs8', format: 'pem' }),
+    project_id: PROJECT,
+    token_uri: 'https://oauth2.googleapis.com/token',
+  };
+  const brokenBody = () => () => Promise.resolve({
+    status: 200,
+    ok: true,
+    headers: { forEach: () => {} },
+    text: async () => { throw new Error('socket hang up'); },
+  });
+
+  test('during token exchange stays a distinct token-phase failure', async () => {
+    const client = createFcmClient({ serviceAccount: sa, fetchImpl: brokenBody(), timeoutMs: 50, now: nowFn });
+    const err = await client.send({ token: 'd', title: 'a', body: 'b' }).catch((e) => e);
+    expect(err.code).toBe('FCM_TRANSPORT_FAILED');
+    expect(err.phase).toBe('token');
+    expect(err.deliveryUnknown).toBe(false);
+    expect(err.retryPolicy).toBe('never');
+  });
+
+  test('during a send means the delivery outcome is unknown', async () => {
+    let sends = 0;
+    const fetchImpl = (url, opts) => {
+      if (String(url).includes('oauth2')) {
+        return Promise.resolve({ status: 200, ok: true, headers: { forEach: () => {} },
+          text: async () => '{"access_token":"t","expires_in":3600}' });
+      }
+      sends += 1;
+      return brokenBody()(url, opts);
+    };
+    const client = createFcmClient({ serviceAccount: sa, fetchImpl, timeoutMs: 50, now: nowFn });
+    const err = await client.send({ token: 'd', title: 'a', body: 'b' }).catch((e) => e);
+    expect(err.code).toBe('FCM_SEND_OUTCOME_UNKNOWN');
+    expect(err.phase).toBe('send');
+    expect(err.deliveryUnknown).toBe(true);
+    expect(err.retryable).toBe(false);
+    expect(err.retryPolicy).toBe('reconcile-first');
+    expect(sends).toBe(1);
+  });
+
+  test('never triggers a second send', async () => {
+    let sends = 0;
+    const fetchImpl = (url, opts) => {
+      if (String(url).includes('oauth2')) {
+        return Promise.resolve({ status: 200, ok: true, headers: { forEach: () => {} },
+          text: async () => '{"access_token":"t","expires_in":3600}' });
+      }
+      sends += 1;
+      return brokenBody()(url, opts);
+    };
+    const client = createFcmClient({ serviceAccount: sa, fetchImpl, timeoutMs: 50, now: nowFn });
+    await client.send({ token: 'd', title: 'a', body: 'b' }).catch(() => {});
+    await new Promise((r) => setTimeout(r, 60));
+    expect(sends).toBe(1);
   });
 });
