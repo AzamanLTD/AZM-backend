@@ -223,15 +223,28 @@ function createService({ prisma }) {
                 throw httpError(400, 'NOTHING_TO_UPDATE', 'Provide nickname or isPrimary.');
             }
 
-            const updated = await prisma.$transaction(async (tx) => {
-                if (data.isPrimary === true) {
-                    await tx.savedServiceAccount.updateMany({
-                        where: { userId, serviceCode: row.serviceCode, isPrimary: true, NOT: { id } },
-                        data: { isPrimary: false },
-                    });
+            let updated;
+            try {
+                updated = await prisma.$transaction(async (tx) => {
+                    if (data.isPrimary === true) {
+                        await tx.savedServiceAccount.updateMany({
+                            where: { userId, serviceCode: row.serviceCode, isPrimary: true, NOT: { id } },
+                            data: { isPrimary: false },
+                        });
+                    }
+                    return tx.savedServiceAccount.update({ where: { id }, data });
+                });
+            } catch (err) {
+                // The partial unique index is the final authority on one primary
+                // per member per service. When two promotions race, the loser
+                // hits it, and that must reach the caller as a typed conflict
+                // rather than a raw Prisma code.
+                if (err && err.code === 'P2002') {
+                    throw httpError(409, 'PRIMARY_CONFLICT',
+                        'Another account for this service was just made primary. Refresh and retry.');
                 }
-                return tx.savedServiceAccount.update({ where: { id }, data });
-            });
+                throw err;
+            }
 
             return toPublicAccount(updated, getService(updated.serviceCode));
         },

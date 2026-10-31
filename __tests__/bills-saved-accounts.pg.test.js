@@ -14,8 +14,19 @@
 const fs = require('fs');
 const path = require('path');
 
-const DSN = process.env.TEST_DATABASE_URL || process.env.DATABASE_URL;
-const hasDb = Boolean(DSN && /^postgres(ql)?:\/\//.test(DSN));
+/**
+ * Resolve the reset target. ONLY TEST_DATABASE_URL counts: falling back to
+ * DATABASE_URL would let a normal development database be dropped by someone
+ * who merely runs the suite.
+ */
+function resolveTestDsn() {
+    const uri = process.env.TEST_DATABASE_URL;
+    if (!uri || !/^postgres(ql)?:\/\//.test(uri)) return null;
+    return uri;
+}
+
+const DSN = resolveTestDsn();
+const hasDb = Boolean(DSN);
 
 /**
  * This suite DROPS AND RECREATES tables. It must never be able to point at a
@@ -24,12 +35,20 @@ const hasDb = Boolean(DSN && /^postgres(ql)?:\/\//.test(DSN));
  */
 function assertDisposable(uri) {
     const u = new URL(uri);
-    const local = ['localhost', '127.0.0.1', '::1'].includes(u.hostname);
-    if (!local) {
-        throw new Error(`Refusing to run: ${u.hostname} is not a local disposable database.`);
+    const host = u.hostname || '';
+    if (!['localhost', '127.0.0.1', '::1'].includes(host)) {
+        throw new Error(`Refusing to run: ${host} is not a local disposable database.`);
     }
-    if (/neon|render|aws|azure|gcp|supabase/i.test(u.hostname)) {
+    if (/neon|render|aws|azure|gcp|supabase|rds|digitalocean/i.test(host)) {
         throw new Error('Refusing to run against a managed provider.');
+    }
+    // A tunnel can present localhost. The database name must be explicitly a
+    // test database, so an ordinary dev database cannot be reset by accident.
+    const dbName = decodeURIComponent((u.pathname || '').replace(/^\//, ''));
+    if (!/(^|_)(test|tests|ci|disposable)(_|$)/i.test(dbName)) {
+        throw new Error(
+            `Refusing to run: database "${dbName}" is not named as a disposable test database.`,
+        );
     }
 }
 
@@ -45,6 +64,7 @@ const FP_KEY = 'b'.repeat(64);
     let PrismaClient;
     let prisma;
     let svc;
+    let tmpSchemaPath = null;
 
     beforeAll(async () => {
         assertDisposable(DSN);
@@ -69,6 +89,7 @@ const FP_KEY = 'b'.repeat(64);
             throw new Error('Baseline schema still contains the model under test.');
         }
         const tmpSchema = path.join(os.tmpdir(), `azm-base-${process.pid}.prisma`);
+        tmpSchemaPath = tmpSchema;
         fs.writeFileSync(tmpSchema, trimmed);
         execFileSync(process.execPath, [
             path.join(__dirname, '..', 'node_modules', 'prisma', 'build', 'index.js'),
@@ -91,6 +112,10 @@ const FP_KEY = 'b'.repeat(64);
 
     afterAll(async () => {
         if (prisma) await prisma.$disconnect();
+        // Never leave a generated baseline schema behind.
+        if (tmpSchemaPath) {
+            try { fs.unlinkSync(tmpSchemaPath); } catch (_e) { /* already gone */ }
+        }
     });
 
     const ECG = { serviceCode: 'ECG_PREPAID', providerCode: 'ECG', nickname: 'Home', accountFields: { meterNumber: '0123456789' } };
@@ -202,14 +227,24 @@ const FP_KEY = 'b'.repeat(64);
             nickname: 'Office', accountFields: { meterNumber: '9876543210' },
         });
 
-        await Promise.allSettled([
+        const outcomes = await Promise.allSettled([
             svc.updateAccount({ userId: user.id, id: first.id, isPrimary: true }),
             svc.updateAccount({ userId: user.id, id: second.id, isPrimary: true }),
         ]);
 
+        const fulfilled = outcomes.filter((o) => o.status === 'fulfilled');
+        const rejected = outcomes.filter((o) => o.status === 'rejected');
+
+        // Exactly one promotion may win, and the loser must fail with a
+        // testable, explicit result rather than a silent no-op.
+        expect(fulfilled).toHaveLength(1);
+        expect(rejected).toHaveLength(1);
+        expect(String(rejected[0].reason && (rejected[0].reason.code || rejected[0].reason.message)))
+            .toMatch(/PRIMARY/i);
+
         const rows = await prisma.$queryRawUnsafe(
             `SELECT COUNT(*)::int AS n FROM "SavedServiceAccount" WHERE "userId" = $1 AND "serviceCode" = 'ECG_PREPAID' AND "isPrimary" = true`, user.id);
-        expect(rows[0].n).toBeLessThanOrEqual(1);
+        expect(rows[0].n).toBe(1);
 
         await prisma.user.delete({ where: { id: user.id } });
     });
@@ -235,5 +270,40 @@ const FP_KEY = 'b'.repeat(64);
         const rows = await prisma.$queryRawUnsafe(
             `SELECT COUNT(*)::int AS n FROM "SavedServiceAccount" WHERE "userId" = $1`, user.id);
         expect(rows[0].n).toBe(0);
+    });
+});
+
+describe('reset-target safety', () => {
+    const { resolveTestDsn: resolveFn, assertDisposable: assertFn } = (() => {
+        // The helpers are module-local; re-derive them here so the guards are
+        // tested even when no database is configured (the suite itself skips).
+        const src = fs.readFileSync(__filename, 'utf8');
+        return { resolveTestDsn: eval(`(${src.match(/function resolveTestDsn\(\)[\s\S]*?\n\}/)[0]})`),
+                  assertDisposable: eval(`(${src.match(/function assertDisposable\(uri\)[\s\S]*?\n\}/)[0]})`) };
+    })();
+
+    test('an ordinary DATABASE_URL is never used as the reset target', () => {
+        const previousTest = process.env.TEST_DATABASE_URL;
+        const previousProd = process.env.DATABASE_URL;
+        delete process.env.TEST_DATABASE_URL;
+        process.env.DATABASE_URL = 'postgresql://postgres@localhost:5432/azam_dev';
+        try {
+            expect(resolveFn()).toBeNull();
+        } finally {
+            if (previousTest === undefined) delete process.env.TEST_DATABASE_URL;
+            else process.env.TEST_DATABASE_URL = previousTest;
+            if (previousProd === undefined) delete process.env.DATABASE_URL;
+            else process.env.DATABASE_URL = previousProd;
+        }
+    });
+
+    test('a non-test database name is refused even on localhost', () => {
+        expect(() => assertFn('postgresql://postgres@localhost:5432/azaman_prod'))
+            .toThrow(/not named as a disposable test database/);
+    });
+
+    test('a remote host is refused even when named as a test database', () => {
+        expect(() => assertFn('postgresql://u:p@ep-x-1.neon.tech/azm_test'))
+            .toThrow(/not a local disposable database|managed provider/);
     });
 });
