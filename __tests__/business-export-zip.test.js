@@ -115,4 +115,39 @@ describe('business export archive', () => {
         expect(src).not.toMatch(/require\('archiver'\)/);
         expect(src).toMatch(/require\('\.\.\/utils\/exportZip'\)/);
     });
+
+    test('refuses absolute, parent-escaping and backslash entry names', () => {
+        expect(() => buildZipStream([{ name: '/etc/passwd', data: 'x' }]))
+            .toThrow(/absolute path/);
+        expect(() => buildZipStream([{ name: 'C:\\windows\\system32\\x', data: 'x' }]))
+            .toThrow(/absolute path|backslash/);
+        expect(() => buildZipStream([{ name: '../../escape.csv', data: 'x' }]))
+            .toThrow(/escapes its directory/);
+        expect(() => buildZipStream([{ name: 'reports/../../escape.csv', data: 'x' }]))
+            .toThrow(/escapes its directory/);
+        expect(() => buildZipStream([{ name: 'sub\\file.csv', data: 'x' }]))
+            .toThrow(/backslash/);
+    });
+
+    test('a destroyed output stream settles instead of hanging or rejecting loudly', async () => {
+        const { stream, done } = buildZipStream([{ name: 'a.csv', data: 'x' }]);
+        stream.destroy();
+        await expect(Promise.race([
+            done.then(() => 'settled').catch(() => 'settled'),
+            new Promise((r) => setTimeout(() => r('hung'), 1000)),
+        ])).resolves.toBe('settled');
+    });
+
+    test('the six export documents keep their names and order', async () => {
+        const names = ['orders.csv', 'invoices.csv', 'reviews.csv', 'employees.csv', 'products.csv', 'manifest.json'];
+        const { stream, done } = buildZipStream(names.map((n) => ({ name: n, data: `content:${n}` })));
+        const chunks = [];
+        stream.on('data', (c) => chunks.push(c));
+        const size = await done;
+        const buf = Buffer.concat(chunks);
+        expect(size).toBe(buf.length);
+        const offsets = names.map((n) => buf.indexOf(Buffer.from(n)));
+        expect(offsets.every((o) => o > -1)).toBe(true);
+        expect([...offsets].sort((a, b) => a - b)).toEqual(offsets);
+    });
 });

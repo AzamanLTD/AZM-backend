@@ -20,6 +20,30 @@ const yazl = require('yazl');
  * @returns {{stream: NodeJS.ReadableStream, done: Promise<number>}} `done`
  *          resolves with the archive byte length once the stream is consumed.
  */
+
+/**
+ * ZIP entries are read by other tools, which treat an absolute path or a `..`
+ * segment as an escape from the extraction directory ("zip slip"). Reject them
+ * here rather than emit an archive that can write outside where it is unpacked.
+ */
+function assertSafeEntryName(name) {
+    if (name.includes('\\')) {
+        const err = new Error(`Archive entry uses a backslash path: ${name}`);
+        err.code = 'EXPORT_ENTRY_UNSAFE';
+        throw err;
+    }
+    if (name.startsWith('/') || /^[A-Za-z]:/.test(name)) {
+        const err = new Error(`Archive entry is an absolute path: ${name}`);
+        err.code = 'EXPORT_ENTRY_UNSAFE';
+        throw err;
+    }
+    if (name.split('/').includes('..')) {
+        const err = new Error(`Archive entry escapes its directory: ${name}`);
+        err.code = 'EXPORT_ENTRY_UNSAFE';
+        throw err;
+    }
+}
+
 function buildZipStream(entries = []) {
     if (!Array.isArray(entries) || entries.length === 0) {
         const err = new Error('An export archive needs at least one entry.');
@@ -31,7 +55,7 @@ function buildZipStream(entries = []) {
     const seen = new Set();
 
     for (const entry of entries) {
-        const name = String((entry && entry.name) || '').replace(/^\/+/, '');
+        const name = String((entry && entry.name) || '');
         if (!name) {
             const err = new Error('Every archive entry needs a name.');
             err.code = 'EXPORT_ENTRY_INVALID';
@@ -44,6 +68,7 @@ function buildZipStream(entries = []) {
             err.code = 'EXPORT_ENTRY_DUPLICATE';
             throw err;
         }
+        assertSafeEntryName(name);
         seen.add(name);
 
         const raw = entry.data === undefined || entry.data === null ? '' : entry.data;
@@ -58,7 +83,14 @@ function buildZipStream(entries = []) {
         zip.outputStream.on('data', (chunk) => { bytes += chunk.length; });
         zip.outputStream.on('end', () => resolve(bytes));
         zip.outputStream.on('error', reject);
+        // The response can be torn down mid-flight (client disconnect, socket
+        // error). Settle instead of hanging, and never surface it as an
+        // unhandled rejection: the caller decides what a broken pipe means.
+        zip.outputStream.on('close', () => resolve(bytes));
     });
+    // Mark as handled so a rejected `done` cannot crash the process when the
+    // caller is not awaiting it (the route streams and returns).
+    done.catch(() => {});
 
     return { stream: zip.outputStream, done };
 }
