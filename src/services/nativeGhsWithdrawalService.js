@@ -34,7 +34,8 @@ const fiatLiquidity = require('./fiatLiquidityService');
 const quotes = require('./transactionQuoteService');
 const { recordReconciliationException } = require('../../services/reconciliationExceptionService');
 const { persistPayoutOwnership } = require('../../services/payoutProviderOwnership');
-const { QUOTE_PURPOSE } = require('./ghsFundingPlanner');
+const { QUOTE_PURPOSE, QUOTE_IDENTITY_KIND } = require('./ghsFundingPlanner');
+const { destinationIdentityOf, payoutIntentDigest } = require('./payoutIntent');
 
 const SETTLEMENT_CURRENCY = 'GHS_NATIVE';
 const DISPATCH_PROVIDER = 'MOOLRE_DISBURSEMENT';
@@ -176,6 +177,40 @@ async function processNativeGhsWithdrawal(prisma, userId, args, opts = {}) {
         purpose: QUOTE_PURPOSE,
       });
       const shortfallGhs = new Prisma.Decimal(consumed.amountGhs);
+
+      // §P1-2 THE QUOTE MUST NAME THIS PAYOUT. The quote's identity carries a
+      // digest of the intent it was minted for (rail, exact recipient amount,
+      // fee, payee identity). A quote minted for a different rail, payee or
+      // amount is refused HERE, before any money moves — and because the
+      // refusal throws inside the transaction, the CAS consumption is rolled
+      // back and the customer's quote is not burned by an attempt that was
+      // never theirs to spend.
+      const quoteIntentDigest = payoutIntentDigest({
+        rail: destinationType,
+        recipientGhs,
+        feeGhs,
+        destinationIdentity: destinationIdentityOf({
+          destinationType,
+          destination,
+          destinationSnapshot,
+          beneficiaryId,
+        }),
+      });
+      const expectedPrefix =
+        `${QUOTE_IDENTITY_KIND}:${userId}:${shortfallGhs.toFixed(2).replace('.', '')}:${quoteIntentDigest}:`;
+      if (!String(consumed.quoteIdentity || '').startsWith(expectedPrefix)) {
+        throw new NativeGhsWithdrawalError(
+          'This funding quote was issued for a different payout. Nothing was converted — request a quote for this payout and try again.',
+          'NATIVE_GHS_QUOTE_INTENT_MISMATCH',
+          {
+            quoteId: String(quoteId),
+            quoteIntentDigest: String(consumed.quoteIdentity || '').split(':')[3] || null,
+            payoutIntentDigest: quoteIntentDigest,
+            quotedShortfallGhs: shortfallGhs.toFixed(2),
+            requestedRecipientGhs: recipientGhs.toFixed(2),
+          }
+        );
+      }
 
       // §5.3 RECOMPUTE INSIDE THE AUTHORITATIVE TRANSACTION. The quote is a
       // snapshot of a shortfall that may no longer exist (the customer can

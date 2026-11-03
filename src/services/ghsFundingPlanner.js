@@ -15,6 +15,7 @@
 
 const { Prisma } = require('@prisma/client');
 const quotes = require('./transactionQuoteService');
+const { destinationIdentityOf, payoutIntentDigest } = require('./payoutIntent');
 
 // The persisted TransactionQuote.purpose CHECK constraint is a closed set
 // ('deposit','usdc_purchase','withdrawal','local_wallet','savings_deposit',
@@ -108,8 +109,14 @@ function planGhsPayoutFunding({ amountGhs, feeGhs = 0, availableNativeGhs = 0 })
  * authority (fresh-rate gated, owner-scoped, expiring, one-time). The quote's
  * usdcAmount is EXACTLY the USDC the customer pays for `shortfallGhs`.
  */
-async function quoteGhsShortfall({ prisma, marketOracle, userId, shortfallGhs, ttlSeconds = undefined, now = new Date() }) {
+async function quoteGhsShortfall({ prisma, marketOracle, userId, shortfallGhs, intent, ttlSeconds = undefined, now = new Date() }) {
   const shortfall = toExactPesewa(shortfallGhs, 'shortfallGhs');
+  // §P1-2 A CONSENT NAMES ITS PAYOUT. Without an intent this quote would be a
+  // promise to fund *some* payout with this shortfall; refuse to mint one.
+  if (!intent || !intent.rail || intent.recipientGhs === undefined || intent.recipientGhs === null) {
+    throw new Error('quoteGhsShortfall requires the payout intent (rail, recipientGhs, destinationIdentity) it funds');
+  }
+  const intentDigest = payoutIntentDigest(intent);
   const quote = await quotes.createServerTransactionQuote({
     prisma,
     marketOracle,
@@ -129,7 +136,10 @@ async function quoteGhsShortfall({ prisma, marketOracle, userId, shortfallGhs, t
     },
     // §P.5-C identity is an opaque STRING token ([A-Za-z0-9_-:], 8-200).
     // It names the funding intent, not the economics (the quote carries those).
-    quoteIdentity: `${QUOTE_IDENTITY_KIND}:${userId}:${shortfall.toFixed(2).replace('.', '')}:${new Date(now).getTime()}`,
+    // The token carries the intent digest. Mint and consume both derive it with
+    // payoutIntent.destinationIdentityOf/payoutIntentDigest, so "the payout this
+    // quote funds" is a checkable fact rather than a convention.
+    quoteIdentity: `${QUOTE_IDENTITY_KIND}:${userId}:${shortfall.toFixed(2).replace('.', '')}:${intentDigest}:${new Date(now).getTime()}`,
   });
   // §5.4 DISCLOSURE: the quote's stored USDC amount is an exact 12dp quotient
   // (theoretical). The USDC liability authority debits 8dp. The number the
@@ -151,6 +161,13 @@ async function quoteGhsShortfall({ prisma, marketOracle, userId, shortfallGhs, t
     rateAsOf: quote.rateAsOf,
     rateSource: quote.rateSource,
     expiresAt: quote.expiresAt,
+    intent: {
+      rail: String(intent.rail || 'MOMO').toUpperCase(),
+      recipientGhs: new Prisma.Decimal(intent.recipientGhs).toFixed(2),
+      feeGhs: new Prisma.Decimal(intent.feeGhs ?? 0).toFixed(2),
+      destinationIdentity: intent.destinationIdentity ?? null,
+      digest: intentDigest,
+    },
     consentRequired: true,
   };
 }
@@ -161,6 +178,8 @@ module.exports = {
   QUOTE_IDENTITY_KIND,
   GhsFundingPlannerError,
   toExactPesewa,
+  destinationIdentityOf,
+  payoutIntentDigest,
   planGhsPayoutFunding,
   quoteGhsShortfall,
 };

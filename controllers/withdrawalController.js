@@ -1817,6 +1817,7 @@ const _ghsErrorStatus = (code) => {
             return 400;
         case 'GHS_INSUFFICIENT_BALANCE':
         case 'USDC_INSUFFICIENT_BALANCE':
+        case 'NATIVE_GHS_QUOTE_INTENT_MISMATCH':
         case 'NATIVE_GHS_QUOTE_INVALID':
             return 409;
         case 'BANK_FEE_POLICY_UNEVIDENCED':
@@ -1869,11 +1870,41 @@ exports.ghsFundingPlan = async (req, res) => {
         }
         // Executable quote through the ONE canonical authority. Fail closed if
         // no fresh canonical rate exists — never a display/fallback rate.
+        // §P1-2 the quote is minted for THIS payout, not for "a payout needing
+        // this shortfall". Declaring the destination in the preview body binds
+        // the consent to a payee; omitting it keeps the quote amount-only, and
+        // it then cannot be spent on a payout that names one.
+        const declaredRail = String(req.body.destinationType || 'MOMO').toUpperCase();
+        // Resolve the payee exactly as the payout route will, so a quote taken
+        // against a SAVED account is bound to the number that will be paid
+        // (not to the saved-account id, which never reaches the payout).
+        let declaredDestination = req.body.destination ?? null;
+        if (req.body.savedAccountId) {
+            const resolved = await _resolveGhsDestination(prisma, req.user.id, {
+                destination: req.body.destination,
+                savedAccountId: req.body.savedAccountId,
+            });
+            if (!resolved.ok) {
+                return res.status(resolved.status).json(resolved.body);
+            }
+            declaredDestination = resolved.destination;
+        }
         const quote = await ghsFundingPlanner.quoteGhsShortfall({
             prisma,
             marketOracle: req.app.get('marketOracle'),
             userId: req.user.id,
             shortfallGhs: plan.shortfallGhs,
+            intent: {
+                rail: declaredRail,
+                recipientGhs: plan.recipientGhs,
+                feeGhs: plan.feeGhs,
+                destinationIdentity: ghsFundingPlanner.destinationIdentityOf({
+                    destinationType: declaredRail,
+                    destination: declaredDestination,
+                    destinationSnapshot: req.body.destinationSnapshot ?? null,
+                    beneficiaryId: req.body.beneficiaryId ?? null,
+                }),
+            },
         });
         return res.status(200).json({ success: true, plan, quote, usdcBalanceExact: new Prisma.Decimal(user?.availableBalance ?? 0).toFixed(8) });
     } catch (error) {
