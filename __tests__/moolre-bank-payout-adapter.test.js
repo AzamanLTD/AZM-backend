@@ -514,12 +514,21 @@ describe('D. transfer initiation', () => {
         expect(out.providerStatusRaw).toBe('7');
     });
 
-    test('a pending nested status stays pending', async () => {
+    test('an unproven nested status is an unresolved observation that keeps every provider fact', async () => {
         const transfer = JSON.parse(JSON.stringify(acceptedTransfer));
         transfer.data.txstatus = 0;
         const out = await service(fakeHttp({ transfer: { status: 200, data: transfer } }))
             .initiateBankTransfer({ ...baseInitiation });
-        expect(out.status).toBe('PENDING');
+
+        // 0 has no published meaning for a transfer response, so it may be
+        // reported neither as success nor as failure.
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.reason).toBe('STATUS_SEMANTICS_UNPROVEN');
+        expect(out.providerStatusRaw).toBe('0');
+        expect(out.externalId).toBe(REF);
+        expect(out.providerRef).toBe('32759150');
+        expect(out.amountGhsExact).toBe('25.50');
+        expect(out.fees).toEqual({ amountFee: '1.01', networkFee: '0.00', fee: '0.01' });
     });
 });
 
@@ -602,12 +611,84 @@ describe('F. transfer status', () => {
         expect(call.cfg.headers['X-API-USER']).toBe('api-user');
     });
 
-    test.each([[0, 'PENDING'], [1, 'SUCCESSFUL'], [2, 'FAILED']])('maps txstatus %s to %s', async (raw, expected) => {
+    test.each([[1, 'SUCCESSFUL'], ['1', 'SUCCESSFUL']])(
+        'maps the one documented success value %p to %s',
+        async (raw, expected) => {
+            const body = JSON.parse(JSON.stringify(statusBody));
+            body.data.txstatus = raw;
+            const out = await service(fakeHttp({ status: { status: 200, data: body } }))
+                .getBankTransferStatus({ referenceId: REF });
+            expect(out.status).toBe(expected);
+            expect(out.providerStatusRaw).toBe('1');
+        },
+    );
+
+    // The 0/1/2 triple is a List Transactions FILTER vocabulary. Reusing it as a
+    // transfer-status mapping would turn an unproven value into a refund order.
+    test.each([[0], ['0'], [2], ['2'], [3], ['9']])(
+        'txstatus %p has no published transfer meaning and stays UNRESOLVED',
+        async (raw) => {
+            const body = JSON.parse(JSON.stringify(statusBody));
+            body.data.txstatus = raw;
+            const out = await service(fakeHttp({ status: { status: 200, data: body } }))
+                .getBankTransferStatus({ referenceId: REF });
+            expect(out.status).toBe('UNRESOLVED');
+            expect(out.reason).toBe('STATUS_UNRECOGNISED');
+            expect(out.providerStatusRaw).toBe(String(raw));
+            expect(['PENDING', 'FAILED']).not.toContain(out.status);
+        },
+    );
+
+    test('no status path can ever produce PENDING or FAILED', async () => {
+        for (const raw of [0, '0', 1, '1', 2, '2', 7, 'unexpected', null, undefined, '']) {
+            const body = JSON.parse(JSON.stringify(statusBody));
+            if (raw === null || raw === undefined || raw === '') {
+                delete body.data.txstatus;
+            } else {
+                body.data.txstatus = raw;
+            }
+            const out = await service(fakeHttp({ status: { status: 200, data: body } }))
+                .getBankTransferStatus({ referenceId: REF });
+            expect(['SUCCESSFUL', 'UNRESOLVED']).toContain(out.status);
+        }
+    });
+
+    test('a numeric provider amount is rejected rather than laundered into evidence', async () => {
         const body = JSON.parse(JSON.stringify(statusBody));
-        body.data.txstatus = raw;
+        body.data.amount = 25.5;
         const out = await service(fakeHttp({ status: { status: 200, data: body } }))
             .getBankTransferStatus({ referenceId: REF });
-        expect(out.status).toBe(expected);
+        expect(out.status).toBe('SUCCESSFUL');
+        expect(out.amountGhsExact).toBeNull();
+    });
+
+    test('malformed and overprecision provider amounts are not fabricated', async () => {
+        for (const bad of ['25.505', '1e3', '2,5.00', '-1.00', 'abc', true, {}, []]) {
+            const body = JSON.parse(JSON.stringify(statusBody));
+            body.data.amount = bad;
+            const out = await service(fakeHttp({ status: { status: 200, data: body } }))
+                .getBankTransferStatus({ referenceId: REF });
+            expect(out.amountGhsExact).toBeNull();
+        }
+    });
+
+    test('surrounding transport whitespace is trimmed, not turned into a different number', async () => {
+        const body = JSON.parse(JSON.stringify(statusBody));
+        body.data.amount = ' 25.50 ';
+        const out = await service(fakeHttp({ status: { status: 200, data: body } }))
+            .getBankTransferStatus({ referenceId: REF });
+        expect(out.amountGhsExact).toBe('25.50');
+    });
+
+    test('fees stay separate exact strings and are never summed or filled in', async () => {
+        const body = JSON.parse(JSON.stringify(statusBody));
+        body.data.amountfee = 1.01;
+        body.data.networkfee = null;
+        delete body.data.fee;
+        const out = await service(fakeHttp({ status: { status: 200, data: body } }))
+            .getBankTransferStatus({ referenceId: REF });
+        expect(out.amountGhsExact).toBe('25.50');
+        expect(out).not.toHaveProperty('fees');
     });
 
     test('retains externalref, transactionid, thirdpartyref and amount evidence', async () => {
@@ -747,5 +828,54 @@ describe('G. configuration gate', () => {
         expect(svc.describe()).toMatchObject({ mode: 'production', baseUrlHost: 'api.moolre.com' });
         await svc.listBanks();
         expect(http.calls[0].url.startsWith('https://api.moolre.com/')).toBe(true);
+    });
+});
+
+// ── I. capabilities() preflight contract ────────────────────────────────────
+describe('I. capabilities() preflight contract', () => {
+    test('exposes the agreed shape and nothing secret', () => {
+        const c = service(fakeHttp()).capabilities();
+        expect(Object.keys(c).sort()).toEqual([
+            'bankPayoutEnabled',
+            'canInitiateBankPayout',
+            'credentialsPresent',
+            'host',
+            'hostAllowed',
+            'mode',
+            'providerIoEnabled',
+            'sourceAccountConfigured',
+        ]);
+        expect(c).toMatchObject({
+            providerIoEnabled: true,
+            bankPayoutEnabled: true,
+            credentialsPresent: true,
+            sourceAccountConfigured: true,
+            hostAllowed: true,
+            canInitiateBankPayout: true,
+            mode: 'sandbox',
+        });
+        const serialised = JSON.stringify(c);
+        expect(serialised).not.toContain('api-key');
+        expect(serialised).not.toContain('100000100002');
+    });
+
+    test('the capability boolean is the only thing a consumer may gate on', async () => {
+        for (const override of [
+            { providerMode: 'MOCK' },
+            { providerMode: '' },
+            { bankPayoutEnabled: false },
+            { apiKey: '' },
+            { accountNumber: '' },
+            { baseUrl: 'https://not-moolre.example.com' },
+        ]) {
+            const http = fakeHttp();
+            const svc = service(http, override);
+            expect(svc.capabilities().canInitiateBankPayout).toBe(false);
+            await expect(svc.initiateBankTransfer({ ...baseInitiation })).rejects.toMatchObject({
+                outcome: 'NOT_DISPATCHED',
+                dispatchProven: true,
+            });
+            expect(http.transfers()).toHaveLength(0);
+        }
     });
 });

@@ -83,12 +83,62 @@ From the transfer envelope `data`: `txstatus`, `transactionid`,
   `reason: EXTERNAL_REFERENCE_MISMATCH` — a contradiction, never a silent swap.
 - `providerRef` is `transactionid`, else `thirdpartyref`, else `null`.
 
-Status mapping of `data.txstatus`: `0` → `PENDING`, `1` → `SUCCESSFUL`,
-`2` → `FAILED`, anything else (including missing) → `UNRESOLVED`. A missing
+Status mapping of `data.txstatus` — see section 3.1, which is deliberately
+narrower than the obvious 0/1/2 table. Only `1` → `SUCCESSFUL` is published
+and mapped; every other value, including `0` and `2`, is `UNRESOLVED`. A missing
 status is never reported as pending.
 
 The outer envelope `status` is **not** proof of settlement. Agent A's
 reconciliation authority decides terminality.
+
+### 3.1 Why `0` and `2` are NOT mapped to PENDING and FAILED
+
+The Transfer Status reference documents exactly one successful response, with
+`data.txstatus: 1`. It does not publish a mapping table for the other values.
+
+The `0 / 1 / 2` triple does appear in the List Transactions reference, but there
+it is the vocabulary of a **filter** parameter. Filter values and a status
+response field are different contracts, and the List Transactions page does not
+establish that they mean the same thing about a bank transfer.
+
+The consequence is not cosmetic. If the adapter reported `FAILED` for an
+unproven value, the financial authority could release a reversal (refund GHS to
+the customer) for a payout that Moolre had already delivered to the recipient.
+Reporting `SUCCESSFUL` for an unproven value is the mirror-image error. So the
+adapter maps only the value whose meaning is published, returns `UNRESOLVED`
+with `providerStatusRaw` preserved for everything else, and never invents a
+terminal state in either direction.
+
+To widen the mapping, we need written confirmation from Moolre (or a provider
+contract document) stating what each `data.txstatus` value means for a bank
+transfer, and whether an outer envelope code such as `SS01` is also required to
+treat the result as final. Until then `PENDING` and `FAILED` are never returned
+by this adapter.
+
+Four separate facts stay separate and must not be conflated: the HTTP status,
+the outer `{status, code, message}` envelope, the nested `data.txstatus`, and
+actual customer settlement (which this adapter never asserts).
+
+### 3.2 Amount and fee evidence is string-only
+
+`data.amount`, `data.amountfee`, `data.networkfee` and `data.fee` are accepted
+only as decimal **strings** matching `^(0|[1-9][0-9]*)(\.[0-9]{1,2})?$`, with
+surrounding transport whitespace trimmed. A JSON number is rejected: it has
+already passed through binary floating point before the adapter sees it, so
+accepting one would launder a possibly-corrupted value into `amountGhsExact`,
+which Agent A uses as independent settlement evidence. Rejected evidence becomes
+`null`, never the caller's requested amount, and the three fees are reported
+separately and never summed.
+
+### 3.3 `capabilities()` is the preflight contract
+
+`capabilities()` returns `{ providerIoEnabled, bankPayoutEnabled,
+credentialsPresent, sourceAccountConfigured, host, hostAllowed,
+canInitiateBankPayout, mode }`. It exists, is configured, has the capability
+enabled, points at an allowed host and can actually execute only when
+`canInitiateBankPayout === true`; a consumer must treat that single boolean as
+the gate. `describe()` is the same data in response-shape form and exposes no
+credential and no account number.
 
 ## 4. Error contract
 
@@ -175,7 +225,10 @@ Documented and implemented: the bank directory, the channel-2 account-name
 enquiry, the transfer request shape and the transfer-status request shape.
 Unproven, and therefore not claimed:
 
-1. Whether Azaman's Moolre account has channel 2 bank payouts enabled. This is
+1. Whether Azaman's Moolre account has channel 2 bank payouts enabled.
+   *(Public documentation does not establish account-level enablement, and no
+   authorised non-production credential set is available in this workspace:
+   no `MOOLRE_*` environment variable is set, so no sandbox call was possible.)* This is
    an account-eligibility fact only Moolre can confirm; public documentation
    expressly separates service coverage and commercial eligibility from the API
    contract.
@@ -196,7 +249,11 @@ npx jest __tests__/r15g-moolre-status-contract.test.js \
          __tests__/r16b-moolre-only-topology.test.js       # MoMo regressions unchanged
 ```
 
-No sandbox transfer has been authorised, so none was attempted.
+No sandbox transfer has been authorised, so none was attempted — and none is
+needed to test a path: a transfer initiation is an external financial action even
+when framed as an experiment, so the endpoint family will be settled by written
+confirmation or by non-mutating directory/name-enquiry calls in a proven sandbox,
+never by trying both.
 
 ### What that evidence does and does not prove
 

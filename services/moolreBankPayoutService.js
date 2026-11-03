@@ -55,6 +55,11 @@ const ALLOWED_HOSTS = Object.freeze(['sandbox.moolre.com', 'api.moolre.com']);
 
 const BANK_CHANNEL = '2';
 const CURRENCY = 'GHS';
+
+// The ONLY transfer-status value with published meaning: the Transfer Status
+// reference's successful example. 0 and 2 are deliberately absent - see
+// _mapStatus() and docs/MOOLRE_BANK_PAYOUT_CONTRACT.md section 4.
+const VERIFIED_SUCCESS_STATUS = '1';
 const PROVIDER = 'MOOLRE';
 const PROVIDER_RAIL = 'MOOLRE_DISBURSEMENT';
 
@@ -667,13 +672,13 @@ class MoolreBankPayoutService {
             return this._unresolved(referenceId, { reason: 'EXTERNAL_REFERENCE_MISMATCH', providerCode });
         }
 
-        return {
+        const mapped = this._mapStatus(nestedRaw);
+        const observation = {
             provider: PROVIDER_RAIL,
             rail: 'BANK',
             referenceId,
             externalId: echoedRef,
             providerRef: this._providerRef(data),
-            status: this._mapStatus(nestedRaw),
             amountGhsExact: this._exactString(data.amount),
             currency: CURRENCY,
             fees: {
@@ -683,6 +688,19 @@ class MoolreBankPayoutService {
             },
             providerStatusRaw: nestedRaw,
         };
+
+        if (mapped === 'UNRESOLVED') {
+            // Moolre accepted something, but the status value has no published
+            // meaning, so this is an unresolved observation with every provider
+            // fact retained. It is NOT a failure and must never be reversed.
+            return {
+                ...observation,
+                status: 'UNRESOLVED',
+                reason: 'STATUS_SEMANTICS_UNPROVEN',
+            };
+        }
+
+        return { ...observation, status: mapped };
     }
 
     _pickAlias(input, canonical, alias, referenceId, { optional = false } = {}) {
@@ -727,17 +745,41 @@ class MoolreBankPayoutService {
         return null;
     }
 
+    /**
+     * Provider money evidence, strict by construction.
+     *
+     * Moolre documents amounts as decimal STRINGS. A JSON number has already
+     * been through binary floating point before this function sees it, so
+     * accepting one would launder a possibly-corrupted value into "exact
+     * provider evidence". Numbers are therefore rejected outright and the
+     * provider fact is reported as missing, never fabricated.
+     */
     _exactString(value) {
-        if (typeof value === 'string' && /^(0|[1-9][0-9]*)(\.[0-9]{1,2})?$/.test(value)) return value;
-        if (typeof value === 'number' && Number.isFinite(value)) return String(value);
-        return null;
+        if (typeof value !== 'string') return null;
+        const trimmed = value.trim();
+        if (!/^(0|[1-9][0-9]*)(\.[0-9]{1,2})?$/.test(trimmed)) return null;
+        return trimmed;
     }
 
+    /**
+     * Transfer status semantics - an EVIDENCE BOUNDARY, not a lookup table.
+     *
+     * The Transfer Status reference documents one successful response carrying
+     * data.txstatus = 1. It publishes no complete mapping for the other values.
+     * The 0/1/2 triple appears in the List Transactions reference as a FILTER
+     * vocabulary, which is not proof of the same meaning here.
+     *
+     * The distinction is load-bearing: calling an unproven value FAILED hands
+     * the financial authority a reversal instruction for a payout that may
+     * already have reached the recipient. Only the documented success value is
+     * mapped; everything else stays an unresolved observation with the raw
+     * value preserved, so no terminal state is invented in either direction.
+     */
     _mapStatus(raw) {
-        if (raw === '0') return 'PENDING';
-        if (raw === '1') return 'SUCCESSFUL';
-        if (raw === '2') return 'FAILED';
-        return 'UNRESOLVED'; // never default a missing status to PENDING
+        if (raw === undefined || raw === null) return 'UNRESOLVED';
+        const value = typeof raw === 'number' ? String(raw) : raw;
+        if (value === VERIFIED_SUCCESS_STATUS) return 'SUCCESSFUL';
+        return 'UNRESOLVED';
     }
 
     // ── transfer status ─────────────────────────────────────────────────────
