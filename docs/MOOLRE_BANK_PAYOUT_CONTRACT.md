@@ -3,7 +3,18 @@
 **Status:** provider adapter only. Not wired into `server.js`, no route, no
 controller, no ledger, no beneficiary storage, no reconciliation ownership.
 **Evidence state:** fixture-tested. No sandbox call has been made with Azaman
-credentials and no live payout has ever been attempted.
+credentials and no live payout has ever been attempted. Fixture tests are not a
+CI run: see §10.
+
+**What is documented for channel 2.** Bank name enquiry is a published channel-2
+capability, not a missing API. The per-endpoint reference documents
+`POST /open/transact/validate` for it, with `type: 1`, `channel: "2"`,
+`currency: "GHS"`, `receiver` = account number, `sublistid` = bank code,
+`accountnumber` = Moolre source account, and returns the account holder name in
+`data` as a string (`AVD01` success, `AVD02` account not found). This adapter
+implements that enquiry against the documented fields. The open questions are
+which endpoint family is live (§1.1) and whether Azaman's account is enabled for
+channel 2 (§9) — not whether Moolre can validate a bank account.
 
 Retrieved **2026-11-03** from `docs.moolre.com`.
 
@@ -160,9 +171,17 @@ number.
 
 ## 9. Still unproven (do not claim otherwise)
 
-1. Whether Azaman's Moolre account has channel 2 bank payouts enabled.
+Documented and implemented: the bank directory, the channel-2 account-name
+enquiry, the transfer request shape and the transfer-status request shape.
+Unproven, and therefore not claimed:
+
+1. Whether Azaman's Moolre account has channel 2 bank payouts enabled. This is
+   an account-eligibility fact only Moolre can confirm; public documentation
+   expressly separates service coverage and commercial eligibility from the API
+   contract.
 2. Which endpoint family is live: `/transfer`+`/validate` or
-   `/initiate`+`/validate-name`.
+   `/initiate`+`/validate-name`. The integration blocker is this path question,
+   not the existence of a validation API.
 3. Bank coverage, per-transaction limits, fees and their payer, and settlement
    finality/SLA.
 4. Duplicate-reference and refusal code semantics.
@@ -178,3 +197,18 @@ npx jest __tests__/r15g-moolre-status-contract.test.js \
 ```
 
 No sandbox transfer has been authorised, so none was attempted.
+
+### What that evidence does and does not prove
+
+These are local fixture runs with an injected fake HTTP client. They prove the
+adapter's classification, gating and mapping logic; they do **not** prove the
+provider contract, and they are **not** a CI test run.
+
+On head `9238f02` the `Azaman Test Suite` workflow ran checkout, setup-node and
+`npm ci` successfully, then failed at `npm audit --omit=dev --audit-level=low`
+(29 vulnerabilities: 4 low, 21 moderate, 4 high). Prisma validation, database
+setup and `Run tests` were never reached, so **no provider test has run in CI**.
+The audit gate is deliberately left as it is; remediation belongs to the
+dependency chain (#384), and no suppression or exemption was added here. A full
+CI test run on the final head is still required before this adapter is treated
+as verified.
