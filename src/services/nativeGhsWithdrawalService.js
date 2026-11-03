@@ -124,6 +124,33 @@ function toExactPesewa(value, field = 'amountGhs') {
  * liquidity claim → FinancialOperation claim (COMMITTED before any provider
  * I/O). Any throw rolls back every part.
  */
+/**
+ * §P1-4 THE ACCEPTANCE SNAPSHOT IS EVIDENCE, AND EVIDENCE IS SERVER-OWNED.
+ *
+ * A MoMo payout used to record nothing but the string the request carried: the
+ * confirmation screen, the reconciliation surface and a dispute could not agree
+ * on which number had been accepted, and nothing stated whether the payee name
+ * had ever been checked by anyone. Verified and unverified were
+ * indistinguishable, because neither was written down.
+ *
+ * This builds the record from server-side facts only. accountNameVerified is
+ * false with an explicit reason because this rail performs no name lookup at
+ * acceptance — the field states what happened, not what we wish had happened.
+ */
+function buildMomoDestinationSnapshot({ destination, network = null, capturedAt = new Date() } = {}) {
+  const digits = String(destination ?? '').replace(/\D/g, '');
+  const masked = digits.length >= 4 ? `${'*'.repeat(digits.length - 4)}${digits.slice(-4)}` : '****';
+  return {
+    destinationType: 'MOMO',
+    network: network || null,
+    destinationMasked: masked,
+    destinationDigits: digits.length, // length only: enough to spot a truncated number
+    accountNameVerified: false,
+    verification: 'NOT_LOOKED_UP',
+    capturedAt: new Date(capturedAt).toISOString(),
+  };
+}
+
 async function processNativeGhsWithdrawal(prisma, userId, args, opts = {}) {
   const {
     amountGhs,
@@ -376,10 +403,15 @@ async function processNativeGhsWithdrawal(prisma, userId, args, opts = {}) {
     // was already promised to the account shown on the confirmation screen.
     // The fingerprint is an HMAC, never the plaintext account number.
     if (destinationSnapshot) {
+      // §P1-4 the key names the RAIL the evidence came from. Calling a MoMo
+      // snapshot a "bankDestinationSnapshot" is the same class of lie as
+      // claiming an unverified name was verified: a later reader believes the
+      // label instead of the payload.
+      const snapshotKey = destinationType === 'BANK' ? 'bankDestinationSnapshot' : 'momoDestinationSnapshot';
       await tx.$executeRawUnsafe(
         'UPDATE "TransactionHistory" SET "metadata" = COALESCE("metadata", \'{}\'::jsonb) || jsonb_build_object($2::text, $3::jsonb) WHERE "txHash" = $1',
         reference,
-        'bankDestinationSnapshot',
+        snapshotKey,
         JSON.stringify(destinationSnapshot)
       );
     }
@@ -1247,6 +1279,7 @@ async function reconcileNativeGhsWithdrawals(prisma, { since, take = 500 } = {})
 }
 
 module.exports = {
+  buildMomoDestinationSnapshot,
   SETTLEMENT_CURRENCY,
   DISPATCH_PROVIDER,
   DISPATCH_RAIL,

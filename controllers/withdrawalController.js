@@ -1898,11 +1898,13 @@ exports.ghsFundingPlan = async (req, res) => {
                 rail: declaredRail,
                 recipientGhs: plan.recipientGhs,
                 feeGhs: plan.feeGhs,
+                // §P1-4 EVIDENCE IS SERVER-OWNED. A client-supplied
+                // destinationSnapshot or beneficiaryId is not read here: a
+                // caller could then bind a quote to a payee fingerprint it
+                // asserted rather than one the server resolved.
                 destinationIdentity: ghsFundingPlanner.destinationIdentityOf({
                     destinationType: declaredRail,
                     destination: declaredDestination,
-                    destinationSnapshot: req.body.destinationSnapshot ?? null,
-                    beneficiaryId: req.body.beneficiaryId ?? null,
                 }),
             },
         });
@@ -1978,6 +1980,15 @@ exports.ghsWithdrawal = async (req, res) => {
                 network,
                 reference,
                 quoteId: req.body.quoteId || null,
+                // §P1-4 the accepted destination is recorded as evidence, built
+                // here from server-side facts. req.body.destinationSnapshot is
+                // deliberately NOT read: a payout must never be described by a
+                // snapshot the payer wrote.
+                destinationType: 'MOMO',
+                destinationSnapshot: nativeGhsWithdrawalService.buildMomoDestinationSnapshot({
+                    destination: target.destination,
+                    network,
+                }),
             },
             {
                 commitOperationClaimInTransaction: async (tx, f) => {
@@ -2001,6 +2012,13 @@ exports.ghsWithdrawal = async (req, res) => {
                             nativeGhsBalance: f.nativeGhsBalanceExact,
                             network: network || null,
                             destination: target.destination,
+                            destinationEvidence: {
+                                masked: nativeGhsWithdrawalService.buildMomoDestinationSnapshot({
+                                    destination: target.destination, network,
+                                }).destinationMasked,
+                                accountNameVerified: false,
+                                note: 'Mobile money payouts are not name-checked at acceptance; the masked number above is what was accepted.',
+                            },
                         },
                     };
                     const operation = res.locals?.financialOperation || null;
