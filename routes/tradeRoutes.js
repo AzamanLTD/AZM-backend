@@ -16,6 +16,7 @@ const { protectActive }   = require('../middleware/banGuardMiddleware');
 const { idempotency }       = require('../middleware/idempotency');
 const { require2FA }    = require('../middleware/require2FA');
 const upload              = require('../middleware/uploadMiddleware');
+const { requireKyc } = require('../middleware/requireKyc');
 
 const {
     initiateTrade,
@@ -46,7 +47,7 @@ router.get('/:id',     protect, getTradeDetails);
 // controller's explicit pre-economics guards mark the claim releasable
 // (res.locals.financialClaimRelease), and those provably run before the
 // economic transaction.
-router.post('/initiate', protectActive, require2FA(), idempotency(), initiateTrade);
+router.post('/initiate', protectActive, requireKyc('trade'), require2FA(), idempotency(), initiateTrade);
 
 // ── Vendor approval actions ──────────────────────────────────────────────────
 router.post('/accept',  protectActive, idempotency(), acceptTrade);
