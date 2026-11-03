@@ -33,6 +33,7 @@ const nativeGhsWallet = require('./nativeGhsWalletService');
 const fiatLiquidity = require('./fiatLiquidityService');
 const quotes = require('./transactionQuoteService');
 const { recordReconciliationException } = require('../../services/reconciliationExceptionService');
+const { persistPayoutOwnership } = require('../../services/payoutProviderOwnership');
 const { QUOTE_PURPOSE } = require('./ghsFundingPlanner');
 
 const SETTLEMENT_CURRENCY = 'GHS_NATIVE';
@@ -279,7 +280,7 @@ async function processNativeGhsWithdrawal(prisma, userId, args, opts = {}) {
       metadata: {
         settlementCurrency: SETTLEMENT_CURRENCY,
         provider: DISPATCH_PROVIDER,
-        rail: DISPATCH_RAIL,
+        rail: destinationType === 'BANK' ? 'BANK' : DISPATCH_RAIL,
         funding: funding ? funding.mode : 'GHS_ONLY',
       },
     });
@@ -303,7 +304,7 @@ async function processNativeGhsWithdrawal(prisma, userId, args, opts = {}) {
           totalDebitGhs: totalDebitGhs.toFixed(2),
           feePolicy,
           provider: DISPATCH_PROVIDER,
-          rail: DISPATCH_RAIL,
+          rail: destinationType === 'BANK' ? 'BANK' : DISPATCH_RAIL,
           network,
           destination,
           funding,
@@ -550,6 +551,205 @@ async function parkUncertainDispatch(prisma, { reference, outcome, error, rail =
   return { parked: true, outcome };
 }
 
+
+// ── BANK dispatch observation decision (issue #389 P0-1) ────────────────────
+// A resolved promise from initiateBankTransfer is NOT a provider acceptance.
+// Agent B returns status:'UNRESOLVED' for timeouts, duplicate references and
+// every malformed/inconclusive answer; it returns PENDING/SUCCESSFUL/FAILED
+// only when the provider answered something it could parse. The decision below
+// is therefore about the OBSERVATION, not about whether the HTTP call returned.
+const BANK_PROVIDER_CANONICAL = 'MOOLRE_DISBURSEMENT';
+const BANK_PAYOUT_FAILOVER_TAG = 'moolre';
+const BANK_RAIL = 'BANK';
+const BANK_OBSERVATION_STATUSES = new Set(['PENDING', 'SUCCESSFUL', 'FAILED', 'UNRESOLVED']);
+const BANK_TERMINAL_OBSERVATIONS = new Set(['SUCCESSFUL', 'FAILED']);
+
+function _sameExactGhs(a, b) {
+  if (a == null || b == null) return false;
+  try {
+    return new Prisma.Decimal(String(a)).equals(new Prisma.Decimal(String(b)));
+  } catch (err) {
+    return false;
+  }
+}
+
+/**
+ * Decide what a returned bank-dispatch observation authorises.
+ *
+ * Returns { decision, reason, providerRef, externalId, amountGhsExact,
+ *           observation } where decision is one of:
+ *   ACCEPTED   — the provider holds the payout and reported it as in flight.
+ *                Only this decision may move the reservation to IN_TRANSIT.
+ *   UNRESOLVED — the provider may or may not hold the payout. Funds held, the
+ *                ORIGINAL reference retained, reconciliation against that same
+ *                reference. Never reported as a successful dispatch.
+ *   PARKED     — contradictory or incomplete identity/reference/amount, or a
+ *                terminal status returned at initiation. Nothing is settled or
+ *                refunded here; the observation is retained and the established
+ *                reconciliation authority decides after exact evidence binding.
+ *
+ * The caller's requested amount is NEVER substituted for a missing provider
+ * amount, and a different echoed reference is NEVER adopted.
+ */
+function evaluateBankDispatchObservation(outbound, { reference, amountGhsExact }) {
+  if (!outbound || typeof outbound !== 'object') {
+    return { decision: 'PARKED', reason: 'DISPATCH_OBSERVATION_MISSING' };
+  }
+  const status = typeof outbound.status === 'string' ? outbound.status.toUpperCase() : null;
+  if (!status || !BANK_OBSERVATION_STATUSES.has(status)) {
+    return { decision: 'PARKED', reason: 'DISPATCH_STATUS_UNRECOGNISED', observation: outbound, observedStatus: status };
+  }
+
+  // Provider identity. A named identity that is not the bank provider, or no
+  // identity at all, is not owner evidence — park rather than assume.
+  const observedProvider = outbound.provider ? String(outbound.provider).toUpperCase() : null;
+  if (!observedProvider) {
+    return { decision: 'PARKED', reason: 'DISPATCH_PROVIDER_IDENTITY_MISSING', observation: outbound, observedStatus: status };
+  }
+  if (observedProvider !== BANK_PROVIDER_CANONICAL) {
+    return {
+      decision: 'PARKED',
+      reason: 'DISPATCH_PROVIDER_IDENTITY_CONTRADICTION',
+      observation: outbound,
+      observedStatus: status,
+      observedProvider,
+    };
+  }
+
+  // Rail identity. The bank adapter reports rail:'BANK'; an UNRESOLVED answer
+  // still carries it, so a contradiction here is a real contradiction.
+  if (outbound.rail != null && String(outbound.rail).toUpperCase() !== BANK_RAIL) {
+    return {
+      decision: 'PARKED',
+      reason: 'DISPATCH_RAIL_CONTRADICTION',
+      observation: outbound,
+      observedStatus: status,
+      observedRail: String(outbound.rail),
+    };
+  }
+
+  // Echoed business reference. Never adopt a different reference silently.
+  if (outbound.referenceId != null && String(outbound.referenceId) !== String(reference)) {
+    return {
+      decision: 'PARKED',
+      reason: 'DISPATCH_REFERENCE_MISMATCH',
+      observation: outbound,
+      observedStatus: status,
+      observedReference: String(outbound.referenceId),
+    };
+  }
+
+  if (status === 'UNRESOLVED') {
+    return {
+      decision: 'UNRESOLVED',
+      reason: outbound.reason ? String(outbound.reason) : 'PROVIDER_OUTCOME_UNRESOLVED',
+      observation: outbound,
+      observedStatus: status,
+      providerCode: outbound.providerCode ?? null,
+    };
+  }
+
+  // Every non-UNRESOLVED observation must carry the exact payout amount. A
+  // missing amount is not "the amount we asked for" — it is missing evidence.
+  if (outbound.amountGhsExact == null || !_sameExactGhs(outbound.amountGhsExact, amountGhsExact)) {
+    return {
+      decision: 'PARKED',
+      reason: outbound.amountGhsExact == null
+        ? 'DISPATCH_AMOUNT_MISSING'
+        : 'DISPATCH_AMOUNT_MISMATCH',
+      observation: outbound,
+      observedStatus: status,
+      observedAmountGhs: outbound.amountGhsExact ?? null,
+      requestedAmountGhs: amountGhsExact,
+    };
+  }
+
+  if (BANK_TERMINAL_OBSERVATIONS.has(status)) {
+    // A terminal answer at initiation is real information but NOT a settlement
+    // authorisation: the canonical evidence binder plus the settlement
+    // authority own that decision, after the observation is durably bound.
+    return {
+      decision: 'PARKED',
+      reason: 'DISPATCH_TERMINAL_AT_INITIATION',
+      observation: outbound,
+      observedStatus: status,
+      providerRef: outbound.providerRef ?? null,
+      externalId: outbound.externalId ?? null,
+      amountGhsExact: outbound.amountGhsExact,
+    };
+  }
+
+  return {
+    decision: 'ACCEPTED',
+    reason: 'PROVIDER_ACCEPTED',
+    observation: outbound,
+    observedStatus: status,
+    providerRef: outbound.providerRef ?? null,
+    externalId: outbound.externalId ?? null,
+    amountGhsExact: outbound.amountGhsExact,
+  };
+}
+
+/**
+ * Durable operator evidence for a bank dispatch that did NOT produce an
+ * accepted payout. These reasons are deliberately NOT in the admin
+ * provably-not-dispatched set: the provider may hold the money, so the only
+ * safe operator action is escalation/reconciliation on the original reference.
+ */
+async function recordBankDispatchPark(prisma, {
+  reference, rowId, code, decision, observation, bank, amountGhsExact, extra = {},
+}) {
+  await prisma.$executeRawUnsafe(
+    'UPDATE "TransactionHistory" SET "metadata" = COALESCE("metadata", \'{}\'::jsonb) || jsonb_build_object($2::text, $3::jsonb) WHERE "id" = $1',
+    rowId,
+    'dispatchException',
+    JSON.stringify({
+      code,
+      decision,
+      rail: BANK_RAIL,
+      reference,
+      provider: BANK_PROVIDER_CANONICAL,
+      observedStatus: observation?.status ?? null,
+      providerRef: observation?.providerRef ?? null,
+      externalId: observation?.externalId ?? null,
+      observedAmountGhsExact: observation?.amountGhsExact ?? null,
+      requestedAmountGhsExact: amountGhsExact,
+      bankCode: bank?.bankCode ?? null,
+      at: new Date().toISOString(),
+      resolution: 'RECONCILE_ORIGINAL_REFERENCE',
+      providerDispatched: false,
+      refunded: false,
+      ...extra,
+    })
+  );
+  const mirror = await prisma.withdrawal.findFirst({
+    where: { transactionHistoryId: rowId },
+    select: { id: true },
+  });
+  if (mirror) {
+    await recordReconciliationException(prisma, {
+      entityType: 'WITHDRAWAL',
+      entityId: String(mirror.id),
+      reference,
+      reason: code,
+      details: {
+        phase: 'POST_DISPATCH_UNRESOLVED',
+        decision,
+        settlementCurrency: SETTLEMENT_CURRENCY,
+        rail: BANK_RAIL,
+        provider: BANK_PROVIDER_CANONICAL,
+        observedStatus: observation?.status ?? null,
+        providerRef: observation?.providerRef ?? null,
+        externalId: observation?.externalId ?? null,
+        observedAmountGhsExact: observation?.amountGhsExact ?? null,
+        requestedAmountGhsExact: amountGhsExact,
+        bankCode: bank?.bankCode ?? null,
+        ...extra,
+      },
+    });
+  }
+}
+
 /**
  * BANK payout dispatch through the INJECTED provider port (Agent B owns the
  * adapter; this module owns the state machine). Same single-winner claim,
@@ -703,11 +903,126 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
     logger.warn({ reference, outcome, err: err?.message }, '[nativeGhsWithdrawal] BANK dispatch outcome uncertain — funds held, no refund');
     return { dispatched: false, reason: 'PROVIDER_OUTCOME_UNCERTAIN', outcome, refunded: false, error: err.message };
   }
-  const providerRef = outbound?.providerRef || outbound?.transactionId || null;
+  // ── P0-1: the adapter's ANSWER decides, not the fact that it returned ────
+  const verdict = evaluateBankDispatchObservation(outbound, {
+    reference,
+    amountGhsExact: amount.toFixed(2),
+  });
+
+  if (verdict.decision !== 'ACCEPTED') {
+    const code = verdict.decision === 'UNRESOLVED'
+      ? 'PROVIDER_DISPATCH_UNRESOLVED'
+      : (verdict.reason === 'DISPATCH_TERMINAL_AT_INITIATION'
+        ? 'PROVIDER_TERMINAL_AT_INITIATION'
+        : 'DISPATCH_OBSERVATION_CONTRADICTION');
+    await recordBankDispatchPark(prisma, {
+      reference,
+      rowId: row.id,
+      code,
+      decision: verdict.decision,
+      observation: verdict.observation || null,
+      bank,
+      amountGhsExact: amount.toFixed(2),
+      extra: { reason: verdict.reason, providerCode: verdict.providerCode ?? null },
+    });
+    // The reservation deliberately STAYS reserved: the provider may hold the
+    // payout. Nothing here settles, refunds or claims an acceptance.
+    logger.warn(
+      { reference, decision: verdict.decision, reason: verdict.reason },
+      '[nativeGhsWithdrawal] BANK dispatch not accepted by the provider answer — funds held, original reference retained'
+    );
+    return {
+      dispatched: false,
+      reason: code,
+      decision: verdict.decision,
+      detail: verdict.reason,
+      providerRef: verdict.providerRef || null,
+      refunded: false,
+    };
+  }
+
+  const providerRef = verdict.providerRef || verdict.externalId || null;
+
+  // Durable dispatch observation FIRST (owner recovery reads it), then the
+  // canonical ownership write. Both use the repository's existing authorities.
+  try {
+    await fiatLiquidity.recordProviderEvent(prisma, {
+      provider: BANK_PROVIDER_CANONICAL,
+      rail: BANK_RAIL,
+      direction: 'OUTBOUND',
+      status: 'PENDING',
+      providerRef,
+      amountGhs: amount.toFixed(2),
+      dedupKey: `event:payout-dispatch:${BANK_PROVIDER_CANONICAL}:${reference}`,
+      relatedReference: reference,
+      raw: {
+        source: 'bank_dispatch_initiation',
+        externalId: verdict.externalId ?? null,
+        providerStatusRaw: outbound?.providerStatusRaw ?? null,
+        bankCode: bank?.bankCode ?? null,
+      },
+    });
+  } catch (err) {
+    logger.error({ reference, err: err.message }, '[nativeGhsWithdrawal] BANK dispatch observation could not be persisted');
+  }
+
+  try {
+    await persistPayoutOwnership(prisma, {
+      reference,
+      failoverTag: BANK_PAYOUT_FAILOVER_TAG,
+      intendedProvider: BANK_PROVIDER_CANONICAL,
+      providerRef,
+    });
+  } catch (err) {
+    // The payout is already at the provider. Ownership bookkeeping is
+    // repairable from the dispatch observation above — never auto-refund.
+    logger.error({ reference, err: err.message }, '[nativeGhsWithdrawal] BANK payout ownership write failed after dispatch');
+    try {
+      const mirror = await prisma.withdrawal.findFirst({
+        where: { transactionHistoryId: row.id },
+        select: { id: true },
+      });
+      if (mirror) {
+        await recordReconciliationException(prisma, {
+          entityType: 'WITHDRAWAL',
+          entityId: String(mirror.id),
+          reference,
+          reason: 'POST_DISPATCH_OWNERSHIP_WRITE_FAILED',
+          details: {
+            phase: 'POST_DISPATCH',
+            provider: BANK_PROVIDER_CANONICAL,
+            rail: BANK_RAIL,
+            providerRef,
+            error: String(err.message || '').slice(0, 200),
+          },
+        });
+      }
+    } catch (exceptionError) {
+      logger.error({ reference, err: exceptionError.message }, '[nativeGhsWithdrawal] could not record BANK ownership failure');
+    }
+  }
+
+  if (providerRef) {
+    await prisma.transactionHistory.updateMany({
+      where: { id: row.id },
+      data: { providerRef: String(providerRef) },
+    });
+  }
   await prisma.$executeRawUnsafe(
     'UPDATE "TransactionHistory" SET "metadata" = COALESCE("metadata", \'{}\'::jsonb) || $2::jsonb WHERE "id" = $1',
     row.id,
-    JSON.stringify({ dispatch: { acceptedAt: new Date().toISOString(), rail: 'BANK', providerRef, idempotency: 'canonical-reference' } })
+    JSON.stringify({
+      dispatch: {
+        acceptedAt: new Date().toISOString(),
+        rail: BANK_RAIL,
+        provider: BANK_PROVIDER_CANONICAL,
+        providerRef,
+        externalId: verdict.externalId ?? null,
+        observedStatus: verdict.observedStatus,
+        amountGhsExact: verdict.amountGhsExact,
+        idempotency: 'canonical-reference',
+      },
+    })
   );
   try {
     await prisma.$transaction(async (tx) => {
@@ -716,7 +1031,7 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
   } catch (err) {
     logger.error({ reference, err: err.message }, '[nativeGhsWithdrawal] BANK IN_TRANSIT transition failed after dispatch');
   }
-  return { dispatched: true, providerRef, rail: 'BANK' };
+  return { dispatched: true, providerRef, rail: BANK_RAIL };
 }
 
 /**
