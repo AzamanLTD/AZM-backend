@@ -1,44 +1,38 @@
 // Provider-boundary tests for the Moolre Ghana BANK PAYOUT adapter (channel 2).
 //
-// These are FIXTURE tests: HTTP is faked at the adapter boundary, so they prove
-// parsing, validation and outcome classification — not that Moolre's sandbox
-// agrees. Sandbox verification is explicitly outstanding (see the contract doc).
-//
-// The money-safety invariants asserted here:
-//   • the caller's referenceId is used verbatim and never regenerated;
-//   • an unknown outcome never becomes a second transfer POST;
-//   • a duplicate reference is its own outcome, not a retry;
-//   • NOT_FOUND, UNRESOLVED and UNKNOWN_OUTCOME are never reported as success.
+// FIXTURE TESTS ONLY. HTTP is faked at the adapter boundary; no request leaves
+// this process and no sandbox credential is used. Anything about Azaman's
+// commercial eligibility for channel 2, real bank coverage, limits, fees, SLA
+// or the /initiate-vs-/transfer path conflict is NOT proven here.
 
 const MoolreBankPayoutService = require('../services/moolreBankPayoutService');
 const { PROVIDER_OUTCOMES, MoolreBankPayoutError } = MoolreBankPayoutService;
-const logger = require('../src/config/logger');
 
-const BANK_DIRECTORY = {
+const REF = 'AZM-WD-000123';
+
+const directoryBody = {
     status: 1,
     code: 'SD01',
-    message: 'Banks Found',
+    message: 'Banks retrieved',
     data: [
-        { name: 'ADB BANK GHANA LTD', code: '030301' },
-        { name: '  ABSA   BANK GHANA LTD ', code: '030100' },
-        { name: 'ADB BANK GHANA LTD', code: '030301' },   // duplicate code
-        { name: '', code: '030999' },                     // malformed: no name
-        { name: 'NO CODE BANK' },                         // malformed: no code
         { name: 'ACCESS BANK GHANA LTD', code: '030402' },
+        { name: 'ABSA BANK GHANA LTD', code: '030100' },
+        { name: 'ADB BANK GHANA LTD', code: '030301' },
+        { name: 'ADB BANK GHANA LTD', code: '030301' },
     ],
 };
 
-const TRANSFER_OK = {
+const acceptedTransfer = {
     status: '1',
     code: 'OBGH01',
-    message: ['Pay out Successful', 'Click close to view transactions.'],
+    message: ['Pay out Successful'],
     data: {
         txstatus: 1,
-        receiver: '0246798993',
+        receiver: '0123456789012',
         transactionid: '32759150',
-        externalref: 'wd-42',
+        externalref: REF,
         thirdpartyref: '901733241086',
-        receivername: 'YUSIF YA-ADZAGEY',
+        receivername: 'AKOSUA MENSAH',
         amount: '25.50',
         amountfee: '1.01',
         networkfee: '0.00',
@@ -46,323 +40,712 @@ const TRANSFER_OK = {
     },
 };
 
-const ACCOUNT = '0012345678901';
+const statusBody = {
+    status: 1,
+    code: 'SS01',
+    message: 'Transaction Successful',
+    data: {
+        txstatus: 1,
+        txtype: 2,
+        accountnumber: '100000100002',
+        payee: '0123456789012',
+        amount: '25.50',
+        transactionid: '31830714',
+        externalref: REF,
+        thirdpartyref: '141704447750',
+    },
+};
 
-function fakeHttp(overrides = {}) {
+function transportError(code) {
+    return Object.assign(new Error('transport ' + code), { code });
+}
+
+function fakeHttp(over = {}) {
     const calls = [];
     const http = {
         calls,
         get: async (url, cfg) => {
             calls.push({ method: 'GET', url, cfg });
-            if (overrides.directoryError) throw overrides.directoryError;
-            return overrides.directory || { status: 200, data: BANK_DIRECTORY };
+            if (over.directoryError) throw over.directoryError;
+            return over.directory ?? { status: 200, data: directoryBody };
         },
         post: async (url, body, cfg) => {
             calls.push({ method: 'POST', url, body, cfg });
             if (url.endsWith('/validate')) {
-                if (overrides.validateError) throw overrides.validateError;
-                return overrides.validate || { status: 200, data: { status: 1, code: 'AVD01', message: 'Successful', data: '  BRIGHT   BUAME ' } };
+                if (over.validateError) throw over.validateError;
+                return over.validate ?? { status: 200, data: { status: 1, code: 'AVD01', message: 'Successful', data: 'AKOSUA MENSAH' } };
             }
             if (url.endsWith('/transfer')) {
-                if (overrides.transferError) throw overrides.transferError;
-                return overrides.transfer || { status: 200, data: TRANSFER_OK };
+                if (over.transferError) throw over.transferError;
+                return over.transfer ?? { status: 200, data: acceptedTransfer };
             }
             if (url.endsWith('/status')) {
-                if (overrides.statusError) throw overrides.statusError;
-                return overrides.status || { status: 200, data: { status: 1, code: 'SS01', message: 'Transaction Successful', data: { txstatus: 1, transactionid: '31830714', externalref: 'wd-42' } } };
+                if (over.statusError) throw over.statusError;
+                return over.status ?? { status: 200, data: statusBody };
             }
-            return { status: 404, data: {} };
+            throw new Error('unexpected path ' + url);
         },
     };
+    http.transfers = () => calls.filter(c => c.url.endsWith('/transfer'));
+    http.validations = () => calls.filter(c => c.url.endsWith('/validate'));
+    http.statuses = () => calls.filter(c => c.url.endsWith('/status'));
     return http;
 }
 
-const service = (http, opts = {}) => new MoolreBankPayoutService({
-    http,
-    apiUser: 'api-user',
-    apiKey: 'private-key',
-    accountNumber: '100000100002',
-    baseUrl: 'https://sandbox.moolre.com',
-    ...opts,
-});
+function service(http, opts = {}) {
+    return new MoolreBankPayoutService({
+        http,
+        providerMode: 'LIVE',
+        bankPayoutEnabled: true,
+        env: 'sandbox',
+        apiUser: 'api-user',
+        apiKey: 'private-key',
+        accountNumber: '100000100002',
+        ...opts,
+    });
+}
 
-const transferCalls = (http) => http.calls.filter((c) => c.url.endsWith('/transfer'));
-const statusCalls = (http) => http.calls.filter((c) => c.url.endsWith('/status'));
-
-async function expectOutcome(promise, outcome, code) {
-    await expect(promise).rejects.toBeInstanceOf(MoolreBankPayoutError);
+/** Await a rejection and return the typed provider error. */
+async function rejectOf(promise) {
     try {
         await promise;
     } catch (err) {
-        expect(err.outcome).toBe(outcome);
-        if (code) expect(err.code).toBe(code);
         return err;
     }
-    return null;
+    throw new Error('expected the adapter to refuse, but it resolved');
 }
 
-describe('Moolre bank payout adapter — bank directory', () => {
-    test('maps provider name/code, preserves leading zeroes, dedupes and sorts', async () => {
+const baseInitiation = {
+    referenceId: REF,
+    amountGhsExact: '25.50',
+    recipientAccountNumber: '0123456789012',
+    bankCode: '030100',
+};
+
+beforeEach(() => {
+    jest.spyOn(console, 'log').mockImplementation(() => {});
+});
+
+// ── A. interface contract ───────────────────────────────────────────────────
+describe('A. provider interface', () => {
+    test('listBanks returns the agreed shape with string-only bank codes', async () => {
         const http = fakeHttp();
-        const result = await service(http).listBanks();
-
-        expect(result.source).toBe('MOOLRE');
-        expect(result.stale).toBe(false);
-        expect(result.banks.map((b) => b.code)).toEqual(['030100', '030301', '030402']);
-        expect(result.banks[0].code).toBe('030100');            // leading zero kept
-        expect(result.banks[0].name).toBe('ABSA BANK GHANA LTD'); // whitespace normalised
-        expect(result.banks).toHaveLength(3);                    // duplicate code collapsed
-        expect(typeof result.retrievedAt).toBe('string');
+        const out = await service(http).listBanks();
+        expect(out).toMatchObject({ source: 'MOOLRE', stale: false });
+        expect(typeof out.retrievedAt).toBe('string');
+        expect(Number.isInteger(out.cacheAgeMs)).toBe(true);
+        out.banks.forEach(b => {
+            expect(typeof b.code).toBe('string');
+            expect(typeof b.name).toBe('string');
+        });
     });
 
-    test('rejects a malformed or empty directory instead of inventing banks', async () => {
-        await expectOutcome(service(fakeHttp({ directory: { status: 200, data: { status: 0, code: 'SD00', data: [] } } })).listBanks(), PROVIDER_OUTCOMES.PROVIDER_UNAVAILABLE, 'DIRECTORY_STATUS');
-        await expectOutcome(service(fakeHttp({ directory: { status: 200, data: { status: 1, data: 'banks' } } })).listBanks(), PROVIDER_OUTCOMES.PROVIDER_UNAVAILABLE, 'DIRECTORY_SHAPE');
-        await expectOutcome(service(fakeHttp({ directory: { status: 200, data: { status: 1, data: [{ name: '' }, { code: '' }] } } })).listBanks(), PROVIDER_OUTCOMES.PROVIDER_UNAVAILABLE, 'DIRECTORY_EMPTY');
+    test('validateBankAccount takes exactly { accountNumber, bankCode }', async () => {
+        const http = fakeHttp();
+        const out = await service(http).validateBankAccount({ accountNumber: '0123456789012', bankCode: '030100' });
+        expect(out).toEqual({
+            valid: true,
+            accountName: 'AKOSUA MENSAH',
+            bankCode: '030100',
+            validatedAt: expect.any(String),
+            provider: 'MOOLRE',
+        });
     });
 
-    test('caches within the TTL and forceRefresh bypasses it', async () => {
+    test('initiateBankTransfer accepts the canonical contract', async () => {
+        const http = fakeHttp();
+        const out = await service(http).initiateBankTransfer({ ...baseInitiation });
+        expect(out.provider).toBe('MOOLRE_DISBURSEMENT');
+        expect(out.rail).toBe('BANK');
+        expect(out.referenceId).toBe(REF);
+    });
+
+    test('initiateBankTransfer accepts the settled consumer call shape (aliases)', async () => {
+        const http = fakeHttp();
+        const out = await service(http).initiateBankTransfer({
+            referenceId: REF,
+            externalId: REF,
+            amountGhs: '25.50',
+            bankCode: '030100',
+            accountNumber: '0123456789012',
+            accountName: 'IGNORED CLIENT NAME',
+            narration: 'Azaman payout ' + REF,
+        });
+        expect(out.status).toBe('SUCCESSFUL');
+        const body = http.transfers()[0].body;
+        expect(body.amount).toBe('25.50');
+        expect(body.receiver).toBe('0123456789012');
+        expect(body.reference).toBe('Azaman payout ' + REF);
+    });
+
+    test('conflicting canonical and alias values are refused, never resolved', async () => {
+        const http = fakeHttp();
+        const err = await rejectOf(service(http).initiateBankTransfer({
+            ...baseInitiation,
+            amountGhs: '99.99',
+        }));
+        expect(err).toBeInstanceOf(MoolreBankPayoutError);
+        expect(err.code).toBe('ARGUMENT_ALIAS_CONFLICT');
+        expect(http.transfers()).toHaveLength(0);
+    });
+
+    test('getBankTransferStatus takes exactly { referenceId }', async () => {
+        const http = fakeHttp();
+        const out = await service(http).getBankTransferStatus({ referenceId: REF });
+        expect(out).toMatchObject({ provider: 'MOOLRE_DISBURSEMENT', rail: 'BANK', referenceId: REF });
+    });
+
+    test('describe() is accurate and carries no secret or account number', () => {
+        const d = service(fakeHttp()).describe();
+        expect(d).toEqual({
+            provider: 'MOOLRE',
+            capability: 'BANK_PAYOUT',
+            mode: 'sandbox',
+            baseUrlHost: 'sandbox.moolre.com',
+            providerIoEnabled: true,
+            bankPayoutEnabled: true,
+            credentialsPresent: true,
+            sourceAccountConfigured: true,
+            channel: 2,
+            currency: 'GHS',
+        });
+        const s = JSON.stringify(d);
+        expect(s).not.toContain('private-key');
+        expect(s).not.toContain('100000100002');
+        expect(s).not.toContain('api-user');
+    });
+
+    test('every status object identifies provider and rail, and never generates a reference', async () => {
+        const http = fakeHttp({ status: { status: 200, data: { status: 0, code: 'SS00', message: 'unknown' } } });
+        const out = await service(http).getBankTransferStatus({ referenceId: REF });
+        expect(out.provider).toBe('MOOLRE_DISBURSEMENT');
+        expect(out.rail).toBe('BANK');
+        expect(out.referenceId).toBe(REF);
+        expect(out.status).toBe('UNRESOLVED');
+    });
+
+    test('externalId is the echoed Moolre externalref, never a generated one', async () => {
+        const out = await service(fakeHttp()).initiateBankTransfer({ ...baseInitiation });
+        expect(out.externalId).toBe(REF);
+        const st = await service(fakeHttp()).getBankTransferStatus({ referenceId: REF });
+        expect(st.externalId).toBe(REF);
+    });
+
+    test('amountGhsExact is the provider-reported amount, not the caller amount', async () => {
+        const transfer = JSON.parse(JSON.stringify(acceptedTransfer));
+        transfer.data.amount = '24.00';
+        const out = await service(fakeHttp({ transfer: { status: 200, data: transfer } }))
+            .initiateBankTransfer({ ...baseInitiation });
+        expect(out.amountGhsExact).toBe('24.00');
+    });
+});
+
+// ── B. bank directory ───────────────────────────────────────────────────────
+describe('B. bank directory', () => {
+    test('maps names/codes, preserves leading zeroes, dedupes and sorts deterministically', async () => {
+        const out = await service(fakeHttp()).listBanks();
+        expect(out.banks.map(b => b.code)).toEqual(['030100', '030301', '030402']);
+        expect(out.banks[0].code.startsWith('0')).toBe(true);
+        expect(out.banks.filter(b => b.code === '030301')).toHaveLength(1);
+    });
+
+    test('normalises display whitespace only', async () => {
+        const directory = { status: 200, data: { status: 1, data: [{ name: '  ADB   BANK  ', code: '030301' }] } };
+        const out = await service(fakeHttp({ directory })).listBanks();
+        expect(out.banks[0].name).toBe('ADB BANK');
+    });
+
+    test.each([
+        ['empty data', { status: 200, data: { status: 1, data: [] } }, 'DIRECTORY_SHAPE'],
+        ['null data', { status: 200, data: { status: 1, data: null } }, 'DIRECTORY_SHAPE'],
+        ['envelope failure', { status: 200, data: { status: 0, message: 'nope' } }, 'DIRECTORY_UNAVAILABLE'],
+        ['non-object body', { status: 200, data: 'not json' }, 'DIRECTORY_UNAVAILABLE'],
+        ['malformed row', { status: 200, data: { status: 1, data: [{ name: '', code: '030301' }] } }, 'DIRECTORY_ROW_MALFORMED'],
+    ])('rejects %s instead of inventing banks', async (_label, directory, code) => {
+        const err = await rejectOf(service(fakeHttp({ directory })).listBanks());
+        expect(err).toBeInstanceOf(MoolreBankPayoutError);
+        expect(err.code).toBe(code);
+        expect(err.outcome).toBe(PROVIDER_OUTCOMES.PROVIDER_UNAVAILABLE);
+    });
+
+    test('serves a fresh cache without a second network call', async () => {
         const http = fakeHttp();
         const svc = service(http);
         await svc.listBanks();
         await svc.listBanks();
-        expect(http.calls.filter((c) => c.method === 'GET')).toHaveLength(1);
-
-        await svc.listBanks({ forceRefresh: true });
-        expect(http.calls.filter((c) => c.method === 'GET')).toHaveLength(2);
+        expect(http.calls.filter(c => c.method === 'GET')).toHaveLength(1);
     });
 
-    test('serves stale metadata during an outage, then fails closed beyond the window', async () => {
+    test('forceRefresh bypasses the cache', async () => {
         const http = fakeHttp();
-        const svc = service(http, { cacheTtlMs: 0, staleWindowMs: 60000 });
+        const svc = service(http);
         await svc.listBanks();
+        await svc.listBanks({ forceRefresh: true });
+        expect(http.calls.filter(c => c.method === 'GET')).toHaveLength(2);
+    });
 
-        http.get = async () => { throw Object.assign(new Error('down'), { code: 'ECONNREFUSED' }); };
-        const stale = await svc.listBanks();
-        expect(stale.stale).toBe(true);
-        expect(stale.banks).toHaveLength(3);
+    test('an outage with a fresh cache is returned explicitly as stale', async () => {
+        const http = fakeHttp();
+        const svc = service(http);
+        await svc.listBanks();
+        http.get = async () => { throw transportError('ECONNREFUSED'); };
+        const out = await svc.listBanks({ forceRefresh: true });
+        expect(out.stale).toBe(true);
+        expect(out.banks).toHaveLength(3);
+        expect(out.cacheAgeMs).toBeGreaterThanOrEqual(0);
+    });
 
-        // Beyond the documented freshness window the same cache must fail closed.
-        svc.staleWindowMs = 0;
-        await expectOutcome(svc.listBanks(), PROVIDER_OUTCOMES.PROVIDER_UNAVAILABLE, 'DIRECTORY_UNAVAILABLE');
+    test('an outage beyond the stale window fails closed', async () => {
+        const http = fakeHttp();
+        const svc = service(http);
+        await svc.listBanks();
+        http.get = async () => { throw transportError('ECONNREFUSED'); };
+        svc._staleWindowMs = 0;
+        const err = await rejectOf(svc.listBanks({ forceRefresh: true }));
+        expect(err.outcome).toBe(PROVIDER_OUTCOMES.PROVIDER_UNAVAILABLE);
+    });
+
+    test('stale directory data is refused for validation and transfer', async () => {
+        const http = fakeHttp();
+        const svc = service(http, { cacheTtlMs: 0 });
+        await svc.listBanks();
+        http.get = async () => { throw transportError('ECONNREFUSED'); };
+        const vErr = await rejectOf(svc.validateBankAccount({ accountNumber: '0123456789012', bankCode: '030100' }));
+        expect(vErr.code).toBe('DIRECTORY_STALE');
+        expect(http.validations()).toHaveLength(0);
+        const tErr = await rejectOf(svc.initiateBankTransfer({ ...baseInitiation }));
+        expect(tErr.code).toBe('DIRECTORY_STALE');
+        expect(http.transfers()).toHaveLength(0);
+    });
+
+    test('never puts a credential in the directory URL', async () => {
+        const http = fakeHttp();
+        await service(http).listBanks();
+        const get = http.calls.find(c => c.method === 'GET');
+        expect(get.url).toBe('https://sandbox.moolre.com/open/transact/data?country=gha&data=banks');
+        expect(get.url).not.toContain('private-key');
+        expect(get.url).not.toContain('api-user');
     });
 });
 
-describe('Moolre bank payout adapter — account validation', () => {
-    test('sends the documented channel, bank code and source account, and returns the provider name', async () => {
+// ── C. validation ───────────────────────────────────────────────────────────
+describe('C. account validation', () => {
+    test('sends the documented fields and the account number exactly', async () => {
         const http = fakeHttp();
-        const result = await service(http).validateBankAccount({ accountNumber: ACCOUNT, bankCode: '030100' });
-
-        const call = http.calls.find((c) => c.url.endsWith('/validate'));
+        await service(http).validateBankAccount({ accountNumber: '0012345678', bankCode: '030100' });
+        const call = http.validations()[0];
+        expect(call.url).toBe('https://sandbox.moolre.com/open/transact/validate');
         expect(call.body).toEqual({
             type: 1,
             channel: '2',
             currency: 'GHS',
-            receiver: ACCOUNT,
+            receiver: '0012345678',
             sublistid: '030100',
             accountnumber: '100000100002',
         });
         expect(call.cfg.headers['X-API-USER']).toBe('api-user');
         expect(call.cfg.headers['X-API-KEY']).toBe('private-key');
-
-        expect(result.valid).toBe(true);
-        expect(result.accountName).toBe('BRIGHT BUAME');
-        expect(result.bankCode).toBe('030100');
-        expect(result.provider).toBe('MOOLRE');
-        expect(typeof result.validatedAt).toBe('string');
     });
 
-    test('a refused account is a definitive validation refusal, not a valid beneficiary', async () => {
-        const http = fakeHttp({ validate: { status: 400, data: { status: 0, code: 'AVD02', message: 'Account not found', data: 'Account not found' } } });
-        const err = await expectOutcome(service(http).validateBankAccount({ accountNumber: ACCOUNT, bankCode: '030100' }), PROVIDER_OUTCOMES.DEFINITIVE_REJECTION, 'ACCOUNT_NOT_VALID');
-        expect(err.providerCode).toBe('AVD02');
+    test('parses the documented string data as the account name', async () => {
+        const out = await service(fakeHttp()).validateBankAccount({ accountNumber: '0123456789012', bankCode: '030100' });
+        expect(out.accountName).toBe('AKOSUA MENSAH');
     });
 
-    test('an unknown bank code is refused before any provider write', async () => {
+    test('AVD01 is a successful validation, never an initiation refusal', async () => {
+        const out = await service(fakeHttp()).validateBankAccount({ accountNumber: '0123456789012', bankCode: '030100' });
+        expect(out.valid).toBe(true);
+    });
+
+    test('AVD02 is a documented validation refusal', async () => {
+        const http = fakeHttp({ validate: { status: 200, data: { status: 0, code: 'AVD02', message: 'Account not found' } } });
+        const err = await rejectOf(service(http).validateBankAccount({ accountNumber: '0123456789012', bankCode: '030100' }));
+        expect(err.outcome).toBe(PROVIDER_OUTCOMES.DEFINITIVE_REJECTION);
+        expect(err.code).toBe('ACCOUNT_NOT_FOUND');
+        expect(err.dispatchProven).toBe(true);
+    });
+
+    test.each([
+        ['auth failure', { validate: { status: 401, data: { status: 0, code: 'AUTH', message: 'bad key' } } }],
+        ['rate limit', { validate: { status: 429, data: { status: 0, code: 'RATE', message: 'slow down' } } }],
+        ['5xx', { validate: { status: 502, data: {} } }],
+        ['malformed', { validate: { status: 200, data: 'oops' } }],
+        ['transport reset', { validateError: transportError('ECONNRESET') }],
+    ])('%s is provider unavailability, not an invalid account', async (_label, over) => {
+        const err = await rejectOf(service(fakeHttp(over)).validateBankAccount({ accountNumber: '0123456789012', bankCode: '030100' }));
+        expect(err.outcome).toBe(PROVIDER_OUTCOMES.PROVIDER_UNAVAILABLE);
+        expect(err.outcome).not.toBe(PROVIDER_OUTCOMES.DEFINITIVE_REJECTION);
+    });
+
+    test('an unknown bank code never reaches the provider', async () => {
         const http = fakeHttp();
-        await expectOutcome(service(http).validateBankAccount({ accountNumber: ACCOUNT, bankCode: '999999' }), PROVIDER_OUTCOMES.NOT_DISPATCHED, 'BANK_CODE_UNKNOWN');
-        expect(http.calls.filter((c) => c.url.endsWith('/validate'))).toHaveLength(0);
+        const err = await rejectOf(service(http).validateBankAccount({ accountNumber: '0123456789012', bankCode: '999999' }));
+        expect(err.code).toBe('BANK_CODE_UNKNOWN');
+        expect(http.validations()).toHaveLength(0);
     });
 
-    test('validation never leaks the account number into results or logs', async () => {
-        const infoSpy = jest.spyOn(logger, 'info').mockImplementation(() => {});
-        const http = fakeHttp();
-        const result = await service(http).validateBankAccount({ accountNumber: ACCOUNT, bankCode: '030100' });
+    test('the account number is neither returned nor logged', async () => {
+        const logger = require('../src/config/logger');
+        const info = jest.spyOn(logger, 'info').mockImplementation(() => {});
+        const warn = jest.spyOn(logger, 'warn').mockImplementation(() => {});
+        const out = await service(fakeHttp()).validateBankAccount({ accountNumber: '0123456789012', bankCode: '030100' });
+        expect(JSON.stringify(out)).not.toContain('0123456789012');
+        const logged = JSON.stringify(info.mock.calls.concat(warn.mock.calls));
+        expect(logged).not.toContain('0123456789012');
+        info.mockRestore(); warn.mockRestore();
+    });
 
-        expect(JSON.stringify(result)).not.toContain(ACCOUNT);
-        const logged = JSON.stringify(infoSpy.mock.calls);
-        expect(logged).not.toContain(ACCOUNT);
-        expect(logged).not.toContain('private-key');
-        infoSpy.mockRestore();
+    test('a client-supplied account name is not accepted as evidence', async () => {
+        const out = await service(fakeHttp()).validateBankAccount({
+            accountNumber: '0123456789012', bankCode: '030100', accountName: 'SOMEONE ELSE',
+        });
+        expect(out.accountName).toBe('AKOSUA MENSAH');
+    });
+
+    test('drops and rejects an account number outside the documented Azaman safety bound', async () => {
+        const http = fakeHttp();
+        const err = await rejectOf(service(http).validateBankAccount({ accountNumber: 'ABC123', bankCode: '030100' }));
+        expect(err.code).toBe('ACCOUNT_NUMBER_INVALID');
+        expect(err.message).toContain('Azaman safety bound');
+        expect(http.validations()).toHaveLength(0);
     });
 });
 
-describe('Moolre bank payout adapter — transfer initiation', () => {
-    test('sends the exact original reference, amount and bank routing fields', async () => {
+// ── D. transfer precision, identity and fees ────────────────────────────────
+describe('D. transfer initiation', () => {
+    test('sends the documented body with the original reference verbatim', async () => {
         const http = fakeHttp();
-        const result = await service(http).initiateBankTransfer({
-            referenceId: 'wd-42',
-            amountGhsExact: '25.50',
-            recipientAccountNumber: ACCOUNT,
-            bankCode: '030402',
-            payeeNote: 'Withdrawal',
-        });
-
-        const call = transferCalls(http)[0];
-        expect(call.body).toEqual({
+        await service(http).initiateBankTransfer({ ...baseInitiation, payerMessage: 'Rent' });
+        const body = http.transfers()[0].body;
+        expect(body).toEqual({
             type: 1,
             channel: '2',
             currency: 'GHS',
             amount: '25.50',
-            receiver: ACCOUNT,
-            sublistid: '030402',
-            externalref: 'wd-42',
+            receiver: '0123456789012',
+            sublistid: '030100',
+            externalref: REF,
             accountnumber: '100000100002',
-            reference: 'Withdrawal',
+            reference: 'Rent',
         });
-        expect(call.cfg.timeout).toBeGreaterThan(0);
-
-        expect(result.provider).toBe('MOOLRE_DISBURSEMENT');
-        expect(result.referenceId).toBe('wd-42');
-        expect(result.providerRef).toBe('32759150');
-        expect(result.status).toBe('SUCCESSFUL');
-        expect(result.currency).toBe('GHS');
-        expect(result.amountGhsExact).toBe('25.50');
     });
 
-    test('rejects malformed amounts without any wire request', async () => {
-        const bad = ['0', '0.00', '-1', '1e3', '10.999', ' 1.00', '1,000', '1.2.3', '', '10000000000'];
-        for (const amount of bad) {
-            const http = fakeHttp();
-            await expectOutcome(service(http).initiateBankTransfer({ referenceId: 'wd-42', amountGhsExact: amount, recipientAccountNumber: ACCOUNT, bankCode: '030402' }), PROVIDER_OUTCOMES.NOT_DISPATCHED);
-            expect(transferCalls(http)).toHaveLength(0);
-        }
+    test.each([
+        ['zero', '0', 'AMOUNT_NOT_POSITIVE'],
+        ['zero decimals', '0.00', 'AMOUNT_NOT_POSITIVE'],
+        ['negative', '-5.00', 'AMOUNT_MALFORMED'],
+        ['exponent', '1e3', 'AMOUNT_MALFORMED'],
+        ['whitespace', ' 25.50', 'AMOUNT_MALFORMED'],
+        ['overprecision', '25.505', 'AMOUNT_MALFORMED'],
+        ['thousands separator', '1,000.00', 'AMOUNT_MALFORMED'],
+        ['leading zeroes', '025.50', 'AMOUNT_MALFORMED'],
+        ['number type', 25.5, 'AMOUNT_NOT_STRING'],
+        ['above safety bound', '1000000.01', 'AMOUNT_ABOVE_SAFETY_BOUND'],
+    ])('rejects %s before any wire request', async (_label, amount, code) => {
         const http = fakeHttp();
-        await expectOutcome(service(http).initiateBankTransfer({ referenceId: 'wd-42', amountGhsExact: 25.5, recipientAccountNumber: ACCOUNT, bankCode: '030402' }), PROVIDER_OUTCOMES.NOT_DISPATCHED, 'AMOUNT_NOT_STRING');
+        const err = await rejectOf(service(http).initiateBankTransfer({ ...baseInitiation, amountGhsExact: amount }));
+        expect(err).toBeInstanceOf(MoolreBankPayoutError);
+        expect(err.code).toBe(code);
+        expect(err.outcome).toBe(PROVIDER_OUTCOMES.NOT_DISPATCHED);
+        expect(http.transfers()).toHaveLength(0);
     });
 
-    test('preserves provider fee fields exactly and never invents a fee total', async () => {
-        const result = await service(fakeHttp()).initiateBankTransfer({
-            referenceId: 'wd-42', amountGhsExact: '25.50', recipientAccountNumber: ACCOUNT, bankCode: '030402',
+    test('accepts an exact whole-cedi amount and canonicalises to two decimals', async () => {
+        const http = fakeHttp();
+        await service(http).initiateBankTransfer({ ...baseInitiation, amountGhsExact: '25' });
+        expect(http.transfers()[0].body.amount).toBe('25.00');
+    });
+
+    test('preserves leading zeroes in the recipient account number', async () => {
+        const http = fakeHttp();
+        await service(http).initiateBankTransfer({ ...baseInitiation, recipientAccountNumber: '0012345678' });
+        expect(http.transfers()[0].body.receiver).toBe('0012345678');
+    });
+
+    test('an unknown bank code is refused before dispatch', async () => {
+        const http = fakeHttp();
+        const err = await rejectOf(service(http).initiateBankTransfer({ ...baseInitiation, bankCode: '777777' }));
+        expect(err.code).toBe('BANK_CODE_UNKNOWN');
+        expect(http.transfers()).toHaveLength(0);
+    });
+
+    test('a duplicate response issues exactly one POST and is never retried', async () => {
+        const http = fakeHttp({
+            transfer: { status: 200, data: { status: 0, code: 'TP13', message: 'Duplicate external reference' } },
         });
-        expect(result.fees).toEqual({ amountFee: '1.01', networkFee: '0.00', fee: '0.01' });
-        expect(result.fees).not.toHaveProperty('total');
-        expect(JSON.stringify(result)).not.toContain('1.02');
+        const out = await service(http).initiateBankTransfer({ ...baseInitiation });
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.reason).toBe('DUPLICATE_REFERENCE');
+        expect(http.transfers()).toHaveLength(1);
     });
 
-    test('parses pending and string status envelopes from documented fields only', async () => {
-        const pending = { status: 1, code: 'OBGH01', data: { txstatus: 0, externalref: 'wd-42', transactionid: '1' } };
-        const result = await service(fakeHttp({ transfer: { status: 200, data: pending } })).initiateBankTransfer({
-            referenceId: 'wd-42', amountGhsExact: '1.00', recipientAccountNumber: ACCOUNT, bankCode: '030402',
-        });
-        expect(result.status).toBe('PENDING');
+    test('keeps every provider fee separate and invents no total', async () => {
+        const out = await service(fakeHttp()).initiateBankTransfer({ ...baseInitiation });
+        expect(out.fees).toEqual({ amountFee: '1.01', networkFee: '0.00', fee: '0.01' });
+        expect(Object.keys(out.fees)).toEqual(['amountFee', 'networkFee', 'fee']);
     });
 
-    test('a malformed success body is uncertainty, never a proven failure', async () => {
-        const http = fakeHttp({ transfer: { status: 200, data: { status: 1, code: 'OBGH01', message: ['ok'] } } });
-        await expectOutcome(service(http).initiateBankTransfer({ referenceId: 'wd-42', amountGhsExact: '1.00', recipientAccountNumber: ACCOUNT, bankCode: '030402' }), PROVIDER_OUTCOMES.UNKNOWN_OUTCOME, 'INITIATE_MALFORMED');
-        expect(transferCalls(http)).toHaveLength(1);
+    test('a malformed fee field becomes null without changing the outcome', async () => {
+        const transfer = JSON.parse(JSON.stringify(acceptedTransfer));
+        transfer.data.amountfee = 'n/a';
+        const out = await service(fakeHttp({ transfer: { status: 200, data: transfer } }))
+            .initiateBankTransfer({ ...baseInitiation });
+        expect(out.status).toBe('SUCCESSFUL');
+        expect(out.fees.amountFee).toBeNull();
+        expect(out.fees.networkFee).toBe('0.00');
     });
 
-    test('a duplicate reference is its own outcome and issues no second transfer', async () => {
-        const http = fakeHttp({ transfer: { status: 400, data: { status: 0, code: 'TP14', message: 'External reference already used' } } });
-        await expectOutcome(service(http).initiateBankTransfer({ referenceId: 'wd-42', amountGhsExact: '1.00', recipientAccountNumber: ACCOUNT, bankCode: '030402' }), PROVIDER_OUTCOMES.DUPLICATE_REFERENCE, 'DUPLICATE_REFERENCE');
-        expect(transferCalls(http)).toHaveLength(1);
+    test('a mismatched echoed reference is an evidence contradiction', async () => {
+        const transfer = JSON.parse(JSON.stringify(acceptedTransfer));
+        transfer.data.externalref = 'SOMEONE-ELSES-REF';
+        const out = await service(fakeHttp({ transfer: { status: 200, data: transfer } }))
+            .initiateBankTransfer({ ...baseInitiation });
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.reason).toBe('EXTERNAL_REFERENCE_MISMATCH');
+        expect(out.referenceId).toBe(REF);
     });
 
-    test('classifies transport failures by whether bytes could have been sent', async () => {
-        const refused = fakeHttp({ transferError: Object.assign(new Error('refused'), { code: 'ECONNREFUSED' }) });
-        await expectOutcome(service(refused).initiateBankTransfer({ referenceId: 'wd-42', amountGhsExact: '1.00', recipientAccountNumber: ACCOUNT, bankCode: '030402' }), PROVIDER_OUTCOMES.NOT_DISPATCHED, 'TRANSPORT_PRE_DISPATCH');
-
-        for (const code of ['ECONNABORTED', 'ETIMEDOUT', 'ECONNRESET', 'EPIPE']) {
-            const http = fakeHttp({ transferError: Object.assign(new Error('timeout'), { code }) });
-            await expectOutcome(service(http).initiateBankTransfer({ referenceId: 'wd-42', amountGhsExact: '1.00', recipientAccountNumber: ACCOUNT, bankCode: '030402' }), PROVIDER_OUTCOMES.UNKNOWN_OUTCOME, 'TRANSPORT_UNCERTAIN');
-            expect(transferCalls(http)).toHaveLength(1);   // exactly one attempt
-        }
+    test('an unrecognised nested status is never reported as success', async () => {
+        const transfer = JSON.parse(JSON.stringify(acceptedTransfer));
+        transfer.data.txstatus = 7;
+        const out = await service(fakeHttp({ transfer: { status: 200, data: transfer } }))
+            .initiateBankTransfer({ ...baseInitiation });
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.providerStatusRaw).toBe('7');
     });
 
-    test('5xx and unknown 4xx are uncertain; a documented refusal code is definitive', async () => {
-        const server = fakeHttp({ transfer: { status: 502, data: {} } });
-        await expectOutcome(service(server).initiateBankTransfer({ referenceId: 'wd-42', amountGhsExact: '1.00', recipientAccountNumber: ACCOUNT, bankCode: '030402' }), PROVIDER_OUTCOMES.UNKNOWN_OUTCOME, 'INITIATE_UNCERTAIN');
-
-        const unknown4xx = fakeHttp({ transfer: { status: 418, data: { status: 0, code: 'ZZ99', message: 'teapot' } } });
-        await expectOutcome(service(unknown4xx).initiateBankTransfer({ referenceId: 'wd-42', amountGhsExact: '1.00', recipientAccountNumber: ACCOUNT, bankCode: '030402' }), PROVIDER_OUTCOMES.UNKNOWN_OUTCOME);
-
-        const refused = fakeHttp({ transfer: { status: 400, data: { status: 0, code: 'TP01', message: 'Invalid amount' } } });
-        await expectOutcome(service(refused).initiateBankTransfer({ referenceId: 'wd-42', amountGhsExact: '1.00', recipientAccountNumber: ACCOUNT, bankCode: '030402' }), PROVIDER_OUTCOMES.DEFINITIVE_REJECTION, 'PROVIDER_REFUSED');
+    test('a pending nested status stays pending', async () => {
+        const transfer = JSON.parse(JSON.stringify(acceptedTransfer));
+        transfer.data.txstatus = 0;
+        const out = await service(fakeHttp({ transfer: { status: 200, data: transfer } }))
+            .initiateBankTransfer({ ...baseInitiation });
+        expect(out.status).toBe('PENDING');
     });
 });
 
-describe('Moolre bank payout adapter — status lookup', () => {
-    test('asks with the original external reference and idtype 1', async () => {
-        const http = fakeHttp();
-        const result = await service(http).getBankTransferStatus({ referenceId: 'wd-42' });
-
-        const call = statusCalls(http)[0];
-        expect(call.body).toEqual({ type: 1, idtype: 1, id: 'wd-42', accountnumber: '100000100002' });
-        expect(result).toEqual({ status: 'SUCCESSFUL', referenceId: 'wd-42', providerRef: '31830714', providerStatusRaw: '1' });
-    });
-
-    test('maps numeric and string txstatus forms', async () => {
-        for (const [raw, expected] of [[0, 'PENDING'], ['1', 'SUCCESSFUL'], [2, 'FAILED'], ['2', 'FAILED']]) {
-            const http = fakeHttp({ status: { status: 200, data: { status: 1, code: 'SS01', data: { txstatus: raw, externalref: 'wd-42' } } } });
-            const result = await service(http).getBankTransferStatus({ referenceId: 'wd-42' });
-            expect(result.status).toBe(expected);
+// ── E. outcome classification ───────────────────────────────────────────────
+describe('E. outcome classification', () => {
+    test.each(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN'])(
+        '%s is proven pre-dispatch and safe to reverse',
+        async (code) => {
+            const err = await rejectOf(service(fakeHttp({ transferError: transportError(code) }))
+                .initiateBankTransfer({ ...baseInitiation }));
+            expect(err.outcome).toBe(PROVIDER_OUTCOMES.NOT_DISPATCHED);
+            expect(err.dispatchProven).toBe(true);
+            expect(err.retryable).toBe(false);
         }
-    });
+    );
 
-    test('an authoritative not-found stays NOT_FOUND', async () => {
-        const http = fakeHttp({ status: { status: 400, data: { status: 0, code: 'SS02', message: 'Transaction not found', data: null } } });
-        expect((await service(http).getBankTransferStatus({ referenceId: 'wd-42' })).status).toBe('NOT_FOUND');
-    });
-
-    test('auth failure, rate limit, malformed and 5xx answers are UNRESOLVED, never PENDING', async () => {
-        const variants = [
-            { status: 401, data: { status: 0, code: 'AU01', message: 'Invalid credentials' } },
-            { status: 429, data: { status: 0, code: 'RL01', message: 'Rate limit' } },
-            { status: 200, data: { status: 1, data: { unexpected: true } } },
-            { status: 503, data: {} },
-        ];
-        for (const status of variants) {
-            const http = fakeHttp({ status });
-            const result = await service(http).getBankTransferStatus({ referenceId: 'wd-42' });
-            expect(result.status).toBe('UNRESOLVED');
-            expect(result.status).not.toBe('PENDING');
+    test.each(['ECONNABORTED', 'ETIMEDOUT', 'ECONNRESET', 'EPIPE', 'ERR_BAD_RESPONSE'])(
+        '%s after a possible send is an unknown outcome, not a refusal',
+        async (code) => {
+            const out = await service(fakeHttp({ transferError: transportError(code) }))
+                .initiateBankTransfer({ ...baseInitiation });
+            expect(out.status).toBe('UNRESOLVED');
+            expect(out.reason).toBe('PROVIDER_OUTCOME_UNKNOWN');
         }
+    );
 
-        const timeout = fakeHttp({ statusError: Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' }) });
-        expect((await service(timeout).getBankTransferStatus({ referenceId: 'wd-42' })).status).toBe('UNRESOLVED');
+    test.each([
+        ['5xx', { transfer: { status: 503, data: { status: 0, message: 'upstream' } } }, 'PROVIDER_NON_2XX'],
+        ['unknown 4xx', { transfer: { status: 400, data: { status: 0, code: 'XX01', message: 'bad request' } } }, 'PROVIDER_NON_2XX'],
+        ['malformed 200', { transfer: { status: 200, data: 'not json' } }, 'MALFORMED_PROVIDER_RESPONSE'],
+        ['envelope refusal without evidence', { transfer: { status: 200, data: { status: 0, code: 'TP99', message: 'insufficient float' } } }, 'PROVIDER_STATUS_NOT_ACCEPTED'],
+    ])('%s stays UNRESOLVED rather than being called a refusal', async (_label, over, reason) => {
+        const out = await service(fakeHttp(over)).initiateBankTransfer({ ...baseInitiation });
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.reason).toBe(reason);
     });
 
-    test('a status lookup never issues a transfer', async () => {
-        const http = fakeHttp();
-        await service(http).getBankTransferStatus({ referenceId: 'wd-42' });
-        expect(transferCalls(http)).toHaveLength(0);
+    test('an untyped transport error is never classified as a definitive rejection', async () => {
+        const out = await service(fakeHttp({ transferError: new Error('socket hang up') }))
+            .initiateBankTransfer({ ...baseInitiation });
+        expect(out.status).toBe('UNRESOLVED');
+    });
+
+    test('AVD01 is never used to classify an initiation refusal', async () => {
+        const out = await service(fakeHttp({
+            transfer: { status: 200, data: { status: 0, code: 'AVD01', message: 'Successful' } },
+        })).initiateBankTransfer({ ...baseInitiation });
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.reason).toBe('PROVIDER_STATUS_NOT_ACCEPTED');
+    });
+
+    test('the error contract carries the shared property names', async () => {
+        const err = await rejectOf(service(fakeHttp()).initiateBankTransfer({ ...baseInitiation, bankCode: '999999' }));
+        expect(err.provider).toBe('MOOLRE_DISBURSEMENT');
+        expect(err.outcome).toBe(err.providerOutcome);
+        expect(err.stage).toBe('INITIATE');
+        expect(err.referenceId).toBe(REF);
+        expect(err.retryable).toBe(false);
+        expect(typeof err.code).toBe('string');
+    });
+
+    test('no ambiguous error leaks the raw provider body or credentials', async () => {
+        const out = await service(fakeHttp({ transfer: { status: 500, data: { secretish: 'x', message: 'boom' } } }))
+            .initiateBankTransfer({ ...baseInitiation });
+        const s = JSON.stringify(out);
+        expect(s).not.toContain('private-key');
+        expect(s).not.toContain('100000100002');
+        expect(s).not.toContain('0123456789012');
     });
 });
 
-describe('Moolre bank payout adapter — configuration safety', () => {
-    test('an unconfigured provider fails closed before any provider I/O', async () => {
+// ── F. status ───────────────────────────────────────────────────────────────
+describe('F. transfer status', () => {
+    test('sends idtype 1 with the original reference and the source account', async () => {
         const http = fakeHttp();
-        const svc = new MoolreBankPayoutService({ http, baseUrl: 'https://sandbox.moolre.com' });
-        await expectOutcome(svc.initiateBankTransfer({ referenceId: 'wd-42', amountGhsExact: '1.00', recipientAccountNumber: ACCOUNT, bankCode: '030402' }), PROVIDER_OUTCOMES.NOT_DISPATCHED, 'PROVIDER_NOT_CONFIGURED');
+        await service(http).getBankTransferStatus({ referenceId: REF });
+        const call = http.statuses()[0];
+        expect(call.url).toBe('https://sandbox.moolre.com/open/transact/status');
+        expect(call.body).toEqual({ type: 1, idtype: 1, id: REF, accountnumber: '100000100002' });
+        expect(call.cfg.headers['X-API-USER']).toBe('api-user');
+    });
+
+    test.each([[0, 'PENDING'], [1, 'SUCCESSFUL'], [2, 'FAILED']])('maps txstatus %s to %s', async (raw, expected) => {
+        const body = JSON.parse(JSON.stringify(statusBody));
+        body.data.txstatus = raw;
+        const out = await service(fakeHttp({ status: { status: 200, data: body } }))
+            .getBankTransferStatus({ referenceId: REF });
+        expect(out.status).toBe(expected);
+    });
+
+    test('retains externalref, transactionid, thirdpartyref and amount evidence', async () => {
+        const out = await service(fakeHttp()).getBankTransferStatus({ referenceId: REF });
+        expect(out).toMatchObject({
+            status: 'SUCCESSFUL',
+            referenceId: REF,
+            externalId: REF,
+            providerRef: '31830714',
+            amountGhsExact: '25.50',
+            currency: 'GHS',
+        });
+    });
+
+    test.each([
+        ['missing txstatus', { status: 200, data: { status: 1, data: {} } }, 'STATUS_FIELD_MISSING'],
+        ['unrecognised txstatus', { status: 200, data: { status: 1, data: { txstatus: 9 } } }, 'STATUS_UNRECOGNISED'],
+        ['auth failure', { status: 401, data: { status: 0, code: 'AUTH', message: 'bad key' } }, 'PROVIDER_STATUS_NOT_ACCEPTED'],
+        ['rate limit', { status: 429, data: { status: 0, code: 'RATE' } }, 'PROVIDER_STATUS_NOT_ACCEPTED'],
+        ['malformed body', { status: 200, data: 'nope' }, 'MALFORMED_PROVIDER_RESPONSE'],
+        ['not-found-shaped response with no published code', { status: 200, data: { status: 0, code: 'SS99', message: 'Transaction not found' } }, 'PROVIDER_STATUS_NOT_ACCEPTED'],
+    ])('%s becomes UNRESOLVED, never PENDING or NOT_FOUND', async (_label, response, reason) => {
+        const out = await service(fakeHttp({ status: response })).getBankTransferStatus({ referenceId: REF });
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.reason).toBe(reason);
+    });
+
+    test('a transport failure during status is UNRESOLVED, not a failed payout', async () => {
+        const out = await service(fakeHttp({ statusError: transportError('ETIMEDOUT') }))
+            .getBankTransferStatus({ referenceId: REF });
+        expect(out.status).toBe('UNRESOLVED');
+    });
+
+    test('a status mismatch on the echoed reference is UNRESOLVED', async () => {
+        const body = JSON.parse(JSON.stringify(statusBody));
+        body.data.externalref = 'OTHER-REF';
+        const out = await service(fakeHttp({ status: { status: 200, data: body } }))
+            .getBankTransferStatus({ referenceId: REF });
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.reason).toBe('EXTERNAL_REFERENCE_MISMATCH');
+    });
+
+    test('status lookups never issue a transfer POST', async () => {
+        const http = fakeHttp();
+        await service(http).getBankTransferStatus({ referenceId: REF });
+        expect(http.transfers()).toHaveLength(0);
+    });
+
+    test('NOT_FOUND is only reachable with a published code (none verified today)', async () => {
+        const out = await service(fakeHttp({ status: { status: 200, data: { status: 0, code: 'SS99' } } }))
+            .getBankTransferStatus({ referenceId: REF });
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.status).not.toBe('NOT_FOUND');
+    });
+});
+
+// ── G. live-mode and production safety ──────────────────────────────────────
+describe('G. configuration gate', () => {
+    const good = { apiUser: 'u', apiKey: 'k', accountNumber: '100000100002' };
+
+    test('MOOLRE_PROVIDER=MOCK with a production URL and credentials does no provider I/O', async () => {
+        const http = fakeHttp();
+        const svc = new MoolreBankPayoutService({
+            http, providerMode: 'MOCK', bankPayoutEnabled: true, env: 'production',
+            baseUrl: 'https://api.moolre.com', ...good,
+        });
+        const err = await rejectOf(svc.initiateBankTransfer({ ...baseInitiation }));
+        expect(err.outcome).toBe(PROVIDER_OUTCOMES.NOT_DISPATCHED);
+        expect(err.code).toBe('PROVIDER_IO_DISABLED');
+        expect(http.calls).toHaveLength(0);
+        expect(svc.describe().mode).toBe('disabled');
+    });
+
+    test('a missing MOOLRE_PROVIDER means no provider I/O', async () => {
+        const http = fakeHttp();
+        const svc = new MoolreBankPayoutService({ http, providerMode: '', bankPayoutEnabled: true, ...good });
+        const err = await rejectOf(svc.initiateBankTransfer({ ...baseInitiation }));
+        expect(err.code).toBe('PROVIDER_IO_DISABLED');
         expect(http.calls).toHaveLength(0);
     });
 
-    test('describe() exposes no credential or account number', () => {
-        const svc = service(fakeHttp());
-        const described = JSON.stringify(svc.describe());
-        expect(described).not.toContain('private-key');
-        expect(described).not.toContain('100000100002');
-        expect(JSON.parse(described)).toMatchObject({ provider: 'MOOLRE', capability: 'BANK_PAYOUT', channel: 2, currency: 'GHS' });
+    test('LIVE with the bank flag off disables bank payouts only', async () => {
+        const http = fakeHttp();
+        const svc = new MoolreBankPayoutService({ http, providerMode: 'LIVE', bankPayoutEnabled: false, ...good });
+        const err = await rejectOf(svc.initiateBankTransfer({ ...baseInitiation }));
+        expect(err.code).toBe('BANK_PAYOUT_DISABLED');
+        expect(err.outcome).toBe(PROVIDER_OUTCOMES.NOT_DISPATCHED);
+        expect(http.calls).toHaveLength(0);
+        expect(svc.describe()).toMatchObject({ mode: 'disabled', providerIoEnabled: true, bankPayoutEnabled: false });
     });
 
-    test('the default base URL is sandbox unless production is explicitly configured', () => {
-        const previous = process.env.MOOLRE_ENV;
-        delete process.env.MOOLRE_ENV;
-        expect(service(fakeHttp()).baseUrl).toBe('https://sandbox.moolre.com');
-        process.env.MOOLRE_ENV = 'production';
-        expect(service(fakeHttp(), { baseUrl: undefined }).baseUrl).toBe('https://api.moolre.com');
-        if (previous === undefined) delete process.env.MOOLRE_ENV; else process.env.MOOLRE_ENV = previous;
+    test('the flag is read from MOOLRE_BANK_PAYOUT_ENABLED by default and is off unless exactly true', async () => {
+        const saved = { p: process.env.MOOLRE_PROVIDER, f: process.env.MOOLRE_BANK_PAYOUT_ENABLED };
+        process.env.MOOLRE_PROVIDER = 'LIVE';
+        process.env.MOOLRE_BANK_PAYOUT_ENABLED = 'yes';
+        const svc = new MoolreBankPayoutService({ http: fakeHttp(), ...good });
+        expect(svc.describe().bankPayoutEnabled).toBe(false);
+        process.env.MOOLRE_BANK_PAYOUT_ENABLED = 'true';
+        expect(new MoolreBankPayoutService({ http: fakeHttp(), ...good }).describe().bankPayoutEnabled).toBe(true);
+        process.env.MOOLRE_PROVIDER = saved.p;
+        process.env.MOOLRE_BANK_PAYOUT_ENABLED = saved.f;
+        if (saved.p === undefined) delete process.env.MOOLRE_PROVIDER;
+        if (saved.f === undefined) delete process.env.MOOLRE_BANK_PAYOUT_ENABLED;
+    });
+
+    test('a non-allowlisted host disables the capability even when everything else is set', async () => {
+        const http = fakeHttp();
+        const svc = service(http, { baseUrl: 'https://moolre.evil.example' });
+        const err = await rejectOf(svc.initiateBankTransfer({ ...baseInitiation }));
+        expect(err.code).toBe('PROVIDER_HOST_NOT_ALLOWED');
+        expect(http.calls).toHaveLength(0);
+    });
+
+    test.each([
+        ['credentials missing', { apiUser: '', apiKey: '' }, 'PROVIDER_CREDENTIALS_MISSING'],
+        ['source account missing', { accountNumber: '' }, 'PROVIDER_SOURCE_ACCOUNT_MISSING'],
+    ])('%s fails closed before any I/O', async (_label, override, code) => {
+        const http = fakeHttp();
+        const svc = service(http, override);
+        const err = await rejectOf(svc.initiateBankTransfer({ ...baseInitiation }));
+        expect(err.code).toBe(code);
+        expect(http.calls).toHaveLength(0);
+    });
+
+    test('injecting a fake http client never enables a disabled adapter', async () => {
+        const http = fakeHttp();
+        const svc = new MoolreBankPayoutService({ http, providerMode: 'MOCK', bankPayoutEnabled: false });
+        await rejectOf(svc.listBanks());
+        await rejectOf(svc.validateBankAccount({ accountNumber: '0123456789012', bankCode: '030100' }));
+        await rejectOf(svc.getBankTransferStatus({ referenceId: REF }));
+        expect(http.calls).toHaveLength(0);
+    });
+
+    test('every method shares the same gate; describe() reports the resulting mode', async () => {
+        const http = fakeHttp();
+        const svc = service(http, { env: 'production', baseUrl: 'https://api.moolre.com' });
+        expect(svc.describe()).toMatchObject({ mode: 'production', baseUrlHost: 'api.moolre.com' });
+        await svc.listBanks();
+        expect(http.calls[0].url.startsWith('https://api.moolre.com/')).toBe(true);
     });
 });
