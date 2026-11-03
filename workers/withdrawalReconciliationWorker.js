@@ -29,20 +29,30 @@ const SMS_LARGE_WITHDRAWAL_THRESHOLD = parseFloat(
     process.env.SMS_LARGE_WITHDRAWAL_THRESHOLD || '100'
 );
 
+// §P0-2: the bank rail's durable provider identity. One registry
+// (services/payoutProviderOwnership) owns these names; this constant is only the
+// worker's expectation for a BANK payout, used to detect a wrong-rail owner.
+const BANK_PROVIDER_CANONICAL = 'MOOLRE_DISBURSEMENT';
+
 class WithdrawalReconciliationWorker {
-    constructor(prisma, io, mtnDisbursementService, emailService, smsService) {
+    constructor(prisma, io, mtnDisbursementService, emailService, smsService, bankPayoutPort = null) {
         this.prisma = prisma;
         this.io = io;
         this.mtn = mtnDisbursementService;
         this.email = emailService || null;
         this.sms = smsService || null;
+        // §P0-2: the BANK payout adapter (Agent B owns the provider contract;
+        // this worker owns reconciliation). Optional: the bank rail stays
+        // dependency-injected and default-off, so an unbound port simply
+        // parks BANK rows instead of polling them on the wrong rail.
+        this.bankPayoutPort = bankPayoutPort || null;
         this._timer = null;
         this._running = false;
     }
 
     start() {
         if (this._timer) return;
-        if (!this.mtn) {
+        if (!this.mtn && !this.bankPayoutPort) {
             logger.warn('[WithdrawalReconciliation] disbursement service not bound — worker disabled.');
             return;
         }
@@ -342,14 +352,61 @@ class WithdrawalReconciliationWorker {
             // search below remains correct.
         }
 
+        // §P0-2 RAIL IDENTITY. A bank payout is reconciled on the BANK rail and
+        // NOTHING else: the MoMo status service cannot know what a bank
+        // disbursement did, and a "not found" answer from it would be a lie
+        // about a provider that was never asked. The mirror's payoutMethod and
+        // the canonical metadata rail both carry the truth; either one naming
+        // BANK makes this a bank payout.
+        const canonicalRail = String(txRow.metadata?.rail || '').toUpperCase();
+        const mirrorRail = String(withdrawal.payoutMethod || '').toUpperCase();
+        const isBankPayout = mirrorRail === 'BANK' || canonicalRail === 'BANK';
+        const evidenceRail = isBankPayout ? 'BANK' : 'MOMO';
+
+        // A durable owner on the WRONG rail for this payout is a contradiction,
+        // not new information: never poll it, never settle or reverse on it.
+        if (isBankPayout && payoutOwner && payoutOwner.canonicalName
+            && String(payoutOwner.canonicalName).toUpperCase() !== BANK_PROVIDER_CANONICAL) {
+            logger.error({ reference, owner: payoutOwner.canonicalName, rail: 'BANK' },
+                '[WithdrawalReconciliation] BANK payout is owned by a non-bank provider — parking for operator review');
+            await this._recordException(
+                withdrawal,
+                'OWNER_RAIL_CONTRADICTION',
+                { reference, owner: payoutOwner, expectedRail: 'BANK', ownerCanonicalName: payoutOwner.canonicalName },
+                reference
+            );
+            return;
+        }
+
         let statusResp;
         try {
-            statusResp = await this.mtn.getTransferStatus(reference, payoutOwner?.tag);
+            if (isBankPayout) {
+                // Bank status is evidence-only: the adapter never initiates,
+                // retries or invents a reference. Poll the ORIGINAL reference.
+                if (!this.bankPayoutPort || typeof this.bankPayoutPort.getBankTransferStatus !== 'function') {
+                    await this._recordException(
+                        withdrawal,
+                        'BANK_STATUS_PORT_UNAVAILABLE',
+                        {
+                            reference,
+                            settlementCurrency: txRow.settlementCurrency || null,
+                            ownerCanonicalName: payoutOwner?.canonicalName || null,
+                            note: 'BANK payout cannot be reconciled without the bank payout port; never polled on the MoMo rail',
+                        },
+                        reference
+                    );
+                    logger.warn(`[WithdrawalReconciliation] ref=${reference} BANK payout has no bank status port — parked, never polled on the wrong rail.`);
+                    return;
+                }
+                statusResp = await this.bankPayoutPort.getBankTransferStatus({ referenceId: reference });
+            } else {
+                statusResp = await this.mtn.getTransferStatus(reference, payoutOwner?.tag);
+            }
         } catch (err) {
             await this._recordException(
                 withdrawal,
                 'PROVIDER_STATUS_UNAVAILABLE',
-                { provider: payoutOwner?.canonicalName || 'DISBURSEMENT', error: err.message },
+                { provider: payoutOwner?.canonicalName || 'DISBURSEMENT', rail: evidenceRail, error: err.message },
                 reference
             );
             logger.warn(`[WithdrawalReconciliation] provider status query failed for ${reference}: ${err.message}`);
@@ -358,6 +415,14 @@ class WithdrawalReconciliationWorker {
 
         const remoteStatus = String((statusResp && statusResp.status) || 'PENDING').toUpperCase();
         const providerRef = statusResp?.providerRef || statusResp?.referenceId || statusResp?.transactionId || statusResp?.txId || null;
+        // §P0-2 AMOUNT ADAPTATION. The bank adapter reports the exact payout
+        // amount as `amountGhsExact`; the MoMo adapters use `amountGhs`. Adapt
+        // explicitly and NEVER substitute the originally requested amount: a
+        // missing provider amount is missing evidence, not "what we asked".
+        const observedAmountGhs = isBankPayout
+            ? (statusResp?.amountGhsExact ?? null)
+            : (statusResp?.amountGhs ?? null);
+        const observedExternalId = statusResp?.externalId ?? null;
 
         // r15 hardening: a KNOWN owner is authoritative — the status
         // answer's own self-identification may never override it. If the
@@ -395,7 +460,7 @@ class WithdrawalReconciliationWorker {
         try {
             await fiatLiquidity.recordProviderEvent(this.prisma, {
                 provider: evidenceProvider,
-                rail: 'MOMO',
+                rail: evidenceRail,
                 direction: 'OUTBOUND',
                 status: remoteStatus,
                 providerRef,
@@ -403,13 +468,17 @@ class WithdrawalReconciliationWorker {
                 // echoed business reference are durable evidence too. The
                 // semantics layer fails closed on a materially-different
                 // payload replaying under the same observation identity.
-                amountGhs: statusResp?.amountGhs ?? null,
+                // The bank rail's exact amount arrives as `amountGhsExact`.
+                amountGhs: observedAmountGhs,
                 dedupKey: `event:payout-outbound:${evidenceProvider}:${reference}:${remoteStatus}`,
                 relatedReference: reference,
                 raw: {
                     source: 'provider_status_poll',
+                    rail: evidenceRail,
                     reason: statusResp?.reason || null,
-                    externalId: statusResp?.externalId ?? null,
+                    externalId: observedExternalId,
+                    providerCode: statusResp?.providerCode ?? null,
+                    providerStatusRaw: statusResp?.providerStatusRaw ?? null,
                 },
             });
         } catch (evidenceErr) {
@@ -438,9 +507,12 @@ class WithdrawalReconciliationWorker {
                 'PROVIDER_REFERENCE_NOT_FOUND',
                 {
                     provider: evidenceProvider,
+                    rail: evidenceRail,
                     owner: payoutOwner?.tag || null,
                     ownerCanonicalName: payoutOwner?.canonicalName || null,
                     observedStatus: remoteStatus,
+                    observedAmountGhs,
+                    providerRef,
                     response: statusResp,
                 },
                 reference
@@ -462,8 +534,11 @@ class WithdrawalReconciliationWorker {
             const binding = await bindOutboundSettlementEvidence(this.prisma, {
                 reference,
                 provider: evidenceProvider,
-                externalId: statusResp?.externalId ?? null,
-                amountGhs: statusResp?.amountGhs ?? null,
+                externalId: observedExternalId,
+                // Explicit adaptation: the bank adapter's `amountGhsExact` is
+                // what the binder compares against the committed economics. A
+                // null provider amount is never backfilled from the request.
+                amountGhs: observedAmountGhs,
                 status: remoteStatus,
                 source: 'provider_status_poll',
                 payoutOwner,
@@ -513,9 +588,12 @@ class WithdrawalReconciliationWorker {
                 'PROVIDER_STATUS_UNRESOLVED',
                 {
                     provider: evidenceProvider,
+                    rail: evidenceRail,
                     owner: payoutOwner?.tag || null,
                     ownerCanonicalName: payoutOwner?.canonicalName || null,
-                    unresolvedReason: statusResp?.unresolvedReason || null,
+                    unresolvedReason: statusResp?.unresolvedReason || statusResp?.reason || null,
+                    providerRef,
+                    observedAmountGhs,
                     response: statusResp,
                 },
                 reference
