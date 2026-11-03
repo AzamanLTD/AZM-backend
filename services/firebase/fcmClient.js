@@ -23,6 +23,11 @@
 const crypto = require('crypto');
 
 const TOKEN_URI = 'https://oauth2.googleapis.com/token';
+// Imported lazily to keep this module free of a hard dependency cycle: the
+// credentials module is the only place that names these constants for callers.
+const { DEFAULT_CLICK_ACTION, LOCAL_CREDENTIAL_FILE: _LCF } = require('./credentials');
+const DEFAULT_CLICK_ACTION_FIELD = 'click_action';
+
 const SCOPE = 'https://www.googleapis.com/auth/firebase.messaging';
 const DEFAULT_TOKEN_TTL_SECONDS = 3600;
 const DEFAULT_HTTP_TIMEOUT_MS = 10000;
@@ -289,11 +294,17 @@ function createFcmClient({ serviceAccount, http, fetchImpl, timeoutMs = DEFAULT_
         const notification = { title: title || '', body: body || '' };
         if (imageUrl) notification.image = imageUrl;
 
+        // Production seeds this default inside its string-normalising reduce
+        // (utils/firebaseService.js), so every push the Flutter app receives
+        // carries it and its click routing depends on it. A caller-supplied
+        // value wins, which is the behaviour the reduce also produced.
+        const payloadData = { [DEFAULT_CLICK_ACTION_FIELD]: DEFAULT_CLICK_ACTION, ...(data || {}) };
+
         const message = {
             message: {
                 token,
                 notification,
-                ...(data ? { data: Object.fromEntries(Object.entries(data).map(([k, v]) => [k, String(v)])) } : {}),
+                data: Object.fromEntries(Object.entries(payloadData).map(([k, v]) => [k, String(v)])),
             },
         };
 

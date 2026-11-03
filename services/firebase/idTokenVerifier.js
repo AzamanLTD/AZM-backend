@@ -339,7 +339,9 @@ async function verifyIdToken(idToken, { projectId, resolveKey, now = () => Date.
         throw new IdTokenError('ID_TOKEN_SUBJECT_MISMATCH', 'sub and user_id disagree.');
     }
 
-    return claims;
+    // ssoController reads decodedToken.uid || decodedToken.sub, and the SDK
+    // sets uid itself. Supplying it keeps that call site unchanged.
+    return { ...claims, uid: claims.sub };
 }
 
 module.exports = {

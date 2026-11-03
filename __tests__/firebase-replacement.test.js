@@ -12,6 +12,10 @@ const {
 const {
     createFcmClient, buildAssertion, classifySendFailure, parseRetryAfter, createHttpTransport,
 } = require('../services/firebase/fcmClient');
+const {
+    parseServiceAccount, resolveServiceAccount, createFailSafeMessaging,
+    DEFAULT_CLICK_ACTION, CREDENTIAL_PARSE_ERROR, CREDENTIAL_MISSING,
+} = require('../services/firebase/credentials');
 
 const PROJECT = 'azaman-app';
 const KID = 'test-kid-1';
@@ -893,5 +897,155 @@ describe('FCM: a generic body-read failure', () => {
     await client.send({ token: 'd', title: 'a', body: 'b' }).catch(() => {});
     await new Promise((r) => setTimeout(r, 60));
     expect(sends).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Credential resolution: parity with the production Firebase service.
+// No real credential exists anywhere in this file; the values below are
+// obviously fake and never leave the process.
+// ---------------------------------------------------------------------------
+describe('credentials — production priority order', () => {
+  const fake = { client_email: 'svc@example.test', private_key: 'not-a-real-key', project_id: 'azaman-app' };
+  const asJson = JSON.stringify(fake);
+  const asB64 = Buffer.from(asJson, 'utf8').toString('base64');
+
+  test('accepts raw JSON from the primary variable', () => {
+    const out = resolveServiceAccount({ env: { FIREBASE_SERVICE_ACCOUNT: asJson } });
+    expect(out.source).toBe('FIREBASE_SERVICE_ACCOUNT');
+    expect(out.serviceAccount.project_id).toBe('azaman-app');
+  });
+
+  test('accepts base64 from the primary variable', () => {
+    const out = resolveServiceAccount({ env: { FIREBASE_SERVICE_ACCOUNT: asB64 } });
+    expect(out.serviceAccount.client_email).toBe('svc@example.test');
+  });
+
+  test('accepts URL-safe base64', () => {
+    const urlSafe = asB64.replace(/\+/g, '-').replace(/\//g, '_');
+    expect(resolveServiceAccount({ env: { FIREBASE_SERVICE_ACCOUNT_BASE64: urlSafe } })
+      .serviceAccount.project_id).toBe('azaman-app');
+  });
+
+  test('accepts base64 with the padding stripped', () => {
+    const unpadded = asB64.replace(/=+$/, '');
+    expect(resolveServiceAccount({ env: { FIREBASE_SERVICE_ACCOUNT_BASE64: unpadded } })
+      .serviceAccount.project_id).toBe('azaman-app');
+  });
+
+  test('primary wins over the secondary and the file', () => {
+    const other = JSON.stringify({ ...fake, project_id: 'secondary' });
+    const out = resolveServiceAccount({
+      env: { FIREBASE_SERVICE_ACCOUNT: asJson, FIREBASE_SERVICE_ACCOUNT_BASE64: Buffer.from(other).toString('base64') },
+      readFile: () => JSON.stringify({ ...fake, project_id: 'from-file' }),
+    });
+    expect(out.source).toBe('FIREBASE_SERVICE_ACCOUNT');
+    expect(out.serviceAccount.project_id).toBe('azaman-app');
+  });
+
+  test('falls back to the secondary variable', () => {
+    const out = resolveServiceAccount({ env: { FIREBASE_SERVICE_ACCOUNT_BASE64: asB64 } });
+    expect(out.source).toBe('FIREBASE_SERVICE_ACCOUNT_BASE64');
+  });
+
+  test('falls back to the local file last', () => {
+    const out = resolveServiceAccount({ env: {}, readFile: () => asJson });
+    expect(out.source).toBe('file:service-account.json');
+  });
+
+  test('a missing credential is a distinct error', () => {
+    expect(() => resolveServiceAccount({ env: {}, readFile: () => null })).toThrow(CREDENTIAL_MISSING);
+  });
+
+  test('a malformed credential never echoes its own content', () => {
+    const secretish = 'eyJQUklWQVRFX0tFWSI6ICJzZWNyZXQtbWF0ZXJpYWwi';
+    let message = '';
+    try { parseServiceAccount(secretish); } catch (err) { message = err.message; }
+    expect(message).toBe(CREDENTIAL_PARSE_ERROR);
+    expect(message).not.toContain('secret-material');
+    expect(message).not.toContain(secretish.slice(0, 12));
+  });
+
+  test('a parsed but incomplete credential names only the absent fields', () => {
+    expect(() => resolveServiceAccount({ env: { FIREBASE_SERVICE_ACCOUNT: JSON.stringify({ project_id: 'p' }) } }))
+      .toThrow(/FIREBASE_CREDENTIAL_INCOMPLETE: missing client_email, private_key/);
+  });
+});
+
+describe('credentials — fail-safe start-up', () => {
+  test('a missing credential disables messaging without throwing', async () => {
+    const warns = [];
+    const messaging = createFailSafeMessaging({
+      env: {},
+      logger: { warn: (...a) => warns.push(a) },
+      resolve: () => { throw new Error(CREDENTIAL_MISSING); },
+    });
+    expect(messaging.configured).toBe(false);
+    expect(warns).toHaveLength(1);
+    await expect(messaging.sendPush('device-1', 't', 'b')).resolves.toBeNull();
+  });
+
+  test('the warning carries no credential material', () => {
+    const warns = [];
+    createFailSafeMessaging({
+      env: {},
+      logger: { warn: (...a) => warns.push(a) },
+      resolve: () => { throw new Error(CREDENTIAL_MISSING); },
+    });
+    expect(JSON.stringify(warns)).not.toMatch(/BEGIN [A-Z ]*PRIVATE KEY/);
+  });
+
+  test('a resolved credential delegates to the client', async () => {
+    const sent = [];
+    const messaging = createFailSafeMessaging({
+      env: { FIREBASE_SERVICE_ACCOUNT: 'whatever' },
+      resolve: () => ({ serviceAccount: { project_id: 'azaman-app' }, source: 'test' }),
+      createClient: () => ({ send: async (args) => { sent.push(args); return { ok: true }; } }),
+    });
+    expect(messaging.configured).toBe(true);
+    await expect(messaging.sendPush('device-1', 't', 'b', { a: 1 })).resolves.toEqual({ ok: true });
+    expect(sent).toHaveLength(1);
+    await expect(messaging.sendPush('', 't', 'b')).resolves.toBeNull();
+    expect(sent).toHaveLength(1);
+  });
+});
+
+describe('messaging parity — Flutter click routing and uid alias', () => {
+  // Local harness: the FCM suite's stub is scoped to its own describe block.
+  const paritySa = {
+    client_email: 'sender@azaman-app.iam.gserviceaccount.com',
+    private_key: privateKey.export({ type: 'pkcs8', format: 'pem' }),
+    project_id: PROJECT,
+    token_uri: 'https://oauth2.googleapis.com/token',
+  };
+  const parityHttp = () => jest.fn(async (req) => (
+    req.url.includes('oauth2')
+      ? { status: 200, json: { access_token: 'stub-token', expires_in: 3600 } }
+      : { status: 200, json: { name: 'projects/azaman-app/messages/1' } }
+  ));
+
+  test('every push carries the Flutter click action by default', async () => {
+    const http = parityHttp();
+    const client = createFcmClient({ serviceAccount: paritySa, http, now: nowFn });
+    await client.send({ token: 'device-1', title: 'Hi', body: 'There' });
+    const payload = JSON.parse(http.mock.calls[1][0].body).message;
+    expect(payload.data.click_action).toBe(DEFAULT_CLICK_ACTION);
+    expect(payload.data.click_action).toBe('FLUTTER_NOTIFICATION_CLICK');
+  });
+
+  test('a caller-supplied click action wins and values stay strings', async () => {
+    const http = parityHttp();
+    const client = createFcmClient({ serviceAccount: paritySa, http, now: nowFn });
+    await client.send({ token: 'd', title: 't', body: 'b', data: { click_action: 'OPEN_TRADE', tradeId: 7, flag: true } });
+    const payload = JSON.parse(http.mock.calls[1][0].body).message;
+    expect(payload.data.click_action).toBe('OPEN_TRADE');
+    expect(payload.data.tradeId).toBe('7');
+    expect(payload.data.flag).toBe('true');
+  });
+
+  test('verified claims expose uid, which ssoController reads first', async () => {
+    const claims = await verify(mint());
+    expect(claims.uid).toBe(claims.sub);
+    expect(claims.uid).toBe('user-123');
   });
 });
