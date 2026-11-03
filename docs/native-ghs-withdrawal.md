@@ -85,6 +85,21 @@ fingerprint; ciphertext is never a lookup key. API shapes are masked-tail only a
 never returned, logged or persisted. Decryption happens only at the payout boundary for the
 owner's own row.
 
+## Headline contract (resolved, not deferred)
+
+The valuation question raised during inventory — #369's consolidated headline versus Planning #78's
+native-GHS-only headline — is **decided and already implemented upstream** in this branch's base:
+`src/services/balanceValuationService.js` (commit `9909fe2`, "ghs headline is the native balance only")
+and `controllers/profileController.js` build the headline from `nativeGhsAvailable` only.
+
+`usdcEquivalent` is the *estimate of that GHS headline in USDC* — display only. It is never added to the
+headline, never a second balance, and a missing or stale rate leaves the headline valid while the estimate
+goes `null` (`FX_UNAVAILABLE`). Regression: `__tests__/balance-valuation.test.js` (11/11 on this head),
+which asserts that a rate change moves only the estimate and never the headline.
+
+This branch adds no competing headline logic; the payout leg simply spends the same native-GHS balance the
+headline already reflects.
+
 ## Compatibility
 
 Legacy USDC-denominated fiat/crypto/MoMo withdrawals are untouched: with the flag OFF these
