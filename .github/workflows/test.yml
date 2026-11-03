@@ -124,6 +124,8 @@ jobs:
 
       - name: Install native-GHS settlement overlay
         run: node infra/install-native-ghs-settlement-overlay.js
+      - name: Install native-GHS withdrawal overlay
+        run: node infra/install-native-ghs-withdrawal-overlay.js
 
       # PR #292 follow-up: the release chain (npm run release) executes the
       # business-os overlay in production (it is the schema authority for

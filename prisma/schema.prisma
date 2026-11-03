@@ -1000,6 +1000,7 @@ model User {
   onchainSweeps  OnchainSweep[]
 
   @@index([phoneHash])
+  savedBankBeneficiaries SavedBankBeneficiary[]
 }
 
 // =============================================================================
@@ -1376,6 +1377,8 @@ model Withdrawal {
   // infra overlay) — a Withdrawal row can never exist without its
   // canonical row.
   transactionHistoryId String?  @db.VarChar(36)
+  amountGhs Decimal? @db.Decimal(20, 2)
+  settlementCurrency String?
   totalGasFee          Decimal  @default(0.0) @db.Decimal(20, 8)
   vendorGasShare       Decimal  @default(0.0) @db.Decimal(20, 8)
   adminGasShare        Decimal  @default(0.0) @db.Decimal(20, 8)
@@ -1520,6 +1523,8 @@ model GlobalSettings {
   // ON credits the customer's native-GHS wallet in exact pesewas instead —
   // GHS stays GHS. Mutually exclusive with Model B (fail-closed).
   nativeGhsSettlementEnabled Boolean @default(false)
+
+  nativeGhsWithdrawalEnabled Boolean @default(false)
 
   // Phase Q15: App Version Gate
   minAppVersion  String @default("1.0.0") // Minimum supported app version (semver)
@@ -1969,6 +1974,8 @@ model TransactionHistory {
   payerMsisdn       String? // MSISDN that paid — stored raw, masked before display
   initiatedByUserId Int? // User who triggered this deposit (null = USSD walk-up)
   metadata          Json? // { provider, network, amountGhs, rateAtInitiation, ... }
+  amountGhs Decimal? @db.Decimal(20, 2)
+  settlementCurrency String?
   status            TransactionStatus @default(PENDING)
   createdAt         DateTime          @default(now())
 
@@ -7452,4 +7459,31 @@ model CustodyEvidence {
   @@index([custodyAccountId, createdAt(sort: Desc)])
   @@index([status])
   @@index([scope, status])
+}
+
+/// Saved BANK payout beneficiary (issue #389). The account number exists only
+/// as a versioned AES-256-GCM envelope plus an HMAC-SHA256 fingerprint under a
+/// DISTINCT key; plaintext is never persisted, logged or returned after save.
+/// accountName is a provider-validated fact, never a client claim.
+model SavedBankBeneficiary {
+  id                  String    @id @default(uuid())
+  userId              Int
+  bankCode            String    @db.VarChar(16)
+  bankName            String    @db.VarChar(80)
+  accountName         String?   @db.VarChar(120)
+  accountNumberEnc    String
+  accountNumberMasked String    @db.VarChar(32)
+  accountNumberHmac   String    @db.VarChar(64)
+  nickname            String?   @db.VarChar(40)
+  status              String    @default("ACTIVE")
+  isPrimary           Boolean   @default(false)
+  validatedAt         DateTime?
+  keyId               String?   @db.VarChar(32)
+  envelopeVersion     Int       @default(2)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, accountNumberHmac])
+  @@index([userId, status])
 }

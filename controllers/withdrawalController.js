@@ -1790,3 +1790,226 @@ exports.getWithdrawalStatus = async (req, res) => {
         return res.status(500).json({ success: false, code: 'SERVER_ERROR', message: error.message });
     }
 };
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NATIVE-GHS PAYOUT SURFACE (issue #389, Agent A)
+//
+// GHS is denominated, debited, reserved and dispatched in GHS. No rate is
+// consulted anywhere in a GHS-only payout; the ONLY rate in this flow belongs
+// to an explicit, quoted, consented USDC→GHS shortfall conversion.
+//
+// Reuses the canonical state machine end to end: the reservation transaction
+// commits the FinancialOperation claim (COMMITTED, 202 body) inside the same
+// economics as the GHS debit, the P5-D liquidity claim and the Withdrawal
+// mirror; dispatch happens AFTER the response and claims PENDING→DISPATCHING
+// exactly once (single winner vs worker/admin/webhook).
+// ═══════════════════════════════════════════════════════════════════════════
+
+const nativeGhsWithdrawalService = require('../src/services/nativeGhsWithdrawalService');
+const ghsFundingPlanner = require('../src/services/ghsFundingPlanner');
+
+const _ghsErrorStatus = (code) => {
+    switch (code) {
+        case 'GHS_AMOUNT_INVALID':
+        case 'GHS_AMOUNT_REQUIRED':
+        case 'GHS_AMOUNT_PRECISION':
+            return 400;
+        case 'GHS_INSUFFICIENT_BALANCE':
+        case 'USDC_INSUFFICIENT_BALANCE':
+        case 'NATIVE_GHS_QUOTE_INVALID':
+            return 409;
+        case 'NATIVE_GHS_LIQUIDITY_AUTHORITY_REQUIRED':
+        case 'RATE_UNAVAILABLE':
+        case 'QUOTE_RATE_UNAVAILABLE':
+            return 503;
+        case 'FIAT_POOL_INSUFFICIENT':
+            return 503;
+        case 'QUOTE_ALREADY_CONSUMED':
+        case 'QUOTE_EXPIRED':
+        case 'QUOTE_WRONG_OWNER':
+            return 409;
+        default:
+            return 400;
+    }
+};
+
+const _resolveGhsDestination = async (prisma, userId, { destination, savedAccountId }) => {
+    if (savedAccountId) {
+        const saved = await prisma.savedMomoAccount.findUnique({ where: { id: savedAccountId } });
+        if (!saved || saved.userId !== userId) {
+            return { ok: false, status: 404, body: { success: false, code: 'SAVED_ACCOUNT_NOT_FOUND', message: 'Saved account not found.' } };
+        }
+        return { ok: true, destination: saved.phoneNumber || saved.accountNumber, network: saved.network || null };
+    }
+    const dest = String(destination || '').trim();
+    if (!dest || dest.length < 9) {
+        return { ok: false, status: 400, body: { success: false, code: 'DESTINATION_REQUIRED', message: 'A payout destination phone number is required.' } };
+    }
+    return { ok: true, destination: dest, network: null };
+};
+
+/// PREVIEW + QUOTE (no mutation of money): what would this payout need?
+exports.ghsFundingPlan = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const enabled = await nativeGhsWithdrawalService.isNativeGhsWithdrawalEnabled(prisma);
+        if (!enabled) {
+            return res.status(503).json({ success: false, code: 'NATIVE_GHS_WITHDRAWAL_DISABLED', message: 'Native-GHS withdrawals are not enabled.' });
+        }
+        const user = await prisma.user.findUnique({ where: { id: req.user.id }, select: { nativeGhsBalance: true, availableBalance: true } });
+        const plan = ghsFundingPlanner.planGhsPayoutFunding({
+            amountGhs: req.body.amountGhs,
+            feeGhs: 0,
+            availableNativeGhs: user?.nativeGhsBalance ?? 0,
+        });
+        if (!plan.requiresQuote) {
+            return res.status(200).json({ success: true, plan, quote: null, usdcBalanceExact: new Prisma.Decimal(user?.availableBalance ?? 0).toFixed(8) });
+        }
+        // Executable quote through the ONE canonical authority. Fail closed if
+        // no fresh canonical rate exists — never a display/fallback rate.
+        const quote = await ghsFundingPlanner.quoteGhsShortfall({
+            prisma,
+            marketOracle: req.app.get('marketOracle'),
+            userId: req.user.id,
+            shortfallGhs: plan.shortfallGhs,
+        });
+        return res.status(200).json({ success: true, plan, quote, usdcBalanceExact: new Prisma.Decimal(user?.availableBalance ?? 0).toFixed(8) });
+    } catch (error) {
+        logger.error({ err: error, userId: req.user?.id }, '[ghsFundingPlan] error');
+        return res.status(_ghsErrorStatus(error.code)).json({ success: false, code: error.code || 'SERVER_ERROR', message: error.message });
+    }
+};
+
+exports.ghsWithdrawal = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
+    const payoutDispatcher = req.app.get('paymentFailoverService') || req.app.get('mtnDisbursementService');
+    try {
+        const enabled = await nativeGhsWithdrawalService.isNativeGhsWithdrawalEnabled(prisma);
+        if (!enabled) {
+            res.locals.financialClaimRelease = true;
+            return res.status(503).json({ success: false, code: 'NATIVE_GHS_WITHDRAWAL_DISABLED', message: 'Native-GHS withdrawals are not enabled.' });
+        }
+        const userId = req.user.id;
+        const target = await _resolveGhsDestination(prisma, userId, req.body);
+        if (!target.ok) {
+            res.locals.financialClaimRelease = true;
+            return res.status(target.status).json(target.body);
+        }
+        const network = req.body.network || target.network;
+
+        // Fraud evaluation (same seam as the fiat path) — a block is a
+        // pre-economics refusal, so the idempotency claim is released.
+        try {
+            const fraud = await fraudService.evaluate({
+                userId,
+                action: 'WITHDRAWAL_GHS',
+                amount: Number(req.body.amountGhs),
+                destination: target.destination,
+                ip: req.ip,
+            });
+            if (fraud?.blocked) {
+                res.locals.financialClaimRelease = true;
+                return res.status(403).json({ success: false, code: 'FRAUD_BLOCKED', message: 'This withdrawal was blocked for review.' });
+            }
+        } catch (err) {
+            logger.warn({ err: err.message, userId }, '[ghsWithdrawal] fraud evaluation unavailable');
+        }
+
+        // Funding plan first: a genuine shortfall REQUIRES an explicit,
+        // consented quote. Equal amounts mean the quote covers it EXACTLY.
+        const user = await prisma.user.findUnique({ where: { id: userId }, select: { nativeGhsBalance: true } });
+        const plan = ghsFundingPlanner.planGhsPayoutFunding({
+            amountGhs: req.body.amountGhs,
+            feeGhs: 0,
+            availableNativeGhs: user?.nativeGhsBalance ?? 0,
+        });
+        if (plan.requiresQuote && !req.body.quoteId) {
+            res.locals.financialClaimRelease = true;
+            return res.status(409).json({
+                success: false,
+                code: 'GHS_SHORTFALL_QUOTE_REQUIRED',
+                message: 'Native GHS does not cover this withdrawal. Request a shortfall quote and consent to it before retrying.',
+                plan,
+            });
+        }
+
+        const reference = randomUUID();
+        let acceptedResponse = null;
+        const facts = await nativeGhsWithdrawalService.processNativeGhsWithdrawal(
+            prisma,
+            userId,
+            {
+                amountGhs: req.body.amountGhs,
+                destination: target.destination,
+                network,
+                reference,
+                quoteId: req.body.quoteId || null,
+            },
+            {
+                commitOperationClaimInTransaction: async (tx, f) => {
+                    acceptedResponse = {
+                        success: true,
+                        status: 'PENDING',
+                        message: 'Native-GHS withdrawal accepted. The payout is being processed — track it with this reference.',
+                        reference,
+                        data: {
+                            reference,
+                            status: 'PENDING',
+                            asset: 'GHS',
+                            settlementCurrency: nativeGhsWithdrawalService.SETTLEMENT_CURRENCY,
+                            withdrawalId: f.withdrawalRecord?.id ?? null,
+                            transactionId: f.txRecord.id,
+                            amountGhs: f.recipientGhsExact,
+                            feeGhs: f.feeGhsExact,
+                            totalDebitGhs: f.totalDebitGhsExact,
+                            feePolicy: nativeGhsWithdrawalService.GHS_NATIVE_FEE_POLICY,
+                            funding: f.funding ?? { mode: 'GHS_ONLY' },
+                            nativeGhsBalance: f.nativeGhsBalanceExact,
+                            network: network || null,
+                            destination: target.destination,
+                        },
+                    };
+                    const operation = res.locals?.financialOperation || null;
+                    if (!operation) return;
+                    const committed = await tx.financialOperation.updateMany({
+                        where: { id: operation.id, status: 'IN_PROGRESS' },
+                        data: { status: 'COMMITTED', statusCode: 202, responseBody: JSON.stringify(acceptedResponse) },
+                    });
+                    if (committed.count !== 1) {
+                        const err = new Error('Idempotency operation state conflict.');
+                        err.code = 'IDEMPOTENCY_STATE_CONFLICT';
+                        throw err;
+                    }
+                },
+            }
+        );
+
+        // Response emitted AT/BEFORE the commit boundary; dispatch follows.
+        res.status(202).json(acceptedResponse);
+        if (typeof emitBalanceUpdate === 'function') {
+            try { emitBalanceUpdate(userId); } catch (_) { /* socket best-effort */ }
+        }
+
+        const dispatch = await nativeGhsWithdrawalService.dispatchNativeGhsWithdrawal(prisma, {
+            reference,
+            amountGhsExact: facts.recipientGhsExact,
+            destination: target.destination,
+            network,
+            dispatcher: payoutDispatcher,
+        });
+        if (dispatch.reason === 'DISPATCH_CLAIM_LOST' || dispatch.reason === 'DISPATCHER_UNAVAILABLE') {
+            logger.warn({ reference, dispatch }, '[ghsWithdrawal] dispatch deferred (single-winner claim / dispatcher binding)');
+        }
+        if (dispatch.reason === 'PROVIDER_REJECTED') {
+            logger.warn({ reference, dispatch }, '[ghsWithdrawal] provider rejected pre-dispatch — reversed once');
+        }
+        return undefined;
+    } catch (error) {
+        logger.error({ err: error, userId: req.user?.id }, '[ghsWithdrawal] error');
+        if (!res.headersSent) {
+            return res.status(_ghsErrorStatus(error.code)).json({ success: false, code: error.code || 'SERVER_ERROR', message: error.message });
+        }
+        return undefined;
+    }
+};

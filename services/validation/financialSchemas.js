@@ -26,6 +26,20 @@ exports.initiateFiatDepositSchema = z.object({
 // the controller still enforces the phone-presence rule. savedAccountId is the
 // saved-momo account selected as payout destination (r42 WAVE-2 alias compat:
 // the live Flutter app sends it; the controller verifies ownership + isVerified).
+// Native-GHS withdrawal leg (issue #389). GHS-only: NO amount in USDC and no
+// rate anywhere. `quoteId` is present ONLY when the customer explicitly
+// consented to the separate USDC->GHS shortfall quote.
+exports.ghsWithdrawalSchema = z.object({
+  amountGhs:        z.union([z.string(), z.number()]),
+  destination:      z.string().min(9, 'destination must be at least 9 characters').optional(),
+  network:          z.string().optional(),
+  savedAccountId:   z.string().optional(),
+  quoteId:          z.string().optional(),
+}).refine((v) => !!(v.destination || v.savedAccountId), {
+  message: 'destination or savedAccountId is required',
+  path: ['destination'],
+});
+
 exports.fiatWithdrawalSchema = z.object({
   amount:           z.coerce.number().positive('Amount must be positive'),
   payoutMethod:     z.string().optional(),
