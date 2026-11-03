@@ -16,6 +16,7 @@
 
 const logger = require('../src/config/logger');
 const fraudService = require('../services/fraudDetectionService');
+const payoutRiskGate = require('../src/services/payoutRiskGate');
 const ledger = require('../services/ledgerService'); // §P.4 authoritative ledger (shadow journalIntegration no longer used on this path)
 const restrictedObligations = require('../services/restrictedObligationService');
 const financeService          = require('../services/finance.service');
@@ -1933,22 +1934,29 @@ exports.ghsWithdrawal = async (req, res) => {
         }
         const network = req.body.network || target.network;
 
-        // Fraud evaluation (same seam as the fiat path) — a block is a
-        // pre-economics refusal, so the idempotency claim is released.
-        try {
-            const fraud = await fraudService.evaluate({
-                userId,
-                action: 'WITHDRAWAL_GHS',
-                amount: Number(req.body.amountGhs),
-                destination: target.destination,
-                ip: req.ip,
+        // §P0-1 RISK GATE. This used to call evaluate() with `action:
+        // 'WITHDRAWAL_GHS'` and read `.blocked`: the engine keys on `type` and
+        // answers `allowed`, so no rule ran and no answer was read, and a failed
+        // evaluation was logged and ignored. It is now the shared asset-aware
+        // seam, and it refuses BEFORE any debit, quote consumption, reservation
+        // or dispatch.
+        const risk = await payoutRiskGate.evaluatePayoutRisk({
+            userId,
+            amount: Number(req.body.amountGhs),
+            asset: 'GHS',
+            destination: target.destination,
+            rail: 'MOMO',
+            accountAgeHours: payoutRiskGate.accountAgeHoursOf(req.user),
+            channel: 'NATIVE_GHS_MOMO',
+        });
+        if (!risk.ok) {
+            res.locals.financialClaimRelease = true;
+            return res.status(risk.status).json({
+                success: false,
+                code: risk.code,
+                message: risk.message,
+                data: risk.rules ? { rules: risk.rules } : undefined,
             });
-            if (fraud?.blocked) {
-                res.locals.financialClaimRelease = true;
-                return res.status(403).json({ success: false, code: 'FRAUD_BLOCKED', message: 'This withdrawal was blocked for review.' });
-            }
-        } catch (err) {
-            logger.warn({ err: err.message, userId }, '[ghsWithdrawal] fraud evaluation unavailable');
         }
 
         // Funding plan first: a genuine shortfall REQUIRES an explicit,
@@ -2097,6 +2105,29 @@ exports.bankWithdrawal = async (req, res) => {
         }
         const userId = req.user.id;
         const bank = await savedBankBeneficiaryService.revealForPayout(prisma, userId, req.body.beneficiaryId);
+        // §P0-1 the BANK rail had NO risk gate at all. Same authority, same
+        // asset awareness, same pre-economics position: before the verification
+        // gate flips any state, before the balance debit, before the quote is
+        // consumed and before the reservation. The payee identity is passed as
+        // masked context only — never a full account number.
+        const risk = await payoutRiskGate.evaluatePayoutRisk({
+            userId,
+            amount: Number(req.body.amountGhs),
+            asset: 'GHS',
+            destination: bank.accountNumberMasked,
+            rail: 'BANK',
+            accountAgeHours: payoutRiskGate.accountAgeHoursOf(req.user),
+            channel: 'NATIVE_GHS_BANK',
+        });
+        if (!risk.ok) {
+            res.locals.financialClaimRelease = true;
+            return res.status(risk.status).json({
+                success: false,
+                code: risk.code,
+                message: risk.message,
+                data: risk.rules ? { rules: risk.rules } : undefined,
+            });
+        }
         // §P0-3: only a PROVIDER-VERIFIED destination may be paid. The
         // beneficiary endpoint establishes this from the provider's own answer,
         // so an unverified payee means validation has not happened (or was

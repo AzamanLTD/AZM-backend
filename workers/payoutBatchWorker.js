@@ -295,6 +295,20 @@ class PayoutBatchWorker {
                     { payoutMethod: 'MTN_MOMO' },
                     { payoutMethod: 'MOBILE_MONEY' },
                     { payoutMethod: 'FIAT' }
+                ],
+                // §P0-1 NATIVE-GHS ROWS ARE NOT THIS WORKER'S ROWS. Their
+                // Withdrawal.amount is the zero-valued USDC mirror; the
+                // authoritative figure is amountGhs. Auto-approving them here
+                // read a real GHS payout as a $0 withdrawal, and dispatching
+                // them would send a GHS payout down the USDC/fiat path. They
+                // are claimed and dispatched on their own path.
+                AND: [
+                    {
+                        OR: [
+                            { settlementCurrency: null },
+                            { settlementCurrency: { not: 'GHS_NATIVE' } }
+                        ]
+                    }
                 ]
             },
             include: {
@@ -325,6 +339,32 @@ class PayoutBatchWorker {
 
         for (const withdrawal of pendingWithdrawals) {
             const amount = Number(withdrawal.amount);
+
+            // Defence in depth for the query above: if a native-GHS row ever
+            // reaches this loop, park it — never measure it with the USDC
+            // auto-approval limit, whose $0 mirror amount says nothing about a
+            // GHS payout's real size.
+            if (withdrawal.settlementCurrency === 'GHS_NATIVE') {
+                const parked = await this._parkForManualReview(withdrawal, 'NATIVE_GHS_NOT_FIAT_BATCH', {
+                    amount,
+                    settlementCurrency: withdrawal.settlementCurrency,
+                    message: 'Native-GHS payouts are not dispatched by the fiat batch worker; the USDC mirror amount is not their value.',
+                });
+                if (parked) results.flaggedManualReview.push({ id: withdrawal.id, reason: 'NATIVE_GHS_NOT_FIAT_BATCH', amount });
+                continue;
+            }
+
+            // A zero (or unreadable) USDC amount is not a zero-value payout. It
+            // is a row this policy cannot measure, so it cannot be
+            // auto-approved by it.
+            if (!Number.isFinite(amount) || amount <= 0) {
+                const parked = await this._parkForManualReview(withdrawal, 'ZERO_AMOUNT_NOT_AUTO_APPROVABLE', {
+                    amount: Number.isFinite(amount) ? amount : null,
+                    message: 'Withdrawal amount is zero or unreadable; the auto-approve limit cannot measure this payout.',
+                });
+                if (parked) results.flaggedManualReview.push({ id: withdrawal.id, reason: 'ZERO_AMOUNT_NOT_AUTO_APPROVABLE', amount: null });
+                continue;
+            }
 
             if (amount > maxAmount) {
                 const parked = await this._parkForManualReview(withdrawal, 'AMOUNT_EXCEEDS_THRESHOLD', {

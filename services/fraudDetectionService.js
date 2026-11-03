@@ -125,6 +125,50 @@ const RULES = {
   },
 };
 
+// ── Asset-aware amount policy ─────────────────────────────────────────────────
+//
+// The amount thresholds above are USDC thresholds. A native-GHS payout amount is
+// NOT comparable to them: 10,000 GHS is a few hundred dollars, so applying the
+// USDC "huge withdrawal" block to GHS would freeze perfectly ordinary payouts —
+// and converting the GHS amount to USDC first would make a RISK decision depend
+// on a live FX rate, which is both an FX coupling the payout does not otherwise
+// have and a way for the gate to disappear whenever the rate source is down.
+//
+// GHS thresholds are therefore a SEPARATE, explicitly configured policy. No
+// default numbers are invented here. Unset means the amount dimension is simply
+// not evaluated for GHS, and the decision says so (amountPolicy / policyGaps)
+// rather than quietly implying the check ran and passed. A malformed policy is a
+// configuration error and THROWS, so callers refuse the payout instead of
+// proceeding with a gate they cannot trust.
+function resolveGhsAmountPolicy() {
+  const raw = process.env.GHS_RISK_AMOUNT_POLICY;
+  if (raw === undefined || raw === null || String(raw).trim() === '') return null;
+  let parsed;
+  try {
+    parsed = JSON.parse(String(raw));
+  } catch (err) {
+    throw new Error(`GHS_RISK_AMOUNT_POLICY is not valid JSON: ${err.message}`);
+  }
+  const num = (v) => (v === undefined || v === null || v === '' ? null : Number(v));
+  const policy = {
+    largeGhs: num(parsed.largeGhs),
+    hugeGhs: num(parsed.hugeGhs),
+    newAccountMinGhs: num(parsed.newAccountMinGhs),
+  };
+  for (const [key, value] of Object.entries(policy)) {
+    if (value !== null && (!Number.isFinite(value) || value <= 0)) {
+      throw new Error(`GHS_RISK_AMOUNT_POLICY.${key} must be a positive number`);
+    }
+  }
+  return policy;
+}
+
+const GHS_RULES = {
+  GHS_LARGE_WITHDRAWAL: { id: 'GHS_LARGE_WITHDRAWAL', type: 'AMOUNT', severity: 'REVIEW', description: 'GHS withdrawal above the configured large-withdrawal threshold' },
+  GHS_HUGE_WITHDRAWAL: { id: 'GHS_HUGE_WITHDRAWAL', type: 'AMOUNT', severity: 'BLOCK', description: 'GHS withdrawal above the configured huge-withdrawal threshold' },
+  GHS_NEW_ACCOUNT_LARGE_TX: { id: 'GHS_NEW_ACCOUNT_LARGE_TX', type: 'PATTERN', severity: 'BLOCK', description: 'Account < 24h old + GHS withdrawal above the configured new-account threshold' },
+};
+
 // ── Evaluation Engine ──────────────────────────────────────────────────────────
 
 /**
@@ -134,14 +178,25 @@ const RULES = {
  * @returns {Object} { allowed, riskScore, triggeredRules: [{ id, severity, description }] }
  */
 async function evaluate(tx) {
+  if (!tx || typeof tx !== 'object') throw new Error('evaluate(tx) requires a transaction descriptor');
   const triggered = [];
   let riskScore = 0;
+
+  const asset = String(tx.asset || 'USDC').toUpperCase();
+  const isGhs = asset === 'GHS';
+  // Every stored withdrawal type counts toward the same velocity envelope.
+  const velocityTypes = Array.isArray(tx.velocityTypes) && tx.velocityTypes.length
+    ? tx.velocityTypes
+    : (tx.type ? [tx.type] : []);
+  // Throws on a malformed GHS policy: callers must refuse, not guess.
+  const ghsPolicy = isGhs ? resolveGhsAmountPolicy() : null;
+  const policyGaps = [];
 
   const db = prisma();
 
   // ── VELOCITY checks ──────────────────────────────────────────────────────────
-  if (tx.type === 'WITHDRAWAL') {
-    const count = await _countRecentTransactions(db, tx.userId, 'WITHDRAWAL', RULES.WITHDRAWAL_VELOCITY.config.windowSeconds);
+  if (tx.type === 'WITHDRAWAL' || isGhs) {
+    const count = await _countRecentTransactionsByTypes(db, tx.userId, velocityTypes, RULES.WITHDRAWAL_VELOCITY.config.windowSeconds);
     if (count >= RULES.WITHDRAWAL_VELOCITY.config.maxCount) {
       triggered.push(_formatRule(RULES.WITHDRAWAL_VELOCITY));
       riskScore += 50;
@@ -165,8 +220,21 @@ async function evaluate(tx) {
   }
 
   // ── AMOUNT checks ──────────────────────────────────────────────────────────────
-  if (tx.amount && tx.type === 'WITHDRAWAL') {
-    if (tx.amount >= RULES.HUGE_WITHDRAWAL.config.threshold) {
+  if (tx.amount && (tx.type === 'WITHDRAWAL' || isGhs)) {
+    if (isGhs) {
+      // NEVER the USDC thresholds: those numbers mean nothing in GHS.
+      if (!ghsPolicy) {
+        policyGaps.push('GHS_AMOUNT_THRESHOLD_UNCONFIGURED');
+      } else {
+        if (ghsPolicy.hugeGhs !== null && tx.amount >= ghsPolicy.hugeGhs) {
+          triggered.push(_formatRule(GHS_RULES.GHS_HUGE_WITHDRAWAL));
+          riskScore += 60;
+        } else if (ghsPolicy.largeGhs !== null && tx.amount >= ghsPolicy.largeGhs) {
+          triggered.push(_formatRule(GHS_RULES.GHS_LARGE_WITHDRAWAL));
+          riskScore += 20;
+        }
+      }
+    } else if (tx.amount >= RULES.HUGE_WITHDRAWAL.config.threshold) {
       triggered.push(_formatRule(RULES.HUGE_WITHDRAWAL));
       riskScore += 60;
     } else if (tx.amount >= RULES.LARGE_WITHDRAWAL.config.threshold) {
@@ -184,7 +252,16 @@ async function evaluate(tx) {
 
   // ── PATTERN: new account + large transaction ───────────────────────────────────
   if (tx.accountAgeHours !== undefined && tx.accountAgeHours < RULES.NEW_ACCOUNT_LARGE_TX.config.maxAccountAgeHours) {
-    if (tx.amount && tx.amount > RULES.NEW_ACCOUNT_LARGE_TX.config.minAmount) {
+    if (isGhs) {
+      // The USDC minAmount is not a GHS minAmount. Without a configured GHS
+      // figure this pattern is not evaluated, and the decision says so.
+      if (!ghsPolicy || ghsPolicy.newAccountMinGhs === null) {
+        if (!policyGaps.includes('GHS_NEW_ACCOUNT_THRESHOLD_UNCONFIGURED')) policyGaps.push('GHS_NEW_ACCOUNT_THRESHOLD_UNCONFIGURED');
+      } else if (tx.amount && tx.amount > ghsPolicy.newAccountMinGhs) {
+        triggered.push(_formatRule(GHS_RULES.GHS_NEW_ACCOUNT_LARGE_TX));
+        riskScore += 40;
+      }
+    } else if (tx.amount && tx.amount > RULES.NEW_ACCOUNT_LARGE_TX.config.minAmount) {
       triggered.push(_formatRule(RULES.NEW_ACCOUNT_LARGE_TX));
       riskScore += 40;
     }
@@ -223,6 +300,11 @@ async function evaluate(tx) {
     allowed,
     riskScore: Math.min(riskScore, 100),
     triggeredRules: triggered,
+    asset,
+    // What the amount dimension actually did, so no caller can claim a check
+    // ran when the policy behind it does not exist.
+    amountPolicy: isGhs ? (ghsPolicy ? 'APPLIED' : 'NOT_CONFIGURED') : 'APPLIED',
+    policyGaps,
   };
 }
 
@@ -251,6 +333,23 @@ async function _countRecentTransactions(db, userId, type, windowSeconds) {
     return count;
   } catch {
     // Table might not exist in some environments
+    return 0;
+  }
+}
+
+/**
+ * Count withdrawals across EVERY stored withdrawal type. Native-GHS payouts are
+ * written as WITHDRAWAL_FIAT while the older fiat path writes WITHDRAWAL, so a
+ * single-type count would let a customer alternate rails to escape the velocity
+ * envelope entirely.
+ */
+async function _countRecentTransactionsByTypes(db, userId, types, windowSeconds) {
+  try {
+    const since = new Date(Date.now() - windowSeconds * 1000);
+    return await db.transactionHistory.count({
+      where: { userId, type: { in: types }, createdAt: { gte: since } },
+    });
+  } catch {
     return 0;
   }
 }
