@@ -23,6 +23,8 @@ if (hasDb) {
     process.env.BANK_BENEFICIARY_HMAC_KEY = process.env.BANK_BENEFICIARY_HMAC_KEY || 'test-hmac-key-distinct-from-encryption';
     process.env.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'a'.repeat(64);
     process.env.BANK_PAYOUT_FEE_GHS = '0';
+    process.env.GHS_RISK_AMOUNT_POLICY = process.env.GHS_RISK_AMOUNT_POLICY
+        || '{"largeGhs":1000000,"hugeGhs":2000000,"newAccountMinGhs":900000}';
 }
 
 maybe('BANK payouts reconcile on the BANK rail (real PostgreSQL)', () => {
@@ -96,7 +98,9 @@ maybe('BANK payouts reconcile on the BANK rail (real PostgreSQL)', () => {
             amountGhsExact: facts.recipientGhsExact,
             bank,
             port: {
+                capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
                 initiateBankTransfer: async () => ({
+                capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
                     provider: 'MOOLRE_DISBURSEMENT',
                     rail: 'BANK',
                     referenceId: reference,

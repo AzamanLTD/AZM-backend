@@ -54,6 +54,10 @@ async function evaluatePayoutRisk({
     rail = null,
     accountAgeHours = undefined,
     channel = 'PAYOUT',
+    // The request-scoped client. The fraud authority must read through the SAME
+    // client the caller uses, so a test (or a future read replica) can hand it a
+    // specific one instead of a hidden module singleton.
+    db = null,
 } = {}) {
     const numeric = Number(amount);
     let decision;
@@ -70,16 +74,28 @@ async function evaluatePayoutRisk({
             accountAgeHours,
             velocityTypes: WITHDRAWAL_VELOCITY_TYPES,
             channel,
+            // A money-out decision needs EVERY query behind it to have answered.
+            // Best-effort mode reported an unreadable database as "zero risk".
+            riskDataMode: 'FAIL_CLOSED',
+            ...(db ? { db } : {}),
         });
     } catch (err) {
-        // Includes a malformed GHS_RISK_AMOUNT_POLICY: a gate we cannot trust
-        // must not silently pass.
-        const policyInvalid = /GHS_RISK_AMOUNT_POLICY/.test(String(err && err.message));
-        logger.error({ err: err && err.message, userId, channel }, '[payoutRiskGate] risk authority unavailable');
+        // Three distinct unavailability classes, each refused the same way and
+        // each distinguishable in the logs:
+        //   RISK_DATA_UNAVAILABLE — a required risk query failed. "We could not
+        //                           look" is NOT "nothing to see".
+        //   RISK_POLICY_INVALID   — the configured GHS policy cannot be trusted.
+        //   RISK_SERVICE_UNAVAILABLE — the authority itself is down.
+        const code = err && err.code === 'RISK_DATA_UNAVAILABLE'
+            ? 'RISK_DATA_UNAVAILABLE'
+            : (err && err.code === 'RISK_POLICY_INVALID') || /GHS_RISK_AMOUNT_POLICY/.test(String(err && err.message))
+                ? 'RISK_POLICY_INVALID'
+                : 'RISK_SERVICE_UNAVAILABLE';
+        logger.error({ err: err && err.message, code, userId, channel }, '[payoutRiskGate] risk authority unavailable');
         return {
             ok: false,
             status: 503,
-            code: policyInvalid ? 'RISK_POLICY_INVALID' : 'RISK_SERVICE_UNAVAILABLE',
+            code,
             message: 'Security checks are temporarily unavailable, so this withdrawal was not started. Nothing was debited. Please try again shortly.',
             unavailable: true,
         };
@@ -87,9 +103,21 @@ async function evaluatePayoutRisk({
 
     const rules = (decision.triggeredRules || []).map((r) => r.id);
     if (decision.policyGaps && decision.policyGaps.length) {
-        // Visible, never fatal on its own: the platform has no approved GHS
-        // amount thresholds yet. Recorded so it cannot be mistaken for a pass.
-        logger.warn({ userId, channel, policyGaps: decision.policyGaps }, '[payoutRiskGate] risk policy gaps (amount dimension not evaluated)');
+        // A MISSING POLICY IS A REFUSAL. This used to log a warning and continue,
+        // which meant a GHS payout was cleared on a risk dimension that was never
+        // evaluated — the gate existed but the amount question was never asked.
+        // The platform still has no approved GHS thresholds; until it does, the
+        // native-GHS payout path stays closed rather than guessing.
+        logger.error({ userId, channel, policyGaps: decision.policyGaps, missing: decision.amountPolicyMissing }, '[payoutRiskGate] GHS risk policy not configured — refusing');
+        return {
+            ok: false,
+            status: 503,
+            code: 'RISK_POLICY_UNCONFIGURED',
+            message: 'GHS withdrawal security policy is not fully configured, so this withdrawal was not started. Nothing was debited.',
+            policyGaps: decision.policyGaps,
+            policyMissing: decision.amountPolicyMissing || [],
+            decision,
+        };
     }
     if (!decision.allowed) {
         logger.warn({ userId, channel, rules, riskScore: decision.riskScore }, '[payoutRiskGate] payout blocked by risk authority');

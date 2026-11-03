@@ -135,7 +135,15 @@ exports.createPaymentRequestSchema = z.object({
 exports.bankBeneficiarySchema = z.object({
   bankCode:      z.string().min(2).max(16),
   bankName:      z.string().min(2).max(80),
-  accountNumber: z.string().min(6).max(24),
+  // Account numbers are 10-16 digits — the SAME range the saved-beneficiary
+  // domain service enforces (ACCOUNT_NUMBER_MIN_DIGITS / MAX_DIGITS). This layer
+  // used to advertise 6-20, so a client could pass HTTP validation and be refused
+  // by the service with a different rule. Leading zeroes are significant and are
+  // preserved verbatim: nothing here trims or coerces the value.
+  accountNumber: z.string()
+    .trim()
+    .transform((v) => v.replace(/[\s-]/g, ''))
+    .pipe(z.string().regex(/^[0-9]{10,16}$/, 'Account number must be 10-16 digits')),
   accountName:   z.string().max(120).optional(),
   nickname:      z.string().max(40).optional(),
   isPrimary:     z.boolean().optional(),
@@ -157,3 +165,11 @@ exports.bankWithdrawalSchema = z.object({
   quoteId:        z.string().optional(),
   idempotencyKey: z.string().optional(),
 });
+
+// §P1C the only mutable fields. A payee's destination is immutable, so an update
+// can never silently redirect a verified account; unknown keys are refused so a
+// client cannot even ask.
+exports.bankBeneficiaryUpdateSchema = z.object({
+  nickname:  z.string().max(40).nullable().optional(),
+  isPrimary: z.boolean().optional(),
+}).strict();

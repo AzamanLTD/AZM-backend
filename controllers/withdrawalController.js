@@ -1865,6 +1865,16 @@ exports.bankFundingPlan = async (req, res) => {
         if (!enabled) {
             return res.status(503).json({ success: false, code: 'NATIVE_GHS_WITHDRAWAL_DISABLED', message: 'Native-GHS withdrawals are not enabled.' });
         }
+        // §P0 A QUOTE IS A PROMISE TO PAY. Never mint an executable customer
+        // consent for a rail whose payout capability is disabled: the customer
+        // would consent to a payout that cannot happen.
+        if (!bankPayoutIsAvailable(req.app.get('moolreBankPayoutPort'))) {
+            return res.status(503).json({
+                success: false,
+                code: 'BANK_PAYOUT_CAPABILITY_UNAVAILABLE',
+                message: 'Bank payouts are not available right now, so no quote was issued. Nothing was debited.',
+            });
+        }
         // 1. the beneficiary is the OWNER's, and must be ACTIVE.
         let bank;
         try {
@@ -2053,6 +2063,7 @@ exports.ghsWithdrawal = async (req, res) => {
             rail: 'MOMO',
             accountAgeHours: payoutRiskGate.accountAgeHoursOf(req.user),
             channel: 'NATIVE_GHS_MOMO',
+            db: prisma,
         });
         if (!risk.ok) {
             res.locals.financialClaimRelease = true;
@@ -2060,7 +2071,11 @@ exports.ghsWithdrawal = async (req, res) => {
                 success: false,
                 code: risk.code,
                 message: risk.message,
-                data: risk.rules ? { rules: risk.rules } : undefined,
+                // Operator-visible refusal evidence: which rules fired, or which
+                // parts of the GHS risk policy are missing.
+                data: risk.rules
+                    ? { rules: risk.rules }
+                    : (risk.policyGaps ? { policyGaps: risk.policyGaps, policyMissing: risk.policyMissing } : undefined),
             });
         }
 
@@ -2186,6 +2201,24 @@ exports.ghsWithdrawal = async (req, res) => {
 // BANK PAYOUT SURFACE (issue #389 section 4, Agent A)
 //
 // Explicitly typed BANK destination — never inferred. The provider call is
+// §P0 BANK CAPABILITY BEFORE ECONOMICS. "The method exists" is not "the rail can
+// pay out": an adapter can expose initiateBankTransfer while its payout
+// capability is disabled by configuration (no credentials, no source account, an
+// unapproved host, provider mode 'disabled'). Every bank entry point therefore
+// asks the adapter what it can actually do, and a capability that cannot be
+// PROVEN is unavailable. Refusing here costs the customer a retry; refusing
+// later costs them their money.
+function bankPayoutIsAvailable(port) {
+    if (!port || typeof port.capabilities !== 'function' || typeof port.initiateBankTransfer !== 'function') {
+        return false;
+    }
+    try {
+        return port.capabilities()?.canInitiateBankPayout === true;
+    } catch (_) {
+        return false;
+    }
+}
+
 // delegated to the INJECTED `moolreBankPayoutPort` (Agent B's adapter, not
 // edited here); when that capability is not bound the route refuses 503 with
 // ZERO mutation instead of guessing a rail. Economics, operation identity,
@@ -2202,9 +2235,9 @@ exports.bankWithdrawal = async (req, res) => {
             res.locals.financialClaimRelease = true;
             return res.status(503).json({ success: false, code: 'NATIVE_GHS_WITHDRAWAL_DISABLED', message: 'Native-GHS withdrawals are not enabled.' });
         }
-        // Capability-first: a missing port is a configuration fact, not a
-        // customer error — refuse BEFORE any money moves.
-        if (!bankPort || typeof bankPort.initiateBankTransfer !== 'function') {
+        // Capability-first: a missing OR DISABLED rail is a configuration fact,
+        // not a customer error — refuse BEFORE any money moves.
+        if (!bankPayoutIsAvailable(bankPort)) {
             res.locals.financialClaimRelease = true;
             return res.status(503).json({
                 success: false,
@@ -2227,6 +2260,7 @@ exports.bankWithdrawal = async (req, res) => {
             rail: 'BANK',
             accountAgeHours: payoutRiskGate.accountAgeHoursOf(req.user),
             channel: 'NATIVE_GHS_BANK',
+            db: prisma,
         });
         if (!risk.ok) {
             res.locals.financialClaimRelease = true;
@@ -2234,7 +2268,11 @@ exports.bankWithdrawal = async (req, res) => {
                 success: false,
                 code: risk.code,
                 message: risk.message,
-                data: risk.rules ? { rules: risk.rules } : undefined,
+                // Operator-visible refusal evidence: which rules fired, or which
+                // parts of the GHS risk policy are missing.
+                data: risk.rules
+                    ? { rules: risk.rules }
+                    : (risk.policyGaps ? { policyGaps: risk.policyGaps, policyMissing: risk.policyMissing } : undefined),
             });
         }
         // §P0-3: only a PROVIDER-VERIFIED destination may be paid. The
@@ -2251,6 +2289,33 @@ exports.bankWithdrawal = async (req, res) => {
                 message: verificationError.message,
             });
         }
+        // §P1C VALIDATION FRESHNESS. A stored validatedAt proves the provider
+        // once confirmed this account; it does not prove the account is payable
+        // NOW, and no approved validity interval exists to say how old is too
+        // old. So the payout boundary re-asks the provider, bound to the STORED
+        // number and bank code, and records the provider's own validation
+        // timestamp in the immutable snapshot. A refusal costs a retry; a stale
+        // pass costs the money.
+        let freshness;
+        try {
+            freshness = await savedBankBeneficiaryService.revalidateBeneficiary(prisma, userId, bank.id, { port: bankPort });
+        } catch (freshnessError) {
+            res.locals.financialClaimRelease = true;
+            const code = freshnessError.code || 'BENEFICIARY_REVALIDATION_REQUIRED';
+            const unavailable = code === 'VALIDATION_UNAVAILABLE' || code === 'VALIDATION_UNDETERMINED'
+                || code === 'DIRECTORY_UNAVAILABLE' || code === 'BENEFICIARY_KEY_UNAVAILABLE';
+            return res.status(unavailable ? 503 : (code === 'BENEFICIARY_NOT_FOUND' ? 404 : 422)).json({
+                success: false,
+                code,
+                message: unavailable
+                    ? 'Bank account verification is unavailable right now, so this withdrawal was not started. Nothing was debited.'
+                    : 'This destination could not be re-verified with the bank just now, so this withdrawal was not started. Nothing was debited.',
+            });
+        }
+        bank.accountName = freshness.beneficiary.accountName;
+        bank.accountNameVerified = true;
+        bank.validatedAt = freshness.beneficiary.validatedAt || null;
+
         // §6 immutable acceptance snapshot: what the customer confirmed, not
         // what the payee record happens to say later.
         const beneficiarySnapshot = {
@@ -2264,6 +2329,10 @@ exports.bankWithdrawal = async (req, res) => {
             accountNameVerified: bank.accountNameVerified === true,
             accountNumberMasked: bank.accountNumberMasked,
             fingerprint: savedBankBeneficiaryService.fingerprint(bank.accountNumber),
+            // WHEN the provider confirmed this exact destination, not merely
+            // "true": a boolean cannot be aged or questioned later.
+            providerValidatedAt: (freshness.verification && freshness.verification.validatedAt) || null,
+            verificationSource: 'MOOLRE_ACCOUNT_ENQUIRY',
             capturedAt: new Date().toISOString(),
         };
 

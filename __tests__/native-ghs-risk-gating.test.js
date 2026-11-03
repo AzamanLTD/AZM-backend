@@ -29,9 +29,19 @@ if (hasDb) {
     process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_secret_at_least_32_chars_long_xxxxx';
     process.env.BANK_BENEFICIARY_HMAC_KEY = process.env.BANK_BENEFICIARY_HMAC_KEY || 'test-hmac-key-distinct-from-encryption';
     process.env.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'a'.repeat(64);
+    // §P0 the gate REFUSES while no complete GHS amount policy exists, so the
+    // happy-path tests in this suite configure one explicitly. The numbers sit
+    // far above every fixture amount so only the tests that WANT an amount rule
+    // to fire override them.
+    process.env.GHS_RISK_AMOUNT_POLICY = '{"largeGhs":1000000,"hugeGhs":2000000,"newAccountMinGhs":900000}';
 }
 
 (hasDb ? describe : describe.skip)('native-GHS risk gating (real PostgreSQL)', () => {
+    // The GHS amount policy is required for a payout to be allowed, so every
+    // test starts from a valid one; the tests about a missing, partial or
+    // malformed policy override it deliberately.
+    const SUITE_POLICY = '{"largeGhs":1000000,"hugeGhs":2000000,"newAccountMinGhs":900000}';
+    beforeEach(() => { process.env.GHS_RISK_AMOUNT_POLICY = SUITE_POLICY; });
     const { randomUUID } = require('crypto');
     const express = require('express');
     const request = require('supertest');
@@ -60,7 +70,12 @@ if (hasDb) {
         beneficiaries = require('../src/services/savedBankBeneficiaryService');
     });
     afterAll(async () => { if (prisma) await prisma.$disconnect(); });
-    beforeEach(() => { jest.restoreAllMocks(); delete process.env.GHS_RISK_AMOUNT_POLICY; });
+    beforeEach(() => {
+        jest.restoreAllMocks();
+        // Reset to a VALID policy: the payout gate refuses without one, so a test
+        // that unsets it must not leak that state into the next test.
+        process.env.GHS_RISK_AMOUNT_POLICY = SUITE_POLICY;
+    });
 
     async function setSettings(extra = {}) {
         const data = {
@@ -89,7 +104,9 @@ if (hasDb) {
             validateBankAccount: jest.fn(async ({ accountNumber, bankCode }) => ({
                 valid: true, accountName: 'AMA MENSAH', bankCode, validatedAt: new Date().toISOString(),
             })),
+            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
             initiateBankTransfer: jest.fn(async () => { calls.initiateBankTransfer += 1; return { status: 'PENDING', externalId: 'ext-risk-1', providerRef: 'MUL-RISK-1' }; }),
+            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
             getBankTransferStatus: jest.fn(async () => ({ status: 'PENDING' })),
         };
         return { dispatcher, bankPort, calls };
@@ -187,7 +204,7 @@ if (hasDb) {
         jest.spyOn(fraudService, 'evaluate').mockResolvedValue({
             allowed: false, riskScore: 60,
             triggeredRules: [{ id: 'WITHDRAWAL_VELOCITY', severity: 'BLOCK', description: 'blocked' }],
-            asset: 'GHS', amountPolicy: 'NOT_CONFIGURED', policyGaps: ['GHS_AMOUNT_THRESHOLD_UNCONFIGURED'],
+            asset: 'GHS', amountPolicy: 'APPLIED', policyGaps: [],
         });
         const before = await stateOf(user.id);
         const res = await bankPost(app, user, { amountGhs: '50.00', beneficiaryId: beneficiary.id });
@@ -229,28 +246,44 @@ if (hasDb) {
     });
 
     // ── 5. GHS amounts are not USDC amounts ────────────────────────────────
-    test('5: a GHS amount is never judged by the USDC thresholds', async () => {
+    test('5: a GHS amount is never judged by the USDC thresholds, and an unset policy refuses', async () => {
         await setSettings();
+        delete process.env.GHS_RISK_AMOUNT_POLICY;
         // 12,000 GHS would be "huge" if someone compared it to the USDC $10,000
-        // rule. With no approved GHS threshold policy it must NOT be blocked by
-        // that rule, and the decision must say the amount dimension is unset.
+        // rule, and it must never be judged by that rule. The engine says the
+        // amount dimension was NOT evaluated; the gate turns that gap into a
+        // refusal. "Nobody configured this" is not "the check passed".
         const direct = await fraudService.evaluate({
             userId: 999999, type: 'WITHDRAWAL', asset: 'GHS', amount: 12000,
             velocityTypes: ['WITHDRAWAL_FIAT', 'WITHDRAWAL_CRYPTO'],
         });
-        expect(direct.allowed).toBe(true);
         expect(direct.amountPolicy).toBe('NOT_CONFIGURED');
-        expect(direct.policyGaps).toContain('GHS_AMOUNT_THRESHOLD_UNCONFIGURED');
+        expect(direct.policyGaps).toContain('GHS_AMOUNT_POLICY_MISSING');
+        expect(direct.policyGaps).not.toContain('GHS_AMOUNT_THRESHOLD_UNCONFIGURED');
         expect(direct.triggeredRules.map((r) => r.id)).not.toContain('HUGE_WITHDRAWAL');
+        expect(direct.triggeredRules.map((r) => r.id)).not.toContain('GHS_HUGE_WITHDRAWAL');
 
-        // And USDC behaviour is unchanged: the same number IS huge in USDC.
+        const user = await seedUser(prisma, { nativeGhsBalance: 20000 });
+        const { dispatcher, calls } = providerFakes();
+        const app = buildApp({ dispatcher });
+        const before = await stateOf(user.id);
+        const res = await ghsPost(app, user, { amountGhs: '12000.00' });
+        expect(res.status).toBe(503);
+        expect(res.body.code).toBe('RISK_POLICY_UNCONFIGURED');
+        expect(res.body.data.policyGaps).toContain('GHS_AMOUNT_POLICY_MISSING');
+        expect(await stateOf(user.id)).toEqual(before);
+        expect(calls.initiateTransfer).toBe(0);
+
+        // And USDC behaviour is unchanged: the same number IS huge in USDC, and
+        // an absent GHS policy is irrelevant to a USDC decision.
         const usdc = await fraudService.evaluate({ userId: 999999, type: 'WITHDRAWAL', asset: 'USDC', amount: 12000 });
         expect(usdc.allowed).toBe(false);
         expect(usdc.triggeredRules.map((r) => r.id)).toContain('HUGE_WITHDRAWAL');
+        expect(usdc.policyGaps).toEqual([]);
     });
 
     test('5b: a configured GHS policy is honoured, and a huge GHS payout is blocked', async () => {
-        process.env.GHS_RISK_AMOUNT_POLICY = JSON.stringify({ largeGhs: 2000, hugeGhs: 5000 });
+        process.env.GHS_RISK_AMOUNT_POLICY = JSON.stringify({ largeGhs: 2000, hugeGhs: 5000, newAccountMinGhs: 1000 });
         await setSettings();
         const user = await seedUser(prisma, { nativeGhsBalance: 20000 });
         const { dispatcher, calls } = providerFakes();

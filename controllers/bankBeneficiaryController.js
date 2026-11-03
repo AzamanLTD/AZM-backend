@@ -22,6 +22,16 @@ const _status = (code) => {
             return 422;
         case 'BENEFICIARY_LIMIT_REACHED':
             return 409;
+        case 'BENEFICIARY_FIELD_IMMUTABLE':
+        case 'BENEFICIARY_FIELD_NOT_UPDATABLE':
+        case 'BENEFICIARY_UPDATE_EMPTY':
+            return 400;
+        case 'BANK_DIRECTORY_UNAVAILABLE':
+        case 'VALIDATION_UNDETERMINED':
+            return 503;
+        case 'ACCOUNT_NOT_FOUND':
+        case 'ACCOUNT_NAME_MISMATCH':
+            return 422;
         default:
             return 400;
     }
@@ -68,5 +78,44 @@ exports.remove = async (req, res) => {
         return res.status(200).json({ success: true, ...result });
     } catch (error) {
         return _fail(res, error, 'remove');
+    }
+};
+
+// §P1C GET /api/bank-beneficiaries/banks — the provider's bank directory, with
+// its real freshness. Bank codes stay strings so leading zeroes survive.
+exports.banks = async (req, res) => {
+    try {
+        const port = req.app.get('moolreBankPayoutPort') || null;
+        const forceRefresh = String(req.query.refresh || '') === 'true';
+        const directory = await service.listBankDirectory(port, { forceRefresh });
+        return res.status(200).json({ success: true, ...directory });
+    } catch (error) {
+        return _fail(res, error, 'banks');
+    }
+};
+
+// §P1C PATCH /api/bank-beneficiaries/:id — nickname / primary only. The
+// destination is immutable: a different account is a different payee.
+exports.update = async (req, res) => {
+    try {
+        const prisma = req.app.get('prisma');
+        const beneficiary = await service.updateBeneficiary(prisma, req.user.id, req.params.id, req.body);
+        return res.status(200).json({ success: true, beneficiary });
+    } catch (error) {
+        return _fail(res, error, 'update');
+    }
+};
+
+// §P1C POST /api/bank-beneficiaries/:id/validate — re-run provider validation
+// against the STORED account. The number is decrypted server-side and is never
+// accepted from, or returned to, the client.
+exports.revalidate = async (req, res) => {
+    try {
+        const prisma = req.app.get('prisma');
+        const port = req.app.get('moolreBankPayoutPort') || null;
+        const result = await service.revalidateBeneficiary(prisma, req.user.id, req.params.id, { port });
+        return res.status(200).json({ success: true, ...result });
+    } catch (error) {
+        return _fail(res, error, 'revalidate');
     }
 };

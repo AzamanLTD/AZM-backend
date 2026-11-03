@@ -6824,6 +6824,13 @@ model FraudAssessment {
   id              String  @id @default(uuid())
   userId          Int
   transactionType String  @db.VarChar(50)
+  /// Asset the assessed amount is denominated in. Historical rows were always
+  /// USDC; new rows name their asset so a GHS amount is never read as dollars.
+  asset           String  @default("USDC") @db.VarChar(10)
+  /// The assessed amount in `asset`, exactly as the decision saw it.
+  amountExact     Decimal @default(0) @db.Decimal(30, 8)
+  /// LEGACY, USDC-ONLY. Kept so existing consumers and historical rows keep
+  /// their meaning. A non-USDC assessment writes 0 here and its amount above.
   amountUsdc      Decimal @default(0) @db.Decimal(20, 8)
   riskScore       Int     @default(0)
   triggeredRules  String  @db.VarChar(500)

@@ -29,6 +29,8 @@ if (hasDb) {
     // These tests evidence a zero-fee bank contract so the economics are
     // exercised; the refusal path is proven separately below.
     process.env.BANK_PAYOUT_FEE_GHS = '0';
+    process.env.GHS_RISK_AMOUNT_POLICY = process.env.GHS_RISK_AMOUNT_POLICY
+        || '{"largeGhs":1000000,"hugeGhs":2000000,"newAccountMinGhs":900000}';
 }
 
 maybe('saved bank beneficiaries + BANK payout (real PostgreSQL)', () => {
@@ -83,6 +85,8 @@ maybe('saved bank beneficiaries + BANK payout (real PostgreSQL)', () => {
     // carries a faithful validation surface; the validation lifecycle itself is
     // proven in bank-beneficiary-validation.test.js.
     const providerSurface = () => ({
+        // a port must PROVE it can pay out, not merely expose the method
+        capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
         listBanks: async () => ({ banks: [{ code: 'GCB', name: 'GCB Bank' }], stale: false, source: 'MOOLRE' }),
         validateBankAccount: async ({ accountNumber, bankCode }) => ({
             valid: true, accountName: 'AMA MENSAH', bankCode,
@@ -222,7 +226,9 @@ maybe('saved bank beneficiaries + BANK payout (real PostgreSQL)', () => {
         // Too short to be any real account: 6-9 digits used to be accepted.
         const short = await createBene(app, user, { accountNumber: '123456' });
         expect(short.status).toBe(400);
-        expect(short.body.code).toBe('ACCOUNT_NUMBER_INVALID');
+        // §P1-6 the HTTP layer enforces the same 10-16 window, so it refuses
+        // first and its envelope names the field.
+        expect(JSON.stringify(short.body)).toContain('10-16');
 
         // Not a name at all.
         const digitsOnly = await createBene(app, user, { accountName: '12345' });

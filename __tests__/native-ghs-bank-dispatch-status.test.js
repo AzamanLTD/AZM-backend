@@ -24,6 +24,8 @@ if (hasDb) {
     process.env.BANK_BENEFICIARY_HMAC_KEY = process.env.BANK_BENEFICIARY_HMAC_KEY || 'test-hmac-key-distinct-from-encryption';
     process.env.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'a'.repeat(64);
     process.env.BANK_PAYOUT_FEE_GHS = '0';
+    process.env.GHS_RISK_AMOUNT_POLICY = process.env.GHS_RISK_AMOUNT_POLICY
+        || '{"largeGhs":1000000,"hugeGhs":2000000,"newAccountMinGhs":900000}';
 }
 
 maybe('BANK dispatch decides on the provider answer (real PostgreSQL)', () => {
@@ -117,7 +119,9 @@ maybe('BANK dispatch decides on the provider answer (real PostgreSQL)', () => {
         const before = await liquidity();
 
         const out = await dispatch(reference, facts, bank, {
+            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
             initiateBankTransfer: async () => ({
+            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
                 provider: 'MOOLRE_DISBURSEMENT',
                 rail: 'BANK',
                 referenceId: reference,
@@ -153,7 +157,9 @@ maybe('BANK dispatch decides on the provider answer (real PostgreSQL)', () => {
         const { bank, reference, mirror, facts } = await seedAcceptedPayout();
 
         const out = await dispatch(reference, facts, bank, {
+            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
             initiateBankTransfer: async () => ({
+            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
                 provider: 'MOOLRE_DISBURSEMENT',
                 rail: 'BANK',
                 referenceId: reference,
@@ -194,7 +200,9 @@ maybe('BANK dispatch decides on the provider answer (real PostgreSQL)', () => {
         const before = await liquidity();
 
         const out = await dispatch(reference, facts, bank, {
+            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
             initiateBankTransfer: async () => ({
+            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
                 provider: 'MOOLRE_DISBURSEMENT',
                 rail: 'BANK',
                 referenceId: reference,
@@ -228,7 +236,9 @@ maybe('BANK dispatch decides on the provider answer (real PostgreSQL)', () => {
         const { bank, reference, mirror, facts } = await seedAcceptedPayout();
 
         const out = await dispatch(reference, facts, bank, {
+            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
             initiateBankTransfer: async () => ({ referenceId: reference, ...observation }),
+            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
         });
 
         expect(out.dispatched).toBe(false);
@@ -246,7 +256,9 @@ maybe('BANK dispatch decides on the provider answer (real PostgreSQL)', () => {
     test('D2: an echoed reference that is not ours is never adopted', async () => {
         const { bank, reference, facts } = await seedAcceptedPayout();
         const out = await dispatch(reference, facts, bank, {
+            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
             initiateBankTransfer: async () => ({
+            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
                 provider: 'MOOLRE_DISBURSEMENT',
                 rail: 'BANK',
                 referenceId: 'SOMEONE-ELSES-REFERENCE',

@@ -26,6 +26,8 @@ if (hasDb) {
     process.env.BANK_BENEFICIARY_HMAC_KEY = process.env.BANK_BENEFICIARY_HMAC_KEY || 'test-hmac-key-distinct-from-encryption';
     process.env.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'a'.repeat(64);
     process.env.BANK_PAYOUT_FEE_GHS = '0';
+    process.env.GHS_RISK_AMOUNT_POLICY = process.env.GHS_RISK_AMOUNT_POLICY
+        || '{"largeGhs":1000000,"hugeGhs":2000000,"newAccountMinGhs":900000}';
 }
 
 maybe('provider-backed bank beneficiary validation (real PostgreSQL)', () => {
@@ -85,7 +87,9 @@ maybe('provider-backed bank beneficiary validation (real PostgreSQL)', () => {
         directoryThrows = false,
     } = {}) {
         return {
+            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
             initiateBankTransfer: jest.fn(async () => ({
+            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
                 provider: 'MOOLRE_DISBURSEMENT', rail: 'BANK', status: 'PENDING', amountGhsExact: '0.00',
             })),
             listBanks: jest.fn(async () => {
@@ -306,13 +310,16 @@ maybe('provider-backed bank beneficiary validation (real PostgreSQL)', () => {
         const app = buildApp(providerPort());
         const user = await seedUser(prisma, {});
 
+        // §P1-6 both layers now say 10-16, so the HTTP layer refuses first and
+        // its envelope names the field. A 9- or 17-digit number never reaches
+        // the service, which is the point: one rule, refused at the boundary.
         const nine = await createBene(app, user, { accountNumber: '123456789' });
         expect(nine.status).toBe(400);
-        expect(nine.body.code).toBe('ACCOUNT_NUMBER_INVALID');
+        expect(JSON.stringify(nine.body)).toContain('10-16');
 
         const seventeen = await createBene(app, user, { accountNumber: '12345678901234567' });
         expect(seventeen.status).toBe(400);
-        expect(seventeen.body.code).toBe('ACCOUNT_NUMBER_INVALID');
+        expect(JSON.stringify(seventeen.body)).toContain('10-16');
 
         const sixteen = await createBene(app, user, { accountNumber: '1234567890123456' });
         expect(sixteen.status).toBe(201);

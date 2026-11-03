@@ -25,6 +25,12 @@ if (hasDb) {
     process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
     process.env.NODE_ENV = 'test';
     process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_secret_at_least_32_chars_long_xxxxx';
+    // §P0 GHS amount-risk policy: the gate REFUSES a payout while this policy is
+    // absent, partial or malformed, so a suite that exercises the happy path
+    // configures one explicitly. The numbers are deliberately far above every
+    // fixture amount in this suite so no amount rule fires here.
+    process.env.GHS_RISK_AMOUNT_POLICY = process.env.GHS_RISK_AMOUNT_POLICY
+        || '{"largeGhs":1000000,"hugeGhs":2000000,"newAccountMinGhs":900000}';
 }
 
 const express = require('express');

@@ -406,6 +406,145 @@ async function revealForPayout(prisma, userId, id) {
     };
 }
 
+
+// ── §P1C BANK DIRECTORY ──────────────────────────────────────────────────────
+// The list of banks is PROVIDER data, never a hardcoded table: a bank code the
+// adapter does not know cannot be paid, and codes are opaque strings (leading
+// zeroes are meaningful: "030100" is not 30100).
+async function listBankDirectory(port, { forceRefresh = false } = {}) {
+    if (!port || typeof port.listBanks !== 'function') {
+        throw new BankBeneficiaryError('The bank directory is not available right now.', 'BANK_DIRECTORY_UNAVAILABLE');
+    }
+    let result;
+    try {
+        result = await port.listBanks({ forceRefresh: forceRefresh === true });
+    } catch (err) {
+        logger.warn({ err: err?.message }, '[bankBeneficiary] directory unavailable');
+        throw new BankBeneficiaryError('The bank directory is not available right now.', 'BANK_DIRECTORY_UNAVAILABLE');
+    }
+    const raw = Array.isArray(result?.banks) ? result.banks : (Array.isArray(result) ? result : null);
+    if (!raw) {
+        throw new BankBeneficiaryError('The bank directory returned an unusable response.', 'BANK_DIRECTORY_UNAVAILABLE');
+    }
+    const banks = raw
+        .filter((b) => b && b.code !== undefined && b.code !== null && typeof b.name === 'string' && b.name.trim() !== '')
+        .map((b) => ({ code: String(b.code), name: b.name.trim() }));
+    if (banks.length === 0) {
+        throw new BankBeneficiaryError('The bank directory returned no usable banks.', 'BANK_DIRECTORY_UNAVAILABLE');
+    }
+    return {
+        banks,
+        source: result.source || 'MOOLRE',
+        retrievedAt: result.retrievedAt || result.fetchedAt || new Date().toISOString(),
+        // Honest freshness: a cached directory is reported as cached, and it is
+        // never allowed to establish a verified beneficiary (see
+        // verifyAccountWithProvider, which refuses a stale directory outright).
+        stale: result.stale === true,
+    };
+}
+
+// ── §P1C SAFE UPDATE ─────────────────────────────────────────────────────────
+// A saved payee's DESTINATION is immutable. Changing the account number or bank
+// must be a new payee, because a payout quote/consent binds to the exact
+// destination that was verified; an in-place edit would mutate the meaning of
+// every quote the customer already approved. Only presentation and preference
+// fields are updatable.
+const UPDATABLE_FIELDS = ['nickname', 'isPrimary'];
+const IMMUTABLE_FIELDS = ['accountNumber', 'bankCode', 'bankName', 'accountName', 'validatedAt', 'status'];
+
+async function updateBeneficiary(prisma, userId, id, patch = {}) {
+    const keys = Object.keys(patch || {});
+    const forbidden = keys.filter((k) => !UPDATABLE_FIELDS.includes(k));
+    if (forbidden.length) {
+        const immutable = forbidden.filter((k) => IMMUTABLE_FIELDS.includes(k));
+        throw new BankBeneficiaryError(
+            immutable.length
+                ? `These fields identify the payee and cannot be changed: ${immutable.join(', ')}. Save the new account as a new beneficiary.`
+                : `These fields cannot be updated: ${forbidden.join(', ')}.`,
+            immutable.length ? 'BENEFICIARY_FIELD_IMMUTABLE' : 'BENEFICIARY_FIELD_NOT_UPDATABLE'
+        );
+    }
+    if (keys.length === 0) {
+        throw new BankBeneficiaryError('Nothing to update.', 'BENEFICIARY_UPDATE_EMPTY');
+    }
+    const row = await getOwnedBeneficiary(prisma, userId, id);
+    if (row.status !== ACTIVE) {
+        throw new BankBeneficiaryError('This beneficiary is no longer active.', 'BENEFICIARY_NOT_FOUND');
+    }
+    const data = {};
+    if (patch.nickname !== undefined) {
+        data.nickname = patch.nickname === null ? null : String(patch.nickname).trim().slice(0, 40);
+    }
+    if (patch.isPrimary !== undefined) data.isPrimary = patch.isPrimary === true;
+
+    const write = async () => prisma.$transaction(async (tx) => {
+        // ONE WINNER: the partial unique index (user_id WHERE is_primary) makes
+        // two concurrent promotions impossible, and the demote-then-promote runs
+        // in the same transaction so a refusal leaves the old primary intact.
+        if (data.isPrimary === true) {
+            await tx.savedBankBeneficiary.updateMany({
+                where: { userId, status: ACTIVE, isPrimary: true, NOT: { id: row.id } },
+                data: { isPrimary: false },
+            });
+        }
+        return tx.savedBankBeneficiary.update({ where: { id: row.id }, data });
+    });
+
+    let updated;
+    try {
+        updated = await write();
+    } catch (err) {
+        if (_isPrimaryCollision(err)) {
+            updated = await write();
+        } else {
+            throw err;
+        }
+    }
+    return toPublic(updated);
+}
+
+// ── §P1C REVALIDATION ────────────────────────────────────────────────────────
+// The provider's evidence is bound to the EXACT stored account number and bank
+// code: the number is decrypted server-side, never taken from the client, and the
+// name that gets stored is the provider's, never a customer-supplied string.
+async function revalidateBeneficiary(prisma, userId, id, { port } = {}) {
+    const row = await getOwnedBeneficiary(prisma, userId, id);
+    if (row.status !== ACTIVE) {
+        throw new BankBeneficiaryError('This beneficiary is no longer active.', 'BENEFICIARY_NOT_FOUND');
+    }
+    const revealed = await revealForPayout(prisma, userId, id);
+    const verification = await verifyAccountWithProvider(port, {
+        accountNumber: revealed.accountNumber,
+        bankCode: row.bankCode,
+    });
+    if (!verification.verified) {
+        // A FAILED revalidation must not leave the row looking verified, so a
+        // definitive provider answer on a stored account is recorded by
+        // withdrawing the evidence rather than by editing the number.
+        if (verification.definitive) {
+            await prisma.savedBankBeneficiary.update({ where: { id: row.id }, data: { validatedAt: null } });
+        }
+        throw new BankBeneficiaryError(
+            verification.reason === 'VALIDATION_UNAVAILABLE' || verification.reason === 'DIRECTORY_UNAVAILABLE'
+                ? 'Bank account verification is unavailable right now. Nothing was changed.'
+                : 'The provider could not verify this account. Nothing was changed.',
+            verification.reason === 'VALIDATION_UNAVAILABLE' || verification.reason === 'DIRECTORY_UNAVAILABLE'
+                ? 'VALIDATION_UNAVAILABLE'
+                : (verification.definitive ? verification.reason : 'VALIDATION_UNDETERMINED')
+        );
+    }
+    const updated = await prisma.savedBankBeneficiary.update({
+        where: { id: row.id },
+        data: {
+            // Provider-owned evidence only, bound to the stored destination.
+            accountName: verification.accountName || row.accountName,
+            bankName: verification.bankName || row.bankName,
+            validatedAt: verification.validatedAt || new Date(),
+        },
+    });
+    return { beneficiary: toPublic(updated), verification: _verificationView(verification) };
+}
+
 module.exports = {
     ACTIVE,
     MAX_ACTIVE_BENEFICIARIES,
@@ -423,6 +562,9 @@ module.exports = {
     createBeneficiary,
     listBeneficiaries,
     getOwnedBeneficiary,
+    listBankDirectory,
+    updateBeneficiary,
+    revalidateBeneficiary,
     deleteBeneficiary,
     revealForPayout,
 };
