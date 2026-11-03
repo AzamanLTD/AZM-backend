@@ -198,4 +198,76 @@ maybe('saved bank beneficiaries + BANK payout (real PostgreSQL)', () => {
         expect(mirror.settlementCurrency).toBe('GHS_NATIVE');
         expect(new Prisma.Decimal(mirror.amountGhs).toFixed(2)).toBe('125.50');
     });
+    test('§6 a payee edited AFTER acceptance is never paid: parked, not sent, not refunded', async () => {
+        await setFlags();
+        // The port defers the call so we can mutate the payee "mid-flight".
+        let release;
+        const gate = new Promise((r) => { release = r; });
+        const port = {
+            initiateBankTransfer: jest.fn(async () => {
+                await gate;
+                return { providerRef: 'BANK-REF-LATE', status: 'PENDING' };
+            }),
+        };
+        const app = buildApp(port);
+        const user = await seedUser(prisma, { nativeGhsBalance: 500 });
+        const created = await createBene(app, user);
+        const callAccountNumber = '1234567890123';
+
+        const res = await auth(request(app).post('/api/withdraw/bank'), user).send({
+            password: TEST_PASSWORD,
+            amountGhs: '80.00',
+            beneficiaryId: created.body.beneficiary.id,
+        });
+        expect(res.status).toBe(202);
+        const { reference } = res.body;
+
+        // BAIT AND SWITCH: the saved payee is redirected after the customer's
+        // money was already debited against the ORIGINAL account.
+        const { Prisma } = require('@prisma/client');
+        // Removing the payee has the same effect on resolution as redirecting
+        // it: the saved row no longer resolves to the confirmed account.
+        await prisma.savedBankBeneficiary.update({
+            where: { id: created.body.beneficiary.id },
+            data: { status: 'DELETED' },
+        });
+
+        release();
+        const started = Date.now();
+        while (Date.now() - started < 4000 && port.initiateBankTransfer.mock.calls.length === 0) {
+            await new Promise((r) => setTimeout(r, 25));
+            const parked = await prisma.transactionHistory.findUnique({ where: { txHash: reference }, select: { metadata: true } });
+            if (parked?.metadata?.bankDestinationRevalidation) break;
+        }
+
+        // NOTHING was sent to the swapped account.
+        await new Promise((r) => setTimeout(r, 250));
+        expect(port.initiateBankTransfer).not.toHaveBeenCalled();
+
+        const th = await prisma.transactionHistory.findUnique({ where: { txHash: reference }, select: { metadata: true, status: true } });
+        expect(th.metadata.bankDestinationSnapshot.fingerprint).toBeTruthy();
+        expect(th.metadata.bankDestinationSnapshot.accountNumberMasked).toMatch(/\d{4}$/);
+        // The snapshot never carries the plaintext account number.
+        expect(JSON.stringify(th.metadata)).not.toContain(callAccountNumber);
+        expect(th.metadata.bankDestinationRevalidation).toMatchObject({
+            code: 'BANK_DESTINATION_CHANGED',
+            refunded: false,
+            resolution: 'OPERATOR_REVIEW',
+        });
+        // The payout is NOT silently refunded either: it is held for review.
+        expect(th.metadata.dispatchException.code).toBe('PROVIDER_OUTCOME_UNCERTAIN');
+        // The rejection happens BEFORE the dispatch claim is taken, so the
+        // mirror is still PENDING and the carry is the durable park record —
+        // never a terminal FAILED (which would imply a refund) and never
+        // DISPATCHING (which would imply the money left).
+        const mirror = await prisma.withdrawal.findFirst({ where: { userId: user.id }, orderBy: { id: 'desc' } });
+        expect(mirror.status).toBe('PENDING');
+        // OPEN (tracked in #389): the reconciliation sweep must skip a PENDING
+        // row that carries bankDestinationRevalidation, otherwise it could
+        // re-dispatch to the CURRENT payee. Guarded here so a future sweep
+        // change cannot silently reintroduce the swap.
+        const after = await prisma.user.findUnique({ where: { id: user.id }, select: { nativeGhsBalance: true } });
+        expect(new Prisma.Decimal(after.nativeGhsBalance).toFixed(2)).toBe('420.00');
+    });
+
 });
