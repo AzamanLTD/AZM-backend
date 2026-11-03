@@ -1789,12 +1789,12 @@ exports.rejectWithdrawal = async (req, res) => {
                 if (canonical.settlementCurrency === 'GHS_NATIVE') {
                     // Native GHS: the USDC reversal would refund zero (the
                     // canonical amount is 0 — the money is in amountGhs).
-                    // Claim the mirror, then refund through the GHS authority.
-                    const claimed = await prisma.withdrawal.updateMany({
-                        where: { id: withdrawalId, status: { in: ['PENDING', 'APPROVED'] } },
-                        data: { status: 'PENDING' }
-                    });
-                    if (claimed.count === 0) throw new Error('WITHDRAWAL_ALREADY_FINALIZED');
+                    // §P1-1: NO pre-claim here. Moving the mirror out of its
+                    // admin state outside the reversal's transaction left it
+                    // sitting at PENDING after a refusal — claimable by the
+                    // dispatcher — while the operator was told nothing was
+                    // refunded. The reversal now claims the state it observes,
+                    // atomically, and a refusal leaves the row untouched.
                     reversed = await _reverseCanonicalForAdmin(prisma, {
                         canonical,
                         withdrawalId,
@@ -2469,39 +2469,26 @@ async function _reverseCanonicalForAdmin(prisma, { canonical, withdrawalId, reas
     if (canonical.settlementCurrency !== 'GHS_NATIVE') {
         return { nativeGhs: false };
     }
-    const mirror = await prisma.withdrawal.findFirst({ where: { id: withdrawalId }, select: { status: true } });
-    const previous = mirror?.status || 'PENDING';
-    const needsClaim = !['PENDING', 'DISPATCHING'].includes(previous);
-    if (needsClaim) {
-        const claimed = await prisma.withdrawal.updateMany({
-            where: { id: withdrawalId, status: previous },
-            data: { status: 'PENDING' },
-        });
-        if (claimed.count === 0) throw new Error('WITHDRAWAL_ALREADY_FINALIZED');
-    }
-    let result;
-    try {
-        result = await nativeGhsWithdrawalService.reverseNativeGhsWithdrawal(prisma, {
-            reference: canonical.txHash,
-            reason,
-        });
-    } catch (err) {
-        if (needsClaim) {
-            await prisma.withdrawal.updateMany({
-                where: { id: withdrawalId, status: 'PENDING' },
-                data: { status: previous },
-            }).catch(() => {});
-        }
-        throw err;
-    }
+    const mirror = await prisma.withdrawal.findFirst({
+        where: { id: withdrawalId },
+        select: { status: true },
+    });
+    // §P1-1: the observed admin/review state is the state the reversal is
+    // allowed to claim. There is no separate claim and therefore no
+    // compensation to get wrong: success, refusal and failure are all decided
+    // inside the reversal's single transaction, and a refusal mutates nothing.
+    const observed = mirror?.status ? String(mirror.status) : null;
+    const result = await nativeGhsWithdrawalService.reverseNativeGhsWithdrawal(prisma, {
+        reference: canonical.txHash,
+        reason,
+        allowedMirrorStatuses: observed ? [observed] : [],
+    });
     if (!result || result.reversed !== true) {
-        if (needsClaim) {
-            await prisma.withdrawal.updateMany({
-                where: { id: withdrawalId, status: 'PENDING' },
-                data: { status: previous },
-            }).catch(() => {});
-        }
+        // One message for every refusal reason: the caller (and the operator)
+        // need "nothing was refunded", not a taxonomy. The specific reason
+        // travels in `code` and in the evidence payload.
         const err = new Error('NATIVE_GHS_REVERSAL_REFUSED');
+        err.code = result?.reason || 'NATIVE_GHS_REVERSAL_REFUSED';
         err.detail = result || null;
         throw err;
     }
@@ -2840,11 +2827,11 @@ exports.resolveManualReview = async (req, res) => {
                     // Native GHS: refund the REAL GHS through its own authority
                     // (the USDC reversal would refund zero). The reversal also
                     // flips the canonical row FAILED, single-winner.
-                    const claimed = await prisma.withdrawal.updateMany({
-                        where: { id: withdrawalId, status: 'NEEDS_MANUAL_REVIEW' },
-                        data: { status: 'PENDING' }
-                    });
-                    if (claimed.count === 0) throw new Error('WITHDRAWAL_ALREADY_FINALIZED');
+                    // §P1-1: no pre-claim. A refusal used to leave this row at
+                    // PENDING (claimable by the dispatcher) while the operator
+                    // was told it "stays in review". The reversal now claims
+                    // NEEDS_MANUAL_REVIEW inside its own transaction, so a
+                    // refusal genuinely leaves the row in review.
                     reversed = await _reverseCanonicalForAdmin(prisma, {
                         canonical,
                         withdrawalId,

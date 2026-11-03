@@ -685,6 +685,10 @@ class WithdrawalReconciliationWorker {
                     ? await nativeGhsWithdrawalService.reverseNativeGhsWithdrawal(this.prisma, {
                         reference,
                         reason: `provider_async_failure: ${statusResp.reason || 'unspecified'}`,
+                        // §P1-1: this authority owns the row in PROCESSING (that
+                        // is the state it scans), so it must be able to claim it.
+                        // Terminal paid states stay non-reversible regardless.
+                        allowedMirrorStatuses: [withdrawal.status],
                     })
                     : await financeService.reverseFiatWithdrawal(this.prisma, reference, {
                         reason: `provider_async_failure: ${statusResp.reason || 'unspecified'}`

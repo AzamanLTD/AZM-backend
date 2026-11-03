@@ -1040,7 +1040,22 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
  * CAS stamps the canonical row before any money moves, so a replay or a
  * concurrent authority can never reverse twice.
  */
-async function reverseNativeGhsWithdrawal(prisma, { reference, reason }) {
+/**
+ * Which mirror states a reversal may claim.
+ *
+ * The DEFAULT set is what the payout pipeline itself can still own: a row that
+ * is queued or dispatched but not settled. Admin/review states are added by the
+ * CALLER (see `allowedMirrorStatuses`), never by widening this set, because a
+ * reversal has to stay comparable across every rail.
+ *
+ * The terminal set is a hard denylist: a payout recorded as paid is never
+ * reversible through this path, whatever the caller asks for. Only the
+ * reconciliation authority, holding provider evidence, may touch those.
+ */
+const REVERSIBLE_MIRROR_STATES = Object.freeze(['PENDING', 'DISPATCHING']);
+const NON_REVERSIBLE_TERMINAL_STATES = Object.freeze(['COMPLETED', 'PAID_OUT', 'SUCCESS', 'SETTLED']);
+
+async function reverseNativeGhsWithdrawal(prisma, { reference, reason, allowedMirrorStatuses = [] }) {
   return prisma.$transaction(async (tx) => {
     const row = await tx.transactionHistory.findUnique({
       where: { txHash: reference },
@@ -1056,8 +1071,24 @@ async function reverseNativeGhsWithdrawal(prisma, { reference, reason }) {
       where: { transactionHistoryId: row.id },
       select: { id: true, status: true },
     });
-    if (mirror && !['PENDING', 'DISPATCHING'].includes(mirror.status)) {
-      return { reversed: false, reason: 'NOT_REVERSIBLE_IN_STATE', status: mirror.status };
+    // §P1-1: one atomic boundary. The caller states which states it is willing
+    // to claim (admin/review states included); a state outside that set is
+    // REFUSED here, before any mutation, so a refusal can never leave a
+    // half-applied claim behind for a later dispatcher to pick up.
+    const claimable = new Set([
+      ...REVERSIBLE_MIRROR_STATES,
+      ...(Array.isArray(allowedMirrorStatuses) ? allowedMirrorStatuses : []),
+    ]);
+    if (mirror) {
+      const mirrorStatus = String(mirror.status || '');
+      if (NON_REVERSIBLE_TERMINAL_STATES.includes(mirrorStatus)) {
+        // Already recorded as paid. Refusing here is the whole point: refunding
+        // on top of a completed payout would pay the customer twice.
+        return { reversed: false, reason: 'ALREADY_PAID_OR_COMPLETED', status: mirrorStatus };
+      }
+      if (!claimable.has(mirrorStatus)) {
+        return { reversed: false, reason: 'NOT_REVERSIBLE_IN_STATE', status: mirrorStatus };
+      }
     }
     const stamped = await tx.$executeRawUnsafe(
       'UPDATE "TransactionHistory" SET "metadata" = COALESCE("metadata", \'{}\'::jsonb) || jsonb_build_object($2::text, jsonb_build_object(\'at\', now(), \'reason\', $3::text)) ' +
@@ -1117,8 +1148,24 @@ async function reverseNativeGhsWithdrawal(prisma, { reference, reason }) {
     // instead of reporting a refund the float never reflected.
     await fiatLiquidity.releaseReservation(tx, { reference, reason: String(reason ?? 'definitive_failure') });
 
-    await tx.transactionHistory.updateMany({ where: { id: row.id }, data: { status: 'FAILED' } });
-    await tx.withdrawal.updateMany({ where: { transactionHistoryId: row.id }, data: { status: 'FAILED' } });
+    // Compare-and-set on the way out as well: if the payout moved on between
+    // the read above and here (a concurrent settle), the whole reversal rolls
+    // back instead of overwriting a completed payout with FAILED.
+    const canonicalFlip = await tx.transactionHistory.updateMany({
+      where: { id: row.id, status: 'PENDING' },
+      data: { status: 'FAILED' },
+    });
+    if (canonicalFlip.count !== 1) {
+      throw new NativeGhsWithdrawalError('canonical payout moved during reversal', 'NATIVE_GHS_REVERSAL_RACED');
+    }
+    const mirrorStates = [...claimable];
+    const mirrorFlip = await tx.withdrawal.updateMany({
+      where: { transactionHistoryId: row.id, status: { in: mirrorStates } },
+      data: { status: 'FAILED' },
+    });
+    if (mirror && mirrorFlip.count !== 1) {
+      throw new NativeGhsWithdrawalError('payout mirror moved during reversal', 'NATIVE_GHS_REVERSAL_RACED');
+    }
     return { reversed: true, amountGhs: amountGhs.toFixed(2) };
   });
 }
@@ -1179,6 +1226,8 @@ module.exports = {
   parkUncertainDispatch,
   dispatchNativeGhsWithdrawal,
   dispatchNaturalGhsBankWithdrawal,
+  REVERSIBLE_MIRROR_STATES,
+  NON_REVERSIBLE_TERMINAL_STATES,
   reverseNativeGhsWithdrawal,
   reconcileNativeGhsWithdrawals,
 };
