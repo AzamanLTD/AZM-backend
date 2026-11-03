@@ -21,6 +21,7 @@ const quotes = require('./transactionQuoteService');
 // 'savings_withdrawal'). A shortfall conversion is a withdrawal-purpose
 // quote — reusing that value keeps ONE quote authority and requires no
 // constraint change. The funding intent is carried by quoteIdentity.
+const SHORTFALL_ROUTE = 'USDC_TO_GHS_SHORTFALL';
 const QUOTE_PURPOSE = 'withdrawal';
 const QUOTE_IDENTITY_KIND = 'ghs_shortfall_funding';
 
@@ -117,16 +118,36 @@ async function quoteGhsShortfall({ prisma, marketOracle, userId, shortfallGhs, t
     amountGhs: Number(shortfall.toFixed(2)),
     ttlSeconds,
     now,
+    // §5.1 DIRECTION: the default quote route identity is GHS-in/USDC-out (the
+    // deposit direction). A shortfall funding quote is the OPPOSITE: the
+    // customer pays USDC and receives GHS. Persisting the wrong direction
+    // would let a settlement path read the rate backwards.
+    routeIdentity: {
+      inputAsset: 'USDC',
+      outputAsset: 'GHS',
+      selectedRoute: SHORTFALL_ROUTE,
+    },
     // §P.5-C identity is an opaque STRING token ([A-Za-z0-9_-:], 8-200).
     // It names the funding intent, not the economics (the quote carries those).
     quoteIdentity: `${QUOTE_IDENTITY_KIND}:${userId}:${shortfall.toFixed(2).replace('.', '')}:${new Date(now).getTime()}`,
   });
+  // §5.4 DISCLOSURE: the quote's stored USDC amount is an exact 12dp quotient
+  // (theoretical). The USDC liability authority debits 8dp. The number the
+  // customer accepts must BE the number that is debited, so the executable
+  // quote discloses the final 8dp debit, and the theoretical quotient is kept
+  // alongside it as evidence, never as the price.
+  const theoretical12 = new Prisma.Decimal(quote.usdcAmount);
+  const actualDebit8 = theoretical12.toDecimalPlaces(8, Prisma.Decimal.ROUND_HALF_UP);
   return {
     quoteId: quote.id,
     purpose: QUOTE_PURPOSE,
     shortfallGhs: new Prisma.Decimal(quote.amountGhs).toFixed(2),
-    usdcDebitExact: new Prisma.Decimal(quote.usdcAmount).toFixed(12),
+    usdcDebit: actualDebit8.toFixed(8),
+    usdcDebitExact: actualDebit8.toFixed(8),
+    usdcDebitTheoretical: theoretical12.toFixed(12),
+    roundingPolicy: 'USDC debit is the exact 12dp quotient rounded HALF_UP once to the 8dp ledger scale; the disclosed usdcDebit is the amount debited.',
     rateGhsPerUsdcExact: new Prisma.Decimal(quote.rateGhsPerUsdc).toFixed(8),
+    routeIdentity: { inputAsset: 'USDC', outputAsset: 'GHS', selectedRoute: SHORTFALL_ROUTE },
     rateAsOf: quote.rateAsOf,
     rateSource: quote.rateSource,
     expiresAt: quote.expiresAt,
@@ -135,6 +156,7 @@ async function quoteGhsShortfall({ prisma, marketOracle, userId, shortfallGhs, t
 }
 
 module.exports = {
+  SHORTFALL_ROUTE,
   QUOTE_PURPOSE,
   QUOTE_IDENTITY_KIND,
   GhsFundingPlannerError,

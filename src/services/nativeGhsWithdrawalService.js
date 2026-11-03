@@ -28,6 +28,7 @@
 const { Prisma } = require('@prisma/client');
 const logger = require('../../src/config/logger');
 const ledger = require('../../services/ledgerService');
+const savedBankBeneficiaryService = require('./savedBankBeneficiaryService');
 const nativeGhsWallet = require('./nativeGhsWalletService');
 const fiatLiquidity = require('./fiatLiquidityService');
 const quotes = require('./transactionQuoteService');
@@ -54,10 +55,13 @@ const GHS_NATIVE_FEE_POLICY = Object.freeze({
 });
 
 class NativeGhsWithdrawalError extends Error {
-  constructor(message, code) {
+  constructor(message, code, details = null) {
     super(message);
     this.name = 'NativeGhsWithdrawalError';
     this.code = code || 'NATIVE_GHS_WITHDRAWAL_ERROR';
+    // Structured, non-secret context for the refusal (quoted vs current split,
+    // etc.). Never carries an account number or a credential.
+    this.details = details;
   }
 }
 
@@ -115,6 +119,7 @@ async function processNativeGhsWithdrawal(prisma, userId, args, opts = {}) {
     // 'MOMO' (default, unchanged) or 'BANK' — an EXPLICIT typed destination.
     // The rail is never inferred from the destination string.
     destinationType = 'MOMO',
+    destinationSnapshot = null,
     beneficiaryId = null,
   } = args;
   if (!reference) throw new NativeGhsWithdrawalError('reference is required', 'REFERENCE_REQUIRED');
@@ -144,6 +149,36 @@ async function processNativeGhsWithdrawal(prisma, userId, args, opts = {}) {
         purpose: QUOTE_PURPOSE,
       });
       const shortfallGhs = new Prisma.Decimal(consumed.amountGhs);
+
+      // §5.3 RECOMPUTE INSIDE THE AUTHORITATIVE TRANSACTION. The quote is a
+      // snapshot of a shortfall that may no longer exist (the customer can
+      // receive GHS between preview and confirmation) or may have grown (a
+      // payout made in the meantime). Charging the quoted USDC for a stale
+      // shortfall either overcharges the customer or funds the payout from
+      // money that is not there. Any material change rolls the whole
+      // transaction back — the quote is NOT consumed and no funds move.
+      const current = await tx.user.findUnique({
+        where: { id: userId },
+        select: { nativeGhsBalance: true },
+      });
+      const currentNativeGhs = new Prisma.Decimal(current?.nativeGhsBalance ?? 0);
+      const requiredNow = recipientGhs.plus(feeGhs);
+      const recomputedShortfall = requiredNow.minus(currentNativeGhs).isNegative()
+        ? new Prisma.Decimal(0)
+        : requiredNow.minus(currentNativeGhs);
+      if (!recomputedShortfall.equals(shortfallGhs)) {
+        throw new NativeGhsWithdrawalError(
+          `Your native GHS balance changed after this quote was issued, so the exact funding split no longer matches. Nothing was converted. Request a fresh quote to continue.`,
+          'NATIVE_GHS_QUOTE_INTENT_CHANGED',
+          {
+            quotedShortfallGhs: shortfallGhs.toFixed(2),
+            currentShortfallGhs: recomputedShortfall.toFixed(2),
+            availableNativeGhs: currentNativeGhs.toFixed(2),
+            requiredGhs: requiredNow.toFixed(2),
+          }
+        );
+      }
+
       // The quote carries an EXACT 12dp USDC quotient; the USDC liability
       // authority is 8dp (ledger scale). Round ONCE, here, at the debit
       // authority — never re-derive the rate.
@@ -272,6 +307,21 @@ async function processNativeGhsWithdrawal(prisma, userId, args, opts = {}) {
       throw new NativeGhsWithdrawalError('Withdrawal mirror insert returned no row', 'WITHDRAWAL_MIRROR_MISSING');
     }
 
+    // §6 IMMUTABLE DESTINATION SNAPSHOT: the exact bank destination that was
+    // ACCEPTED is recorded in the same transaction that debits the customer.
+    // The beneficiary row stays editable (nickname, primary, even the account
+    // number), and an edited payee must never silently redirect a payout that
+    // was already promised to the account shown on the confirmation screen.
+    // The fingerprint is an HMAC, never the plaintext account number.
+    if (destinationSnapshot) {
+      await tx.$executeRawUnsafe(
+        'UPDATE "TransactionHistory" SET "metadata" = COALESCE("metadata", \'{}\'::jsonb) || jsonb_build_object($2::text, $3::jsonb) WHERE "txHash" = $1',
+        reference,
+        'bankDestinationSnapshot',
+        JSON.stringify(destinationSnapshot)
+      );
+    }
+
     // ── P5-D GHS liquidity claim: ONE atomic reservation boundary ──────────
     const reservation = await fiatLiquidity.reserveForPayout(tx, {
       reference,
@@ -335,11 +385,6 @@ async function dispatchNativeGhsWithdrawal(prisma, {
   if (!row || row.type !== 'WITHDRAWAL_FIAT' || row.settlementCurrency !== SETTLEMENT_CURRENCY) {
     return { dispatched: false, reason: 'NOT_A_NATIVE_GHS_WITHDRAWAL' };
   }
-  // The canonical TransactionHistory status is the TransactionStatus ENUM
-  // (PENDING until a terminal outcome). The DISPATCH CLAIM lives on the
-  // Withdrawal mirror's String status — exactly like the fiat payout path:
-  // PENDING -> DISPATCHING is the single-winner dispatch authority, and the
-  // worker (-> PROCESSING) and admin (-> REJECTED) compete on the same row.
   const claim = await prisma.withdrawal.updateMany({
     where: { transactionHistoryId: row.id, status: 'PENDING' },
     data: { status: 'DISPATCHING' },
@@ -489,7 +534,8 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
   amountGhsExact,
   bank,
   port,
-  narration,
+  payerMessage = null,
+  payeeNote = null,
 }) {
   if (!reference) throw new NativeGhsWithdrawalError('reference is required', 'REFERENCE_REQUIRED');
   if (!port || typeof port.initiateBankTransfer !== 'function') {
@@ -498,13 +544,67 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
   if (!bank || !bank.accountNumber || !bank.bankCode) {
     return { dispatched: false, reason: 'BANK_DESTINATION_INCOMPLETE' };
   }
+
   const amount = toExactPesewa(amountGhsExact);
   const row = await prisma.transactionHistory.findUnique({
     where: { txHash: reference },
-    select: { id: true, type: true, settlementCurrency: true },
+    select: { id: true, type: true, settlementCurrency: true, userId: true },
   });
   if (!row || row.type !== 'WITHDRAWAL_FIAT' || row.settlementCurrency !== SETTLEMENT_CURRENCY) {
     return { dispatched: false, reason: 'NOT_A_NATIVE_GHS_WITHDRAWAL' };
+  }
+  // The canonical TransactionHistory status is the TransactionStatus ENUM
+  // (PENDING until a terminal outcome). The DISPATCH CLAIM lives on the
+  // Withdrawal mirror's String status — exactly like the fiat payout path:
+  // PENDING -> DISPATCHING is the single-winner dispatch authority, and the
+  // worker (-> PROCESSING) and admin (-> REJECTED) compete on the same row.
+  // §6 REVALIDATION BEFORE DISPATCH. Re-read the payer's saved beneficiary and
+  // prove it still resolves to the account captured at acceptance. A changed
+  // or deleted payee parks the payout for review — it is never sent to a
+  // destination the customer did not confirm.
+  const snapshotRow = await prisma.transactionHistory.findUnique({
+    where: { txHash: reference },
+    select: { metadata: true },
+  });
+  const snapshot = snapshotRow?.metadata?.bankDestinationSnapshot || null;
+  if (snapshot) {
+    let current = null;
+    let revalidationError = null;
+    try {
+      current = await savedBankBeneficiaryService.revealForPayout(prisma, row.userId, snapshot.beneficiaryId);
+    } catch (err) {
+      // Benign for the comparison (current stays null => parked for review),
+      // but the REASON is recorded: an operator must be able to tell a deleted
+      // payee from an unreadable ciphertext.
+      current = null;
+      revalidationError = { code: err?.code || err?.name || 'REVEAL_FAILED', message: String(err?.message || '').slice(0, 200) };
+    }
+    const currentFingerprint = current ? savedBankBeneficiaryService.fingerprint(current.accountNumber) : null;
+    if (!current || currentFingerprint !== snapshot.fingerprint || current.bankCode !== snapshot.bankCode) {
+      await parkUncertainDispatch(prisma, {
+        reference,
+        outcome: PROVIDER_OUTCOME.NOT_DISPATCHED,
+        error: { code: 'BANK_DESTINATION_CHANGED' },
+        rail: 'BANK',
+      });
+      await prisma.$executeRawUnsafe(
+        'UPDATE "TransactionHistory" SET "metadata" = COALESCE("metadata", \'{}\'::jsonb) || jsonb_build_object($2::text, $3::jsonb) WHERE "txHash" = $1',
+        reference,
+        'bankDestinationRevalidation',
+        JSON.stringify({
+          code: 'BANK_DESTINATION_CHANGED',
+          at: new Date().toISOString(),
+          snapshotFingerprint: snapshot.fingerprint,
+          currentFingerprint,
+          revalidationError,
+          snapshotBankCode: snapshot.bankCode,
+          currentBankCode: current?.bankCode ?? null,
+          refunded: false,
+          resolution: 'OPERATOR_REVIEW',
+        })
+      );
+      return { dispatched: false, reason: 'BANK_DESTINATION_CHANGED' };
+    }
   }
   const claim = await prisma.withdrawal.updateMany({
     where: { transactionHistoryId: row.id, status: 'PENDING', payoutMethod: 'BANK' },
@@ -514,14 +614,17 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
 
   let outbound;
   try {
+    // EXACT provider contract (Agent B, services/moolreBankPayoutService.js).
+    // The GHS amount is passed as the exact 2dp pesewa string — never a JS
+    // float — and the external reference is the ORIGINAL Azaman reference so
+    // the provider's idempotency key matches the one we can reconcile against.
     outbound = await port.initiateBankTransfer({
       referenceId: reference,
-      externalId: reference,
-      amountGhs: amount.toFixed(2),
+      amountGhsExact: amount.toFixed(2),
+      recipientAccountNumber: bank.accountNumber,
       bankCode: bank.bankCode,
-      accountNumber: bank.accountNumber,
-      accountName: bank.accountName || null,
-      narration: narration || `Azaman payout ${reference}`,
+      payerMessage: payerMessage || `Azaman payout ${reference}`,
+      payeeNote: payeeNote || `Withdrawal ${reference}`,
     });
   } catch (err) {
     const outcome = classifyProviderOutcome(err);

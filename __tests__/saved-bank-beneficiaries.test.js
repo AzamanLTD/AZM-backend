@@ -178,9 +178,17 @@ maybe('saved bank beneficiaries + BANK payout (real PostgreSQL)', () => {
             await new Promise((r) => setTimeout(r, 25));
         }
         expect(port.initiateBankTransfer).toHaveBeenCalledTimes(1);
+        // EXACT Agent B contract (services/moolreBankPayoutService.js):
+        // { referenceId, amountGhsExact, recipientAccountNumber, bankCode,
+        //   payerMessage, payeeNote } — the fake must not invent a different one.
         const call = port.initiateBankTransfer.mock.calls[0][0];
-        expect(call.amountGhs).toBe('125.50');
-        expect(call.accountNumber).toBe('1234567890123'); // decrypted at the boundary only
+        expect(Object.keys(call).sort()).toEqual([
+            'amountGhsExact', 'bankCode', 'payeeNote', 'payerMessage', 'recipientAccountNumber', 'referenceId',
+        ]);
+        expect(call.amountGhsExact).toBe('125.50');
+        expect(call.referenceId).toBe(res.body.reference); // ORIGINAL reference, not a new one
+        expect(call.bankCode).toBe('GCB'); // the stored bank code, passed through untouched
+        expect(call.recipientAccountNumber).toBe('1234567890123'); // decrypted at the boundary only
 
         const fresh = await prisma.user.findUnique({ where: { id: user.id } });
         expect(new Prisma.Decimal(fresh.nativeGhsBalance).toFixed(2)).toBe('374.50');

@@ -2047,6 +2047,17 @@ exports.bankWithdrawal = async (req, res) => {
         }
         const userId = req.user.id;
         const bank = await savedBankBeneficiaryService.revealForPayout(prisma, userId, req.body.beneficiaryId);
+        // §6 immutable acceptance snapshot: what the customer confirmed, not
+        // what the payee record happens to say later.
+        const beneficiarySnapshot = {
+            beneficiaryId: bank.id,
+            bankCode: bank.bankCode,
+            bankName: bank.bankName,
+            accountName: bank.accountName || null,
+            accountNumberMasked: bank.accountNumberMasked,
+            fingerprint: savedBankBeneficiaryService.fingerprint(bank.accountNumber),
+            capturedAt: new Date().toISOString(),
+        };
 
         const user = await prisma.user.findUnique({ where: { id: userId }, select: { nativeGhsBalance: true } });
         const plan = ghsFundingPlanner.planGhsPayoutFunding({
@@ -2076,6 +2087,7 @@ exports.bankWithdrawal = async (req, res) => {
                 quoteId: req.body.quoteId || null,
                 destinationType: 'BANK',
                 beneficiaryId: bank.id,
+                destinationSnapshot: beneficiarySnapshot,
             },
             {
                 commitOperationClaimInTransaction: async (tx, claimFacts) => {
