@@ -2433,7 +2433,7 @@ exports.getNeedsManualReview = async (req, res) => {
         // parked and which resolution actions are backend-provable. Rows
         // parked before the fail-closed evidence fix carry no phase — the
         // backend then only ever proves ESCALATE for them.
-        const parkingEvidence = await _manualReviewParkingEvidence(prisma, withdrawals.map((w) => w.id));
+        const parkingEvidence = await _manualReviewParkingEvidence(prisma, withdrawals);
         for (const w of withdrawals) {
             w.manualReview = parkingEvidence.get(w.id) || { reasons: [], resolutionOptions: ['ESCALATE'] };
         }
@@ -2564,22 +2564,56 @@ const REVIEW_SAFE_PHASES = new Set(['PRE_DISPATCH', 'DISPATCH_FAILED_PROVEN']);
  * bucketed for the review listing. Raw SQL — the exception queue is a
  * migration-backed table without a Prisma model.
  */
-async function _manualReviewParkingEvidence(prisma, withdrawalIds) {
+async function _manualReviewParkingEvidence(prisma, withdrawals) {
     const evidence = new Map();
-    if (!Array.isArray(withdrawalIds) || withdrawalIds.length === 0) return evidence;
-    const rows = await prisma.$queryRawUnsafe(
+    const rows = Array.isArray(withdrawals) ? withdrawals : [];
+    if (rows.length === 0) return evidence;
+
+    // §P1-2 EVIDENCE MUST NAME THIS PAYOUT. ReconciliationException.entityId is
+    // a bare string with no foreign key, so rows survive the payout they were
+    // written for, and a re-provisioned database can hand a fresh withdrawal an
+    // id an old row already names. Grouping by entityId alone therefore showed
+    // one payout's exception reason and resolution options on another's review
+    // card. The canonical reference is the durable identity, so evidence is
+    // matched on it.
+    const txIds = rows.map((w) => w.transactionHistoryId).filter((v) => v !== null && v !== undefined);
+    const referenceByWithdrawal = new Map();
+    if (txIds.length > 0) {
+        const txs = await prisma.transactionHistory.findMany({
+            where: { id: { in: txIds } },
+            select: { id: true, txHash: true },
+        });
+        const refByTxId = new Map((txs || []).map((t) => [t.id, t.txHash || null]));
+        for (const w of rows) {
+            referenceByWithdrawal.set(w.id, refByTxId.get(w.transactionHistoryId) || null);
+        }
+    }
+
+    const raw = await prisma.$queryRawUnsafe(
         'SELECT "entityId", "reason", "reference", "details", "firstSeenAt", "lastSeenAt" FROM "ReconciliationException" ' +
         'WHERE "status" = \'OPEN\' AND "entityType" = $1 AND "entityId" = ANY($2::text[]) ' +
         'ORDER BY "lastSeenAt" DESC',
-        'WITHDRAWAL', withdrawalIds.map(String)
+        'WITHDRAWAL', rows.map((w) => String(w.id))
     );
-    for (const row of rows || []) {
+
+    for (const row of raw || []) {
         const id = Number(row.entityId);
+        const expectedReference = referenceByWithdrawal.get(id) || null;
+        const rowReference = row.reference ? String(row.reference) : null;
+        if (expectedReference) {
+            // The payout's identity is known: only evidence naming it describes
+            // it. A null-reference row cannot be shown to belong here.
+            if (rowReference !== expectedReference) continue;
+        } else if (rowReference) {
+            // No canonical reference of our own, but the evidence names one:
+            // it belongs to some other payout, provably not this one.
+            continue;
+        }
         const entry = evidence.get(id) || { reasons: [], resolutionOptions: ['ESCALATE'] };
         entry.reasons.push({
             reason: String(row.reason),
             phase: row.details?.phase || null,
-            reference: row.reference || null,
+            reference: rowReference,
             firstSeenAt: row.firstSeenAt,
             lastSeenAt: row.lastSeenAt
         });
@@ -2663,10 +2697,39 @@ async function _reviewEligibility(prisma, withdrawal, canonical) {
         }
     }
 
+    // §P1-1 A RESUME NEEDS A DISPATCHER. Setting NEEDS_MANUAL_REVIEW back to
+    // PENDING only re-enters a pipeline that actually selects the row. Two cases
+    // have no such consumer:
+    //   - native-GHS rows: the fiat batch worker deliberately excludes them
+    //     (their amount is a zero-valued USDC mirror), and native GHS is
+    //     dispatched inline at acceptance, so nothing re-runs that gate. RESUME
+    //     would leave the customer's money reserved forever while the operator
+    //     was told the payout "resumed".
+    //   - BANK_DESTINATION_CHANGED: the saved payee no longer matches the
+    //     destination accepted with the quote. Re-running dispatch against the
+    //     NEW payee would silently redirect an accepted payout to an account the
+    //     customer never confirmed, and re-running it against the OLD details is
+    //     impossible (that is what changed). Neither is a redispatch path.
+    // Until a customer-confirmed destination-reconfirmation flow exists, these
+    // are rejected/reversed, never resumed.
+    const resumeBlockers = [];
+    const isNativeGhs = String(withdrawal.settlementCurrency || '') === 'GHS_NATIVE';
+    const destinationChanged = safeReasons.some((r) => r.reason === 'BANK_DESTINATION_CHANGED')
+        || (withdrawalExceptions || []).some((r) => String(r.reason) === 'BANK_DESTINATION_CHANGED');
+    if (isNativeGhs) {
+        resumeBlockers.push('No dispatcher claims native-GHS withdrawals: a resume would re-enter a pipeline that never selects this row.');
+    }
+    if (destinationChanged) {
+        resumeBlockers.push('The accepted destination changed. Re-dispatching would pay an account the customer never confirmed; reject and let the customer create a new withdrawal against the re-validated payee.');
+    }
+
     return {
         mayMove: blockers.length === 0,
         blockers,
         safeReasons,
+        resumeBlocked: resumeBlockers.length > 0,
+        resumeBlockers,
+        resolutionOptions: (blockers.length === 0 && resumeBlockers.length === 0) ? ['RESUME', 'REJECT', 'ESCALATE'] : ['REJECT', 'ESCALATE'],
         canonicalReference: canonical?.txHash || null,
         canonicalStatus: canonical ? canonical.status : null
     };
@@ -2723,6 +2786,20 @@ exports.resolveManualReview = async (req, res) => {
                     data: { withdrawalId, blockers: eligibility.blockers }
                 });
             }
+        }
+
+        // §P1-1 RESUME is only honest where a real redispatch path exists.
+        if (action === 'RESUME' && eligibility.resumeBlocked) {
+            return res.status(409).json({
+                success: false,
+                code: 'RESUME_NOT_AVAILABLE',
+                message: 'Resuming is not available for this payout. Reject it to restore the customer\'s funds through the canonical reversal, and the customer can create a new withdrawal once the destination is confirmed.',
+                data: {
+                    withdrawalId,
+                    blockers: eligibility.resumeBlockers,
+                    availableActions: eligibility.resolutionOptions
+                }
+            });
         }
 
         // ── RESUME: provably-undispatched row re-enters the payout pipeline.

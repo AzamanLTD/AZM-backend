@@ -58,9 +58,28 @@ const REVERSAL_MARKER = 'nativeGhsWithdrawalReversal';
 function bankPayoutFeePolicy() {
   const raw = process.env.BANK_PAYOUT_FEE_GHS;
   if (raw === undefined || raw === null || String(raw).trim() === '') return null;
-  const fee = new Prisma.Decimal(String(raw).trim());
-  if (fee.isNegative()) return null;
-  return { code: 'BANK_FEE_V1', feeGhs: fee.toFixed(2) };
+  let fee;
+  try {
+    fee = new Prisma.Decimal(String(raw).trim());
+  } catch (_) {
+    return null;
+  }
+  if (!fee.isFinite() || fee.isNegative()) return null;
+  // §P1-3 A NON-ZERO CUSTOMER FEE IS NOT SAFE YET. The debit includes the fee,
+  // but a failed bank payout is refunded through reverseNativeGhsWithdrawal,
+  // whose credit is the recipient amount. Charging a fee the reversal path does
+  // not return would leave the customer short by exactly that fee whenever the
+  // payout fails — and it is the failing payouts where the customer can least
+  // afford to fund our unresolved policy. Until the fee payer and the refund
+  // policy are explicitly approved, a non-zero fee must not enable the rail.
+  // (Zero is a real policy and must be configured explicitly, which is why an
+  // absent value still refuses: silence is not a fee agreement.)
+  if (fee.greaterThan(0)) return null;
+  return {
+    code: 'BANK_FEE_V1',
+    feeGhs: fee.toFixed(2),
+    note: 'Configured zero-fee bank policy. The recipient receives exactly amountGhs and the debit equals the recipient amount.',
+  };
 }
 
 const GHS_NATIVE_FEE_POLICY = Object.freeze({
@@ -174,6 +193,17 @@ async function processNativeGhsWithdrawal(prisma, userId, args, opts = {}) {
   // mutation instead of running on an assumption.
   const feePolicy = destinationType === 'BANK' ? bankPayoutFeePolicy() : GHS_NATIVE_FEE_POLICY;
   if (!feePolicy) {
+    const configured = String(process.env.BANK_PAYOUT_FEE_GHS ?? '').trim();
+    if (configured !== '' && !/^0*(\.0+)?$/.test(configured)) {
+      // §P1-3: a non-zero fee policy is configured but NOT approved, because the
+      // reversal path does not refund the fee. Refuse as a policy gap, not as a
+      // missing configuration, so nobody "fixes" it by zeroing the number they
+      // were told to check.
+      throw new NativeGhsWithdrawalError(
+        'Bank payouts are not enabled with a non-zero customer fee: the refund policy for that fee has not been approved, so a failed payout could leave you short. Nothing was debited.',
+        'BANK_FEE_POLICY_UNAPPROVED'
+      );
+    }
     throw new NativeGhsWithdrawalError(
       'Bank payouts are not enabled: the bank transfer fee has not been agreed with the provider, so the exact amount the recipient receives cannot be promised. Nothing was debited.',
       'BANK_FEE_POLICY_UNEVIDENCED'
@@ -364,6 +394,7 @@ async function processNativeGhsWithdrawal(prisma, userId, args, opts = {}) {
           amountGhs: recipientGhs.toFixed(2),
           payoutGhs: recipientGhs.toFixed(2),
           totalDebitGhs: totalDebitGhs.toFixed(2),
+          feeGhs: feeGhs.toFixed(2),
           feePolicy,
           provider: DISPATCH_PROVIDER,
           rail: destinationType === 'BANK' ? 'BANK' : DISPATCH_RAIL,
@@ -1167,6 +1198,26 @@ async function reverseNativeGhsWithdrawal(prisma, { reference, reason, allowedMi
     if (!stamped) return { reversed: false, reason: 'ALREADY_REVERSED_OR_RACED' };
 
     const amountGhs = row.amountGhs ? new Prisma.Decimal(row.amountGhs) : null;
+    // §P1-3 THE REFUND IS THE DEBIT, NOT THE RECIPIENT AMOUNT. The withdrawal
+    // debited recipient + fee. Refunding only the recipient leaves a failed
+    // payout short by the fee. The fee actually charged is read from the
+    // recorded metadata (never recomputed from today's configuration, which may
+    // have changed since the debit) and defaults to zero for rows that carry no
+    // fee evidence.
+    let refundGhs = amountGhs;
+    if (amountGhs) {
+      const meta = row.metadata && typeof row.metadata === 'object' ? row.metadata : {};
+      const recordedFee = meta.feeGhs !== undefined && meta.feeGhs !== null
+        ? meta.feeGhs
+        : (meta.feePolicy && meta.feePolicy.feeGhs !== undefined ? meta.feePolicy.feeGhs : 0);
+      try {
+        const fee = new Prisma.Decimal(String(recordedFee));
+        if (fee.isFinite() && fee.greaterThanOrEqualTo(0)) refundGhs = amountGhs.plus(fee);
+      } catch (_) {
+        // Unreadable fee evidence: refund the recipient amount (the conservative
+        // default) rather than inventing a refund figure.
+      }
+    }
     if (!amountGhs) {
       // Without the authoritative amount the reversal cannot be exact — the
       // stamp rolls back and the row parks for reconciliation.
@@ -1175,7 +1226,7 @@ async function reverseNativeGhsWithdrawal(prisma, { reference, reason, allowedMi
     await nativeGhsWallet.creditNativeGhs({
       tx,
       userId: row.userId,
-      amountGhs,
+      amountGhs: refundGhs,
       idempotencyKey: `${REVERSAL_KEY_PREFIX}${reference}`,
       description: `Native GHS withdrawal reversal ${reference}`,
       reference,
@@ -1279,6 +1330,10 @@ async function reconcileNativeGhsWithdrawals(prisma, { since, take = 500 } = {})
 }
 
 module.exports = {
+  // §P0-2/§P1-3: the quote and the payout must resolve the SAME rail fee
+  // policy, so it is exported rather than re-derived by callers.
+  bankPayoutFeePolicy,
+  GHS_NATIVE_FEE_POLICY,
   buildMomoDestinationSnapshot,
   SETTLEMENT_CURRENCY,
   DISPATCH_PROVIDER,

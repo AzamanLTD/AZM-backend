@@ -151,6 +151,74 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
         }
     });
 
+    // §P1-1 RESUME USED TO BE A LIE. Setting the mirror back to PENDING only
+    // re-enters a pipeline that selects the row: nothing claims a native-GHS
+    // payout (the fiat batch worker excludes it and native GHS dispatches
+    // inline at acceptance), and for BANK_DESTINATION_CHANGED a redispatch would
+    // pay a payee the customer never confirmed. The operator was told the payout
+    // "resumed" while the funds stayed reserved forever.
+    test('§P1-1 RESUME is refused where no dispatcher exists, and the row stays in review', async () => {
+        await setFlags();
+        const { user, mirror } = await seedParkedPayout();
+        const before = await prisma.user.findUnique({
+            where: { id: user.id },
+            select: { availableBalance: true, nativeGhsBalance: true },
+        });
+
+        const admin = await seedUser(prisma, { role: 'ADMIN' });
+        const app = buildApp({ initiateBankTransfer: jest.fn() });
+        const res = await request(app)
+            .post(`/api/admin/withdrawals/${mirror.id}/resolve-review`)
+            .set('Authorization', `Bearer ${tokenFor(admin)}`)
+            .send({ action: 'RESUME', reason: 'operator believes the account is fine now' });
+
+        expect(res.status).toBe(409);
+        expect(res.body.code).toBe('RESUME_NOT_AVAILABLE');
+        expect(res.body.data.availableActions).toEqual(['REJECT', 'ESCALATE']);
+        expect(res.body.data.blockers.join(' ')).toMatch(/destination changed|dispatcher/i);
+
+        const after = await prisma.withdrawal.findUnique({ where: { id: mirror.id }, select: { status: true } });
+        expect(after.status).toBe('NEEDS_MANUAL_REVIEW');
+        const funds = await prisma.user.findUnique({
+            where: { id: user.id },
+            select: { availableBalance: true, nativeGhsBalance: true },
+        });
+        expect(new Prisma.Decimal(funds.nativeGhsBalance).toFixed(2)).toBe(new Prisma.Decimal(before.nativeGhsBalance).toFixed(2));
+        expect(new Prisma.Decimal(funds.availableBalance).toFixed(2)).toBe(new Prisma.Decimal(before.availableBalance).toFixed(2));
+    });
+
+    // §P1-2 EVIDENCE MUST NAME THIS PAYOUT. entityId has no foreign key, so a
+    // stale OPEN row written for a deleted payout can share a numeric id with a
+    // fresh one. Grouping by entityId alone put another payout's exception
+    // reason (and its resolution options) on this review card.
+    test('§P1-2 evidence naming another payout is never shown on this one', async () => {
+        await setFlags();
+        const { mirror } = await seedParkedPayout();
+        // A stale row for a DIFFERENT payout that reuses this numeric id.
+        const staleReference = 'ref-of-a-different-payout';
+        await prisma.$executeRawUnsafe(
+            'INSERT INTO "ReconciliationException" ("id","entityType","entityId","reference","reason","details","status","firstSeenAt","lastSeenAt") ' +
+            'VALUES (gen_random_uuid(), \'WITHDRAWAL\', $1, $2, \'PROVIDER_STATUS_UNAVAILABLE\', \'{"phase":"POST_DISPATCH"}\'::jsonb, \'OPEN\', now(), now())',
+            String(mirror.id), staleReference
+        );
+
+        const admin = await seedUser(prisma, { role: 'ADMIN' });
+        const app = buildApp({ initiateBankTransfer: jest.fn() });
+        const list = await request(app)
+            .get('/api/admin/payouts/needs-review')
+            .set('Authorization', `Bearer ${tokenFor(admin)}`);
+        expect([200, 403]).toContain(list.status);
+        if (list.status === 200) {
+            const row = (list.body.withdrawals || []).find((w) => w.id === mirror.id);
+            expect(row).toBeTruthy();
+            const reasons = row.manualReview.reasons.map((r) => r.reason);
+            expect(reasons).toContain('BANK_DESTINATION_CHANGED');
+            // The other payout's unknowable anomaly must not appear here.
+            expect(reasons).not.toContain('PROVIDER_STATUS_UNAVAILABLE');
+            expect(row.manualReview.reasons.every((r) => !r.reference || r.reference !== staleReference)).toBe(true);
+        }
+    });
+
     test('§4.4 operator REJECT refunds the real GHS exactly once and touches no USDC', async () => {
         await setFlags();
         const { user, reference, mirror } = await seedParkedPayout();

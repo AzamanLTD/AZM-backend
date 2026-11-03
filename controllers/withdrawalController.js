@@ -1852,6 +1852,111 @@ const _resolveGhsDestination = async (prisma, userId, { destination, savedAccoun
     return { ok: true, destination: dest, network: null };
 };
 
+/// §P0-2 BANK PREVIEW + QUOTE (no money mutation). The BANK rail needed this:
+/// a bank payout that native GHS cannot cover answers
+/// GHS_SHORTFALL_QUOTE_REQUIRED, and there was no way to obtain the quote it
+/// demands. Everything the digest binds is resolved SERVER-SIDE here from the
+/// owner's persisted beneficiary — never a client-supplied fingerprint, bank
+/// code or snapshot.
+exports.bankFundingPlan = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const enabled = await nativeGhsWithdrawalService.isNativeGhsWithdrawalEnabled(prisma);
+        if (!enabled) {
+            return res.status(503).json({ success: false, code: 'NATIVE_GHS_WITHDRAWAL_DISABLED', message: 'Native-GHS withdrawals are not enabled.' });
+        }
+        // 1. the beneficiary is the OWNER's, and must be ACTIVE.
+        let bank;
+        try {
+            bank = await savedBankBeneficiaryService.revealForPayout(prisma, req.user.id, req.body.beneficiaryId);
+        } catch (beneficiaryError) {
+            const notFound = beneficiaryError.code === 'BENEFICIARY_NOT_FOUND';
+            return res.status(notFound ? 404 : 422).json({
+                success: false,
+                code: beneficiaryError.code || 'BENEFICIARY_UNAVAILABLE',
+                message: beneficiaryError.message,
+            });
+        }
+        // 2. and it must be PROVIDER-verified: a quote is a consent to pay THIS
+        // payee, and an unverified payee cannot be paid at all.
+        try {
+            savedBankBeneficiaryService.assertPayableVerification(bank);
+        } catch (verificationError) {
+            return res.status(422).json({
+                success: false,
+                code: verificationError.code || 'BENEFICIARY_NOT_VERIFIED',
+                message: verificationError.message,
+            });
+        }
+        // 3. the SAME fee policy the payout will charge. A quote that cannot
+        // state the exact debit must not be minted.
+        const feePolicy = nativeGhsWithdrawalService.bankPayoutFeePolicy();
+        if (!feePolicy) {
+            const configured = String(process.env.BANK_PAYOUT_FEE_GHS ?? '').trim();
+            const nonZero = configured !== '' && !/^0*(\.0+)?$/.test(configured);
+            return res.status(503).json({
+                success: false,
+                code: nonZero ? 'BANK_FEE_POLICY_UNAPPROVED' : 'BANK_FEE_POLICY_UNEVIDENCED',
+                message: 'Bank payouts are not enabled, so no quote can be issued. Nothing was debited.',
+            });
+        }
+        const user = await prisma.user.findUnique({ where: { id: req.user.id }, select: { nativeGhsBalance: true, availableBalance: true } });
+        const plan = ghsFundingPlanner.planGhsPayoutFunding({
+            amountGhs: req.body.amountGhs,
+            feeGhs: feePolicy.feeGhs,
+            availableNativeGhs: user?.nativeGhsBalance ?? 0,
+        });
+        // 4. identity from the PERSISTED record: the acceptance-time HMAC
+        // fingerprint of the account number plus the bank code. Digits are only
+        // unique within a bank, so the code is part of the payee.
+        const beneficiaryIdentity = ghsFundingPlanner.destinationIdentityOf({
+            destinationType: 'BANK',
+            destinationSnapshot: {
+                fingerprint: savedBankBeneficiaryService.fingerprint(bank.accountNumber),
+                bankCode: bank.bankCode,
+            },
+            beneficiaryId: bank.id,
+        });
+        if (!plan.requiresQuote) {
+            return res.status(200).json({
+                success: true,
+                plan,
+                quote: null,
+                usdcBalanceExact: new Prisma.Decimal(user?.availableBalance ?? 0).toFixed(8),
+                beneficiary: {
+                    id: bank.id, bankCode: bank.bankCode, bankName: bank.bankName,
+                    accountNumberMasked: bank.accountNumberMasked, accountNameVerified: bank.accountNameVerified === true,
+                },
+            });
+        }
+        const quote = await ghsFundingPlanner.quoteGhsShortfall({
+            prisma,
+            marketOracle: req.app.get('marketOracle'),
+            userId: req.user.id,
+            shortfallGhs: plan.shortfallGhs,
+            intent: {
+                rail: 'BANK',
+                recipientGhs: plan.recipientGhs,
+                feeGhs: plan.feeGhs,
+                destinationIdentity: beneficiaryIdentity,
+            },
+        });
+        return res.status(200).json({
+            success: true,
+            plan,
+            quote,
+            usdcBalanceExact: new Prisma.Decimal(user?.availableBalance ?? 0).toFixed(8),
+            beneficiary: {
+                id: bank.id, bankCode: bank.bankCode, bankName: bank.bankName,
+                accountNumberMasked: bank.accountNumberMasked, accountNameVerified: bank.accountNameVerified === true,
+            },
+        });
+    } catch (error) {
+        logger.error({ err: error, userId: req.user?.id }, '[bankFundingPlan] error');
+        return res.status(_ghsErrorStatus(error.code)).json({ success: false, code: error.code || 'SERVER_ERROR', message: error.message });
+    }
+};
+
 /// PREVIEW + QUOTE (no mutation of money): what would this payout need?
 exports.ghsFundingPlan = async (req, res) => {
     const prisma = req.app.get('prisma');
@@ -1962,9 +2067,13 @@ exports.ghsWithdrawal = async (req, res) => {
         // Funding plan first: a genuine shortfall REQUIRES an explicit,
         // consented quote. Equal amounts mean the quote covers it EXACTLY.
         const user = await prisma.user.findUnique({ where: { id: userId }, select: { nativeGhsBalance: true } });
+        // §P0-2 the plan must use the fee the QUOTE was minted with, or the
+        // shortfall the customer consented to and the shortfall we recompute
+        // would differ by the fee.
+        const bankFeePolicy = nativeGhsWithdrawalService.bankPayoutFeePolicy();
         const plan = ghsFundingPlanner.planGhsPayoutFunding({
             amountGhs: req.body.amountGhs,
-            feeGhs: 0,
+            feeGhs: bankFeePolicy ? bankFeePolicy.feeGhs : 0,
             availableNativeGhs: user?.nativeGhsBalance ?? 0,
         });
         if (plan.requiresQuote && !req.body.quoteId) {

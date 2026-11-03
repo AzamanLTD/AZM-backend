@@ -143,6 +143,14 @@ exports.bankBeneficiarySchema = z.object({
 
 // Bank payout request (issue #389): explicit typed BANK destination. The
 // amount is GHS-denominated and exact to the pesewa.
+// §P0-2: a BANK shortfall quote is requested for a SAVED, provider-verified
+// beneficiary. The client names the beneficiary, never a fingerprint, an account
+// number or a snapshot: those are server-derived from the persisted record.
+exports.bankWithdrawalQuoteSchema = z.object({
+  amountGhs:     z.union([z.string(), z.number()]),
+  beneficiaryId: z.string().min(4).max(64),
+});
+
 exports.bankWithdrawalSchema = z.object({
   amountGhs:      z.union([z.string(), z.number()]),
   beneficiaryId:  z.string().min(4).max(64),

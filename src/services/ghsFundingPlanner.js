@@ -66,7 +66,12 @@ function toExactPesewa(value, field = 'amountGhs') {
  */
 function planGhsPayoutFunding({ amountGhs, feeGhs = 0, availableNativeGhs = 0 }) {
   const recipient = toExactPesewa(amountGhs, 'amountGhs');
-  const fee = feeGhs === 0 ? new Prisma.Decimal(0) : toExactPesewa(feeGhs, 'feeGhs');
+  // A ZERO FEE IS A POLICY, NOT A MISSING VALUE. The amount validator refuses
+  // zero (a payout of nothing is not a payout), so a zero fee must be
+  // recognized here as exact zero rather than pushed through it.
+  const feeIsZero = feeGhs === 0 || feeGhs === '0' || feeGhs === '0.0' || feeGhs === '0.00'
+    || (feeGhs !== null && feeGhs !== undefined && feeGhs !== '' && String(Number(feeGhs)) === '0');
+  const fee = feeIsZero ? new Prisma.Decimal(0) : toExactPesewa(feeGhs, 'feeGhs');
   const required = recipient.plus(fee);
   let available;
   try {
