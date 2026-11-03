@@ -129,3 +129,23 @@ exports.createPaymentRequestSchema = z.object({
   requestMode:     z.enum(['DIRECT', 'LINK']),
   recipientUserId: z.union([z.string().min(1).max(64), z.number()]).optional(),
 }).passthrough();
+
+// Saved BANK payout beneficiary (issue #389 section 4). The account number is
+// write-only: 6-20 digits, stored encrypted with a separate HMAC fingerprint.
+exports.bankBeneficiarySchema = z.object({
+  bankCode:      z.string().min(2).max(16),
+  bankName:      z.string().min(2).max(80),
+  accountNumber: z.string().min(6).max(24),
+  accountName:   z.string().max(120).optional(),
+  nickname:      z.string().max(40).optional(),
+  isPrimary:     z.boolean().optional(),
+});
+
+// Bank payout request (issue #389): explicit typed BANK destination. The
+// amount is GHS-denominated and exact to the pesewa.
+exports.bankWithdrawalSchema = z.object({
+  amountGhs:      z.union([z.string(), z.number()]),
+  beneficiaryId:  z.string().min(4).max(64),
+  quoteId:        z.string().optional(),
+  idempotencyKey: z.string().optional(),
+});

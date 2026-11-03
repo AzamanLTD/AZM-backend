@@ -28,6 +28,7 @@ const { randomUUID }          = require('crypto');
 const { audit }               = require('../utils/audit');
 const { FEE_DISCOUNT_TIERS } = require('../services/azmSpendService');
 const { Prisma } = require('@prisma/client');
+const savedBankBeneficiaryService = require('../src/services/savedBankBeneficiaryService');
 
 const POLYGON_GAS_FEE_MATIC   = 0.05;  // V2 Blueprint: 100% of network gas is borne by user
 const FIAT_POOL_ALERT_THRESH  = financeService.FIAT_POOL_ALERT_THRESH;
@@ -2007,6 +2008,128 @@ exports.ghsWithdrawal = async (req, res) => {
         return undefined;
     } catch (error) {
         logger.error({ err: error, userId: req.user?.id }, '[ghsWithdrawal] error');
+        if (!res.headersSent) {
+            return res.status(_ghsErrorStatus(error.code)).json({ success: false, code: error.code || 'SERVER_ERROR', message: error.message });
+        }
+        return undefined;
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BANK PAYOUT SURFACE (issue #389 section 4, Agent A)
+//
+// Explicitly typed BANK destination — never inferred. The provider call is
+// delegated to the INJECTED `moolreBankPayoutPort` (Agent B's adapter, not
+// edited here); when that capability is not bound the route refuses 503 with
+// ZERO mutation instead of guessing a rail. Economics, operation identity,
+// reservation, state machine, reversal and reconciliation are the SAME
+// authorities the MoMo GHS leg uses.
+// ═══════════════════════════════════════════════════════════════════════════
+exports.bankWithdrawal = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
+    const bankPort = req.app.get('moolreBankPayoutPort');
+    try {
+        const enabled = await nativeGhsWithdrawalService.isNativeGhsWithdrawalEnabled(prisma);
+        if (!enabled) {
+            res.locals.financialClaimRelease = true;
+            return res.status(503).json({ success: false, code: 'NATIVE_GHS_WITHDRAWAL_DISABLED', message: 'Native-GHS withdrawals are not enabled.' });
+        }
+        // Capability-first: a missing port is a configuration fact, not a
+        // customer error — refuse BEFORE any money moves.
+        if (!bankPort || typeof bankPort.initiateBankTransfer !== 'function') {
+            res.locals.financialClaimRelease = true;
+            return res.status(503).json({
+                success: false,
+                code: 'BANK_PAYOUT_CAPABILITY_UNAVAILABLE',
+                message: 'Bank payouts are not available right now. Nothing was debited.',
+            });
+        }
+        const userId = req.user.id;
+        const bank = await savedBankBeneficiaryService.revealForPayout(prisma, userId, req.body.beneficiaryId);
+
+        const user = await prisma.user.findUnique({ where: { id: userId }, select: { nativeGhsBalance: true } });
+        const plan = ghsFundingPlanner.planGhsPayoutFunding({
+            amountGhs: req.body.amountGhs,
+            feeGhs: 0,
+            availableNativeGhs: user?.nativeGhsBalance ?? 0,
+        });
+        if (plan.requiresQuote && !req.body.quoteId) {
+            res.locals.financialClaimRelease = true;
+            return res.status(409).json({
+                success: false,
+                code: 'GHS_SHORTFALL_QUOTE_REQUIRED',
+                message: 'Native GHS does not cover this withdrawal. Request a shortfall quote and consent to it before retrying.',
+                data: { plan },
+            });
+        }
+
+        const reference = randomUUID();
+        let acceptedResponse = null;
+        const facts = await nativeGhsWithdrawalService.processNativeGhsWithdrawal(
+            prisma,
+            userId,
+            {
+                amountGhs: req.body.amountGhs,
+                destination: bank.accountNumberMasked,
+                reference,
+                quoteId: req.body.quoteId || null,
+                destinationType: 'BANK',
+                beneficiaryId: bank.id,
+            },
+            {
+                commitOperationClaimInTransaction: async (tx, claimFacts) => {
+                    acceptedResponse = {
+                        success: true,
+                        status: 'PENDING',
+                        message: 'Bank payout accepted. The transfer is being processed — track it with this reference.',
+                        reference,
+                        data: {
+                            reference,
+                            status: 'PENDING',
+                            destinationType: 'BANK',
+                            settlementCurrency: 'GHS_NATIVE',
+                            withdrawalId: claimFacts.withdrawalRecord?.id ?? null,
+                            transactionId: claimFacts.txRecord?.id ?? null,
+                            amountGhs: claimFacts.recipientGhsExact,
+                            feeGhs: claimFacts.feeGhsExact,
+                            totalDebitGhs: claimFacts.totalDebitGhsExact,
+                            bankName: bank.bankName,
+                            accountName: bank.accountName || null,
+                            accountNumberMasked: bank.accountNumberMasked,
+                            funding: claimFacts.funding ?? { mode: 'GHS_ONLY' },
+                        },
+                    };
+                    const operation = res.locals?.financialOperation || null;
+                    if (!operation) return;
+                    const committed = await tx.financialOperation.updateMany({
+                        where: { id: operation.id, status: 'IN_PROGRESS' },
+                        data: { status: 'COMMITTED', statusCode: 202, responseBody: JSON.stringify(acceptedResponse) },
+                    });
+                    if (committed.count !== 1) {
+                        const err = new Error('Idempotency operation state conflict.');
+                        err.code = 'IDEMPOTENCY_STATE_CONFLICT';
+                        throw err;
+                    }
+                },
+            }
+        );
+
+        res.status(202).json(acceptedResponse);
+        if (typeof emitBalanceUpdate === 'function') {
+            try {
+                emitBalanceUpdate(userId, { nativeGhsBalance: facts.nativeGhsBalanceExact, availableBalance: facts.usdcBalanceExact });
+            } catch (_) { /* socket fan-out is best effort */ }
+        }
+        await nativeGhsWithdrawalService.dispatchNaturalGhsBankWithdrawal(prisma, {
+            reference,
+            amountGhsExact: facts.recipientGhsExact,
+            bank,
+            port: bankPort,
+        });
+        return undefined;
+    } catch (error) {
+        logger.error({ err: error, userId: req.user?.id }, '[bankWithdrawal] error');
         if (!res.headersSent) {
             return res.status(_ghsErrorStatus(error.code)).json({ success: false, code: error.code || 'SERVER_ERROR', message: error.message });
         }

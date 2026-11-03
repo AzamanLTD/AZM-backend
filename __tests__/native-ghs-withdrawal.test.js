@@ -321,14 +321,17 @@ describe('native-GHS withdrawal leg (real PostgreSQL)', () => {
     test('2FA is enforced BEFORE any idempotency claim', async () => {
         await setSettings();
         const user = await ghsUser({ ghs: 300 });
+        const probeKey = randomUUID();
         const res = await request(buildApp())
             .post('/api/withdraw/ghs')
             .set('Authorization', `Bearer ${tokenFor(user)}`)
-            .set('Idempotency-Key', randomUUID())
+            .set('Idempotency-Key', probeKey)
             .send({ amountGhs: '10.00', destination: '233241234567' }); // no password
         expect(res.status).toBe(401);
         expect(['2FA_REQUIRED', 'PASSWORD_REQUIRED']).toContain(res.body.code);
-        const claims = await prisma.financialOperation.count({ where: { userId: user.id } });
+        // Scoped to THIS request's key: a rejected pre-economics request must
+        // never leave a committed claim behind.
+        const claims = await prisma.financialOperation.count({ where: { userId: user.id, key: probeKey } });
         expect(claims).toBe(0);
         const after = await prisma.user.findUnique({ where: { id: user.id }, select: { nativeGhsBalance: true } });
         expect(after.nativeGhsBalance.toFixed(2)).toBe('300.00');

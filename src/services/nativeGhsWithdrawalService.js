@@ -112,6 +112,10 @@ async function processNativeGhsWithdrawal(prisma, userId, args, opts = {}) {
     network = null,
     reference,
     quoteId = null,
+    // 'MOMO' (default, unchanged) or 'BANK' — an EXPLICIT typed destination.
+    // The rail is never inferred from the destination string.
+    destinationType = 'MOMO',
+    beneficiaryId = null,
   } = args;
   if (!reference) throw new NativeGhsWithdrawalError('reference is required', 'REFERENCE_REQUIRED');
   const recipientGhs = toExactPesewa(amountGhs);
@@ -257,7 +261,7 @@ async function processNativeGhsWithdrawal(prisma, userId, args, opts = {}) {
       userId,
       recipientGhs.toFixed(2),
       SETTLEMENT_CURRENCY,
-      DISPATCH_RAIL,
+      destinationType === 'BANK' ? 'BANK' : DISPATCH_RAIL,
       network,
       destination,
       'PENDING',
@@ -273,7 +277,7 @@ async function processNativeGhsWithdrawal(prisma, userId, args, opts = {}) {
       reference,
       amountGhs: recipientGhs,
       provider: DISPATCH_PROVIDER,
-      rail: DISPATCH_RAIL,
+      rail: destinationType === 'BANK' ? 'BANK' : DISPATCH_RAIL,
       destination,
       relatedTransactionId: txRecord.id,
     });
@@ -397,6 +401,71 @@ async function dispatchNativeGhsWithdrawal(prisma, {
     logger.error({ reference, err: err.message }, '[nativeGhsWithdrawal] IN_TRANSIT transition failed after dispatch');
   }
   return { dispatched: true, providerRef, provider: providerName };
+}
+
+/**
+ * BANK payout dispatch through the INJECTED provider port (Agent B owns the
+ * adapter; this module owns the state machine). Same single-winner claim,
+ * same reversal authority, same evidence — only the provider call differs.
+ */
+async function dispatchNaturalGhsBankWithdrawal(prisma, {
+  reference,
+  amountGhsExact,
+  bank,
+  port,
+  narration,
+}) {
+  if (!reference) throw new NativeGhsWithdrawalError('reference is required', 'REFERENCE_REQUIRED');
+  if (!port || typeof port.initiateBankTransfer !== 'function') {
+    return { dispatched: false, reason: 'BANK_PORT_UNAVAILABLE' };
+  }
+  if (!bank || !bank.accountNumber || !bank.bankCode) {
+    return { dispatched: false, reason: 'BANK_DESTINATION_INCOMPLETE' };
+  }
+  const amount = toExactPesewa(amountGhsExact);
+  const row = await prisma.transactionHistory.findUnique({
+    where: { txHash: reference },
+    select: { id: true, type: true, settlementCurrency: true },
+  });
+  if (!row || row.type !== 'WITHDRAWAL_FIAT' || row.settlementCurrency !== SETTLEMENT_CURRENCY) {
+    return { dispatched: false, reason: 'NOT_A_NATIVE_GHS_WITHDRAWAL' };
+  }
+  const claim = await prisma.withdrawal.updateMany({
+    where: { transactionHistoryId: row.id, status: 'PENDING', payoutMethod: 'BANK' },
+    data: { status: 'DISPATCHING' },
+  });
+  if (claim.count !== 1) return { dispatched: false, reason: 'DISPATCH_CLAIM_LOST' };
+
+  let outbound;
+  try {
+    outbound = await port.initiateBankTransfer({
+      referenceId: reference,
+      externalId: reference,
+      amountGhs: amount.toFixed(2),
+      bankCode: bank.bankCode,
+      accountNumber: bank.accountNumber,
+      accountName: bank.accountName || null,
+      narration: narration || `Azaman payout ${reference}`,
+    });
+  } catch (err) {
+    // No accepted provider bytes: definitive pre-dispatch failure → reverse once.
+    const reversal = await reverseNativeGhsWithdrawal(prisma, { reference, reason: err.message });
+    return { dispatched: false, reason: 'PROVIDER_REJECTED', error: err.message, reversal };
+  }
+  const providerRef = outbound?.providerRef || outbound?.transactionId || null;
+  await prisma.$executeRawUnsafe(
+    'UPDATE "TransactionHistory" SET "metadata" = COALESCE("metadata", \'{}\'::jsonb) || $2::jsonb WHERE "id" = $1',
+    row.id,
+    JSON.stringify({ dispatch: { acceptedAt: new Date().toISOString(), rail: 'BANK', providerRef, idempotency: 'canonical-reference' } })
+  );
+  try {
+    await prisma.$transaction(async (tx) => {
+      await fiatLiquidity.markReservationInTransit(tx, { reference, providerRef });
+    });
+  } catch (err) {
+    logger.error({ reference, err: err.message }, '[nativeGhsWithdrawal] BANK IN_TRANSIT transition failed after dispatch');
+  }
+  return { dispatched: true, providerRef, rail: 'BANK' };
 }
 
 /**
@@ -539,6 +608,7 @@ module.exports = {
   toExactPesewa,
   processNativeGhsWithdrawal,
   dispatchNativeGhsWithdrawal,
+  dispatchNaturalGhsBankWithdrawal,
   reverseNativeGhsWithdrawal,
   reconcileNativeGhsWithdrawals,
 };

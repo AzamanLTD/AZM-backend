@@ -7,7 +7,7 @@ const withdrawalController = require('../controllers/withdrawalController');
 const { requireFreshFxRate } = require('../middleware/fxTransactionGateMiddleware');
 const authMiddleware = require('../middleware/authMiddleware');
 const { validate } = require('../middleware/validate');
-const { fiatWithdrawalSchema, cryptoWithdrawalSchema, ghsWithdrawalSchema } = require('../services/validation/financialSchemas');
+const { fiatWithdrawalSchema, cryptoWithdrawalSchema, ghsWithdrawalSchema, bankWithdrawalSchema } = require('../services/validation/financialSchemas');
 
 const { idempotency } = require('../middleware/idempotency');
 const { require2FA } = require('../middleware/require2FA');
@@ -74,6 +74,15 @@ router.post('/crypto',
 
 // Real-time withdrawal progress popup — polling fallback for the Socket.IO
 // `withdrawal_progress` event. Owner-only; returns a {stage,label,pct} triple.
+// BANK payout: explicit typed destination, GHS-denominated, NO F+X gate (a
+// GHS-only payout is not an FX transaction). The provider is the injected
+// bank port; when unbound the handler refuses 503 before any mutation.
+router.post('/bank',
+    protect, require2FA(),
+    idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
+    validate(bankWithdrawalSchema),
+    withdrawalController.bankWithdrawal);
+
 router.get('/status/:reference', protect, withdrawalController.getWithdrawalStatus);
 
 module.exports = router;
