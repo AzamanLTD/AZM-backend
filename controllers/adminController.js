@@ -11,6 +11,7 @@ const withdrawalBridge = require('../services/withdrawalBridgeService'); // r18 
 const rbac = require('./adminRbacController'); // r272 finding 3 — the declared approval-tier authority
 const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 const financeService = require('../services/finance.service');
+const nativeGhsWithdrawalService = require('../src/services/nativeGhsWithdrawalService');
 const { resolvePayoutOwner } = require('../services/payoutProviderOwnership');
 const { recordReconciliationException } = require('../services/reconciliationExceptionService');
 
@@ -1785,27 +1786,54 @@ exports.rejectWithdrawal = async (req, res) => {
             // rolls the whole rejection back.
             let reversed;
             try {
-                reversed = await prisma.$transaction(async (tx) => {
-                    const claimed = await tx.withdrawal.updateMany({
+                if (canonical.settlementCurrency === 'GHS_NATIVE') {
+                    // Native GHS: the USDC reversal would refund zero (the
+                    // canonical amount is 0 — the money is in amountGhs).
+                    // Claim the mirror, then refund through the GHS authority.
+                    const claimed = await prisma.withdrawal.updateMany({
                         where: { id: withdrawalId, status: { in: ['PENDING', 'APPROVED'] } },
-                        data: { status: 'REJECTED' }
+                        data: { status: 'PENDING' }
                     });
-                    if (claimed.count === 0) {
-                        throw new Error('WITHDRAWAL_ALREADY_FINALIZED');
-                    }
-                    const result = await financeService.reverseFiatWithdrawal(prisma, canonical.txHash, {
-                        tx,
+                    if (claimed.count === 0) throw new Error('WITHDRAWAL_ALREADY_FINALIZED');
+                    reversed = await _reverseCanonicalForAdmin(prisma, {
+                        canonical,
+                        withdrawalId,
                         reason: `admin_rejection:${reason}`
                     });
-                    if (!result || result.alreadyReversed) {
-                        // The canonical row moved under us (settled or
-                        // already reversed) — the mirror claim must roll back.
-                        throw new Error('WITHDRAWAL_CANONICAL_ALREADY_FINALIZED');
-                    }
-                    return result;
-                });
+                    // No status write here: the GHS reversal already marked the
+                    // mirror FAILED inside its own transaction, which is the
+                    // honest label (the payout failed and the money came back).
+                    // Forcing REJECTED afterwards would contradict it.
+                } else {
+                    reversed = await prisma.$transaction(async (tx) => {
+                        const claimed = await tx.withdrawal.updateMany({
+                            where: { id: withdrawalId, status: { in: ['PENDING', 'APPROVED'] } },
+                            data: { status: 'REJECTED' }
+                        });
+                        if (claimed.count === 0) {
+                            throw new Error('WITHDRAWAL_ALREADY_FINALIZED');
+                        }
+                        const result = await financeService.reverseFiatWithdrawal(prisma, canonical.txHash, {
+                            tx,
+                            reason: `admin_rejection:${reason}`
+                        });
+                        if (!result || result.alreadyReversed) {
+                            // The canonical row moved under us (settled or
+                            // already reversed) — the mirror claim must roll back.
+                            throw new Error('WITHDRAWAL_CANONICAL_ALREADY_FINALIZED');
+                        }
+                        return result;
+                    });
+                }
             } catch (err) {
                 if (err.message === 'WITHDRAWAL_ALREADY_FINALIZED') throw err;
+                if (err.message === 'NATIVE_GHS_REVERSAL_REFUSED') {
+                    return res.status(409).json({
+                        success: false,
+                        message: 'The GHS payout could not be reversed safely; nothing was refunded. It stays visible for reconciliation.',
+                        data: { withdrawalId, canonicalStatus: canonical.status, evidence: err.detail || null }
+                    });
+                }
                 if (err.message === 'WITHDRAWAL_CANONICAL_ALREADY_FINALIZED') {
                     return res.status(409).json({
                         success: false,
@@ -2422,6 +2450,70 @@ exports.getNeedsManualReview = async (req, res) => {
     }
 };
 
+/**
+ * Admin-side canonical reversal, rail-aware.
+ *
+ * A native-GHS payout is NOT a USDC withdrawal: its canonical row carries
+ * amountUsdc 0 and the real money in amountGhs, so the legacy USDC reversal
+ * would mark the payout FAILED while refunding nothing — the customer's GHS
+ * stays debited and the operator sees a "refunded" payout. The GHS authority
+ * refunds the exact GHS and is atomic across the liability, any USDC shortfall
+ * funding, the conversion posting and the reservation.
+ *
+ * The GHS reversal only accepts a payout it can still claim (PENDING /
+ * DISPATCHING). Admin states (APPROVED, NEEDS_MANUAL_REVIEW) are moved to
+ * PENDING as the claim and put back if the reversal refuses, so a refusal can
+ * never destroy the row's state.
+ */
+async function _reverseCanonicalForAdmin(prisma, { canonical, withdrawalId, reason }) {
+    if (canonical.settlementCurrency !== 'GHS_NATIVE') {
+        return { nativeGhs: false };
+    }
+    const mirror = await prisma.withdrawal.findFirst({ where: { id: withdrawalId }, select: { status: true } });
+    const previous = mirror?.status || 'PENDING';
+    const needsClaim = !['PENDING', 'DISPATCHING'].includes(previous);
+    if (needsClaim) {
+        const claimed = await prisma.withdrawal.updateMany({
+            where: { id: withdrawalId, status: previous },
+            data: { status: 'PENDING' },
+        });
+        if (claimed.count === 0) throw new Error('WITHDRAWAL_ALREADY_FINALIZED');
+    }
+    let result;
+    try {
+        result = await nativeGhsWithdrawalService.reverseNativeGhsWithdrawal(prisma, {
+            reference: canonical.txHash,
+            reason,
+        });
+    } catch (err) {
+        if (needsClaim) {
+            await prisma.withdrawal.updateMany({
+                where: { id: withdrawalId, status: 'PENDING' },
+                data: { status: previous },
+            }).catch(() => {});
+        }
+        throw err;
+    }
+    if (!result || result.reversed !== true) {
+        if (needsClaim) {
+            await prisma.withdrawal.updateMany({
+                where: { id: withdrawalId, status: 'PENDING' },
+                data: { status: previous },
+            }).catch(() => {});
+        }
+        const err = new Error('NATIVE_GHS_REVERSAL_REFUSED');
+        err.detail = result || null;
+        throw err;
+    }
+    return {
+        nativeGhs: true,
+        alreadyReversed: false,
+        refundedAmount: Number(result.amountGhs),
+        refundedCurrency: 'GHS',
+        amountGhs: result.amountGhs,
+    };
+}
+
 // =============================================================================
 // NEEDS_MANUAL_REVIEW RESOLUTION (P0 dead-end fix, 2026-10-08)
 // =============================================================================
@@ -2455,7 +2547,11 @@ const REVIEW_SAFE_PARKING_REASONS = new Set([
     'MISSING_RECIPIENT_PHONE',
     'AUTHORITY_HEADROOM_BELOW_THRESHOLD',
     'INSUFFICIENT_POOL_LIQUIDITY',
-    'DISBURSEMENT_DISPATCH_FAILED'
+    'DISBURSEMENT_DISPATCH_FAILED',
+    // §6: the saved payee no longer matches the destination confirmed at
+    // acceptance. The check runs BEFORE the dispatch claim, so the provider
+    // was provably never called — RESUME/REJECT are both provable.
+    'BANK_DESTINATION_CHANGED'
 ]);
 
 // Anomaly reasons where the provider MAY have paid and the external outcome
@@ -2730,26 +2826,51 @@ exports.resolveManualReview = async (req, res) => {
         if (canonical) {
             let reversed;
             try {
-                reversed = await prisma.$transaction(async (tx) => {
-                    const claimed = await tx.withdrawal.updateMany({
+                if (canonical.settlementCurrency === 'GHS_NATIVE') {
+                    // Native GHS: refund the REAL GHS through its own authority
+                    // (the USDC reversal would refund zero). The reversal also
+                    // flips the canonical row FAILED, single-winner.
+                    const claimed = await prisma.withdrawal.updateMany({
                         where: { id: withdrawalId, status: 'NEEDS_MANUAL_REVIEW' },
-                        data: { status: 'REJECTED' }
+                        data: { status: 'PENDING' }
                     });
-                    if (claimed.count === 0) {
-                        throw new Error('WITHDRAWAL_ALREADY_FINALIZED');
-                    }
-                    const result = await financeService.reverseFiatWithdrawal(prisma, canonical.txHash, {
-                        tx,
+                    if (claimed.count === 0) throw new Error('WITHDRAWAL_ALREADY_FINALIZED');
+                    reversed = await _reverseCanonicalForAdmin(prisma, {
+                        canonical,
+                        withdrawalId,
                         reason: `manual_review_rejection:${reason}`
                     });
-                    if (!result || result.alreadyReversed) {
-                        throw new Error('WITHDRAWAL_CANONICAL_ALREADY_FINALIZED');
-                    }
-                    return result;
-                });
+                    // See above: the GHS reversal owns the terminal mirror
+                    // status (FAILED), so it is not overwritten here.
+                } else {
+                    reversed = await prisma.$transaction(async (tx) => {
+                        const claimed = await tx.withdrawal.updateMany({
+                            where: { id: withdrawalId, status: 'NEEDS_MANUAL_REVIEW' },
+                            data: { status: 'REJECTED' }
+                        });
+                        if (claimed.count === 0) {
+                            throw new Error('WITHDRAWAL_ALREADY_FINALIZED');
+                        }
+                        const result = await financeService.reverseFiatWithdrawal(prisma, canonical.txHash, {
+                            tx,
+                            reason: `manual_review_rejection:${reason}`
+                        });
+                        if (!result || result.alreadyReversed) {
+                            throw new Error('WITHDRAWAL_CANONICAL_ALREADY_FINALIZED');
+                        }
+                        return result;
+                    });
+                }
             } catch (err) {
                 if (err.message === 'WITHDRAWAL_ALREADY_FINALIZED') {
                     return res.status(409).json({ success: false, message: 'Withdrawal was resolved concurrently — refresh to see its final state.' });
+                }
+                if (err.message === 'NATIVE_GHS_REVERSAL_REFUSED') {
+                    return res.status(409).json({
+                        success: false,
+                        message: 'The GHS payout could not be reversed safely; nothing was refunded and the row stays in review.',
+                        data: { withdrawalId, canonicalStatus: canonical.status, evidence: err.detail || null }
+                    });
                 }
                 if (err.message === 'WITHDRAWAL_CANONICAL_ALREADY_FINALIZED') {
                     return res.status(409).json({ success: false, message: 'The linked withdrawal transaction was finalized concurrently. Refusing to refund twice — please refresh.' });

@@ -633,6 +633,36 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
           nextStep: 'Customer re-confirms the bank destination; RESUME re-runs every gate.',
         })
       );
+      // Durable OPERATOR evidence, not just metadata. The admin review queue
+      // derives an operator's allowed actions from ReconciliationException
+      // rows; a park recorded only in metadata shows up as a row with no
+      // reason and no option but ESCALATE — which for this park would send an
+      // operator to poll a provider that was provably never called. The phase
+      // is PRE_DISPATCH because this check runs BEFORE the dispatch claim.
+      const mirror = await prisma.withdrawal.findFirst({
+        where: { transactionHistoryId: row.id },
+        select: { id: true },
+      });
+      if (mirror) {
+        await recordReconciliationException(prisma, {
+          entityType: 'WITHDRAWAL',
+          entityId: String(mirror.id),
+          reference,
+          reason: 'BANK_DESTINATION_CHANGED',
+          details: {
+            phase: 'PRE_DISPATCH',
+            settlementCurrency: SETTLEMENT_CURRENCY,
+            resolution: 'PAYEE_MUST_BE_CONFIRMED',
+            snapshotFingerprint: snapshot.fingerprint,
+            currentFingerprint,
+            snapshotBankCode: snapshot.bankCode,
+            currentBankCode: current?.bankCode ?? null,
+            revalidationError,
+            providerDispatched: false,
+            refunded: false,
+          },
+        });
+      }
       return { dispatched: false, reason: 'BANK_DESTINATION_CHANGED' };
     }
   }
