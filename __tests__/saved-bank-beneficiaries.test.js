@@ -25,6 +25,10 @@ const maybe = hasDb ? describe : describe.skip;
 if (hasDb) {
     process.env.BANK_BENEFICIARY_HMAC_KEY = process.env.BANK_BENEFICIARY_HMAC_KEY || 'test-hmac-key-distinct-from-encryption';
     process.env.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'a'.repeat(64);
+    // §9: the BANK rail is OFF unless a fee policy is explicitly evidenced.
+    // These tests evidence a zero-fee bank contract so the economics are
+    // exercised; the refusal path is proven separately below.
+    process.env.BANK_PAYOUT_FEE_GHS = '0';
 }
 
 maybe('saved bank beneficiaries + BANK payout (real PostgreSQL)', () => {
@@ -198,74 +202,133 @@ maybe('saved bank beneficiaries + BANK payout (real PostgreSQL)', () => {
         expect(mirror.settlementCurrency).toBe('GHS_NATIVE');
         expect(new Prisma.Decimal(mirror.amountGhs).toFixed(2)).toBe('125.50');
     });
-    test('§6 a payee edited AFTER acceptance is never paid: parked, not sent, not refunded', async () => {
+    test('§9 BANK refuses with zero mutation while the bank fee is unevidenced', async () => {
         await setFlags();
-        // The port defers the call so we can mutate the payee "mid-flight".
-        let release;
-        const gate = new Promise((r) => { release = r; });
-        const port = {
-            initiateBankTransfer: jest.fn(async () => {
-                await gate;
-                return { providerRef: 'BANK-REF-LATE', status: 'PENDING' };
-            }),
-        };
-        const app = buildApp(port);
+        const svc = require('../src/services/nativeGhsWithdrawalService');
+        const beneSvc = require('../src/services/savedBankBeneficiaryService');
+        const app = buildApp({ initiateBankTransfer: jest.fn() });
         const user = await seedUser(prisma, { nativeGhsBalance: 500 });
         const created = await createBene(app, user);
-        const callAccountNumber = '1234567890123';
+        const bank = await beneSvc.revealForPayout(prisma, user.id, created.body.beneficiary.id);
 
-        const res = await auth(request(app).post('/api/withdraw/bank'), user).send({
-            password: TEST_PASSWORD,
-            amountGhs: '80.00',
-            beneficiaryId: created.body.beneficiary.id,
-        });
-        expect(res.status).toBe(202);
-        const { reference } = res.body;
-
-        // BAIT AND SWITCH: the saved payee is redirected after the customer's
-        // money was already debited against the ORIGINAL account.
-        const { Prisma } = require('@prisma/client');
-        // Removing the payee has the same effect on resolution as redirecting
-        // it: the saved row no longer resolves to the confirmed account.
-        await prisma.savedBankBeneficiary.update({
-            where: { id: created.body.beneficiary.id },
-            data: { status: 'DELETED' },
-        });
-
-        release();
-        const started = Date.now();
-        while (Date.now() - started < 4000 && port.initiateBankTransfer.mock.calls.length === 0) {
-            await new Promise((r) => setTimeout(r, 25));
-            const parked = await prisma.transactionHistory.findUnique({ where: { txHash: reference }, select: { metadata: true } });
-            if (parked?.metadata?.bankDestinationRevalidation) break;
+        const saved = process.env.BANK_PAYOUT_FEE_GHS;
+        delete process.env.BANK_PAYOUT_FEE_GHS;
+        let err = null;
+        try {
+            await svc.processNativeGhsWithdrawal(
+                prisma,
+                user.id,
+                {
+                    amountGhs: '80.00',
+                    destination: bank.accountNumberMasked,
+                    reference: randomUUID(),
+                    destinationType: 'BANK',
+                    beneficiaryId: bank.id,
+                },
+                { commitOperationClaimInTransaction: async () => {} }
+            );
+        } catch (e) {
+            err = e;
+        } finally {
+            process.env.BANK_PAYOUT_FEE_GHS = saved;
         }
 
-        // NOTHING was sent to the swapped account.
-        await new Promise((r) => setTimeout(r, 250));
+        expect(err).not.toBeNull();
+        expect(err.code).toBe('BANK_FEE_POLICY_UNEVIDENCED');
+        // The MoMo zero-fee contract must not be silently inherited.
+        expect(err.message).toMatch(/bank transfer fee/i);
+        const after = await prisma.user.findUnique({ where: { id: user.id }, select: { nativeGhsBalance: true } });
+        expect(new Prisma.Decimal(after.nativeGhsBalance).toFixed(2)).toBe('500.00');
+        expect(await prisma.withdrawal.count({ where: { userId: user.id } })).toBe(0);
+        expect(await prisma.transactionHistory.count({ where: { userId: user.id, type: 'WITHDRAWAL_FIAT' } })).toBe(0);
+    });
+
+    test('§6 a payee changed AFTER acceptance is never paid (deterministic, no timing window)', async () => {
+        await setFlags();
+        const svc = require('../src/services/nativeGhsWithdrawalService');
+        const beneSvc = require('../src/services/savedBankBeneficiaryService');
+        const app = buildApp();
+        const user = await seedUser(prisma, { nativeGhsBalance: 500 });
+
+        const created = await createBene(app, user);
+        expect(created.status).toBe(201);
+        const beneficiaryId = created.body.beneficiary.id;
+
+        // The destination the customer actually CONFIRMED.
+        const bank = await beneSvc.revealForPayout(prisma, user.id, beneficiaryId);
+        const snapshot = {
+            beneficiaryId: bank.id,
+            bankCode: bank.bankCode,
+            bankName: bank.bankName,
+            accountName: bank.accountName || null,
+            accountNumberMasked: bank.accountNumberMasked,
+            fingerprint: beneSvc.fingerprint(bank.accountNumber),
+            capturedAt: new Date().toISOString(),
+        };
+
+        // STEP 1: acceptance. Money moves, snapshot is bound. No dispatch here,
+        // so there is no race with anything that follows.
+        const reference = randomUUID();
+        const facts = await svc.processNativeGhsWithdrawal(
+            prisma,
+            user.id,
+            {
+                amountGhs: '80.00',
+                destination: bank.accountNumberMasked,
+                reference,
+                destinationType: 'BANK',
+                beneficiaryId: bank.id,
+                destinationSnapshot: snapshot,
+            },
+            { commitOperationClaimInTransaction: async () => {} }
+        );
+        expect(new Prisma.Decimal(facts.recipientGhsExact).toFixed(2)).toBe('80.00');
+
+        // BAIT AND SWITCH: after the customer's GHS is already debited, the
+        // saved payee stops resolving to the confirmed account.
+        await prisma.savedBankBeneficiary.update({ where: { id: beneficiaryId }, data: { status: 'DELETED' } });
+
+        // STEP 2: dispatch, called explicitly — the outcome cannot depend on
+        // how fast the test reached this line.
+        const port = { initiateBankTransfer: jest.fn(async () => ({ providerRef: 'SHOULD-NEVER-HAPPEN', status: 'PENDING' })) };
+        const out = await svc.dispatchNaturalGhsBankWithdrawal(prisma, {
+            reference,
+            amountGhsExact: facts.recipientGhsExact,
+            bank,
+            port,
+        });
+
+        expect(out.dispatched).toBe(false);
+        expect(out.reason).toBe('BANK_DESTINATION_CHANGED');
         expect(port.initiateBankTransfer).not.toHaveBeenCalled();
 
-        const th = await prisma.transactionHistory.findUnique({ where: { txHash: reference }, select: { metadata: true, status: true } });
-        expect(th.metadata.bankDestinationSnapshot.fingerprint).toBeTruthy();
-        expect(th.metadata.bankDestinationSnapshot.accountNumberMasked).toMatch(/\d{4}$/);
-        // The snapshot never carries the plaintext account number.
-        expect(JSON.stringify(th.metadata)).not.toContain(callAccountNumber);
+        const th = await prisma.transactionHistory.findUnique({
+            where: { txHash: reference },
+            select: { id: true, metadata: true, status: true },
+        });
+        // The snapshot is durable, masked-tail + HMAC only.
+        expect(th.metadata.bankDestinationSnapshot).toMatchObject({
+            beneficiaryId,
+            bankCode: 'GCB',
+            accountNumberMasked: '*********0123',
+            fingerprint: snapshot.fingerprint,
+        });
+        expect(JSON.stringify(th.metadata)).not.toContain('1234567890123');
+        // The refusal is evidence, not a guess, and it is not a refund.
         expect(th.metadata.bankDestinationRevalidation).toMatchObject({
             code: 'BANK_DESTINATION_CHANGED',
             refunded: false,
-            resolution: 'OPERATOR_REVIEW',
+            resolution: 'PAYEE_MUST_BE_CONFIRMED',
         });
-        // The payout is NOT silently refunded either: it is held for review.
-        expect(th.metadata.dispatchException.code).toBe('PROVIDER_OUTCOME_UNCERTAIN');
-        // The rejection happens BEFORE the dispatch claim is taken, so the
-        // mirror is still PENDING and the carry is the durable park record —
-        // never a terminal FAILED (which would imply a refund) and never
-        // DISPATCHING (which would imply the money left).
-        const mirror = await prisma.withdrawal.findFirst({ where: { userId: user.id }, orderBy: { id: 'desc' } });
-        expect(mirror.status).toBe('PENDING');
-        // OPEN (tracked in #389): the reconciliation sweep must skip a PENDING
-        // row that carries bankDestinationRevalidation, otherwise it could
-        // re-dispatch to the CURRENT payee. Guarded here so a future sweep
-        // change cannot silently reintroduce the swap.
+        // No bogus lookup instruction: nothing was dispatched, so polling the
+        // provider for the original reference can never resolve this.
+        expect(th.metadata.dispatchException).toBeUndefined();
+
+        // Nothing is sent and nothing is refunded: the payout is HELD.
+        const mirror = await prisma.withdrawal.findFirst({ where: { transactionHistoryId: th.id }, orderBy: { id: 'desc' } });
+        // Out of the retry set (a PENDING row would be re-attempted on every
+        // worker tick), and visibly queued for a human instead.
+        expect(mirror.status).toBe('NEEDS_MANUAL_REVIEW');
         const after = await prisma.user.findUnique({ where: { id: user.id }, select: { nativeGhsBalance: true } });
         expect(new Prisma.Decimal(after.nativeGhsBalance).toFixed(2)).toBe('420.00');
     });

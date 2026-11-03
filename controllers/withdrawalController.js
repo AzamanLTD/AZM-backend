@@ -1819,6 +1819,7 @@ const _ghsErrorStatus = (code) => {
         case 'USDC_INSUFFICIENT_BALANCE':
         case 'NATIVE_GHS_QUOTE_INVALID':
             return 409;
+        case 'BANK_FEE_POLICY_UNEVIDENCED':
         case 'NATIVE_GHS_LIQUIDITY_AUTHORITY_REQUIRED':
         case 'RATE_UNAVAILABLE':
         case 'QUOTE_RATE_UNAVAILABLE':

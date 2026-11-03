@@ -48,6 +48,19 @@ const REVERSAL_MARKER = 'nativeGhsWithdrawalReversal';
 // fee is 0, so the recipient receives EXACTLY amountGhs and totalDebitGhs
 // equals amountGhs. The policy is EXPLICIT and itemised in the response and in
 // metadata — never inferred from provider facts, never silently changed.
+// BANK rail fee policy: NONE agreed by default. Resolved at CALL time so the
+// rail is enabled only by an explicit, visible configuration and never by an
+// assumption baked into the module. Unset => the BANK leg refuses (see the
+// guard in processNativeGhsWithdrawal) instead of inheriting the MoMo
+// zero-fee contract, which is a different provider leg entirely.
+function bankPayoutFeePolicy() {
+  const raw = process.env.BANK_PAYOUT_FEE_GHS;
+  if (raw === undefined || raw === null || String(raw).trim() === '') return null;
+  const fee = new Prisma.Decimal(String(raw).trim());
+  if (fee.isNegative()) return null;
+  return { code: 'BANK_FEE_V1', feeGhs: fee.toFixed(2) };
+}
+
 const GHS_NATIVE_FEE_POLICY = Object.freeze({
   code: 'ZERO_FEE_V1',
   feeGhs: '0.00',
@@ -124,7 +137,20 @@ async function processNativeGhsWithdrawal(prisma, userId, args, opts = {}) {
   } = args;
   if (!reference) throw new NativeGhsWithdrawalError('reference is required', 'REFERENCE_REQUIRED');
   const recipientGhs = toExactPesewa(amountGhs);
-  const feeGhs = new Prisma.Decimal(GHS_NATIVE_FEE_POLICY.feeGhs);
+  // §9 FEE POLICY IS PER RAIL AND MUST BE EVIDENCED. ZERO_FEE_V1 is a MOBILE
+  // MONEY contract: Moolre charges nothing on the MoMo payout leg. It says
+  // nothing whatsoever about a BANK transfer, so inheriting it silently would
+  // promise the customer a zero-fee bank payout that nobody has agreed to.
+  // Until the bank fee is documented, the BANK rail refuses before any
+  // mutation instead of running on an assumption.
+  const feePolicy = destinationType === 'BANK' ? bankPayoutFeePolicy() : GHS_NATIVE_FEE_POLICY;
+  if (!feePolicy) {
+    throw new NativeGhsWithdrawalError(
+      'Bank payouts are not enabled: the bank transfer fee has not been agreed with the provider, so the exact amount the recipient receives cannot be promised. Nothing was debited.',
+      'BANK_FEE_POLICY_UNEVIDENCED'
+    );
+  }
+  const feeGhs = new Prisma.Decimal(feePolicy.feeGhs);
   const totalDebitGhs = recipientGhs.plus(feeGhs);
 
   // The P5-D fiat-liquidity authority is REQUIRED: the legacy SystemFiatPool
@@ -275,7 +301,7 @@ async function processNativeGhsWithdrawal(prisma, userId, args, opts = {}) {
           amountGhs: recipientGhs.toFixed(2),
           payoutGhs: recipientGhs.toFixed(2),
           totalDebitGhs: totalDebitGhs.toFixed(2),
-          feePolicy: GHS_NATIVE_FEE_POLICY,
+          feePolicy,
           provider: DISPATCH_PROVIDER,
           rail: DISPATCH_RAIL,
           network,
@@ -581,11 +607,14 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
     }
     const currentFingerprint = current ? savedBankBeneficiaryService.fingerprint(current.accountNumber) : null;
     if (!current || currentFingerprint !== snapshot.fingerprint || current.bankCode !== snapshot.bankCode) {
-      await parkUncertainDispatch(prisma, {
-        reference,
-        outcome: PROVIDER_OUTCOME.NOT_DISPATCHED,
-        error: { code: 'BANK_DESTINATION_CHANGED' },
-        rail: 'BANK',
+      // NOT parkUncertainDispatch: that helper records
+      // STATUS_LOOKUP_ORIGINAL_REFERENCE, which would send an operator to poll
+      // a provider that was never called. Nobody can look this up — the payee
+      // itself has to be re-confirmed by the customer, so the row must leave
+      // the retry set and land in the human review queue instead.
+      await prisma.withdrawal.updateMany({
+        where: { transactionHistoryId: row.id, status: 'PENDING' },
+        data: { status: 'NEEDS_MANUAL_REVIEW' },
       });
       await prisma.$executeRawUnsafe(
         'UPDATE "TransactionHistory" SET "metadata" = COALESCE("metadata", \'{}\'::jsonb) || jsonb_build_object($2::text, $3::jsonb) WHERE "txHash" = $1',
@@ -600,7 +629,8 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
           snapshotBankCode: snapshot.bankCode,
           currentBankCode: current?.bankCode ?? null,
           refunded: false,
-          resolution: 'OPERATOR_REVIEW',
+          resolution: 'PAYEE_MUST_BE_CONFIRMED',
+          nextStep: 'Customer re-confirms the bank destination; RESUME re-runs every gate.',
         })
       );
       return { dispatched: false, reason: 'BANK_DESTINATION_CHANGED' };
