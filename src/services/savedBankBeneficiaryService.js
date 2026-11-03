@@ -45,10 +45,35 @@ function currentKeyId() {
 
 function normalizeAccountNumber(value) {
     const digits = String(value == null ? '' : value).replace(/[\s-]/g, '');
-    if (!/^[0-9]{6,20}$/.test(digits)) {
-        throw new BankBeneficiaryError('Account number must be 6-20 digits.', 'ACCOUNT_NUMBER_INVALID');
+    // Ghanaian bank account numbers are 10-16 digits. The old 6-20 window
+    // accepted strings no bank issues ("123456") and stored them as valid
+    // payees — a typo that only surfaces when a payout fails.
+    if (!/^[0-9]{10,16}$/.test(digits)) {
+        throw new BankBeneficiaryError('Account number must be 10-16 digits.', 'ACCOUNT_NUMBER_INVALID');
     }
     return digits;
+}
+
+/**
+ * The account name is the customer's assertion about whose account this is.
+ * It is NOT evidence, and until a real bank name-enquiry verifies it we must
+ * never present it as verified. Typed here so obviously-wrong values (blank,
+ * digits only, a single character) are refused at save time.
+ */
+function assertAccountName(accountName) {
+    if (accountName == null) return null;
+    const name = String(accountName).trim().replace(/\s+/g, ' ');
+    if (name === '') return null;
+    if (name.length < 2 || name.length > 60) {
+        throw new BankBeneficiaryError('Account name must be 2-60 characters.', 'ACCOUNT_NAME_INVALID');
+    }
+    if (!/[A-Za-z]/.test(name)) {
+        throw new BankBeneficiaryError('Account name must contain letters.', 'ACCOUNT_NAME_INVALID');
+    }
+    if (!/^[A-Za-z][A-Za-z .'-]*$/.test(name)) {
+        throw new BankBeneficiaryError('Account name contains unsupported characters.', 'ACCOUNT_NAME_INVALID');
+    }
+    return name;
 }
 
 function fingerprint(accountNumber) {
@@ -76,6 +101,9 @@ function toPublic(row) {
         bankCode: row.bankCode,
         bankName: row.bankName,
         accountName: row.accountName || null,
+        // null validatedAt => the name is the CUSTOMER'S ASSERTION. Callers
+        // must show it as unverified; nothing here may imply a bank confirmed it.
+        accountNameVerified: !!(row.validatedAt),
         accountNumberMasked: row.accountNumberMasked,
         nickname: row.nickname || null,
         status: row.status,
@@ -87,8 +115,9 @@ function toPublic(row) {
 
 // ── CRUD (owner-scoped, fail-closed) ────────────────────────────────────────
 async function createBeneficiary(prisma, userId, input = {}) {
-    const { bankCode, bankName, accountNumber, accountName, nickname, isPrimary } = input;
+    const { bankCode, bankName, accountNumber, nickname, isPrimary } = input;
     assertBankInput({ bankCode, bankName });
+    const typedName = assertAccountName(input.accountName);
     const digits = normalizeAccountNumber(accountNumber);
     if (!fieldCipher.isKeyAvailable()) {
         throw new BankBeneficiaryError(
@@ -117,11 +146,13 @@ async function createBeneficiary(prisma, userId, input = {}) {
                 bankName: String(bankName).trim(),
                 accountNumberEnc: enc,
                 accountNumberMasked: masked,
-                accountName: accountName ? String(accountName).trim().slice(0, 120) : null,
+                accountName: typedName,
                 nickname: nickname ? String(nickname).trim().slice(0, 40) : null,
                 isPrimary: isPrimary === true,
                 keyId: currentKeyId(),
                 envelopeVersion: 2,
+                // Re-saving invalidates any earlier verification: the value
+                // changed, so the old evidence no longer describes this payee.
                 validatedAt: null,
             },
         });
@@ -143,7 +174,7 @@ async function createBeneficiary(prisma, userId, input = {}) {
                 accountNumberEnc: enc,
                 accountNumberMasked: masked,
                 accountNumberHmac: hmac,
-                accountName: accountName ? String(accountName).trim().slice(0, 120) : null,
+                accountName: typedName,
                 nickname: nickname ? String(nickname).trim().slice(0, 40) : null,
                 isPrimary: isPrimary === true,
                 keyId: currentKeyId(),
@@ -200,6 +231,10 @@ async function revealForPayout(prisma, userId, id) {
         accountName: row.accountName,
         accountNumber,
         accountNumberMasked: row.accountNumberMasked,
+        // Carried so callers can disclose verification state from evidence
+        // rather than hardcoding "unverified" forever.
+        validatedAt: row.validatedAt || null,
+        accountNameVerified: !!(row.validatedAt),
         keyId: row.keyId,
     };
 }
@@ -209,6 +244,7 @@ module.exports = {
     DELETED,
     BankBeneficiaryError,
     normalizeAccountNumber,
+    assertAccountName,
     fingerprint,
     mask,
     toPublic,

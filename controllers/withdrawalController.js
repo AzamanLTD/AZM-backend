@@ -2055,6 +2055,10 @@ exports.bankWithdrawal = async (req, res) => {
             bankCode: bank.bankCode,
             bankName: bank.bankName,
             accountName: bank.accountName || null,
+            // Evidence, not decoration: this says whether the bank ever
+            // confirmed the name, so a payout can never be described as going
+            // to a verified account when the name was only typed by the payer.
+            accountNameVerified: bank.accountNameVerified === true,
             accountNumberMasked: bank.accountNumberMasked,
             fingerprint: savedBankBeneficiaryService.fingerprint(bank.accountNumber),
             capturedAt: new Date().toISOString(),
@@ -2109,6 +2113,7 @@ exports.bankWithdrawal = async (req, res) => {
                             totalDebitGhs: claimFacts.totalDebitGhsExact,
                             bankName: bank.bankName,
                             accountName: bank.accountName || null,
+                            accountNameVerified: bank.accountNameVerified === true,
                             accountNumberMasked: bank.accountNumberMasked,
                             funding: claimFacts.funding ?? { mode: 'GHS_ONLY' },
                         },

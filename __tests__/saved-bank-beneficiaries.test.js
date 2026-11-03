@@ -202,6 +202,44 @@ maybe('saved bank beneficiaries + BANK payout (real PostgreSQL)', () => {
         expect(mirror.settlementCurrency).toBe('GHS_NATIVE');
         expect(new Prisma.Decimal(mirror.amountGhs).toFixed(2)).toBe('125.50');
     });
+    test('§6 typed validation: unusable account numbers and names are refused at save time', async () => {
+        await setFlags();
+        const app = buildApp();
+        const user = await seedUser(prisma, {});
+
+        // Too short to be any real account: 6-9 digits used to be accepted.
+        const short = await createBene(app, user, { accountNumber: '123456' });
+        expect(short.status).toBe(400);
+        expect(short.body.code).toBe('ACCOUNT_NUMBER_INVALID');
+
+        // Not a name at all.
+        const digitsOnly = await createBene(app, user, { accountName: '12345' });
+        expect(digitsOnly.status).toBe(400);
+        expect(digitsOnly.body.code).toBe('ACCOUNT_NAME_INVALID');
+        const singleChar = await createBene(app, user, { accountName: 'A' });
+        expect(singleChar.status).toBe(400);
+        expect(singleChar.body.code).toBe('ACCOUNT_NAME_INVALID');
+
+        // Unsaved on every refusal: a rejected payee is never a row.
+        expect(await prisma.savedBankBeneficiary.count({ where: { userId: user.id } })).toBe(0);
+
+        // A valid save is explicit that the name is UNVERIFIED.
+        const ok = await createBene(app, user);
+        expect(ok.status).toBe(201);
+        expect(ok.body.beneficiary.accountName).toBe('Ama Mensah');
+        expect(ok.body.beneficiary.accountNameVerified).toBe(false);
+        expect(ok.body.beneficiary.validatedAt).toBeNull();
+    });
+
+    test('§6 whitespace and dotted names are normalised, not rejected', async () => {
+        await setFlags();
+        const app = buildApp();
+        const user = await seedUser(prisma, {});
+        const res = await createBene(app, user, { accountName: '  ama   mensah-owusu .jr ' });
+        expect(res.status).toBe(201);
+        expect(res.body.beneficiary.accountName).toBe('ama mensah-owusu .jr');
+    });
+
     test('§9 BANK refuses with zero mutation while the bank fee is unevidenced', async () => {
         await setFlags();
         const svc = require('../src/services/nativeGhsWithdrawalService');
