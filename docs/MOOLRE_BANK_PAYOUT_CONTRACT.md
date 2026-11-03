@@ -39,10 +39,26 @@ The workflow guide at `docs.moolre.com/guides/transfers/` documents
 `/open/transact/initiate` and `/open/transact/validate-name`. That page returned
 no readable body on retrieval, so the conflict is **unresolved**, not disproved.
 
+Re-retrieved **2026-11-03** for a second time: the guide URL still returns a
+document shell titled "Moolre API Documentation 2.0" with no readable body, and
+the `/ai/...` pages still render in full. The guide therefore remains
+**unreadable, not contradicted and not disproved** — a claim about its content
+would be a claim about a page neither of us can currently read.
+
 This adapter implements only the machine-readable paths and never tries a second
 path: submitting one payout to two endpoints would be a double payout. The paths
 are three constants in `PATHS`. Closing this requires either a non-production
 sandbox call with Azaman sandbox credentials or written confirmation from Moolre.
+
+Independent confirmation retrieved the same day, from
+`/ai/guides/supported-channels.html`: Transfers support `1=MTN; 6=Telecel;
+7=AT; 2=Instant Bank Transfer`, the page states that **named channel values are
+not currently accepted**, and it instructs integrators to "validate requirements
+with your Moolre contact before committing a production rollout plan" because
+"service coverage, commercial eligibility, and operational limits can differ by
+product and account". That is the source for sending `channel: "2"` as a numeric
+string, and it is also the reason account eligibility is recorded as unproven
+rather than merely untested.
 
 ## 2. Requests
 
