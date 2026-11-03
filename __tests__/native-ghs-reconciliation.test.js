@@ -7,10 +7,14 @@
 //      through the ONE finance boundary WITHOUT any USDC side-effect: the
 //      customer's USDC availableBalance is untouched and no USDC fiat
 //      settlement ledger entry is invented for a GHS payout.
-//   B. The §P.5-D provider float is touched at acceptance exactly once
-//      (available -> reserved), so a GHS payout cannot silently bypass the
-//      liquidity authority it depends on.
-//   C. Settlement is idempotent: a second observation changes nothing and
+//   B. The §P.5-D provider float follows the payout it belongs to:
+//      available -> reserved at acceptance, reserved -> in-transit at the
+//      dispatch claim, in-transit -> paid-out on settlement. Availability is
+//      NEVER restored for settled money.
+//   C. SUCCESS evidence that arrives BEFORE the dispatch claim contradicts our
+//      own lifecycle: the reservation is quarantined into the reconciliation
+//      hold and never auto-repaired, so a bucket can never be spent twice.
+//   D. Settlement is idempotent: a second observation changes nothing and
 //      never double-posts.
 // =============================================================================
 
@@ -151,12 +155,20 @@ describe('native-GHS reconciliation (real PostgreSQL)', () => {
         });
         expect(usdcSettlement).toHaveLength(0);
 
-        // NOTE (open, tracked on #389): the provider-float transition from
-        // IN_TRANSIT to PAID_OUT on a native-GHS success is NOT asserted here
-        // yet — settleIfRecorded did not move the reservation in this scenario
-        // and the reason is not established, so asserting either outcome would
-        // be guessing. The float is covered by the §P.5-D suites; what this
-        // test owns is that settlement invents no USDC side-effect.
+        // The float follows the payout: in-transit becomes paid-out, and
+        // availability is NOT restored (this money is spent).
+        const float = await prisma.fiatLiquidityState.findUnique({ where: { id: 1 } });
+        expect(new Prisma.Decimal(float.inTransitGhs).toFixed(2)).toBe('0.00');
+        expect(new Prisma.Decimal(float.reservedGhs).toFixed(2)).toBe('0.00');
+        expect(new Prisma.Decimal(float.paidOutGhs).toFixed(2)).toBe('80.00');
+        expect(new Prisma.Decimal(float.availableGhs).toFixed(2)).toBe('99920.00');
+        expect(new Prisma.Decimal(float.reconciliationHeldGhs).toFixed(2)).toBe('0.00');
+
+        const settledReservation = await prisma.fiatLiquidityReservation.findFirst({ where: { reference } });
+        expect(settledReservation.status).toBe('PAID_OUT');
+        // The dispatch-time provider reference survives settlement: evidence
+        // must stay attributable to the provider transaction that paid it.
+        expect(settledReservation.providerRef).toBe('GHS-OK-1');
 
         // Idempotent: a second observation changes nothing, posts nothing.
         const again = await financeService.completeFiatWithdrawal(prisma, reference, { providerTxId: 'GHS-OK-1' });
@@ -164,5 +176,66 @@ describe('native-GHS reconciliation (real PostgreSQL)', () => {
         const after2 = await prisma.user.findUnique({ where: { id: user.id }, select: { nativeGhsBalance: true, availableBalance: true } });
         expect(new Prisma.Decimal(after2.nativeGhsBalance).toFixed(2)).toBe('420.00');
         expect(new Prisma.Decimal(after2.availableBalance).toFixed(2)).toBe(new Prisma.Decimal(before.availableBalance).toFixed(2));
+        const float2 = await prisma.fiatLiquidityState.findUnique({ where: { id: 1 } });
+        expect(new Prisma.Decimal(float2.paidOutGhs).toFixed(2)).toBe('80.00');
+        expect(new Prisma.Decimal(float2.inTransitGhs).toFixed(2)).toBe('0.00');
+    });
+
+    test('SUCCESS evidence before the dispatch claim is quarantined, never auto-repaired', async () => {
+        await setSettings();
+        const liquidity = require('../src/services/fiatLiquidityService');
+        const reference = `GHS-PREDISPATCH-${Date.now()}`;
+
+        // Reserved but never dispatched: our lifecycle says "no provider saw
+        // this" while the provider says it paid. Both cannot be true.
+        await prisma.$transaction(async (tx) => {
+            await liquidity.reserveForPayout(tx, {
+                reference,
+                amountGhs: '50.00',
+                provider: 'MOOLRE_DISBURSEMENT',
+                rail: 'MOMO',
+            });
+        });
+        const before = await prisma.fiatLiquidityState.findUnique({ where: { id: 1 } });
+        expect(new Prisma.Decimal(before.reservedGhs).toFixed(2)).toBe('50.00');
+        expect(new Prisma.Decimal(before.availableGhs).toFixed(2)).toBe('99950.00');
+
+        const settled = await prisma.$transaction(async (tx) => liquidity.settleReservation(tx, {
+            reference,
+            outcome: 'SUCCESSFUL',
+            providerTxId: 'PREDISPATCH-1',
+            reason: 'success before dispatch claim',
+        }));
+        expect(settled.reservation.status).toBe('RECONCILIATION_REQUIRED');
+
+        const after = await prisma.fiatLiquidityState.findUnique({ where: { id: 1 } });
+        // Held, not spent and not spendable: the disputed 50 leaves both
+        // reserved and available until an operator resolves it.
+        expect(new Prisma.Decimal(after.reservedGhs).toFixed(2)).toBe('0.00');
+        expect(new Prisma.Decimal(after.reconciliationHeldGhs).toFixed(2)).toBe('50.00');
+        expect(new Prisma.Decimal(after.paidOutGhs).toFixed(2)).toBe('0.00');
+        expect(new Prisma.Decimal(after.inTransitGhs).toFixed(2)).toBe('0.00');
+        expect(new Prisma.Decimal(after.availableGhs).toFixed(2)).toBe('99950.00');
+
+        // A later identical observation is a replay: it never "fixes" the
+        // quarantine by writing PAID_OUT on its own.
+        const replay = await prisma.$transaction(async (tx) => liquidity.settleReservation(tx, {
+            reference,
+            outcome: 'SUCCESSFUL',
+            providerTxId: 'PREDISPATCH-1',
+        }));
+        expect(replay.replay).toBe(true);
+        const after2 = await prisma.fiatLiquidityState.findUnique({ where: { id: 1 } });
+        expect(new Prisma.Decimal(after2.reconciliationHeldGhs).toFixed(2)).toBe('50.00');
+        expect(new Prisma.Decimal(after2.availableGhs).toFixed(2)).toBe('99950.00');
+
+        // Test hygiene only: the quarantined row stays in the DB (that IS the
+        // evidence), but the shared aggregate is returned to the seeded shape
+        // so this file cannot leak a held balance into another suite's
+        // arithmetic. Nothing above depends on this.
+        await prisma.fiatLiquidityState.update({
+            where: { id: 1 },
+            data: { availableGhs: 100000, reservedGhs: 0, inTransitGhs: 0, paidOutGhs: 0, reconciliationHeldGhs: 0 },
+        });
     });
 });
