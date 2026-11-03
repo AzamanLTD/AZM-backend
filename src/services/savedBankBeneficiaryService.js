@@ -181,6 +181,27 @@ function toPublic(row) {
 }
 
 // ── CRUD (owner-scoped, fail-closed) ────────────────────────────────────────
+/**
+ * §P1-3 ACCOUNT POLICY: a bounded payee list.
+ *
+ * A saved-payee list is a payout surface. Unbounded, it becomes a place to keep
+ * hundreds of accounts — which is not a customer saving an account, it is a
+ * disbursement list nobody is reviewing. The cap is enforced inside the write
+ * transaction so two concurrent saves cannot both slip under it.
+ */
+const MAX_ACTIVE_BENEFICIARIES = 25;
+
+/**
+ * Is this Prisma error the primary-exclusivity index (a concurrency collision
+ * that a retry resolves) rather than the payee duplicate key (a real answer)?
+ */
+function _isPrimaryCollision(err) {
+    if (!err || err.code !== 'P2002') return false;
+    const text = `${JSON.stringify(err.meta?.target ?? '')} ${err.message || ''}`.toLowerCase();
+    if (text.includes('accountnumberhmac')) return false;
+    return text.includes('oneprimary') || text.includes('one_primary') || text.includes('userid');
+}
+
 async function createBeneficiary(prisma, userId, input = {}, options = {}) {
     const { bankCode, bankName, accountNumber, nickname, isPrimary } = input;
     assertBankInput({ bankCode, bankName });
@@ -222,42 +243,54 @@ async function createBeneficiary(prisma, userId, input = {}, options = {}) {
     const hmac = fingerprint(digits);
     const masked = mask(digits);
 
-    // Uniqueness is per-owner over the FINGERPRINT — the same account saved
-    // twice is a duplicate instruction, not two payees.
-    const existing = await prisma.savedBankBeneficiary.findUnique({
-        where: { userId_accountNumberHmac: { userId, accountNumberHmac: hmac } },
-    });
-    if (existing && existing.status === ACTIVE) {
-        throw new BankBeneficiaryError('This bank account is already saved.', 'BENEFICIARY_DUPLICATE');
-    }
-    if (existing) {
-        const revived = await prisma.savedBankBeneficiary.update({
-            where: { id: existing.id },
-            data: {
-                status: ACTIVE,
-                bankCode: verification.verified ? verification.bankCode : String(bankCode),
-                bankName: resolvedBankName,
-                accountNumberEnc: enc,
-                accountNumberMasked: masked,
-                accountName: effectiveName,
-                nickname: nickname ? String(nickname).trim().slice(0, 40) : null,
-                isPrimary: isPrimary === true,
-                keyId: currentKeyId(),
-                envelopeVersion: 2,
-                // Re-saving invalidates any earlier verification: the value
-                // changed, so the old evidence no longer describes this payee.
-                // A NEW provider validation in this same call may re-establish it.
-                validatedAt,
-            },
+    // One transactional write for BOTH paths. Saving an account and reviving a
+    // deleted one differ only in which row is written; keeping them apart is how
+    // the revival path lost the primary-exclusivity rule in the first place
+    // (it set isPrimary with nobody demoted, so a customer could end up with two
+    // primaries). Uniqueness is per-owner over the FINGERPRINT — the same
+    // account saved twice is a duplicate instruction, not two payees.
+    const writeOnce = async () => prisma.$transaction(async (tx) => {
+        const existing = await tx.savedBankBeneficiary.findUnique({
+            where: { userId_accountNumberHmac: { userId, accountNumberHmac: hmac } },
         });
-        return { ...toPublic(revived), verification: _verificationView(verification) };
-    }
-
-    const created = await prisma.$transaction(async (tx) => {
+        if (existing && existing.status === ACTIVE) {
+            throw new BankBeneficiaryError('This bank account is already saved.', 'BENEFICIARY_DUPLICATE');
+        }
+        // Policy is checked against the state this write would produce.
+        const activeCount = await tx.savedBankBeneficiary.count({ where: { userId, status: ACTIVE } });
+        if (activeCount >= MAX_ACTIVE_BENEFICIARIES) {
+            throw new BankBeneficiaryError(
+                `You can keep up to ${MAX_ACTIVE_BENEFICIARIES} saved bank accounts. Remove one to add another.`,
+                'BENEFICIARY_LIMIT_REACHED'
+            );
+        }
         if (isPrimary === true) {
+            // Demote first: within this transaction the index never sees two.
             await tx.savedBankBeneficiary.updateMany({
-                where: { userId, isPrimary: true },
+                where: { userId, status: ACTIVE, isPrimary: true },
                 data: { isPrimary: false },
+            });
+        }
+        if (existing) {
+            return tx.savedBankBeneficiary.update({
+                where: { id: existing.id },
+                data: {
+                    status: ACTIVE,
+                    bankCode: verification.verified ? verification.bankCode : String(bankCode),
+                    bankName: resolvedBankName,
+                    accountNumberEnc: enc,
+                    accountNumberMasked: masked,
+                    accountName: effectiveName,
+                    nickname: nickname ? String(nickname).trim().slice(0, 40) : null,
+                    isPrimary: isPrimary === true,
+                    keyId: currentKeyId(),
+                    envelopeVersion: 2,
+                    // Re-saving invalidates any earlier verification: the value
+                    // changed, so the old evidence no longer describes this
+                    // payee. A NEW provider validation in this same call may
+                    // re-establish it.
+                    validatedAt,
+                },
             });
         }
         return tx.savedBankBeneficiary.create({
@@ -277,6 +310,23 @@ async function createBeneficiary(prisma, userId, input = {}, options = {}) {
             },
         });
     });
+
+    let created;
+    try {
+        created = await writeOnce();
+    } catch (err) {
+        if (_isPrimaryCollision(err)) {
+            // Two concurrent saves both wanted to be primary. The winner is
+            // committed; this attempt demotes it on the retry, so the last
+            // instruction wins and exactly one primary remains.
+            created = await writeOnce();
+        } else if (err && err.code === 'P2002') {
+            // The payee unique key, hit by a concurrent save of the same account.
+            throw new BankBeneficiaryError('This bank account is already saved.', 'BENEFICIARY_DUPLICATE');
+        } else {
+            throw err;
+        }
+    }
     return { ...toPublic(created), verification: _verificationView(verification) };
 }
 
@@ -358,6 +408,7 @@ async function revealForPayout(prisma, userId, id) {
 
 module.exports = {
     ACTIVE,
+    MAX_ACTIVE_BENEFICIARIES,
     ACCOUNT_NUMBER_MIN_DIGITS,
     ACCOUNT_NUMBER_MAX_DIGITS,
     verifyAccountWithProvider,

@@ -20,6 +20,8 @@ const _status = (code) => {
             return 400;
         case 'BENEFICIARY_NOT_VERIFIED':
             return 422;
+        case 'BENEFICIARY_LIMIT_REACHED':
+            return 409;
         default:
             return 400;
     }

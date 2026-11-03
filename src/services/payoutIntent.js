@@ -35,7 +35,13 @@ function destinationIdentityOf({ destinationType = 'MOMO', destination = null, d
     const rail = String(destinationType || 'MOMO').toUpperCase();
     if (rail === 'BANK') {
         const fingerprint = destinationSnapshot?.fingerprint;
-        if (fingerprint) return String(fingerprint);
+        const bankCode = destinationSnapshot?.bankCode;
+        // Account digits are only unique WITHIN a bank: the same number at two
+        // banks is two different payees. Fingerprint alone would let a quote
+        // minted for one bank fund the other.
+        if (fingerprint) {
+            return bankCode ? `fp:${fingerprint}@${String(bankCode).toUpperCase()}` : `fp:${fingerprint}`;
+        }
         if (beneficiaryId !== null && beneficiaryId !== undefined) return `bene:${beneficiaryId}`;
         return null;
     }

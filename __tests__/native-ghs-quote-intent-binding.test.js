@@ -181,7 +181,11 @@ if (hasDb) {
         expect(payoutIntentDigest({ ...base, recipientGhs: '50.01' })).not.toBe(d);
         expect(payoutIntentDigest({ ...base, rail: 'BANK' })).not.toBe(d);
         expect(payoutIntentDigest({ ...base, feeGhs: '0.50' })).not.toBe(d);
-        // a BANK payee is identified by the acceptance-time fingerprint
-        expect(destinationIdentityOf({ destinationType: 'BANK', destinationSnapshot: { fingerprint: 'fp-1' }, beneficiaryId: 7 })).toBe('fp-1');
+        // a BANK payee is identified by the acceptance-time fingerprint AND the
+        // bank: the same digits at two banks are two different payees
+        expect(destinationIdentityOf({ destinationType: 'BANK', destinationSnapshot: { fingerprint: 'fp-1', bankCode: 'GCB' }, beneficiaryId: 7 }))
+            .toBe('fp:fp-1@GCB');
+        expect(destinationIdentityOf({ destinationType: 'BANK', destinationSnapshot: { fingerprint: 'fp-1', bankCode: 'ECO' }, beneficiaryId: 7 }))
+            .not.toBe(destinationIdentityOf({ destinationType: 'BANK', destinationSnapshot: { fingerprint: 'fp-1', bankCode: 'GCB' }, beneficiaryId: 7 }));
     });
 });

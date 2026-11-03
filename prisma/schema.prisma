@@ -7476,6 +7476,11 @@ model SavedBankBeneficiary {
   accountNumberHmac   String    @db.VarChar(64)
   nickname            String?   @db.VarChar(40)
   status              String    @default("ACTIVE")
+  /// §P1-3 At most ONE ACTIVE primary per user. Enforced by the partial unique
+  /// index SavedBankBeneficiary_one_primary_per_user (raw SQL in the
+  /// 20261103190000 migration — Prisma cannot express a partial index). The
+  /// service demotes-then-writes inside a transaction and retries once on a
+  /// primary collision; the index is the backstop for every other writer.
   isPrimary           Boolean   @default(false)
   validatedAt         DateTime?
   keyId               String?   @db.VarChar(32)
