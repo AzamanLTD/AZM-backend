@@ -11,6 +11,7 @@
 
 const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client'); // r39 exact decimals in refund derivation
+const nativeGhsWithdrawalService = require('../src/services/nativeGhsWithdrawalService');
 const financeService = require('../services/finance.service');
 const { recordProviderSettlementAttempt } = require('../services/providerSettlementAttemptService');
 const { resolvePayoutOwner } = require('../services/payoutProviderOwnership');
@@ -506,7 +507,7 @@ class WithdrawalReconciliationWorker {
         // owner's rail, or every rail ambiguous with unknown ownership). The
         // payout stays parked with durable evidence — it is never a state to
         // settle or reverse on.
-        if (remoteStatus === 'UNKNOWN') {
+        if (remoteStatus === 'UNKNOWN' || remoteStatus === 'UNRESOLVED') {
             await this._recordException(
                 withdrawal,
                 'PROVIDER_STATUS_UNRESOLVED',
@@ -594,9 +595,32 @@ class WithdrawalReconciliationWorker {
                         data: { providerRef: String(providerRef) }
                     });
                 }
-                const result = await financeService.reverseFiatWithdrawal(this.prisma, reference, {
-                    reason: `provider_async_failure: ${statusResp.reason || 'unspecified'}`
-                });
+                // §4.4 (issue #389): a native-GHS payout is NOT a USDC
+                // withdrawal. Its mirror row carries amount = 0 and its real
+                // money in `amountGhs`, so the legacy USDC reversal would
+                // "refund" zero and never restore the customer's GHS. Use the
+                // native-GHS reversal authority, which is atomic across the
+                // GHS liability, any USDC shortfall funding, the conversion
+                // posting and the P5-D reservation.
+                const isNativeGhs = txRow.settlementCurrency === 'GHS_NATIVE';
+                const result = isNativeGhs
+                    ? await nativeGhsWithdrawalService.reverseNativeGhsWithdrawal(this.prisma, {
+                        reference,
+                        reason: `provider_async_failure: ${statusResp.reason || 'unspecified'}`,
+                    })
+                    : await financeService.reverseFiatWithdrawal(this.prisma, reference, {
+                        reason: `provider_async_failure: ${statusResp.reason || 'unspecified'}`
+                    });
+                if (isNativeGhs && result.reversed !== true) {
+                    await this._recordException(
+                        withdrawal,
+                        'NATIVE_GHS_REVERSAL_NOT_APPLIED',
+                        { reason: result.reason || null, providerStatus: remoteStatus },
+                        reference
+                    );
+                    logger.error(`[WithdrawalReconciliation] ref=${reference} native-GHS reversal not applied (${result.reason}).`);
+                    return;
+                }
                 if (result.notReversible || result.status === 'COMPLETED') {
                     await this._recordException(
                         withdrawal,
@@ -630,16 +654,21 @@ class WithdrawalReconciliationWorker {
                 // so terminal failure payloads never carry an undefined refund.
                 // r39/P1 — exact refund derivation (Decimal-native), with
                 // a Number() display mirror ONLY for notification payloads.
-                const refundedExact = result.refundedAmount != null
-                    ? new Prisma.Decimal(result.refundedAmount)
-                    : new Prisma.Decimal(txRow.amountUsdc).plus(txRow.feeUsdc);
-                const refundedAmount = Number(refundedExact.toFixed(8));
+                const refundedExact = isNativeGhs
+                    ? new Prisma.Decimal(result.amountGhs || txRow.amountGhs || 0)
+                    : (result.refundedAmount != null
+                        ? new Prisma.Decimal(result.refundedAmount)
+                        : new Prisma.Decimal(txRow.amountUsdc).plus(txRow.feeUsdc));
+                const refundedAmount = isNativeGhs
+                    ? Number(refundedExact.toFixed(2))
+                    : Number(refundedExact.toFixed(8));
+                const refundCurrency = isNativeGhs ? 'GHS' : 'USDC';
 
-                logger.warn(`[WithdrawalReconciliation] ref=${reference} REVERSED. user refund: ${refundedAmount} USDC.`);
+                logger.warn(`[WithdrawalReconciliation] ref=${reference} REVERSED. user refund: ${refundedAmount} ${refundCurrency}.`);
                 if (this.io) {
-                    this.io.to(`user_${withdrawal.userId}`).emit('withdrawal_settled', {
-                        reference, status: 'FAILED', amount: withdrawal.amount, refunded: refundedAmount
-                    });
+                    this.io.to(`user_${withdrawal.userId}`).emit('withdrawal_settled', isNativeGhs
+                        ? { reference, status: 'FAILED', currency: 'GHS', amountGhs: refundedAmount, refundedGhs: refundedAmount, destinationType: withdrawal.payoutMethod || 'MOMO' }
+                        : { reference, status: 'FAILED', amount: withdrawal.amount, refunded: refundedAmount });
                     this.io.emit('admin_alert', {
                         type: 'WITHDRAWAL_AUTO_REVERSED', reference, userId: withdrawal.userId,
                         amountUsdc: withdrawal.amount,
@@ -652,10 +681,10 @@ class WithdrawalReconciliationWorker {
                     const amount = withdrawal.amount;
                     const refunded = refundedAmount;
                     const reasonStr = statusResp.reason || 'The MoMo gateway rejected the disbursement.';
-                    setImmediate(() => this.email.sendWithdrawalReceipt(recipient, {
-                        kind: 'fiat_failure', amount, currency: 'USDC', reference,
-                        refundedAmount: refunded, reason: reasonStr
-                    }).catch(() => {}));
+                    setImmediate(() => this.email.sendWithdrawalReceipt(recipient, isNativeGhs
+                        ? { kind: 'fiat_failure', amount: refundedAmount, currency: 'GHS', reference, refundedAmount: refunded, reason: reasonStr }
+                        : { kind: 'fiat_failure', amount, currency: 'USDC', reference, refundedAmount: refunded, reason: reasonStr }
+                    ).catch(() => {}));
                 }
                 if (this.sms && withdrawal.user?.phoneNumber && withdrawal.user.phoneVerified
                     && withdrawal.amount >= SMS_LARGE_WITHDRAWAL_THRESHOLD) {

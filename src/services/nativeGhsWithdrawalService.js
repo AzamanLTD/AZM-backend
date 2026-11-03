@@ -363,12 +363,26 @@ async function dispatchNativeGhsWithdrawal(prisma, {
       payeeNote: payeeNote || `Withdrawal ${reference}`,
     });
   } catch (err) {
-    // No accepted provider bytes: DEFINITIVE pre-dispatch failure → reverse once.
-    const reversal = await reverseNativeGhsWithdrawal(prisma, {
-      reference,
-      reason: `provider_rejected:${err?.code || err?.name || 'DISPATCH_ERROR'}`,
-    });
-    return { dispatched: false, reason: 'PROVIDER_REJECTED', reversed: reversal.reversed, failure: err?.message };
+    const outcome = classifyProviderOutcome(err);
+    if (REVERSIBLE_OUTCOMES.has(outcome)) {
+      // The adapter PROVED no provider payout exists (typed outcome only).
+      const reversal = await reverseNativeGhsWithdrawal(prisma, {
+        reference,
+        reason: `provider_rejected:${outcome}:${err?.code || err?.name || 'DISPATCH_ERROR'}`,
+      });
+      if (!reversal.reversed) {
+        // Reversal could not complete atomically: funds stay held, the row
+        // parks. Never report a refund that did not happen.
+        await parkUncertainDispatch(prisma, { reference, outcome, error: err, rail: 'MOMO' });
+        return { dispatched: false, reason: 'REVERSAL_PARKED', outcome, reversal, failure: err?.message };
+      }
+      return { dispatched: false, reason: 'PROVIDER_REJECTED', outcome, reversed: true, failure: err?.message };
+    }
+    // DUPLICATE_REFERENCE, UNKNOWN_OUTCOME and every untyped failure: the
+    // provider may hold the payout. Keep funds reserved, keep the reference.
+    await parkUncertainDispatch(prisma, { reference, outcome, error: err, rail: 'MOMO' });
+    logger.warn({ reference, outcome, err: err?.message }, '[nativeGhsWithdrawal] dispatch outcome uncertain — funds held, no refund');
+    return { dispatched: false, reason: 'PROVIDER_OUTCOME_UNCERTAIN', outcome, refunded: false, failure: err?.message };
   }
 
   const providerRef = outbound?.reference || outbound?.transactionId || outbound?.providerRef || null;
@@ -401,6 +415,68 @@ async function dispatchNativeGhsWithdrawal(prisma, {
     logger.error({ reference, err: err.message }, '[nativeGhsWithdrawal] IN_TRANSIT transition failed after dispatch');
   }
   return { dispatched: true, providerRef, provider: providerName };
+}
+
+
+// ── Provider outcome taxonomy (issue #389 P0) ───────────────────────────────
+// An UNCERTAIN payout must never be refunded. Only two outcomes prove that no
+// provider payout exists; everything else (timeout, reset, 5xx, malformed 2xx,
+// duplicate reference, untyped exception) keeps the customer's funds held and
+// parks the withdrawal for status-based reconciliation.
+const PROVIDER_OUTCOME = Object.freeze({
+  NOT_DISPATCHED: 'NOT_DISPATCHED',
+  DEFINITIVE_REJECTION: 'DEFINITIVE_REJECTION',
+  DUPLICATE_REFERENCE: 'DUPLICATE_REFERENCE',
+  UNKNOWN_OUTCOME: 'UNKNOWN_OUTCOME',
+});
+
+// Outcomes that prove the provider cannot have initiated a payout.
+const REVERSIBLE_OUTCOMES = new Set([
+  PROVIDER_OUTCOME.NOT_DISPATCHED,
+  PROVIDER_OUTCOME.DEFINITIVE_REJECTION,
+]);
+
+/**
+ * Classify a dispatch failure from the adapter's TYPED field only. Message
+ * substrings, HTTP status guesses and exception names are deliberately not
+ * used: an unrecognised failure is uncertainty, not proof of non-delivery.
+ */
+function classifyProviderOutcome(error) {
+  const raw = error?.providerOutcome ?? error?.outcome ?? null;
+  const outcome = typeof raw === 'string' ? raw.trim().toUpperCase() : null;
+  if (outcome && Object.prototype.hasOwnProperty.call(PROVIDER_OUTCOME, outcome)) return outcome;
+  return PROVIDER_OUTCOME.UNKNOWN_OUTCOME;
+}
+
+/**
+ * Durable record that a dispatch outcome is uncertain: the funds stay reserved,
+ * the ORIGINAL reference is retained, and status lookup against that reference
+ * is the only permitted resolution. Never a retry, failover or new reference.
+ */
+async function parkUncertainDispatch(prisma, { reference, outcome, error, rail = 'MOMO' }) {
+  const row = await prisma.transactionHistory.findUnique({
+    where: { txHash: reference },
+    select: { id: true },
+  });
+  if (!row) return { parked: false, reason: 'TRANSACTION_NOT_FOUND' };
+  await prisma.$executeRawUnsafe(
+    'UPDATE "TransactionHistory" SET "metadata" = COALESCE("metadata", \'{}\'::jsonb) || jsonb_build_object($2::text, $3::jsonb) WHERE "id" = $1',
+    row.id,
+    'dispatchException',
+    JSON.stringify({
+      code: outcome === PROVIDER_OUTCOME.DUPLICATE_REFERENCE
+        ? 'PROVIDER_DUPLICATE_REFERENCE'
+        : 'PROVIDER_OUTCOME_UNCERTAIN',
+      outcome,
+      rail,
+      reference,
+      errorCode: error?.code ?? error?.name ?? null,
+      at: new Date().toISOString(),
+      resolution: 'STATUS_LOOKUP_ORIGINAL_REFERENCE',
+      refunded: false,
+    })
+  );
+  return { parked: true, outcome };
 }
 
 /**
@@ -448,9 +524,21 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
       narration: narration || `Azaman payout ${reference}`,
     });
   } catch (err) {
-    // No accepted provider bytes: definitive pre-dispatch failure → reverse once.
-    const reversal = await reverseNativeGhsWithdrawal(prisma, { reference, reason: err.message });
-    return { dispatched: false, reason: 'PROVIDER_REJECTED', error: err.message, reversal };
+    const outcome = classifyProviderOutcome(err);
+    if (REVERSIBLE_OUTCOMES.has(outcome)) {
+      const reversal = await reverseNativeGhsWithdrawal(prisma, {
+        reference,
+        reason: `provider_rejected:${outcome}:${err?.code || err?.name || 'DISPATCH_ERROR'}`,
+      });
+      if (!reversal.reversed) {
+        await parkUncertainDispatch(prisma, { reference, outcome, error: err, rail: 'BANK' });
+        return { dispatched: false, reason: 'REVERSAL_PARKED', outcome, reversal, error: err.message };
+      }
+      return { dispatched: false, reason: 'PROVIDER_REJECTED', outcome, reversal, error: err.message };
+    }
+    await parkUncertainDispatch(prisma, { reference, outcome, error: err, rail: 'BANK' });
+    logger.warn({ reference, outcome, err: err?.message }, '[nativeGhsWithdrawal] BANK dispatch outcome uncertain — funds held, no refund');
+    return { dispatched: false, reason: 'PROVIDER_OUTCOME_UNCERTAIN', outcome, refunded: false, error: err.message };
   }
   const providerRef = outbound?.providerRef || outbound?.transactionId || null;
   await prisma.$executeRawUnsafe(
@@ -545,11 +633,11 @@ async function reverseNativeGhsWithdrawal(prisma, { reference, reason }) {
       });
     }
 
-    try {
-      await fiatLiquidity.releaseReservation(tx, { reference, reason: String(reason ?? 'definitive_failure') });
-    } catch (err) {
-      logger.warn({ reference, err: err.message }, '[nativeGhsWithdrawal] reservation release failed during reversal');
-    }
+    // The liquidity authority transition is part of the SAME atomic boundary as
+    // the customer credit: if the reservation cannot be released, the whole
+    // reversal rolls back and the withdrawal stays held for reconciliation
+    // instead of reporting a refund the float never reflected.
+    await fiatLiquidity.releaseReservation(tx, { reference, reason: String(reason ?? 'definitive_failure') });
 
     await tx.transactionHistory.updateMany({ where: { id: row.id }, data: { status: 'FAILED' } });
     await tx.withdrawal.updateMany({ where: { transactionHistoryId: row.id }, data: { status: 'FAILED' } });
@@ -607,6 +695,10 @@ module.exports = {
   isNativeGhsWithdrawalEnabled,
   toExactPesewa,
   processNativeGhsWithdrawal,
+  PROVIDER_OUTCOME,
+  REVERSIBLE_OUTCOMES,
+  classifyProviderOutcome,
+  parkUncertainDispatch,
   dispatchNativeGhsWithdrawal,
   dispatchNaturalGhsBankWithdrawal,
   reverseNativeGhsWithdrawal,

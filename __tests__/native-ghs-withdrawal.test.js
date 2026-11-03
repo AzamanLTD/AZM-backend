@@ -272,10 +272,18 @@ describe('native-GHS withdrawal leg (real PostgreSQL)', () => {
     });
 
     // ── F. amplification: rejection reverses once ──────────────────────────
-    test('definitive provider rejection reverses ONCE: GHS + USDC restored, reservation released', async () => {
+    // NOTE: the reversal is driven by the adapter's TYPED outcome
+    // (`err.outcome`/`err.providerOutcome`), never by the exception itself —
+    // an untyped throw is uncertainty and must NOT refund (see
+    // __tests__/native-ghs-dispatch-outcomes.test.js).
+    test('definitive provider rejection reverses ONCE: GHS restored, reservation released', async () => {
         await setSettings();
         const user = await ghsUser({ ghs: 300, usdc: 1000 });
-        const dispatcher = { initiateTransfer: jest.fn(async () => { throw new Error('provider rejected before acceptance'); }) };
+        const dispatcher = { initiateTransfer: jest.fn(async () => {
+            const err = new Error('provider rejected before acceptance');
+            err.outcome = 'DEFINITIVE_REJECTION';
+            throw err;
+        }) };
         const app = buildApp(dispatcher);
         const res = await ghsPost(app, user, { amountGhs: '75.00' });
         expect(res.status).toBe(202);
