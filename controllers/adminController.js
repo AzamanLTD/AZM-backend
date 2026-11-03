@@ -2612,11 +2612,21 @@ async function _manualReviewParkingEvidence(prisma, withdrawalIds) {
 async function _reviewEligibility(prisma, withdrawal, canonical) {
     const blockers = [];
 
+    // IDENTITY SCOPING. entityId is a bare string with no foreign key, and the
+    // queue is raw SQL: rows survive row deletes, and a reprovisioned or
+    // swept database can hand a fresh withdrawal a numeric id that an older
+    // row already names. Binding another payout's anomaly to THIS withdrawal
+    // would either block a provably-safe reversal or, worse, present the wrong
+    // evidence to an operator. So when the payout's durable reference is known,
+    // only rows naming that reference (or naming none, which is the legacy
+    // shape) may describe it.
+    const canonicalReference = canonical?.txHash ? String(canonical.txHash) : null;
     const withdrawalExceptions = await prisma.$queryRawUnsafe(
         'SELECT "reason", "reference", "details", "lastSeenAt" FROM "ReconciliationException" ' +
         'WHERE "status" = \'OPEN\' AND "entityType" = $1 AND "entityId" = $2 ' +
+        'AND ($3::text IS NULL OR "reference" IS NULL OR "reference" = $3) ' +
         'ORDER BY "lastSeenAt" DESC',
-        'WITHDRAWAL', String(withdrawal.id)
+        'WITHDRAWAL', String(withdrawal.id), canonicalReference
     );
 
     const safeReasons = [];

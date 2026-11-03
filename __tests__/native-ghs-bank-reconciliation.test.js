@@ -128,9 +128,14 @@ maybe('BANK payouts reconcile on the BANK rail (real PostgreSQL)', () => {
     );
 
     const liquidity = async () => prisma.fiatLiquidityState.findUnique({ where: { id: 1 } });
-    const exceptions = async (mirrorId) => prisma.$queryRawUnsafe(
-        'SELECT "reason", "details" FROM "ReconciliationException" WHERE "entityType" = \'WITHDRAWAL\' AND "entityId" = $1',
-        String(mirrorId)
+    // Scope by the DURABLE payout identity (reference), not by entityId.
+    // ReconciliationException is written through raw SQL with no foreign key,
+    // so rows survive test-user sweeps and a reprovisioned database hands a
+    // fresh withdrawal an id an older exception already names. The reference is
+    // the authoritative payout identity and cannot be reused.
+    const exceptions = async (reference) => prisma.$queryRawUnsafe(
+        'SELECT "reason", "details" FROM "ReconciliationException" WHERE "reference" = $1',
+        String(reference)
     );
     const canonicalOf = async (reference) => prisma.transactionHistory.findUnique({ where: { txHash: reference } });
     const mirrorOf = async (id) => prisma.withdrawal.findUnique({ where: { id } });
@@ -163,7 +168,7 @@ maybe('BANK payouts reconcile on the BANK rail (real PostgreSQL)', () => {
             orderBy: { receivedAt: 'desc' },
         });
         expect(event.rail).toBe('BANK');
-        expect((await exceptions(mirror.id)).length).toBe(0);
+        expect((await exceptions(reference)).map((e) => e.reason)).toEqual([]);
     });
 
     test('B: FAILED with the exact amount reverses once and restores the real GHS', async () => {
@@ -202,7 +207,7 @@ maybe('BANK payouts reconcile on the BANK rail (real PostgreSQL)', () => {
         const state = await liquidity();
         expect(new Prisma.Decimal(state.inTransitGhs || 0).toFixed(2)).toBe('80.00');
 
-        const parked = (await exceptions(mirror.id)).find(e => e.reason === 'PROVIDER_STATUS_UNRESOLVED');
+        const parked = (await exceptions(reference)).find(e => e.reason === 'PROVIDER_STATUS_UNRESOLVED');
         expect(parked).toBeTruthy();
         expect(parked.details.rail).toBe('BANK');
         // The provider never stated an amount; it must NOT be backfilled.
@@ -220,7 +225,7 @@ maybe('BANK payouts reconcile on the BANK rail (real PostgreSQL)', () => {
         })._reconcileOne(withdrawal);
 
         expect((await canonicalOf(reference)).status).toBe('PENDING');
-        const parked = (await exceptions(mirror.id)).find(e => e.reason === 'PROVIDER_REFERENCE_NOT_FOUND');
+        const parked = (await exceptions(reference)).find(e => e.reason === 'PROVIDER_REFERENCE_NOT_FOUND');
         expect(parked).toBeTruthy();
         expect(parked.details.rail).toBe('BANK');
         expect(new Prisma.Decimal((await liquidity()).inTransitGhs || 0).toFixed(2)).toBe('80.00');
@@ -239,7 +244,7 @@ maybe('BANK payouts reconcile on the BANK rail (real PostgreSQL)', () => {
 
         expect((await canonicalOf(reference)).status).toBe('PENDING');
         expect((await mirrorOf(mirror.id)).status).toBe('DISPATCHING');
-        const refused = (await exceptions(mirror.id)).find(e => e.reason === 'SETTLEMENT_EVIDENCE_REJECTED');
+        const refused = (await exceptions(reference)).find(e => e.reason === 'SETTLEMENT_EVIDENCE_REJECTED');
         expect(refused).toBeTruthy();
         expect(new Prisma.Decimal((await liquidity()).inTransitGhs || 0).toFixed(2)).toBe('80.00');
         const userAfter = await prisma.user.findUnique({ where: { id: user.id }, select: { nativeGhsBalance: true } });
@@ -252,7 +257,7 @@ maybe('BANK payouts reconcile on the BANK rail (real PostgreSQL)', () => {
         await worker(null)._reconcileOne(withdrawal);
 
         expect((await canonicalOf(reference)).status).toBe('PENDING');
-        const parked = (await exceptions(mirror.id)).find(e => e.reason === 'BANK_STATUS_PORT_UNAVAILABLE');
+        const parked = (await exceptions(reference)).find(e => e.reason === 'BANK_STATUS_PORT_UNAVAILABLE');
         expect(parked).toBeTruthy();
         expect(new Prisma.Decimal((await liquidity()).inTransitGhs || 0).toFixed(2)).toBe('80.00');
     });

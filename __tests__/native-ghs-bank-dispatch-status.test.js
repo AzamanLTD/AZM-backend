@@ -104,9 +104,12 @@ maybe('BANK dispatch decides on the provider answer (real PostgreSQL)', () => {
 
     const liquidity = async () => prisma.fiatLiquidityState.findUnique({ where: { id: 1 } });
     const canonicalOf = async (reference) => prisma.transactionHistory.findUnique({ where: { txHash: reference } });
-    const openExceptions = async (mirrorId) => prisma.$queryRawUnsafe(
-        'SELECT "reason", "details" FROM "ReconciliationException" WHERE "entityType" = \'WITHDRAWAL\' AND "entityId" = $1 AND "status" = \'OPEN\'',
-        String(mirrorId)
+    // Scope by the DURABLE payout identity. ReconciliationException is raw
+    // SQL with no foreign key, so rows outlive a test-user sweep and a
+    // reprovisioned database can re-issue an id an older row already names.
+    const openExceptions = async (reference) => prisma.$queryRawUnsafe(
+        'SELECT "reason", "details" FROM "ReconciliationException" WHERE "reference" = $1 AND "status" = \'OPEN\'',
+        String(reference)
     );
 
     test('A: UNRESOLVED is never reported as an accepted dispatch and moves no reservation', async () => {
@@ -142,7 +145,7 @@ maybe('BANK dispatch decides on the provider answer (real PostgreSQL)', () => {
         expect(String(after.inTransitGhs)).toBe(String(before.inTransitGhs));
         expect(new Prisma.Decimal(after.inTransitGhs || 0).toFixed(2)).toBe('0.00');
 
-        const exceptions = await openExceptions(mirror.id);
+        const exceptions = await openExceptions(reference);
         expect(exceptions.map(e => e.reason)).toContain('PROVIDER_DISPATCH_UNRESOLVED');
     });
 
@@ -180,7 +183,7 @@ maybe('BANK dispatch decides on the provider answer (real PostgreSQL)', () => {
 
         const after = await liquidity();
         expect(new Prisma.Decimal(after.inTransitGhs || 0).toFixed(2)).toBe('80.00');
-        expect((await openExceptions(mirror.id)).length).toBe(0);
+        expect((await openExceptions(reference)).length).toBe(0);
     });
 
     test.each([
@@ -212,7 +215,7 @@ maybe('BANK dispatch decides on the provider answer (real PostgreSQL)', () => {
         const after = await liquidity();
         expect(new Prisma.Decimal(after.inTransitGhs || 0).toFixed(2))
             .toBe(new Prisma.Decimal(before.inTransitGhs || 0).toFixed(2));
-        expect((await openExceptions(mirror.id)).map(e => e.reason)).toContain('PROVIDER_TERMINAL_AT_INITIATION');
+        expect((await openExceptions(reference)).map(e => e.reason)).toContain('PROVIDER_TERMINAL_AT_INITIATION');
     });
 
     test.each([
@@ -237,7 +240,7 @@ maybe('BANK dispatch decides on the provider answer (real PostgreSQL)', () => {
         expect(th.metadata.dispatchException.reason).toBe(expectedReason);
         // Never the caller's amount substituted for the provider's.
         expect(th.metadata.dispatchException.requestedAmountGhsExact).toBe('80.00');
-        expect((await openExceptions(mirror.id)).map(e => e.reason)).toContain('DISPATCH_OBSERVATION_CONTRADICTION');
+        expect((await openExceptions(reference)).map(e => e.reason)).toContain('DISPATCH_OBSERVATION_CONTRADICTION');
     });
 
     test('D2: an echoed reference that is not ours is never adopted', async () => {
