@@ -78,6 +78,18 @@ maybe('saved bank beneficiaries + BANK payout (real PostgreSQL)', () => {
         return app;
     }
 
+    // §P0-3: beneficiaries are only VERIFIED when the injected provider port
+    // answers a name. These payout tests are about the payout leg, so the port
+    // carries a faithful validation surface; the validation lifecycle itself is
+    // proven in bank-beneficiary-validation.test.js.
+    const providerSurface = () => ({
+        listBanks: async () => ({ banks: [{ code: 'GCB', name: 'GCB Bank' }], stale: false, source: 'MOOLRE' }),
+        validateBankAccount: async ({ accountNumber, bankCode }) => ({
+            valid: true, accountName: 'AMA MENSAH', bankCode,
+            validatedAt: new Date().toISOString(), provider: 'MOOLRE',
+        }),
+    });
+
     const tokenFor = (user) => jwt.sign({ id: user.id, role: 'USER' }, JWT_SECRET);
     const auth = (req, user) => req.set('Authorization', `Bearer ${tokenFor(user)}`).set('Idempotency-Key', randomUUID());
 
@@ -162,7 +174,7 @@ maybe('saved bank beneficiaries + BANK payout (real PostgreSQL)', () => {
 
     test('BANK payout with a bound port debits exact GHS and calls the port once', async () => {
         await setFlags();
-        const port = { initiateBankTransfer: jest.fn(async () => ({ providerRef: 'BANK-REF-1', status: 'PENDING' })) };
+        const port = { ...providerSurface(), initiateBankTransfer: jest.fn(async () => ({ providerRef: 'BANK-REF-1', status: 'PENDING' })) };
         const app = buildApp(port);
         const user = await seedUser(prisma, { nativeGhsBalance: 500 });
         const created = await createBene(app, user);
@@ -244,7 +256,7 @@ maybe('saved bank beneficiaries + BANK payout (real PostgreSQL)', () => {
         await setFlags();
         const svc = require('../src/services/nativeGhsWithdrawalService');
         const beneSvc = require('../src/services/savedBankBeneficiaryService');
-        const app = buildApp({ initiateBankTransfer: jest.fn() });
+        const app = buildApp({ ...providerSurface(), initiateBankTransfer: jest.fn() });
         const user = await seedUser(prisma, { nativeGhsBalance: 500 });
         const created = await createBene(app, user);
         const bank = await beneSvc.revealForPayout(prisma, user.id, created.body.beneficiary.id);
@@ -328,7 +340,7 @@ maybe('saved bank beneficiaries + BANK payout (real PostgreSQL)', () => {
 
         // STEP 2: dispatch, called explicitly — the outcome cannot depend on
         // how fast the test reached this line.
-        const port = { initiateBankTransfer: jest.fn(async () => ({ providerRef: 'SHOULD-NEVER-HAPPEN', status: 'PENDING' })) };
+        const port = { ...providerSurface(), initiateBankTransfer: jest.fn(async () => ({ providerRef: 'SHOULD-NEVER-HAPPEN', status: 'PENDING' })) };
         const out = await svc.dispatchNaturalGhsBankWithdrawal(prisma, {
             reference,
             amountGhsExact: facts.recipientGhsExact,

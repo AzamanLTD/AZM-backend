@@ -11,7 +11,15 @@ const _status = (code) => {
         case 'BANK_NAME_INVALID':
             return 400;
         case 'BENEFICIARY_KEY_UNAVAILABLE':
+        case 'VALIDATION_UNAVAILABLE':
             return 503;
+        case 'ACCOUNT_NOT_FOUND':
+        case 'ACCOUNT_NAME_MISMATCH':
+            return 422;
+        case 'BANK_CODE_UNKNOWN':
+            return 400;
+        case 'BENEFICIARY_NOT_VERIFIED':
+            return 422;
         default:
             return 400;
     }
@@ -30,8 +38,12 @@ const _fail = (res, error, tag) => {
 exports.create = async (req, res) => {
     try {
         const prisma = req.app.get('prisma');
-        const beneficiary = await service.createBeneficiary(prisma, req.user.id, req.body);
-        return res.status(201).json({ success: true, beneficiary });
+        // The injected bank payout port IS the provider boundary; validation
+        // goes through it and nothing else. Unbound => saved as UNVERIFIED,
+        // never as verified.
+        const port = req.app.get('moolreBankPayoutPort') || null;
+        const { verification, ...beneficiary } = await service.createBeneficiary(prisma, req.user.id, req.body, { port });
+        return res.status(201).json({ success: true, beneficiary, verification });
     } catch (error) {
         return _fail(res, error, 'create');
     }

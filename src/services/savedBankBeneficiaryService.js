@@ -43,15 +43,82 @@ function currentKeyId() {
     return String(process.env.BANK_BENEFICIARY_KEY_ID || 'k1').slice(0, 32);
 }
 
+// AZAMAN POLICY, NOT A PROVIDER OR GHANA-WIDE FACT.
+// -------------------------------------------------
+// Neither Moolre's documentation nor Ghanaian banking practice establishes a
+// universal account-number length. This 10-16 digit window is Azaman's own
+// product boundary: it sits strictly inside the provider adapter's 6-20 digit
+// transport safety bound, so every number we accept is one the provider
+// contract can express, while obviously-implausible strings ("123456") are
+// refused before they become a saved payee. The window does NOT establish that
+// an account exists — only the provider's validation does (see
+// verifyAccountWithProvider), and an unvalidated beneficiary is refused at
+// payout time.
+const ACCOUNT_NUMBER_MIN_DIGITS = 10;
+const ACCOUNT_NUMBER_MAX_DIGITS = 16;
+
 function normalizeAccountNumber(value) {
     const digits = String(value == null ? '' : value).replace(/[\s-]/g, '');
-    // Ghanaian bank account numbers are 10-16 digits. The old 6-20 window
-    // accepted strings no bank issues ("123456") and stored them as valid
-    // payees — a typo that only surfaces when a payout fails.
-    if (!/^[0-9]{10,16}$/.test(digits)) {
-        throw new BankBeneficiaryError('Account number must be 10-16 digits.', 'ACCOUNT_NUMBER_INVALID');
+    if (!new RegExp(`^[0-9]{${ACCOUNT_NUMBER_MIN_DIGITS},${ACCOUNT_NUMBER_MAX_DIGITS}}$`).test(digits)) {
+        throw new BankBeneficiaryError(
+            `Account number must be ${ACCOUNT_NUMBER_MIN_DIGITS}-${ACCOUNT_NUMBER_MAX_DIGITS} digits (Azaman policy).`,
+            'ACCOUNT_NUMBER_INVALID'
+        );
     }
     return digits;
+}
+
+/**
+ * Ask the provider (Agent B's adapter, injected as `port`) what account this
+ * number is. The provider's answer is the ONLY thing that can make a
+ * beneficiary verified; a stale directory, an outage, an AVD02 and an
+ * inconclusive answer are all distinct, and none of them counts as verified.
+ *
+ * Returns { verified, reason, accountName?, bankName?, bankCode?, validatedAt?,
+ *           definitive? }.
+ */
+async function verifyAccountWithProvider(port, { accountNumber, bankCode }) {
+    if (!port || typeof port.listBanks !== 'function' || typeof port.validateBankAccount !== 'function') {
+        return { verified: false, reason: 'VALIDATION_UNAVAILABLE' };
+    }
+    let directory;
+    try {
+        directory = await port.listBanks();
+    } catch (err) {
+        return { verified: false, reason: err?.code || 'DIRECTORY_UNAVAILABLE' };
+    }
+    // A stale directory may not validate anything: a bank code checked against
+    // yesterday's list is not evidence (the adapter says stale:true explicitly).
+    if (!directory || directory.stale === true) {
+        return { verified: false, reason: 'DIRECTORY_STALE' };
+    }
+    const banks = Array.isArray(directory.banks) ? directory.banks : [];
+    const canonical = banks.find((b) => b && String(b.code) === String(bankCode));
+    if (!canonical) {
+        return { verified: false, reason: 'BANK_CODE_UNKNOWN', definitive: true };
+    }
+    try {
+        const v = await port.validateBankAccount({ accountNumber, bankCode: canonical.code });
+        if (v && v.valid === true && typeof v.accountName === 'string' && v.accountName.trim() !== '') {
+            return {
+                verified: true,
+                reason: null,
+                // The PROVIDER's name, not the customer's typed string.
+                accountName: v.accountName.trim().replace(/\s+/g, ' '),
+                bankName: canonical.name || null,
+                bankCode: String(canonical.code),
+                validatedAt: v.validatedAt ? new Date(v.validatedAt) : new Date(),
+            };
+        }
+        return { verified: false, reason: 'VALIDATION_INCONCLUSIVE' };
+    } catch (err) {
+        if (err?.code === 'ACCOUNT_NOT_FOUND') {
+            // The provider's documented answer: this account does not exist at
+            // this bank. That is definitive, so the save is refused.
+            return { verified: false, reason: 'ACCOUNT_NOT_FOUND', definitive: true };
+        }
+        return { verified: false, reason: err?.code || 'VALIDATION_UNDETERMINED' };
+    }
 }
 
 /**
@@ -114,11 +181,37 @@ function toPublic(row) {
 }
 
 // ── CRUD (owner-scoped, fail-closed) ────────────────────────────────────────
-async function createBeneficiary(prisma, userId, input = {}) {
+async function createBeneficiary(prisma, userId, input = {}, options = {}) {
     const { bankCode, bankName, accountNumber, nickname, isPrimary } = input;
     assertBankInput({ bankCode, bankName });
     const typedName = assertAccountName(input.accountName);
     const digits = normalizeAccountNumber(accountNumber);
+
+    // §P0-3: server-owned provider validation. A client-supplied
+    // accountNameVerified is NEVER read — verification exists only as the
+    // provider's answer, timestamped, against the provider's own bank code.
+    const verification = await verifyAccountWithProvider(options.port, { accountNumber: digits, bankCode });
+    if (verification.definitive === true) {
+        if (verification.reason === 'ACCOUNT_NOT_FOUND') {
+            throw new BankBeneficiaryError(
+                'The provider could not find that account at this bank. Check the number and bank.',
+                'ACCOUNT_NOT_FOUND'
+            );
+        }
+        if (verification.reason === 'BANK_CODE_UNKNOWN') {
+            throw new BankBeneficiaryError(
+                'That bank code is not in the provider bank directory.',
+                'BANK_CODE_UNKNOWN'
+            );
+        }
+    }
+    const resolvedBankName = verification.verified && verification.bankName
+        ? String(verification.bankName).trim()
+        : String(bankName).trim();
+    // Verified => the provider's name and timestamp. Unverified => the customer's
+    // assertion stays, with validatedAt null so nothing can present it as checked.
+    const effectiveName = verification.verified ? verification.accountName : typedName;
+    const validatedAt = verification.verified ? verification.validatedAt : null;
     if (!fieldCipher.isKeyAvailable()) {
         throw new BankBeneficiaryError(
             'Bank beneficiary storage is not configured (encryption key missing).',
@@ -142,21 +235,22 @@ async function createBeneficiary(prisma, userId, input = {}) {
             where: { id: existing.id },
             data: {
                 status: ACTIVE,
-                bankCode: String(bankCode),
-                bankName: String(bankName).trim(),
+                bankCode: verification.verified ? verification.bankCode : String(bankCode),
+                bankName: resolvedBankName,
                 accountNumberEnc: enc,
                 accountNumberMasked: masked,
-                accountName: typedName,
+                accountName: effectiveName,
                 nickname: nickname ? String(nickname).trim().slice(0, 40) : null,
                 isPrimary: isPrimary === true,
                 keyId: currentKeyId(),
                 envelopeVersion: 2,
                 // Re-saving invalidates any earlier verification: the value
                 // changed, so the old evidence no longer describes this payee.
-                validatedAt: null,
+                // A NEW provider validation in this same call may re-establish it.
+                validatedAt,
             },
         });
-        return toPublic(revived);
+        return { ...toPublic(revived), verification: _verificationView(verification) };
     }
 
     const created = await prisma.$transaction(async (tx) => {
@@ -169,20 +263,43 @@ async function createBeneficiary(prisma, userId, input = {}) {
         return tx.savedBankBeneficiary.create({
             data: {
                 userId,
-                bankCode: String(bankCode),
-                bankName: String(bankName).trim(),
+                bankCode: verification.verified ? verification.bankCode : String(bankCode),
+                bankName: resolvedBankName,
                 accountNumberEnc: enc,
                 accountNumberMasked: masked,
                 accountNumberHmac: hmac,
-                accountName: typedName,
+                accountName: effectiveName,
                 nickname: nickname ? String(nickname).trim().slice(0, 40) : null,
                 isPrimary: isPrimary === true,
                 keyId: currentKeyId(),
                 envelopeVersion: 2,
+                validatedAt,
             },
         });
     });
-    return toPublic(created);
+    return { ...toPublic(created), verification: _verificationView(verification) };
+}
+
+function _verificationView(verification) {
+    if (!verification) return { status: 'UNVERIFIED', reason: 'VALIDATION_UNAVAILABLE' };
+    return verification.verified
+        ? { status: 'VERIFIED', provider: 'MOOLRE', validatedAt: verification.validatedAt }
+        : { status: 'UNVERIFIED', reason: verification.reason };
+}
+
+/**
+ * §P0-3: a bank payout may only go to a beneficiary the PROVIDER has verified.
+ * The refusal is explicit and carries the reason, so the client can re-run
+ * validation instead of retrying a payout that cannot settle.
+ */
+function assertPayableVerification(row) {
+    if (!row || !row.validatedAt) {
+        throw new BankBeneficiaryError(
+            'This bank account has not been verified by the provider yet. Re-validate the account, then try again.',
+            'BENEFICIARY_NOT_VERIFIED'
+        );
+    }
+    return true;
 }
 
 async function listBeneficiaries(prisma, userId) {
@@ -241,6 +358,10 @@ async function revealForPayout(prisma, userId, id) {
 
 module.exports = {
     ACTIVE,
+    ACCOUNT_NUMBER_MIN_DIGITS,
+    ACCOUNT_NUMBER_MAX_DIGITS,
+    verifyAccountWithProvider,
+    assertPayableVerification,
     DELETED,
     BankBeneficiaryError,
     normalizeAccountNumber,

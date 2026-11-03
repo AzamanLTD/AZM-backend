@@ -2048,6 +2048,20 @@ exports.bankWithdrawal = async (req, res) => {
         }
         const userId = req.user.id;
         const bank = await savedBankBeneficiaryService.revealForPayout(prisma, userId, req.body.beneficiaryId);
+        // §P0-3: only a PROVIDER-VERIFIED destination may be paid. The
+        // beneficiary endpoint establishes this from the provider's own answer,
+        // so an unverified payee means validation has not happened (or was
+        // invalidated by a bank/account change). Refuse before any money moves.
+        try {
+            savedBankBeneficiaryService.assertPayableVerification(bank);
+        } catch (verificationError) {
+            res.locals.financialClaimRelease = true;
+            return res.status(422).json({
+                success: false,
+                code: verificationError.code || 'BENEFICIARY_NOT_VERIFIED',
+                message: verificationError.message,
+            });
+        }
         // §6 immutable acceptance snapshot: what the customer confirmed, not
         // what the payee record happens to say later.
         const beneficiarySnapshot = {
