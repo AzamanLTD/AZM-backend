@@ -480,8 +480,11 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
         expect(legacyStored.destination).toBe(LEGACY_BANK_ACCOUNT);
     });
     test('§1b the orphan sweep refuses to run unless the target is provably the disposable test database', async () => {
-        const { assertDisposableTestDatabase: guard } = require('./helpers/testDatabaseGuard');
-        const TEST_URL = 'postgres://postgres:postgres@localhost:5432/azm_iso?schema=public';
+        const { assertDisposableTestDatabase: guard, databaseNameFromUrl } = require('./helpers/testDatabaseGuard');
+        // Derived from the real target: this suite runs against azm_iso locally and
+        // azm_test in CI, and a hardcoded name would prove nothing either way.
+        const TEST_URL = process.env.TEST_DATABASE_URL || 'postgres://postgres:postgres@localhost:5432/azm_iso?schema=public';
+        const DB = databaseNameFromUrl(TEST_URL) || 'azm_iso';
         const SID = '7686515198152565070';
         // The exhaustive IPv4 / IPv6 / CIDR / identity matrix lives in
         // __tests__/test-database-guard.test.js (run as its own step in the
@@ -495,7 +498,7 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
             ...over,
         });
 
-        function stubClient({ database = 'azm_iso', serverAddress = '127.0.0.1/32', systemIdentifier = SID, dataDirectory = '/var/lib/postgresql/15/main' } = {}) {
+        function stubClient({ database = DB, serverAddress = '127.0.0.1/32', systemIdentifier = SID, dataDirectory = '/var/lib/postgresql/15/main' } = {}) {
             const statements = [];
             return {
                 statements,
@@ -527,9 +530,9 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
         expect(boundMismatch.message).toContain('db.prod.example.com:5432/azm_test');
 
         // (d) the URL matched but the CONNECTION is a different database
-        const wrongTarget = stubClient({ database: 'azm_production' });
+        const wrongTarget = stubClient({ database: `${DB}_not_the_test_db` });
         await expect(guard(wrongTarget, seams()))
-            .rejects.toThrow(/connected to database "azm_production", but the disposable test database is "azm_iso"/);
+            .rejects.toThrow(/connected to database .*but the disposable test database is /);
         expect(mutations(wrongTarget)).toHaveLength(0);
 
         // (e) unreadable target — and the message must not echo it back
