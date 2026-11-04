@@ -479,53 +479,102 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
         const legacyStored = await prisma.withdrawal.findUnique({ where: { id: legacy.mirror.id } });
         expect(legacyStored.destination).toBe(LEGACY_BANK_ACCOUNT);
     });
-    test('§1b the orphan sweep refuses to run unless the target is provably the disposable test database', async () => {
-        const { assertDisposableTestDatabase: guard, databaseNameFromUrl } = require('./helpers/testDatabaseGuard');
+    test('§1b the orphan sweep refuses to run unless the target is provably a disposable LOCAL test database', async () => {
+        const { assertDisposableTestDatabase: guard } = require('./helpers/testDatabaseGuard');
         const TEST_URL = 'postgres://postgres:postgres@localhost:5432/azm_iso?schema=public';
 
-        // A client that reports a database identity and records every statement
-        // it is asked to run, so "refused" can mean "no mutation was executed".
-        function stubClient(reportingDatabase) {
+        // Records every statement a client is asked to run, so "refused" can also
+        // mean "no mutation was executed" — and, for the host check, "no query at
+        // all was issued".
+        function stubClient({ database = 'azm_iso', serverAddress = '127.0.0.1/32' } = {}) {
             const statements = [];
             return {
                 statements,
-                $queryRawUnsafe: async (sql) => { statements.push(sql); return [{ database: reportingDatabase }]; },
+                $queryRawUnsafe: async (sql) => {
+                    statements.push(sql);
+                    return [{ database, server_address: serverAddress }];
+                },
                 $executeRawUnsafe: async (sql) => { statements.push(sql); },
             };
         }
+        const mutations = (stub) => stub.statements.filter((sql) => /^\s*(UPDATE|DELETE|TRUNCATE|INSERT)/i.test(sql));
 
         // (a) no explicit test database at all
-        await expect(guard(stubClient('azm_iso'), { testUrl: '', databaseUrl: TEST_URL, nodeEnv: 'test' }))
+        await expect(guard(stubClient(), { testUrl: '', databaseUrl: TEST_URL, nodeEnv: 'test' }))
             .rejects.toThrow(/TEST_DATABASE_URL is not set/);
 
         // (b) not the test environment
-        await expect(guard(stubClient('azm_iso'), { testUrl: TEST_URL, databaseUrl: TEST_URL, nodeEnv: 'production' }))
+        await expect(guard(stubClient(), { testUrl: TEST_URL, databaseUrl: TEST_URL, nodeEnv: 'production' }))
             .rejects.toThrow(/NODE_ENV is "production", not "test"/);
 
-        // (c) the client was bound somewhere else
-        await expect(guard(stubClient('azm_prod'), {
-            testUrl: TEST_URL,
-            databaseUrl: 'postgres://postgres:postgres@localhost:5432/azm_prod?schema=public',
-            nodeEnv: 'test',
-        })).rejects.toThrow(/is not the explicit test database/);
+        // (c) the client was bound somewhere else — the error must NOT leak the
+        //     credentials that URL carries.
+        const credentialled = 'postgres://ci_runner:hunter2-should-never-leak@db.prod.example.com:5432/azm_test?schema=public';
+        let boundMismatch;
+        try {
+            await guard(stubClient(), { testUrl: TEST_URL, databaseUrl: credentialled, nodeEnv: 'test' });
+            throw new Error('guard allowed a bound-URL mismatch');
+        } catch (err) {
+            boundMismatch = err;
+        }
+        expect(boundMismatch.message).toMatch(/is not the explicit test database/);
+        expect(boundMismatch.message).not.toContain('hunter2-should-never-leak');
+        expect(boundMismatch.message).not.toContain('ci_runner');
+        expect(boundMismatch.message).not.toContain(credentialled);
+        // it still says WHERE, in redacted form, so an operator can diagnose it
+        expect(boundMismatch.message).toContain('db.prod.example.com:5432/azm_test');
 
         // (d) the URL matched but the CONNECTION is a different database
-        const wrongTarget = stubClient('azm_production');
+        const wrongTarget = stubClient({ database: 'azm_production' });
         await expect(guard(wrongTarget, { testUrl: TEST_URL, databaseUrl: TEST_URL, nodeEnv: 'test' }))
             .rejects.toThrow(/connected to database "azm_production", but the disposable test database is "azm_iso"/);
-        // and it refused BEFORE any mutation was attempted
-        expect(wrongTarget.statements.filter((sql) => /^\s*UPDATE/i.test(sql))).toHaveLength(0);
+        expect(mutations(wrongTarget)).toHaveLength(0);
 
-        // (e) unreadable target
-        await expect(guard(stubClient('azm_iso'), { testUrl: 'not-a-url', databaseUrl: 'not-a-url', nodeEnv: 'test' }))
-            .rejects.toThrow(/cannot read a database name/);
-        expect(databaseNameFromUrl('postgres://u:p@h:5432/azm_iso?schema=public')).toBe('azm_iso');
+        // (e) unreadable target — and the message must not echo it back
+        const opaque = 'postgres://svc:sekret@[::bad/db';
+        let unreadable;
+        try {
+            await guard(stubClient(), { testUrl: opaque, databaseUrl: opaque, nodeEnv: 'test' });
+            throw new Error('guard allowed an unreadable URL');
+        } catch (err) {
+            unreadable = err;
+        }
+        expect(unreadable.message).toMatch(/does not parse into a host and a database name/);
+        expect(unreadable.message).not.toContain('sekret');
 
-        // (f) the positive case, with the same seams, does execute
-        const good = stubClient('azm_iso');
+        // (f) THE NAME IS NOT AN IDENTITY. Identical URLs, a REMOTE host, and a
+        //     server that reports the exact expected database name — still refused,
+        //     and refused BEFORE any statement reaches the connection.
+        const remoteUrl = 'postgres://postgres:postgres@azm-prod-db.example.com:5432/azm_iso?schema=public';
+        const remote = stubClient({ database: 'azm_iso' });
+        await expect(guard(remote, { testUrl: remoteUrl, databaseUrl: remoteUrl, nodeEnv: 'test' }))
+            .rejects.toThrow(/host "azm-prod-db\.example\.com".*is not a loopback address/);
+        expect(remote.statements).toHaveLength(0);
+
+        // private-network hosts are not "local" either
+        const privateUrl = 'postgres://postgres:postgres@10.4.1.9:5432/azm_iso?schema=public';
+        await expect(guard(stubClient(), { testUrl: privateUrl, databaseUrl: privateUrl, nodeEnv: 'test' }))
+            .rejects.toThrow(/host "10\.4\.1\.9".*is not a loopback address/);
+
+        // (g) loopback URL, but the server reports a non-loopback address
+        await expect(guard(stubClient({ serverAddress: '203.0.113.7/32' }), {
+            testUrl: TEST_URL, databaseUrl: TEST_URL, nodeEnv: 'test',
+        })).rejects.toThrow(/server reports address "203\.0\.113\.7", which is not loopback/);
+
+        // (h) the positive case: loopback host, matching name, loopback server
+        const good = stubClient();
         await expect(guard(good, { testUrl: TEST_URL, databaseUrl: TEST_URL, nodeEnv: 'test' }))
-            .resolves.toEqual({ database: 'azm_iso' });
+            .resolves.toEqual({ database: 'azm_iso', host: 'localhost' });
         expect(good.statements).toHaveLength(1);
         expect(good.statements[0]).toMatch(/current_database\(\)/);
+
+        // loopback forms the repository actually uses stay allowed
+        for (const host of ['localhost', '127.0.0.1', '[::1]']) {
+            await expect(guard(stubClient({ database: 'azm_test' }), {
+                testUrl: `postgres://postgres:postgres@${host}:5432/azm_test?schema=public`,
+                databaseUrl: `postgres://postgres:postgres@${host}:5432/azm_test?schema=public`,
+                nodeEnv: 'test',
+            })).resolves.toEqual({ database: 'azm_test', host: host.replace(/[[\]]/g, '') });
+        }
     });
 });
