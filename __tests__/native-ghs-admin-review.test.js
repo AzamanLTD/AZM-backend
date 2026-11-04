@@ -556,10 +556,32 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
         await expect(guard(stubClient(), { testUrl: privateUrl, databaseUrl: privateUrl, nodeEnv: 'test' }))
             .rejects.toThrow(/host "10\.4\.1\.9".*is not a loopback address/);
 
-        // (g) loopback URL, but the server reports a non-loopback address
+        // (g) loopback URL, but the server answers from a globally routable address
         await expect(guard(stubClient({ serverAddress: '203.0.113.7/32' }), {
             testUrl: TEST_URL, databaseUrl: TEST_URL, nodeEnv: 'test',
-        })).rejects.toThrow(/server reports address "203\.0\.113\.7", which is not loopback/);
+        })).rejects.toThrow(/server reports the address "203\.0\.113\.7", which is neither loopback nor this machine's docker bridge/);
+
+        // (g2) the CI topology: a service container reports its docker bridge
+        //      address (observed 172.18.0.2 on run 41879844824) while the client
+        //      connects through localhost. That is this machine's docker network,
+        //      not a remote server, so it must pass — the first version of this
+        //      guard wrongly refused it and took the whole lane down, which is
+        //      exactly what the lane is for.
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), {
+            testUrl: TEST_URL, databaseUrl: TEST_URL, nodeEnv: 'test',
+        })).resolves.toEqual({ database: 'azm_iso', host: 'localhost' });
+
+        // (g3) a local unix socket reports NULL — local by definition
+        await expect(guard(stubClient({ serverAddress: null }), {
+            testUrl: TEST_URL, databaseUrl: TEST_URL, nodeEnv: 'test',
+        })).resolves.toEqual({ database: 'azm_iso', host: 'localhost' });
+
+        // (g4) other private ranges are NOT silently allowed
+        for (const addr of ['10.4.1.9/32', '192.168.1.4/32', '172.32.0.1/32']) {
+            await expect(guard(stubClient({ serverAddress: addr }), {
+                testUrl: TEST_URL, databaseUrl: TEST_URL, nodeEnv: 'test',
+            })).rejects.toThrow(new RegExp(`server reports the address "${addr.split('/')[0]}"`));
+        }
 
         // (h) the positive case: loopback host, matching name, loopback server
         const good = stubClient();

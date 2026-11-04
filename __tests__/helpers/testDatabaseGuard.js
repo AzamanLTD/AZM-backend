@@ -20,11 +20,23 @@
 //   4. the URL must parse, with a host and a database name
 //   5. the HOST must be loopback                  (localhost / 127.0.0.0-8 / ::1)
 //   6. the CONNECTED database name must equal the one in the URL
-//   7. the server-reported address must be loopback when it reports one
+//   7. the server-reported address must not be globally routable
 //
 // SUPPORTED TARGETS, deliberately limited to what this repository actually uses:
 // the GitHub Actions Postgres service container and local development databases
 // (azm_test, azm_iso, azm_h1) all connect over loopback on localhost:5432.
+//
+// ON CHECK 7 — why it is not simply "loopback": GitHub Actions runs Postgres as a
+// service container, reached through the published port on localhost, but the
+// server reports ITS OWN address, which is the container's docker bridge address
+// (observed: 172.18.0.2). Requiring a loopback report there would refuse the very
+// environment this lane runs in — it did, on run 41879844824, which is how the
+// allowance below was established rather than guessed. So check 7 refuses only
+// GLOBALLY ROUTABLE reports (and the 10/8 and 192.168/16 ranges), while accepting
+// loopback, NULL (local unix socket) and 172.16.0.0/12 (the docker bridge a
+// service container reports). The loopback URL check (5) remains the primary
+// identity; check 7 is a second line that catches a server answering from a
+// publicly reachable address.
 //
 // There is NO allowlist for other hosts. A remote or private-network disposable
 // database is not supported by this guard, and must not be made to pass by
@@ -86,6 +98,15 @@ function parseTarget(raw) {
     } catch (_) {
         return null;
     }
+}
+
+/** The docker bridge range a service container reports as its own address. */
+function isDockerBridgeAddress(host) {
+    const h = normalizeHost(host);
+    const m = h.match(/^172\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/);
+    if (!m) return false;
+    const second = Number(m[1]);
+    return second >= 16 && second <= 31; // 172.16.0.0/12
 }
 
 /** inet_server_addr() reports a CIDR such as '127.0.0.1/32' (or NULL locally). */
@@ -165,12 +186,17 @@ async function assertDisposableTestDatabase(prisma, overrides = {}) {
         );
     }
 
-    // The server's own report, not ours. NULL means a local unix socket, which is
-    // by definition on this machine; anything else must be loopback too.
+    // The server's own report, not ours. NULL means a local unix socket (this
+    // machine). A service container reports its docker bridge address, which is
+    // still this machine's docker network — the CI topology. Anything else is a
+    // server answering from somewhere we cannot account for, so refuse.
     const reportedHost = serverAddressHost(row ? row.server_address : null);
-    if (reportedHost !== null && !isLoopbackHost(reportedHost)) {
+    const reportedOk = reportedHost === null
+        || isLoopbackHost(reportedHost)
+        || isDockerBridgeAddress(reportedHost);
+    if (!reportedOk) {
         throw new Error(
-            `[test-db-guard] refusing to run: the server reports address "${reportedHost}", which is not loopback. The configured host said "${target.host}".`
+            `[test-db-guard] refusing to run: the server reports the address "${reportedHost}", which is neither loopback nor this machine's docker bridge. The configured host said "${target.host}".`
         );
     }
 
@@ -184,6 +210,7 @@ module.exports = {
         return parsed ? parsed.database : null;
     },
     describeTarget,
+    isDockerBridgeAddress,
     isLoopbackHost,
     parseTarget,
 };
