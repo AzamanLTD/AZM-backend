@@ -87,9 +87,9 @@ maybe('provider-backed bank beneficiary validation (real PostgreSQL)', () => {
         directoryThrows = false,
     } = {}) {
         return {
-            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
+            capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true, mode: 'sandbox' }),
             initiateBankTransfer: jest.fn(async () => ({
-            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
+            capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true, mode: 'sandbox' }),
                 provider: 'MOOLRE_DISBURSEMENT', rail: 'BANK', status: 'PENDING', amountGhsExact: '0.00',
             })),
             listBanks: jest.fn(async () => {

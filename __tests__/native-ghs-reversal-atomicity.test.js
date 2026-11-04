@@ -107,7 +107,7 @@ maybe('native-GHS reversal atomicity (real PostgreSQL)', () => {
         );
         await prisma.savedBankBeneficiary.update({ where: { id: bene.id }, data: { status: 'DELETED' } });
         const out = await svc.dispatchNaturalGhsBankWithdrawal(prisma, {
-            reference, amountGhsExact: facts.recipientGhsExact, bank, port: { capabilities: () => ({ canInitiateBankPayout: true, canValidateAccount: true }), validateAccount: async ({ accountNumber, bankCode }) => ({ status: 'OK', accountNumber, bankCode, accountName: bank.accountName || null }), initiateBankTransfer: jest.fn() },
+            reference, amountGhsExact: facts.recipientGhsExact, bank, port: { capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true }), validateBankAccount: async ({ accountNumber, bankCode }) => ({ status: 'OK', accountNumber, bankCode, accountName: bank.accountName || null }), initiateBankTransfer: jest.fn() },
         });
         expect(out.reason).toBe('BANK_DESTINATION_CHANGED');
 

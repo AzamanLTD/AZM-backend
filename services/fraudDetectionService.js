@@ -164,6 +164,24 @@ const RULES = {
 // rather than quietly implying the check ran and passed. A malformed policy is a
 // configuration error and THROWS, so callers refuse the payout instead of
 // proceeding with a gate they cannot trust.
+/**
+ * Parse a GHS policy value into exact integer PESEWAS.
+ *
+ * Accepts a decimal string ("5000.00") or a number with at most two decimal
+ * places. Returns null for anything that is not an exact, non-exponent decimal:
+ * the caller treats that as an invalid policy and refuses the payout.
+ */
+function parseExactPesewas(value) {
+  const text = typeof value === 'number'
+    ? (Number.isFinite(value) ? String(value) : '')
+    : (typeof value === 'string' ? value.trim() : '');
+  if (!text) return null;
+  if (!/^[0-9]+(\.[0-9]{1,2})?$/.test(text)) return null;
+  const [whole, frac = ''] = text.split('.');
+  const pesewas = BigInt(whole) * 100n + BigInt((frac + '00').slice(0, 2));
+  return pesewas;
+}
+
 function resolveGhsAmountPolicy() {
   const raw = process.env.GHS_RISK_AMOUNT_POLICY;
   if (raw === undefined || raw === null || String(raw).trim() === '') {
@@ -182,15 +200,20 @@ function resolveGhsAmountPolicy() {
     throw new GhsRiskPolicyError('GHS_RISK_AMOUNT_POLICY must be a JSON object', { reason: 'NOT_AN_OBJECT' });
   }
   const keys = ['largeGhs', 'hugeGhs', 'newAccountMinGhs'];
-  const num = (v) => (v === undefined || v === null || v === '' ? null : Number(v));
   const policy = {};
   const missing = [];
   const invalid = [];
   for (const key of keys) {
-    const value = num(parsed[key]);
-    if (value === null) { missing.push(key); continue; }
-    if (!Number.isFinite(value) || value <= 0) { invalid.push(key); continue; }
-    policy[key] = value;
+    const rawValue = parsed[key];
+    if (rawValue === undefined || rawValue === null || rawValue === '') { missing.push(key); continue; }
+    // EXACT PESEWA PARSING. A threshold decides whether money leaves the
+    // platform, so it is never a float: "5000.007" is rejected rather than
+    // silently rounded into a different policy, and exponent notation ("1e3")
+    // is refused instead of being read as a number.
+    const pesewas = parseExactPesewas(rawValue);
+    if (pesewas === null || pesewas <= 0n) { invalid.push(key); continue; }
+    policy[key] = Number(pesewas) / 100;
+    policy[`${key}Pesewas`] = pesewas;
   }
   if (invalid.length) {
     throw new GhsRiskPolicyError(`GHS_RISK_AMOUNT_POLICY.${invalid.join(', ')} must be a positive number`, { reason: 'INVALID_VALUES', invalid });
@@ -200,14 +223,13 @@ function resolveGhsAmountPolicy() {
     // rules, which is the same bypass in a quieter costume.
     return { policy: null, gaps: ['GHS_AMOUNT_POLICY_INCOMPLETE'], missing };
   }
-  // Ordering is validated at GHS precision (2dp): comparing raw floats would let
-  // 4999.999999 pass as "less than" 5000 while the amount dimension compares
-  // rounded pesewas.
+  // Ordering is validated in exact pesewas — the same unit the amount dimension
+  // compares — so a threshold can never sit "below" another by rounding.
   const cents = (v) => Math.round(v * 100);
-  if (cents(policy.largeGhs) >= cents(policy.hugeGhs)) {
+  if (policy.largeGhsPesewas >= policy.hugeGhsPesewas) {
     throw new GhsRiskPolicyError('GHS_RISK_AMOUNT_POLICY.largeGhs must be less than hugeGhs', { reason: 'ORDERING', largeGhs: policy.largeGhs, hugeGhs: policy.hugeGhs });
   }
-  if (cents(policy.newAccountMinGhs) >= cents(policy.hugeGhs)) {
+  if (policy.newAccountMinGhsPesewas >= policy.hugeGhsPesewas) {
     throw new GhsRiskPolicyError('GHS_RISK_AMOUNT_POLICY.newAccountMinGhs must be less than hugeGhs', { reason: 'ORDERING', newAccountMinGhs: policy.newAccountMinGhs, hugeGhs: policy.hugeGhs });
   }
   return { policy, gaps: [], missing: [] };
@@ -286,10 +308,15 @@ async function evaluate(tx) {
         // The gap is already on the decision (GHS_AMOUNT_POLICY_MISSING /
         // _INCOMPLETE): the dimension was NOT evaluated, and the caller refuses.
       } else {
-        if (ghsPolicy.hugeGhs !== null && tx.amount >= ghsPolicy.hugeGhs) {
+        // EXACT PESEWAS, never a float: the GHS dimension must not depend on
+        // JavaScript's Number() rounding of the customer's amount.
+        const ghsPesewas = tx.amountGhsPesewas === undefined || tx.amountGhsPesewas === null
+          ? parseExactPesewas(tx.amountExact !== undefined ? tx.amountExact : tx.amount)
+          : BigInt(tx.amountGhsPesewas);
+        if (ghsPolicy.hugeGhsPesewas !== undefined && ghsPesewas !== null && ghsPesewas >= ghsPolicy.hugeGhsPesewas) {
           triggered.push(_formatRule(GHS_RULES.GHS_HUGE_WITHDRAWAL));
           riskScore += 60;
-        } else if (ghsPolicy.largeGhs !== null && tx.amount >= ghsPolicy.largeGhs) {
+        } else if (ghsPolicy.largeGhsPesewas !== undefined && ghsPesewas !== null && ghsPesewas >= ghsPolicy.largeGhsPesewas) {
           triggered.push(_formatRule(GHS_RULES.GHS_LARGE_WITHDRAWAL));
           riskScore += 20;
         }
@@ -317,7 +344,8 @@ async function evaluate(tx) {
       // figure this pattern is not evaluated, and the decision says so.
       if (!ghsPolicy) {
         // Not evaluated; the resolver's gap already records why.
-      } else if (tx.amount && tx.amount > ghsPolicy.newAccountMinGhs) {
+      } else if (tx.amountGhsPesewas !== undefined && tx.amountGhsPesewas !== null
+        && BigInt(tx.amountGhsPesewas) > ghsPolicy.newAccountMinGhsPesewas) {
         triggered.push(_formatRule(GHS_RULES.GHS_NEW_ACCOUNT_LARGE_TX));
         riskScore += 40;
       }
@@ -566,6 +594,7 @@ async function getAssessments({ limit = 50, skip = 0, onlyBlocked = false }) {
 }
 
 module.exports = {
+  parseExactPesewas,
   evaluate,
   // Exposed so the payout gate and the tests can prove the policy contract and
   // the typed failures without going through a full evaluation.

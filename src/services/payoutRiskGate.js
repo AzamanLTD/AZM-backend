@@ -33,6 +33,43 @@ const logger = require('../config/logger');
 // exist there can never match, so the list only holds real values.)
 const WITHDRAWAL_VELOCITY_TYPES = ['WITHDRAWAL_FIAT', 'WITHDRAWAL_CRYPTO'];
 
+/**
+ * TRUSTED ACCOUNT AGE.
+ *
+ * The risk gate must not accept an age from a JWT claim, a request body, a
+ * Flutter value or a stored beneficiary field: those are all attacker-shaped
+ * inputs to a security decision. The access token carries no createdAt, so an
+ * age taken from `req.user` is usually `undefined` — which silently SKIPPED the
+ * new-account rule and made every fresh account look seasoned.
+ *
+ * The authoritative source is the live User record, read through the
+ * request-scoped client the caller supplied.
+ */
+async function resolveTrustedAccountAgeHours(db, userId) {
+    if (!db || !db.user || typeof db.user.findUnique !== 'function') {
+        return { ok: false, reason: 'USER_SOURCE_UNAVAILABLE' };
+    }
+    if (userId === undefined || userId === null) {
+        return { ok: false, reason: 'USER_ID_MISSING' };
+    }
+    let row;
+    try {
+        row = await db.user.findUnique({ where: { id: Number(userId) }, select: { createdAt: true } });
+    } catch (err) {
+        return { ok: false, reason: 'AGE_QUERY_FAILED', error: String((err && err.message) || '').slice(0, 200) };
+    }
+    if (!row) return { ok: false, reason: 'USER_NOT_FOUND' };
+    const created = row.createdAt;
+    if (!(created instanceof Date) || Number.isNaN(created.getTime())) {
+        return { ok: false, reason: 'CREATED_AT_INVALID' };
+    }
+    const ms = Date.now() - created.getTime();
+    if (!Number.isFinite(ms) || ms < 0) {
+        return { ok: false, reason: 'AGE_NOT_COMPUTABLE' };
+    }
+    return { ok: true, hours: ms / (1000 * 60 * 60), createdAt: created.toISOString() };
+}
+
 function accountAgeHoursOf(user) {
     if (!user) return undefined;
     const created = user.createdAt || user.created_at;
@@ -64,6 +101,42 @@ async function evaluatePayoutRisk({
     // screen; it is NOT fine for deciding whether a GHS payout crosses a
     // configured threshold, so the exact value travels with it.
     const amountExact = amount === null || amount === undefined || amount === '' ? undefined : String(amount);
+    const assetCode = String(asset || 'USDC').toUpperCase();
+
+    // GHS is decided in EXACT PESEWAS. Number('5000.01') is 5000.009999999999,
+    // so a float comparison at a threshold is a coin flip on which side of the
+    // line a payout lands.
+    let amountGhsPesewas;
+    if (assetCode === 'GHS') {
+        const pesewas = fraudService.parseExactPesewas(amountExact === undefined ? '' : amountExact);
+        if (pesewas === null || pesewas <= 0n) {
+            return {
+                ok: false,
+                status: 422,
+                code: 'GHS_AMOUNT_NOT_EXACT_PESEWAS',
+                message: 'The GHS amount must be an exact two-decimal amount.',
+                rules: [],
+            };
+        }
+        amountGhsPesewas = pesewas;
+    }
+
+    // AGE FROM THE DATABASE, never from the caller. An age that cannot be
+    // established is not "old enough": refuse before any quote, debit,
+    // reservation or provider call.
+    const trustedAge = await resolveTrustedAccountAgeHours(db, userId);
+    if (!trustedAge.ok) {
+        logger.error({ userId, channel, reason: trustedAge.reason }, '[payoutRiskGate] trusted account age unavailable — refusing');
+        return {
+            ok: false,
+            status: 503,
+            code: 'RISK_DATA_UNAVAILABLE',
+            message: 'Risk checks are unavailable right now, so nothing was debited.',
+            rules: [],
+            ageGap: trustedAge.reason,
+        };
+    }
+
     let decision;
     try {
         decision = await fraudService.evaluate({
@@ -74,9 +147,10 @@ async function evaluatePayoutRisk({
             asset: String(asset || 'USDC').toUpperCase(),
             amount: Number.isFinite(numeric) ? numeric : undefined,
             amountExact,
+            amountGhsPesewas,
             destination: destination || undefined,
             rail: rail || undefined,
-            accountAgeHours,
+            accountAgeHours: trustedAge.hours,
             velocityTypes: WITHDRAWAL_VELOCITY_TYPES,
             channel,
             // A money-out decision needs EVERY query behind it to have answered.
@@ -138,4 +212,4 @@ async function evaluatePayoutRisk({
     return { ok: true, decision, rules, riskScore: decision.riskScore };
 }
 
-module.exports = { evaluatePayoutRisk, accountAgeHoursOf, WITHDRAWAL_VELOCITY_TYPES };
+module.exports = { evaluatePayoutRisk, accountAgeHoursOf, resolveTrustedAccountAgeHours, WITHDRAWAL_VELOCITY_TYPES };

@@ -88,8 +88,8 @@ if (hasDb) {
             accountName: ACCOUNT_NAME,
         }, {
             port: {
-                validateAccount: async ({ accountNumber, bankCode }) => ({
-                    status: 'OK', accountNumber, bankCode, accountName: ACCOUNT_NAME,
+                validateBankAccount: async ({ accountNumber, bankCode }) => ({
+                    valid: true, accountName: ACCOUNT_NAME, bankCode, provider: 'MOOLRE', validatedAt: new Date().toISOString(),
                 }),
             },
         });
@@ -113,9 +113,21 @@ if (hasDb) {
         return { user, reference, facts, bank };
     }
 
-    const port = (validateAccount, overrides = {}) => ({
-        capabilities: () => ({ canInitiateBankPayout: true, canValidateAccount: true, mode: 'sandbox', ...(overrides.caps || {}) }),
-        validateAccount,
+    const OK = (accountNumber, bankCode, accountName) => ({
+        valid: true, accountName, bankCode, provider: 'MOOLRE', validatedAt: new Date().toISOString(),
+    });
+    const definitiveNotFound = () => {
+        const err = new Error('account not found');
+        err.outcome = 'DEFINITIVE_REJECTION';
+        err.code = 'ACCOUNT_NOT_FOUND';
+        err.refusalDocumented = true;
+        err.dispatchProven = true;
+        err.provider = 'MOOLRE';
+        return err;
+    };
+    const port = (validateBankAccountFn, overrides = {}) => ({
+        capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true, mode: 'sandbox', ...(overrides.caps || {}) }),
+        validateBankAccount: validateBankAccountFn,
         initiateBankTransfer: overrides.initiate || jest.fn(async () => {
             throw new Error('initiateBankTransfer MUST NOT be called when revalidation does not confirm');
         }),
@@ -135,7 +147,7 @@ if (hasDb) {
         const validated = [];
         const p = port(async (args) => {
             validated.push(args);
-            return { status: 'OK', accountNumber: ACCOUNT, bankCode: BANK_CODE, accountName: ACCOUNT_NAME, providerRef: 'MP-V1' };
+            return OK(ACCOUNT, BANK_CODE, ACCOUNT_NAME);
         }, {
             initiate: jest.fn(async () => ({
                 provider: 'MOOLRE_DISBURSEMENT', rail: 'BANK', referenceId: reference, externalId: reference,
@@ -164,7 +176,7 @@ if (hasDb) {
     test('a definitive ACCOUNT_NOT_FOUND refunds pre-dispatch and never posts a transfer', async () => {
         const { user, reference, facts, bank } = await acceptedBankPayout();
         const before = await prisma.user.findUnique({ where: { id: user.id }, select: { nativeGhsBalance: true } });
-        const p = port(async () => ({ status: 'ACCOUNT_NOT_FOUND' }));
+        const p = port(async () => { throw definitiveNotFound(); });
 
         const out = await svc.dispatchNaturalGhsBankWithdrawal(prisma, {
             reference, amountGhsExact: facts.recipientGhsExact, bank, port: p,
@@ -190,7 +202,7 @@ if (hasDb) {
 
     test('a response for a DIFFERENT bank code is refused and refunded as a definitive negative', async () => {
         const { reference, facts, bank } = await acceptedBankPayout();
-        const p = port(async () => ({ status: 'OK', accountNumber: ACCOUNT, bankCode: 'ECO', accountName: ACCOUNT_NAME }));
+        const p = port(async () => OK(ACCOUNT, 'ECO', ACCOUNT_NAME));
         const out = await svc.dispatchNaturalGhsBankWithdrawal(prisma, {
             reference, amountGhsExact: facts.recipientGhsExact, bank, port: p,
         });
@@ -200,29 +212,36 @@ if (hasDb) {
         expect((await state(reference)).th.status).toBe('FAILED');
     });
 
-    test('a response for a DIFFERENT account is inconclusive: held, never dispatched, never refunded', async () => {
+    test('Moolre does not echo the account number, so the binding is the REQUEST we made', async () => {
         const { reference, facts, bank } = await acceptedBankPayout();
-        const p = port(async () => ({ status: 'OK', accountNumber: '9999999999999', bankCode: BANK_CODE, accountName: ACCOUNT_NAME }));
+        // The documented provider response carries the holder NAME; there is no
+        // account-number echo to compare. The binding is therefore the enquiry
+        // request: it must carry the exact stored account + bank code.
+        const seen = [];
+        const p = port(async (args) => {
+            seen.push(args);
+            return { valid: true, accountName: ACCOUNT_NAME, bankCode: BANK_CODE, provider: 'MOOLRE', validatedAt: new Date().toISOString() };
+        }, {
+            initiate: jest.fn(async () => ({
+                provider: 'MOOLRE_DISBURSEMENT', rail: 'BANK', referenceId: reference, externalId: reference,
+                providerRef: 'MP-2', status: 'PENDING', amountGhsExact: facts.recipientGhsExact,
+            })),
+        });
         const out = await svc.dispatchNaturalGhsBankWithdrawal(prisma, {
             reference, amountGhsExact: facts.recipientGhsExact, bank, port: p,
         });
-        expect(out.dispatched).toBe(false);
-        expect(out.reason).toBe('BANK_PROVIDER_REVALIDATION_INCONCLUSIVE');
-        expect(out.disposition).toBe('HELD_FOR_REVIEW');
-        expect(out.refunded).toBe(false);
-        expect(coins(p)).not.toHaveBeenCalled();
-        const { th, reservation } = await state(reference);
-        expect(th.status).toBe('PENDING');
-        expect(reservation.status).toBe('RESERVED');
-        expect(th.metadata.bankPreDispatchRefusal.code).toBe('BANK_PROVIDER_REVALIDATION_INCONCLUSIVE');
-        // the underlying cause is retained, so an operator can tell a wrong
-        // account echo from a provider timeout
-        expect(th.metadata.bankPreDispatchRefusal.errorCode).toBe('VALIDATION_ACCOUNT_ECHO_MISSING_OR_DIFFERENT');
+        expect(out.dispatched).toBe(true);
+        expect(seen).toEqual([{ accountNumber: ACCOUNT, bankCode: BANK_CODE }]);
+        // no fabricated echo is persisted as provider evidence
+        const th = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+        expect(th.metadata.dispatch.providerValidatedAccountName).toBe(ACCOUNT_NAME);
+        expect(th.metadata.dispatch.providerValidatedBankCode).toBe(BANK_CODE);
+        expect(th.metadata.dispatch.providerEchoedAccountNumber).toBeUndefined();
     });
 
     test('a DIFFERENT account name is held for review, never dispatched', async () => {
         const { reference, facts, bank } = await acceptedBankPayout();
-        const p = port(async () => ({ status: 'OK', accountNumber: ACCOUNT, bankCode: BANK_CODE, accountName: 'Kofi Boateng' }));
+        const p = port(async () => OK(ACCOUNT, BANK_CODE, 'Kofi Boateng'));
         const out = await svc.dispatchNaturalGhsBankWithdrawal(prisma, {
             reference, amountGhsExact: facts.recipientGhsExact, bank, port: p,
         });
@@ -252,7 +271,7 @@ if (hasDb) {
 
     test('a malformed validation answer is inconclusive: held, no transfer', async () => {
         const { reference, facts, bank } = await acceptedBankPayout();
-        for (const answer of [null, 'OK', {}, { status: 'OK' }, { status: 'OK', accountNumber: ACCOUNT, bankCode: BANK_CODE }]) {
+        for (const answer of [null, 'OK', {}, { valid: true }, { valid: true, bankCode: BANK_CODE }, { valid: true, accountName: ACCOUNT_NAME }, { valid: false }, { valid: true, accountName: ACCOUNT_NAME, bankCode: BANK_CODE, provider: 'SOMEONE_ELSE' }, { valid: true, accountName: ACCOUNT_NAME, bankCode: BANK_CODE, provider: 'MOOLRE', validatedAt: 'not-a-date' }]) {
             const p = port(async () => answer);
             const out = await svc.dispatchNaturalGhsBankWithdrawal(prisma, {
                 reference, amountGhsExact: facts.recipientGhsExact, bank, port: p,
@@ -264,9 +283,10 @@ if (hasDb) {
 
     test('a rail with NO enquiry capability keeps the BANK rail unavailable', async () => {
         const { reference, facts, bank } = await acceptedBankPayout();
-        const withoutCapability = { capabilities: () => ({ canInitiateBankPayout: true }), validateAccount: async () => null, initiateBankTransfer: jest.fn() };
-        const throwingCapability = { capabilities: () => { throw new Error('boom'); }, validateAccount: async () => null, initiateBankTransfer: jest.fn() };
-        const withoutMethod = { capabilities: () => ({ canInitiateBankPayout: true, canValidateAccount: true }), initiateBankTransfer: jest.fn() };
+        const withoutCapability = { capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: false }), validateBankAccount: async () => null, initiateBankTransfer: jest.fn() };
+        const throwingCapability = { capabilities: () => { throw new Error('boom'); }, validateBankAccount: async () => null, initiateBankTransfer: jest.fn() };
+        const noMethod = { capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true }), initiateBankTransfer: jest.fn() };
+        const withoutMethod = { capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true }), initiateBankTransfer: jest.fn() };
 
         for (const p of [withoutCapability, throwingCapability, withoutMethod]) {
             const out = await svc.dispatchNaturalGhsBankWithdrawal(prisma, {
@@ -285,7 +305,7 @@ if (hasDb) {
 
     test('a beneficiary edited or deleted between acceptance and dispatch is never paid', async () => {
         const { user, reference, facts, bank } = await acceptedBankPayout();
-        const p = port(async () => ({ status: 'OK', accountNumber: ACCOUNT, bankCode: BANK_CODE, accountName: ACCOUNT_NAME }));
+        const p = port(async () => OK(ACCOUNT, BANK_CODE, ACCOUNT_NAME));
         // the saved payee is deleted after acceptance
         await prisma.savedBankBeneficiary.deleteMany({ where: { userId: user.id } });
 
@@ -303,66 +323,8 @@ if (hasDb) {
     });
 
     // ── GHS risk amount: exact decimal boundaries ───────────────────────────
-    describe('GHS risk amount thresholds are exact, not float', () => {
-        const policy = { largeGhs: 5000, hugeGhs: 10000, newAccountMinGhs: 100 };
-        const setPolicy = (p) => { process.env.GHS_RISK_AMOUNT_POLICY = JSON.stringify(p); };
-
-        const gateFor = async (amount, { accountAgeHours = 999 } = {}) => {
-            const fraudService = require('../services/fraudDetectionService');
-            return fraudService.evaluate({
-                userId: riskUser.id,
-                type: 'WITHDRAWAL',
-                asset: 'GHS',
-                amount: Number(amount),
-                amountExact: String(amount),
-                accountAgeHours,
-                velocityTypes: ['WITHDRAWAL_FIAT'],
-                riskDataMode: 'FAIL_CLOSED',
-                db: prisma,
-            });
-        };
-
-        beforeAll(async () => {
-            setPolicy(policy);
-            riskUser = await seedUser(prisma, { nativeGhsBalance: 0, availableBalance: 0 });
-        });
-        afterAll(() => { process.env.GHS_RISK_AMOUNT_POLICY = '{"largeGhs":1000000,"hugeGhs":2000000,"newAccountMinGhs":900000}'; });
-
-        test.skip('UNVERIFIED: immediately below / at / above largeGhs', async () => {
-            const below = await gateFor('4999.99');
-            const at = await gateFor('5000.00');
-            const above = await gateFor('5000.01');
-            expect(JSON.stringify(below)).not.toContain('GHS_LARGE_WITHDRAWAL');
-            expect(JSON.stringify(at)).toContain('GHS_LARGE_WITHDRAWAL');
-            expect(JSON.stringify(above)).toContain('GHS_LARGE_WITHDRAWAL');
-            expect(JSON.stringify(above)).not.toContain('GHS_HUGE_WITHDRAWAL');
-        });
-
-        test.skip('UNVERIFIED: immediately below / at / above hugeGhs', async () => {
-            const below = await gateFor('9999.99');
-            const at = await gateFor('10000.00');
-            const above = await gateFor('10000.01');
-            expect(JSON.stringify(below)).not.toContain('GHS_HUGE_WITHDRAWAL');
-            expect(JSON.stringify(at)).toContain('GHS_HUGE_WITHDRAWAL');
-            expect(JSON.stringify(above)).toContain('GHS_HUGE_WITHDRAWAL');
-        });
-
-        test.skip('UNVERIFIED: immediately below / at / above newAccountMinGhs for a new account', async () => {
-            const below = await gateFor('100.00', { accountAgeHours: 1 });
-            const above = await gateFor('100.01', { accountAgeHours: 1 });
-            const parse = (d) => JSON.stringify(d);
-            expect(parse(below)).not.toContain('GHS_NEW_ACCOUNT_LARGE_TX');
-            expect(parse(above)).toContain('GHS_NEW_ACCOUNT_LARGE_TX');
-        });
-
-        test.skip('UNVERIFIED: a float-hostile amount cannot be pushed across a threshold by rounding', async () => {
-            // 4999.9950 is not exact pesewas; the exact comparison still reads it
-            // as below 5000, where a float sum of prior cents could tip it over.
-            const d = await gateFor('4999.99');
-            expect(JSON.stringify(d)).not.toContain('GHS_LARGE_WITHDRAWAL');
-            // and the controller states the amount in exact pesewas before the gate
-            expect(typeof svc.toExactPesewa).toBe('function');
-            expect(() => svc.toExactPesewa('100.001')).toThrow();
-        });
-    });
+    // The GHS threshold boundary coverage lives where the DEFECT was: at the
+    // real routes, on both rails — see __tests__/native-ghs-trusted-age-risk.test.js
+    // (pesewa-exact sweeps around largeGhs/hugeGhs/newAccountMinGhs). Nothing
+    // here is skipped: a skipped test would be a claim without evidence.
 });

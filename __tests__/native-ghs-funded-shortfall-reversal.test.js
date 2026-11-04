@@ -396,6 +396,57 @@ if (hasDb) {
     });
 
     // ── 5. injected failures leave NO partial refund ────────────────────────
+    describe('the row-level reversal summary matches the ledger posting', () => {
+        test('metadata.fundingReversal records the SAME facts as the reversal conversion', async () => {
+            const { user, reference } = await acceptMixedPayout();
+            const out = await dispatchDefinitiveFailure(reference);
+            expect(out.reversed).toBe(true);
+
+            const row = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+            const summary = row.metadata.fundingReversal;
+            const posting = await postingOf(`ledger:reversal:withdrawal-ghs-funding:${reference}`);
+            expect(posting).toBeTruthy();
+
+            // 1. the summary names the SAME ledger posting, by its exactly-once key
+            expect(summary.ledgerIdempotencyKey).toBe(posting.idempotencyKey);
+            expect(summary.conversionIdentity).toBe(posting.conversionIdentity);
+            expect(summary.originalFundingIdentity).toBe(`withdrawal-ghs-funding:${reference}`);
+            expect(summary.reversesConversionIdentity).toBe(`withdrawal-ghs-funding:${reference}`);
+            expect(summary.conversionIdentity).not.toBe(summary.reversesConversionIdentity);
+
+            // 2. the exact figures agree with the posting's own metadata
+            expect(summary.shortfallGhs).toBe(posting.metadata.shortfallGhs);
+            expect(summary.shortfallGhs).toBe('30.00');
+            expect(summary.usdcRestoredExact).toBe(posting.metadata.usdcRestoredExact ?? posting.metadata.usdcDebitedExact);
+            expect(summary.rateGhsPerUsdcExact).toBe(String(posting.metadata.rateGhsPerUsdcExact));
+            expect(summary.quoteId).toBe(String(posting.metadata.quoteReference ?? posting.metadata.quoteId ?? summary.quoteId));
+
+            // 3. and with the POSTED LINES, asset by asset
+            const byAccount = (account) => posting.journalEntries.filter((e) => e.account === account)
+                .reduce((acc, e) => ({ debit: acc.debit.plus(e.debit), credit: acc.credit.plus(e.credit) }), { debit: new Prisma.Decimal(0), credit: new Prisma.Decimal(0) });
+            expect(byAccount(`user:${user.id}:liability`).credit.toFixed(8)).toBe(summary.usdcRestoredExact);
+            expect(byAccount('clearing:conversion').debit.toFixed(8)).toBe(summary.usdcRestoredExact);
+            expect(byAccount(`ghs:user:${user.id}:liability`).debit.toFixed(2)).toBe(summary.shortfallGhs);
+            expect(byAccount('fiat:momo:ghs').credit.toFixed(2)).toBe(summary.shortfallGhs);
+
+            // 4. the ORIGINAL funding evidence is untouched by the summary
+            expect(row.metadata.funding.shortfallGhs).toBe('30.00');
+            expect(row.metadata.funding.usdcDebitedExact).toBe('2.40000000');
+        });
+
+        test('a reversal that fails leaves NO summary claiming a refund', async () => {
+            const { reference } = await acceptMixedPayout();
+            injection.target = 'canonical';
+            // the EXTENDED client is what carries the injected failure
+            await expect(svc.reverseNativeGhsWithdrawal(xprisma, { reference, reason: 'cas-loss' }))
+                .rejects.toMatchObject({ code: 'NATIVE_GHS_REVERSAL_RACED' });
+            const row = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+            expect(row.metadata.fundingReversal).toBeUndefined();
+            expect(row.metadata.nativeGhsWithdrawalReversal).toBeUndefined();
+            expect(row.status).toBe('PENDING');
+        });
+    });
+
     describe('injected failures roll the whole boundary back', () => {
         async function expectNoPartial(user, reference) {
             const b = await balancesOf(user.id);

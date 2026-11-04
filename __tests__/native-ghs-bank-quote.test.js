@@ -90,9 +90,9 @@ if (hasDb) {
             validateBankAccount: jest.fn(async () => (verified
                 ? { valid: true, accountName: 'AMA MENSAH' }
                 : { valid: false })),
-            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
+            capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true, mode: 'sandbox' }),
             initiateBankTransfer: jest.fn(async () => ({ status: 'PENDING', externalId: 'ext-1', providerRef: 'MUL-1' })),
-            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
+            capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true, mode: 'sandbox' }),
             getBankTransferStatus: jest.fn(async () => ({ status: 'PENDING' })),
         };
     }

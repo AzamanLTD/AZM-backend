@@ -108,7 +108,7 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
 
         await prisma.savedBankBeneficiary.update({ where: { id: bene.id }, data: { status: 'DELETED' } });
 
-        const port = { capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }), initiateBankTransfer: jest.fn() };
+        const port = { capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true, mode: 'sandbox' }), initiateBankTransfer: jest.fn() };
         const out = await svc.dispatchNaturalGhsBankWithdrawal(prisma, {
             reference,
             amountGhsExact: facts.recipientGhsExact,
@@ -140,7 +140,7 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
 
         // And the operator-facing listing surfaces that reason.
         const admin = await seedUser(prisma, { role: 'ADMIN' });
-        const app = buildApp({ capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }), initiateBankTransfer: jest.fn() });
+        const app = buildApp({ capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true, mode: 'sandbox' }), initiateBankTransfer: jest.fn() });
         const list = await request(app)
             .get('/api/admin/payouts/needs-review')
             .set('Authorization', `Bearer ${tokenFor(admin)}`);
@@ -168,7 +168,7 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
         });
 
         const admin = await seedUser(prisma, { role: 'ADMIN' });
-        const app = buildApp({ capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }), initiateBankTransfer: jest.fn() });
+        const app = buildApp({ capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true, mode: 'sandbox' }), initiateBankTransfer: jest.fn() });
         const res = await request(app)
             .post(`/api/admin/withdrawals/${mirror.id}/resolve-review`)
             .set('Authorization', `Bearer ${tokenFor(admin)}`)
@@ -205,7 +205,7 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
         );
 
         const admin = await seedUser(prisma, { role: 'ADMIN' });
-        const app = buildApp({ capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }), initiateBankTransfer: jest.fn() });
+        const app = buildApp({ capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true, mode: 'sandbox' }), initiateBankTransfer: jest.fn() });
         const list = await request(app)
             .get('/api/admin/payouts/needs-review')
             .set('Authorization', `Bearer ${tokenFor(admin)}`);
@@ -231,7 +231,7 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
         expect(new Prisma.Decimal(before.nativeGhsBalance).toFixed(2)).toBe('420.00');
 
         const admin = await seedUser(prisma, { role: 'ADMIN' });
-        const app = buildApp({ capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }), initiateBankTransfer: jest.fn() });
+        const app = buildApp({ capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true, mode: 'sandbox' }), initiateBankTransfer: jest.fn() });
         const res = await request(app)
             .post(`/api/admin/withdrawals/${mirror.id}/resolve-review`)
             .set('Authorization', `Bearer ${tokenFor(admin)}`)

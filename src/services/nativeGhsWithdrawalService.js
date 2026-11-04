@@ -42,6 +42,9 @@ const DISPATCH_PROVIDER = 'MOOLRE_DISBURSEMENT';
 const DISPATCH_RAIL = 'MOMO';
 const LEDGER_KEY_PREFIX = 'ledger:wallet:withdrawal-ghs:';
 const FUNDING_LEDGER_KEY_PREFIX = 'ledger:wallet:withdrawal-ghs-funding:';
+// The conversion identity of the ORIGINAL funding posting. It is immutable and
+// the reversal must never reuse it (the ledger is unique on conversionIdentity).
+const FUNDING_CONVERSION_PREFIX = 'withdrawal-ghs-funding:';
 const REVERSAL_KEY_PREFIX = 'ledger:reversal:withdrawal-ghs:';
 const FUNDING_REVERSAL_KEY_PREFIX = 'ledger:reversal:withdrawal-ghs-funding:';
 // The reversal is its OWN exchange, not a replay of the funding: the ledger
@@ -361,7 +364,7 @@ async function processNativeGhsWithdrawal(prisma, userId, args, opts = {}) {
         reference,
         relatedEntity: 'transactionHistory',
         conversion: {
-          identity: `withdrawal-ghs-funding:${reference}`,
+          identity: FUNDING_CONVERSION_PREFIX + String(reference),
           rate,
           quoteReference: String(quoteId),
         },
@@ -382,6 +385,10 @@ async function processNativeGhsWithdrawal(prisma, userId, args, opts = {}) {
       });
       funding = {
         mode: 'USDC_SHORTFALL_FUNDED',
+        // The identity of the posting this evidence describes. Recorded, not
+        // inferred later: the reversal has to prove WHICH conversion it inverts.
+        conversionIdentity: FUNDING_CONVERSION_PREFIX + String(reference),
+        ledgerIdempotencyKey: FUNDING_LEDGER_KEY_PREFIX + String(reference),
         quoteId: String(quoteId),
         shortfallGhs: shortfallGhs.toFixed(2),
         usdcDebitedExact: usdcDebit.toFixed(8),
@@ -949,88 +956,134 @@ async function recordBankDispatchPark(prisma, {
  * we refuse rather than dispatch on the strength of the earlier timestamp.
  */
 function bankRevalidationCapability(port) {
-  if (!port || typeof port.capabilities !== 'function' || typeof port.validateAccount !== 'function') {
+  // AGENT B'S PUBLISHED ADAPTER CONTRACT (#391 @ 31a81cf):
+  //   capabilities().canValidateBankAccount === true
+  //   validateBankAccount({ accountNumber, bankCode })
+  // Anything else — a missing method, a missing capability, a throwing
+  // capabilities() — means this rail cannot PROVE the destination is still
+  // valid, so it must not dispatch.
+  if (!port || typeof port.capabilities !== 'function' || typeof port.validateBankAccount !== 'function') {
     return false;
   }
   try {
-    return port.capabilities()?.canValidateAccount === true;
+    return port.capabilities()?.canValidateBankAccount === true;
   } catch (_) {
     return false;
   }
 }
 
+const EXPECTED_VALIDATION_PROVIDER = 'MOOLRE';
+
 /**
- * One provider enquiry, bound to the STORED destination. Nothing here is taken
- * from the client and no requested amount is substituted for provider evidence.
+ * One provider enquiry, bound to the SERVER-STORED destination.
  *
- * Returns { decision, accountName, providerValidatedAt, error }:
- *   CONFIRMED   — provider returned the SAME account number and bank code.
- *   NEGATIVE    — provider proves the account does not exist / does not match.
- *   NAME_MISMATCH — same number, DIFFERENT account name than the accepted
- *                 evidence: never dispatched, a human decides.
- *   INCONCLUSIVE — unavailable, malformed or unreadable answer.
+ * The stored beneficiary fingerprint and bank code establish WHICH account was
+ * supplied to the provider. Moolre's documented validation response returns the
+ * holder NAME; it does not echo the account number, so no account-number echo is
+ * invented or expected here — the binding is the request we made.
+ *
+ * Returns { decision, accountName, providerValidatedAt, provider, error }:
+ *   CONFIRMED     — provider answered valid:true for this exact request.
+ *   NEGATIVE      — the adapter PROVED the account does not exist.
+ *   NAME_MISMATCH — a different holder name than the accepted evidence.
+ *   INCONCLUSIVE  — unavailable, timeout, malformed, unknown provider.
  */
 async function enquiryBankDestination(port, { accountNumber, bankCode, expectedAccountName }) {
+  if (typeof port?.validateBankAccount !== 'function') {
+    return { decision: 'INCONCLUSIVE', error: { code: 'VALIDATION_METHOD_UNAVAILABLE' } };
+  }
   let raw;
   try {
-    raw = await port.validateAccount({ accountNumber, bankCode });
+    raw = await port.validateBankAccount({ accountNumber, bankCode });
   } catch (err) {
+    // A DOCUMENTED account-not-found is a definitive pre-dispatch negative only
+    // when the adapter proves it refused a real enquiry: typed outcome, its own
+    // code, and the "nothing was dispatched" evidence. Everything else — a
+    // timeout, AVD05 provider-unavailable, an untyped throw — stays inconclusive.
+    // The real #391 adapter (@31a81cf) proves it refused a real enquiry with
+    // the typed triple below. It passes `refusalDocumented` into its error
+    // constructor but never assigns it to the instance, so requiring it here
+    // would make every genuine AVD02 answer look inconclusive — a strictly
+    // worse outcome (funds held forever) than the documented refusal it is.
+    const providerFamily = String(err?.provider || '');
+    const definitive =
+      err?.outcome === 'DEFINITIVE_REJECTION'
+      && err?.code === 'ACCOUNT_NOT_FOUND'
+      && err?.dispatchProven === true
+      && (providerFamily === '' || /^MOOLRE/i.test(providerFamily));
+    if (definitive) {
+      return {
+        decision: 'NEGATIVE',
+        error: {
+          code: 'PROVIDER_ACCOUNT_NOT_FOUND',
+          provider: err?.provider ?? null,
+          outcome: err?.outcome ?? null,
+          dispatchProven: err?.dispatchProven === true,
+          providerCode: err?.providerCode ?? null,
+        },
+        providerStatusRaw: 'ACCOUNT_NOT_FOUND',
+      };
+    }
     return {
       decision: 'INCONCLUSIVE',
-      error: { code: err?.code || err?.name || 'VALIDATION_FAILED', message: String(err?.message || '').slice(0, 200) },
+      error: {
+        code: err?.code || err?.name || 'VALIDATION_FAILED',
+        provider: err?.provider ?? null,
+        outcome: err?.outcome ?? null,
+        message: String(err?.message || '').slice(0, 200),
+      },
     };
   }
   if (!raw || typeof raw !== 'object') {
     return { decision: 'INCONCLUSIVE', error: { code: 'VALIDATION_RESPONSE_MALFORMED' } };
   }
-  const status = typeof raw.status === 'string' ? raw.status.toUpperCase() : null;
-  if (status === 'NOT_FOUND' || status === 'ACCOUNT_NOT_FOUND') {
-    return { decision: 'NEGATIVE', error: { code: 'PROVIDER_ACCOUNT_NOT_FOUND' }, providerStatusRaw: status };
-  }
-  if (status === 'ACCOUNT_MISMATCH' || status === 'MISMATCH') {
-    return { decision: 'NEGATIVE', error: { code: 'PROVIDER_ACCOUNT_MISMATCH' }, providerStatusRaw: status };
-  }
-  const echoedNumber = raw.accountNumber == null ? null : String(raw.accountNumber).replace(/\D/g, '');
-  const echoedBank = raw.bankCode == null ? null : String(raw.bankCode).trim();
-  // A response for a DIFFERENT account or bank is not evidence about this one.
-  if (!echoedNumber || echoedNumber !== String(accountNumber).replace(/\D/g, '')) {
+  if (raw.valid !== true) {
+    // valid:false without a documented refusal is not proof of anything.
     return {
       decision: 'INCONCLUSIVE',
-      error: { code: 'VALIDATION_ACCOUNT_ECHO_MISSING_OR_DIFFERENT' },
-      echoedAccountNumber: echoedNumber,
-      providerStatusRaw: status,
+      error: { code: 'VALIDATION_NOT_AFFIRMATIVE', valid: raw.valid ?? null },
+      providerStatusRaw: raw.valid === false ? 'NOT_VALID' : null,
     };
   }
+  const accountName = raw.accountName == null ? '' : String(raw.accountName).trim();
+  if (!accountName) {
+    return { decision: 'INCONCLUSIVE', error: { code: 'VALIDATION_NAME_MISSING' } };
+  }
+  // The configured provider only ever confirmed THIS bank: a response naming a
+  // different bank code is not evidence about the destination being paid.
+  const echoedBank = raw.bankCode == null ? null : String(raw.bankCode).trim();
   if (!echoedBank || echoedBank !== String(bankCode).trim()) {
     return {
       decision: 'NEGATIVE',
       error: { code: 'PROVIDER_BANK_CODE_MISMATCH' },
       echoedBankCode: echoedBank,
-      providerStatusRaw: status,
     };
   }
-  const accountName = raw.accountName == null ? null : String(raw.accountName).trim();
-  if (!accountName) {
-    return { decision: 'INCONCLUSIVE', error: { code: 'VALIDATION_ACCOUNT_NAME_MISSING' }, providerStatusRaw: status };
+  const provider = raw.provider == null ? null : String(raw.provider).trim().toUpperCase();
+  if (provider !== EXPECTED_VALIDATION_PROVIDER) {
+    return { decision: 'INCONCLUSIVE', error: { code: 'VALIDATION_PROVIDER_UNEXPECTED', provider } };
+  }
+  const validatedAt = raw.validatedAt == null ? null : new Date(raw.validatedAt);
+  if (!validatedAt || Number.isNaN(validatedAt.getTime())) {
+    return { decision: 'INCONCLUSIVE', error: { code: 'VALIDATION_TIMESTAMP_INVALID' } };
   }
   if (expectedAccountName && accountName.toUpperCase() !== String(expectedAccountName).trim().toUpperCase()) {
     return {
       decision: 'NAME_MISMATCH',
       accountName,
-      expectedAccountName,
-      providerStatusRaw: status,
-      providerValidatedAt: raw.validatedAt ? new Date(raw.validatedAt) : new Date(),
+      providerValidatedAt: validatedAt.toISOString(),
+      provider,
+      error: { code: 'PROVIDER_ACCOUNT_NAME_CHANGED', acceptedAccountName: expectedAccountName },
     };
   }
   return {
     decision: 'CONFIRMED',
     accountName,
-    providerStatusRaw: status,
-    providerRef: raw.providerRef ?? null,
-    providerValidatedAt: raw.validatedAt ? new Date(raw.validatedAt) : new Date(),
+    providerValidatedAt: validatedAt.toISOString(),
+    provider,
+    providerStatusRaw: 'VALID',
   };
 }
-
 
 /**
  * Durable pre-dispatch refusal evidence: a park that names itself as
@@ -1214,7 +1267,8 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
     bankCode: bank.bankCode,
     expectedAccountName: bank.accountName || bank.verifiedName || null,
   });
-  const enquiryAt = enquiry.providerValidatedAt || new Date();
+  // providerValidatedAt is the adapter's ISO string; normalise it to a Date once.
+  const enquiryAt = enquiry.providerValidatedAt ? new Date(enquiry.providerValidatedAt) : new Date();
   if (enquiry.decision !== 'CONFIRMED') {
     // NOT a provider payout outcome: nothing was sent. A DEFINITIVE negative
     // (no such account / different bank) is safe to refund through the same
@@ -1673,7 +1727,7 @@ async function _reverseNativeGhsWithdrawalTx(prisma, { reference, reason, allowe
     const recordedFunding = row.metadata?.funding;
     if (recordedFunding) {
       const evidence = readFundingReversalEvidence(recordedFunding, { refundGhs });
-      const originalConversionIdentity = `withdrawal-ghs-funding:${reference}`;
+      const originalConversionIdentity = FUNDING_CONVERSION_PREFIX + String(reference);
       const reversalConversionIdentity = `${FUNDING_REVERSAL_CONVERSION_PREFIX}${reference}`;
 
       // 1. The customer's exact USDC debit comes back, at ledger precision.
@@ -1745,6 +1799,7 @@ async function _reverseNativeGhsWithdrawalTx(prisma, { reference, reason, allowe
       }
 
       fundingReversal = {
+        ledgerIdempotencyKey: `${FUNDING_REVERSAL_KEY_PREFIX}${reference}`,
         shortfallGhs: evidence.shortfall.toFixed(2),
         usdcRestoredExact: evidence.usdc.toFixed(8),
         rateGhsPerUsdcExact: evidence.rate.toFixed(8),
@@ -1759,6 +1814,36 @@ async function _reverseNativeGhsWithdrawalTx(prisma, { reference, reason, allowe
     // reversal rolls back and the withdrawal stays held for reconciliation
     // instead of reporting a refund the float never reflected.
     await fiatLiquidity.releaseReservation(tx, { reference, reason: String(reason ?? 'definitive_failure') });
+
+    // §WS5 REVERSAL EVIDENCE ON THE ROW ITSELF. The ledger posting is the
+    // accounting authority; this is the operator-facing summary of the SAME
+    // facts, written in the SAME transaction, so a rolled-back reversal can
+    // never leave a summary claiming a refund that did not happen. It is
+    // additive: the original funding evidence under `funding` is never touched.
+    await tx.$executeRawUnsafe(
+      'UPDATE "TransactionHistory" SET "metadata" = COALESCE("metadata", \'{}\'::jsonb) || jsonb_build_object($2::text, $3::jsonb) WHERE "id" = $1',
+      row.id,
+      'fundingReversal',
+      JSON.stringify({
+        reversedAt: new Date().toISOString(),
+        reason: String(reason ?? 'definitive_failure'),
+        refundGhs: refundGhs ? refundGhs.toFixed(2) : null,
+        // FLAT, not nested: an operator reading the row should not have to
+        // know the summary sits inside a key of the same name.
+        ledgerIdempotencyKey: fundingReversal?.ledgerIdempotencyKey ?? null,
+        shortfallGhs: fundingReversal?.shortfallGhs ?? null,
+        usdcRestoredExact: fundingReversal?.usdcRestoredExact ?? null,
+        rateGhsPerUsdcExact: fundingReversal?.rateGhsPerUsdcExact ?? null,
+        quoteId: fundingReversal?.quoteId ?? null,
+        conversionIdentity: fundingReversal?.conversionIdentity ?? null,
+        reversesConversionIdentity: fundingReversal?.reversesConversionIdentity ?? null,
+        // the SAME destination the payout was bound to (never a client value)
+        destinationFingerprint: row.metadata?.bankDestinationSnapshot?.fingerprint
+          ?? row.metadata?.momoDestinationSnapshot?.fingerprint
+          ?? null,
+        originalFundingIdentity: row.metadata?.funding?.conversionIdentity ?? null,
+      })
+    );
 
     // Compare-and-set on the way out as well: if the payout moved on between
     // the read above and here (a concurrent settle), the whole reversal rolls
@@ -1854,6 +1939,10 @@ module.exports = {
   reverseNativeGhsWithdrawal,
   // exported for consumer-side contract tests (§7 provider echo binding)
   evaluateBankDispatchObservation,
+  // exported so the #391 adapter can be driven through THIS branch's
+  // pre-dispatch validation mapping without a route or a database
+  enquiryBankDestination,
+  bankRevalidationCapability,
   bankRevalidationCapability,
   enquiryBankDestination,
   reconcileNativeGhsWithdrawals,

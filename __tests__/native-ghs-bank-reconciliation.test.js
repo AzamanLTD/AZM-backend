@@ -98,9 +98,9 @@ maybe('BANK payouts reconcile on the BANK rail (real PostgreSQL)', () => {
             amountGhsExact: facts.recipientGhsExact,
             bank,
             port: {
-                capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
+                capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true, mode: 'sandbox' }),
                 initiateBankTransfer: async () => ({
-                capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
+                capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true, mode: 'sandbox' }),
                     provider: 'MOOLRE_DISBURSEMENT',
                     rail: 'BANK',
                     referenceId: reference,

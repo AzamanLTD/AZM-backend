@@ -2076,7 +2076,8 @@ exports.ghsWithdrawal = async (req, res) => {
             asset: 'GHS',
             destination: target.destination,
             rail: 'MOMO',
-            accountAgeHours: payoutRiskGate.accountAgeHoursOf(req.user),
+            // No account age is passed: the gate reads User.createdAt from the
+            // database, so a JWT without createdAt cannot skip the rule.
             channel: 'NATIVE_GHS_MOMO',
             db: prisma,
         });
@@ -2229,11 +2230,20 @@ exports.ghsWithdrawal = async (req, res) => {
 // PROVEN is unavailable. Refusing here costs the customer a retry; refusing
 // later costs them their money.
 function bankPayoutIsAvailable(port) {
-    if (!port || typeof port.capabilities !== 'function' || typeof port.initiateBankTransfer !== 'function') {
+    // BOTH capabilities, at BOTH entry points. The rail cannot pay a destination
+    // it is unable to re-validate immediately before the transfer, so a port
+    // that can initiate but cannot validate is NOT available: accepting its
+    // quote would reserve customer funds for a payout the dispatcher must then
+    // refuse.
+    if (!port
+        || typeof port.capabilities !== 'function'
+        || typeof port.initiateBankTransfer !== 'function'
+        || typeof port.validateBankAccount !== 'function') {
         return false;
     }
     try {
-        return port.capabilities()?.canInitiateBankPayout === true;
+        const caps = port.capabilities();
+        return caps?.canInitiateBankPayout === true && caps?.canValidateBankAccount === true;
     } catch (_) {
         return false;
     }
@@ -2272,13 +2282,28 @@ exports.bankWithdrawal = async (req, res) => {
         // gate flips any state, before the balance debit, before the quote is
         // consumed and before the reservation. The payee identity is passed as
         // masked context only — never a full account number.
+        // Exact pesewas, from the SAME validator the MoMo rail uses. Passing
+        // Number(amountGhs) here let a GHS threshold be decided by float
+        // rounding, and the two rails must not disagree about the amount.
+        let bankRiskAmountExact;
+        try {
+            bankRiskAmountExact = nativeGhsWithdrawalService.toExactPesewa(req.body.amountGhs).toFixed(2);
+        } catch (exactError) {
+            res.locals.financialClaimRelease = true;
+            return res.status(422).json({
+                success: false,
+                code: exactError.code || 'GHS_AMOUNT_NOT_EXACT_PESEWAS',
+                message: exactError.message || 'The amount must be an exact two-decimal GHS amount.',
+            });
+        }
         const risk = await payoutRiskGate.evaluatePayoutRisk({
             userId,
-            amount: Number(req.body.amountGhs),
+            amount: bankRiskAmountExact,
             asset: 'GHS',
             destination: bank.accountNumberMasked,
             rail: 'BANK',
-            accountAgeHours: payoutRiskGate.accountAgeHoursOf(req.user),
+            // No account age is passed: the gate reads User.createdAt from the
+            // database. A token claim or client value would be a bypass.
             channel: 'NATIVE_GHS_BANK',
             db: prisma,
         });

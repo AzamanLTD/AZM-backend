@@ -86,7 +86,7 @@ maybe('saved bank beneficiaries + BANK payout (real PostgreSQL)', () => {
     // proven in bank-beneficiary-validation.test.js.
     const providerSurface = () => ({
         // a port must PROVE it can pay out, not merely expose the method
-        capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
+        capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true, mode: 'sandbox' }),
         listBanks: async () => ({ banks: [{ code: 'GCB', name: 'GCB Bank' }], stale: false, source: 'MOOLRE' }),
         validateBankAccount: async ({ accountNumber, bankCode }) => ({
             valid: true, accountName: 'AMA MENSAH', bankCode,
