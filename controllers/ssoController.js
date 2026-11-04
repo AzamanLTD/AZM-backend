@@ -15,12 +15,9 @@
 const logger = require('../src/config/logger');
 const { issueTokenPair } = require('../services/authTokenService');
 
-// Phase K hardening: when no Firebase Admin is initialised, the dev
-// fallback decodes the JWT WITHOUT verifying the signature. That's a
-// massive security hole if it ever leaks into a non-dev deployment, so
-// we gate it behind an explicit env flag AND require an aud match. The
-// flag is OFF by default — production must initialise Firebase Admin.
-const SSO_DEV_FALLBACK = process.env.SSO_DEV_FALLBACK === '1';
+// Optional extra audience pin for multi-tenant deployments. Firebase Admin
+// already enforces that `aud` equals the initialised project id; this only
+// adds a second comparison when explicitly configured.
 const SSO_EXPECTED_AUD = process.env.FIREBASE_PROJECT_ID || process.env.SSO_EXPECTED_AUD || '';
 
 /**
@@ -60,78 +57,33 @@ exports.ssoLogin = async (req, res) => {
             // crashed on v14 reading `.length` of undefined).
             const { getApps } = require('firebase-admin/app');
             const { getAuth } = require('firebase-admin/auth');
-            // Firebase Admin should be initialized once at server startup
-            // If not initialized, skip verification in dev mode
+            // Firebase Admin is the ONLY authority for SSO identity. There is
+            // deliberately no fallback: if it is not initialised this route
+            // refuses in every environment, because accepting a decoded but
+            // unsigned token is an authentication bypass, not a dev
+            // convenience. Local development without credentials gets the
+            // same fail-closed answer.
             if (getApps().length === 0) {
-                // Phase K: this fallback used to silently decode the JWT
-                // WITHOUT verifying the signature, which is fine for a
-                // local dev box but a critical hole if the env-flag
-                // lands in production. Now gated behind an explicit
-                // SSO_DEV_FALLBACK=1 env flag, AND we still verify the
-                // `aud` claim against FIREBASE_PROJECT_ID so a token
-                // minted for a different Firebase project can't be
-                // replayed against this backend.
-                if (process.env.NODE_ENV === 'production' || !SSO_DEV_FALLBACK) {
-                    return res.status(503).json({
-                        success: false,
-                        message: 'Firebase Admin not initialized. SSO unavailable.'
-                    });
-                }
-                // Phase K hardening: dev fallback ALSO refuses when no
-                // expected audience is configured. Without that guard,
-                // a non-prod env with SSO_DEV_FALLBACK=1 would accept
-                // any unsigned JWT with a valid email — turning the dev
-                // path into an unauthenticated identity oracle.
-                if (!SSO_EXPECTED_AUD) {
-                    logger.error(
-                        '[SSO][dev-fallback] refused: SSO_DEV_FALLBACK=1 ' +
-                        'but no SSO_EXPECTED_AUD or FIREBASE_PROJECT_ID set.'
-                    );
-                    return res.status(503).json({
-                        success: false,
-                        message: 'SSO dev-fallback misconfigured (no aud).'
-                    });
-                }
-                const parts = idToken.split('.');
-                if (parts.length === 3) {
-                    decodedToken = JSON.parse(Buffer.from(parts[1], 'base64').toString());
-                } else {
-                    return res.status(401).json({ success: false, message: 'Invalid token format.' });
-                }
-                // Audience check on the dev path. The SSO_EXPECTED_AUD
-                // guard above already proves it's set; this is the
-                // actual comparison.
-                if (decodedToken.aud !== SSO_EXPECTED_AUD) {
-                    logger.error('[SSO][dev-fallback] aud mismatch:', decodedToken.aud);
-                    return res.status(401).json({
-                        success: false,
-                        message: 'Invalid audience on ID token.'
-                    });
-                }
-                // Expiry check — the SDK does this for us in production,
-                // but the dev fallback has to do it manually.
-                if (decodedToken.exp && decodedToken.exp * 1000 < Date.now()) {
-                    return res.status(401).json({
-                        success: false,
-                        message: 'ID token has expired.'
-                    });
-                }
-            } else {
-                // Production path. verifyIdToken in firebase-admin already
-                // checks signature, expiry, AND aud (it must equal the
-                // initialised project id), so we get all three for free.
-                decodedToken = await getAuth().verifyIdToken(idToken);
-                // Defence-in-depth: if SSO_EXPECTED_AUD is configured,
-                // double-check it. The SDK's check is project-scoped
-                // already, so this is mostly a belt-and-braces on
-                // multi-tenant configs.
-                if (SSO_EXPECTED_AUD && decodedToken.aud !== SSO_EXPECTED_AUD) {
-                    logger.error('[SSO] aud mismatch (post-verify):', decodedToken.aud);
-                    return res.status(401).json({
-                        success: false,
-                        message: 'Invalid audience on ID token.'
-                    });
-                }
+                logger.error('[SSO] refused: Firebase Admin is not initialised.');
+                return res.status(503).json({
+                    success: false,
+                    message: 'Firebase Admin not initialized. SSO unavailable.'
+                });
+            }
+
+            // verifyIdToken already checks signature, expiry, and aud (it must
+            // equal the initialised project id), so we get all three for free.
+            decodedToken = await getAuth().verifyIdToken(idToken);
+            // Defence-in-depth: if SSO_EXPECTED_AUD is configured,
+            // double-check it. The SDK's check is project-scoped
+            // already, so this is mostly a belt-and-braces on
+            // multi-tenant configs.
+            if (SSO_EXPECTED_AUD && decodedToken.aud !== SSO_EXPECTED_AUD) {
+                logger.error('[SSO] aud mismatch (post-verify):', decodedToken.aud);
+                return res.status(401).json({
+                    success: false,
+                    message: 'Invalid audience on ID token.'
+                });
             }
         } catch (verifyError) {
             logger.error({ err: verifyError }, '[SSO] Token verification failed');
