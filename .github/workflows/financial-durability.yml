@@ -153,6 +153,81 @@ jobs:
       - name: Generate Prisma client
         run: npx prisma generate
 
+      - name: 'Guard: the pinned #391 adapter commit must be fetchable'
+        # §392 — the adapter-contract proof reads Agent B's published service
+        # straight out of git at an exact commit. A shallow clone may not hold
+        # that object, and a money-path contract proof that silently skips is
+        # worse than one that fails, so this lane fetches the exact commit and
+        # fails loudly when it cannot.
+        env:
+          ADAPTER_SHA: ea0e580f2d507e242c4b18e62f2a52175f621d8a
+        run: |
+          set -euo pipefail
+          if ! git cat-file -e "${ADAPTER_SHA}:services/moolreBankPayoutService.js" 2>/dev/null; then
+            git fetch --depth=1 origin "${ADAPTER_SHA}" \
+              || git fetch --depth=2 origin refs/pull/391/head
+          fi
+          if ! git cat-file -e "${ADAPTER_SHA}:services/moolreBankPayoutService.js" 2>/dev/null; then
+            echo "::error::The pinned #391 adapter commit ${ADAPTER_SHA} is not available in this clone. The contract proof must not be skipped."
+            exit 1
+          fi
+          echo "Pinned #391 adapter ${ADAPTER_SHA} is present."
+
+      - name: Apply control-plane migration (migration-only tables)
+        # `prisma db push` creates only the models declared in schema.prisma. The
+        # control-plane tables live solely in the 20260828040000 migration, so a
+        # permission-gated admin route answers 403 until it is applied — which
+        # would let a review-queue assertion pass without exercising the
+        # successful response. Idempotent: objects that already exist (or seeds
+        # that already ran) are tolerated; any other error fails the lane.
+        run: |
+          set -o pipefail
+          psql "${TEST_DATABASE_URL%%\?*}" -v ON_ERROR_STOP=0 \
+            -f prisma/migrations/20260828040000_control_plane_staff_access/migration.sql \
+            2>&1 | tee /tmp/control-plane.log
+          if grep -E "ERROR" /tmp/control-plane.log \
+             | grep -vE "42P07|42710|42P06|42701|23505|42P16|already exists"; then
+            echo "::error::control-plane migration failed with a non-tolerable error."
+            exit 1
+          fi
+          echo "control-plane schema present."
+
+      - name: Native-GHS financial-integrity suites (production commit mode)
+        # §392 — the native-GHS money paths (park/review, pre-dispatch
+        # revalidation, dispatch ownership, reconciliation, reversal atomicity,
+        # shortfall integrity, and the #391 adapter contract) must be proven in
+        # CI, not only locally. Explicit filenames: a glob would silently absorb
+        # or drop a suite as files move.
+        #
+        # ORDER IS DELIBERATE. This step runs BEFORE the settlement battery: a few
+        # of these suites assert absolute GHS liquidity and a freshly provisioned
+        # database is the only honest fixture for that, while their residue is
+        # cleared by the settlement battery's own TRUNCATE cleanup.
+        run: |
+          NG_SUITES=(
+            "__tests__/native-ghs-withdrawal.test.js"
+            "__tests__/native-ghs-wallet.test.js"
+            "__tests__/native-ghs-quote-intent-binding.test.js"
+            "__tests__/native-ghs-bank-quote.test.js"
+            "__tests__/native-ghs-destination-snapshot.test.js"
+            "__tests__/native-ghs-bank-predispatch-revalidation.test.js"
+            "__tests__/native-ghs-bank-adapter-contract.test.js"
+            "__tests__/native-ghs-bank-dispatch-status.test.js"
+            "__tests__/native-ghs-bank-initiation-reconciliation.test.js"
+            "__tests__/native-ghs-bank-reconciliation.test.js"
+            "__tests__/native-ghs-dispatch-outcomes.test.js"
+            "__tests__/native-ghs-reconciliation.test.js"
+            "__tests__/native-ghs-admin-review.test.js"
+            "__tests__/native-ghs-reversal-atomicity.test.js"
+            "__tests__/native-ghs-funded-shortfall-reversal.test.js"
+            "__tests__/native-ghs-shortfall-integrity.test.js"
+            "__tests__/native-ghs-settlement.test.js"
+            "__tests__/native-ghs-risk-gating.test.js"
+            "__tests__/native-ghs-risk-hardening.test.js"
+            "__tests__/native-ghs-trusted-age-risk.test.js"
+          )
+          npx jest --runInBand --forceExit "${NG_SUITES[@]}"
+
       - name: Financial-integrity suites (production commit mode)
         # The explicit settlement/reconciliation/reversal set. Every suite here
         # proves a money-movement invariant that must hold under real commit

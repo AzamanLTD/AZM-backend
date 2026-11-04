@@ -15,10 +15,20 @@
 //      reversal would "refund" zero and still mark the payout failed.)
 // =============================================================================
 
-const hasDb = !!process.env.TEST_DATABASE_URL;
+// The disposable database is an EXPLICIT input, captured before anything else
+// touches the connection. This suite contains a table-wide maintenance statement
+// (the orphan sweep), so "a test URL exists" is not permission to run: the guard
+// in beforeEach re-proves the client is connected to THIS database before the
+// statement is executed, and fails closed otherwise.
+const TEST_DATABASE_URL = String(process.env.TEST_DATABASE_URL || '').trim();
+const hasDb = !!TEST_DATABASE_URL;
 const maybe = hasDb ? describe : describe.skip;
 
 if (hasDb) {
+    // Bind Prisma's own URL to the explicit test URL BEFORE the client is built:
+    // a stray DATABASE_URL pointing at another database must never leak in.
+    process.env.DATABASE_URL = TEST_DATABASE_URL;
+    process.env.NODE_ENV = 'test';
     process.env.BANK_BENEFICIARY_HMAC_KEY = process.env.BANK_BENEFICIARY_HMAC_KEY || 'test-hmac-key-distinct-from-encryption';
     process.env.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || 'a'.repeat(64);
     process.env.BANK_PAYOUT_FEE_GHS = '0';
@@ -36,12 +46,14 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
     let prisma;
     let seedUser;
     let recordReconciliationException;
+    let assertDisposableTestDatabase;
     const JWT_SECRET = process.env.JWT_SECRET || 'test_secret_at_least_32_chars_long_xxxxx';
 
     beforeAll(async () => {
         prisma = new PrismaClient();
         ({ seedUser } = require('./helpers/factories'));
         ({ recordReconciliationException } = require('../services/reconciliationExceptionService'));
+        ({ assertDisposableTestDatabase } = require('./helpers/testDatabaseGuard'));
     });
 
     afterAll(async () => {
@@ -84,6 +96,9 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
     // that belongs to a still-existing payout, so live evidence is preserved.
     beforeEach(async () => {
         if (!prisma) return;
+        // FAIL CLOSED: this UPDATE is table-wide, so it may only run once the
+        // client has PROVED it is on TEST_DATABASE_URL (see helpers/testDatabaseGuard).
+        await assertDisposableTestDatabase(prisma);
         await prisma.$executeRawUnsafe(
             'UPDATE "ReconciliationException" r SET "status" = \'RESOLVED\', "resolvedAt" = now() '
             + 'WHERE r."status" = \'OPEN\' AND r."entityType" = \'WITHDRAWAL\' '
@@ -463,5 +478,54 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
         // The stored rows themselves are untouched: this is display only.
         const legacyStored = await prisma.withdrawal.findUnique({ where: { id: legacy.mirror.id } });
         expect(legacyStored.destination).toBe(LEGACY_BANK_ACCOUNT);
+    });
+    test('§1b the orphan sweep refuses to run unless the target is provably the disposable test database', async () => {
+        const { assertDisposableTestDatabase: guard, databaseNameFromUrl } = require('./helpers/testDatabaseGuard');
+        const TEST_URL = 'postgres://postgres:postgres@localhost:5432/azm_iso?schema=public';
+
+        // A client that reports a database identity and records every statement
+        // it is asked to run, so "refused" can mean "no mutation was executed".
+        function stubClient(reportingDatabase) {
+            const statements = [];
+            return {
+                statements,
+                $queryRawUnsafe: async (sql) => { statements.push(sql); return [{ database: reportingDatabase }]; },
+                $executeRawUnsafe: async (sql) => { statements.push(sql); },
+            };
+        }
+
+        // (a) no explicit test database at all
+        await expect(guard(stubClient('azm_iso'), { testUrl: '', databaseUrl: TEST_URL, nodeEnv: 'test' }))
+            .rejects.toThrow(/TEST_DATABASE_URL is not set/);
+
+        // (b) not the test environment
+        await expect(guard(stubClient('azm_iso'), { testUrl: TEST_URL, databaseUrl: TEST_URL, nodeEnv: 'production' }))
+            .rejects.toThrow(/NODE_ENV is "production", not "test"/);
+
+        // (c) the client was bound somewhere else
+        await expect(guard(stubClient('azm_prod'), {
+            testUrl: TEST_URL,
+            databaseUrl: 'postgres://postgres:postgres@localhost:5432/azm_prod?schema=public',
+            nodeEnv: 'test',
+        })).rejects.toThrow(/is not the explicit test database/);
+
+        // (d) the URL matched but the CONNECTION is a different database
+        const wrongTarget = stubClient('azm_production');
+        await expect(guard(wrongTarget, { testUrl: TEST_URL, databaseUrl: TEST_URL, nodeEnv: 'test' }))
+            .rejects.toThrow(/connected to database "azm_production", but the disposable test database is "azm_iso"/);
+        // and it refused BEFORE any mutation was attempted
+        expect(wrongTarget.statements.filter((sql) => /^\s*UPDATE/i.test(sql))).toHaveLength(0);
+
+        // (e) unreadable target
+        await expect(guard(stubClient('azm_iso'), { testUrl: 'not-a-url', databaseUrl: 'not-a-url', nodeEnv: 'test' }))
+            .rejects.toThrow(/cannot read a database name/);
+        expect(databaseNameFromUrl('postgres://u:p@h:5432/azm_iso?schema=public')).toBe('azm_iso');
+
+        // (f) the positive case, with the same seams, does execute
+        const good = stubClient('azm_iso');
+        await expect(guard(good, { testUrl: TEST_URL, databaseUrl: TEST_URL, nodeEnv: 'test' }))
+            .resolves.toEqual({ database: 'azm_iso' });
+        expect(good.statements).toHaveLength(1);
+        expect(good.statements[0]).toMatch(/current_database\(\)/);
     });
 });
