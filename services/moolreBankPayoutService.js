@@ -78,14 +78,30 @@ const PROVIDER_OUTCOMES = Object.freeze({
 // been transmitted and accepted.
 const PROVABLY_PRE_DISPATCH = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
 
-// Transfer refusal codes, each needing published or written provider evidence.
-// EMPTY until such evidence exists (see the evidence note above).
-const DOCUMENTED_TRANSFER_REFUSALS = new Set([]);
-// Status codes that authoritatively mean "Moolre has no such transfer".
+// ── Provider codes, separated by WHAT THEY PROVE ────────────────────────────
+// Source: docs.moolre.com/ai/guides/errors-and-status-codes.md, retrieved
+// 2026-11-04. The page warns that codes can be returned by more than one
+// operation, so each entry below is read with the transfer endpoint in context.
+
+// APY21 "Insufficient wallet balance" proves Azaman's wallet could not fund the
+// payout, so no payout can exist. That is the only transfer code we treat as a
+// documented refusal.
+const DOCUMENTED_TRANSFER_REFUSALS = new Set(['APY21']);
+// Status codes that authoritatively mean "Moolre has no such transfer". The
+// reference publishes AC03 only for a PAYMENT ID / BANK ACCOUNT status lookup,
+// never for a transfer, so this stays empty.
 const DOCUMENTED_STATUS_NOT_FOUND = new Set([]);
-// Codes that mean the external reference is already in use. Empty for the same
-// reason: the duplicate MESSAGE shape is matched instead, and only ever to
-// refuse a second send, never to assert success.
+// APY18 "External reference is required and must be unique". We never omit the
+// reference, so on a transfer this means Moolre already holds it. We only ever
+// use it to refuse a second send, never to assert success.
+const DOCUMENTED_DUPLICATE_CODES = new Set(['APY18']);
+// Documented transfer codes that do NOT prove whether a payout exists: they are
+// preserved as reasons so reconciliation knows what Moolre said, and they never
+// authorise a reversal.
+const AMBIGUOUS_PAYOUT_CODES = new Map([
+    ['APY17', 'PROVIDER_REPORTED_PAYOUT_FAILED_UNVERIFIED'], // "Pay out Failed"
+    ['OTGH02', 'PROVIDER_REPORTED_IN_PROGRESS'], // "Pay out in Progress"
+]);
 const DUPLICATE_HINT = /(duplicate|already\s*(exists|used|processed)|re-?use[ds]?\s*(of\s*)?(the\s*)?(same\s*)?(external)?\s*ref)/i;
 
 // Azaman-side safety bound, NOT a Moolre rule. Moolre's published references do
@@ -716,7 +732,7 @@ class MoolreBankPayoutService {
 
         // Duplicate reference: Moolre already holds this externalref. One POST
         // happened; the caller must look this reference up, never resend.
-        if (DUPLICATE_HINT.test(String(message))) {
+        if (DOCUMENTED_DUPLICATE_CODES.has(providerCode) || DUPLICATE_HINT.test(String(message))) {
             return this._unresolved(referenceId, { reason: 'DUPLICATE_REFERENCE', providerCode });
         }
 
@@ -734,8 +750,12 @@ class MoolreBankPayoutService {
         const echoedRef = data && typeof data.externalref === 'string' ? data.externalref : null;
 
         if (Number(body.status) !== 1 || !data) {
-            // An explicit refusal we cannot yet prove: stay uncertain unless the
-            // code has published evidence.
+            // Documented codes that name a payout state without proving whether
+            // one exists: keep the fact, stay unresolved, never reverse.
+            if (providerCode && AMBIGUOUS_PAYOUT_CODES.has(providerCode)) {
+                return this._unresolved(referenceId, { reason: AMBIGUOUS_PAYOUT_CODES.get(providerCode), providerCode });
+            }
+            // An explicit refusal we can prove: stay uncertain otherwise.
             if (providerCode && DOCUMENTED_TRANSFER_REFUSALS.has(providerCode)) {
                 throw new MoolreBankPayoutError('Moolre refused the transfer.', {
                     outcome: PROVIDER_OUTCOMES.DEFINITIVE_REJECTION,

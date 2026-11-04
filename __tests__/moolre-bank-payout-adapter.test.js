@@ -1133,3 +1133,56 @@ describe('L. observation handshake with the financial consumer', () => {
         expect(out.amountGhsExact).toBe('25.50');
     });
 });
+
+// ── M. documented provider codes (errors-and-status-codes, 2026-11-04) ──────
+describe('M. documented provider codes', () => {
+    const refused = (code, message) => ({ status: 200, data: { status: 0, code, message } });
+
+    test('APY21 insufficient wallet balance is a documented refusal that proves no payout', async () => {
+        const http = fakeHttp({ transfer: refused('APY21', 'Insufficient wallet balance.') });
+        const err = await rejectOf(
+            service(http).initiateBankTransfer({ ...baseInitiation }),
+            PROVIDER_OUTCOMES.DEFINITIVE_REJECTION,
+            'PROVIDER_REFUSED',
+        );
+        expect(err.providerCode).toBe('APY21');
+        expect(err.refusalDocumented).toBe(true);
+        expect(err.dispatchProven).toBe(true);
+        expect(err.retryable).toBe(false);
+        expect(http.transfers()).toHaveLength(1);
+    });
+
+    test('APY18 duplicate external reference refuses a second send and issues only one POST', async () => {
+        const http = fakeHttp({ transfer: refused('APY18', 'External reference is required and must be unique.') });
+        const out = await service(http).initiateBankTransfer({ ...baseInitiation });
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.reason).toBe('DUPLICATE_REFERENCE');
+        expect(out.referenceId).toBe(REF);
+        expect(http.transfers()).toHaveLength(1);
+    });
+
+    test('APY17 "Pay out Failed" is preserved but never treated as proof no payout exists', async () => {
+        const http = fakeHttp({ transfer: refused('APY17', 'Pay out Failed') });
+        const out = await service(http).initiateBankTransfer({ ...baseInitiation });
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.reason).toBe('PROVIDER_REPORTED_PAYOUT_FAILED_UNVERIFIED');
+        expect(out.providerStatusRaw).toBeNull();
+        expect(http.transfers()).toHaveLength(1);
+    });
+
+    test('OTGH02 "Pay out in Progress" stays unresolved rather than pending or failed', async () => {
+        const http = fakeHttp({ transfer: refused('OTGH02', 'Pay out in Progress') });
+        const out = await service(http).initiateBankTransfer({ ...baseInitiation });
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.reason).toBe('PROVIDER_REPORTED_IN_PROGRESS');
+        expect(out.status).not.toBe('PENDING');
+        expect(out.status).not.toBe('FAILED');
+    });
+
+    test('an undocumented provider code stays a plain unresolved observation', async () => {
+        const http = fakeHttp({ transfer: refused('ZZ99', 'Something unmapped') });
+        const out = await service(http).initiateBankTransfer({ ...baseInitiation });
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.reason).toBe('PROVIDER_STATUS_NOT_ACCEPTED');
+    });
+});

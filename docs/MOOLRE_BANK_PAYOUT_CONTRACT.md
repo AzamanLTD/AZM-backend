@@ -187,12 +187,26 @@ reference, never a second POST with a new reference.
 | --- | --- |
 | `AVD01` | **documented success** for Validate Name. Never a refusal. |
 | `AVD02` | **documented account-not-found** for Validate Name → `ACCOUNT_NOT_FOUND`. |
-| transfer refusal codes | **none verified.** `DOCUMENTED_TRANSFER_REFUSALS` is empty, so every transfer-side refusal-shaped answer is `UNRESOLVED`. |
-| status not-found code | **none verified.** `DOCUMENTED_STATUS_NOT_FOUND` is empty, so `NOT_FOUND` is never claimed yet. |
-| duplicate reference | detected from the provider's duplicate message shape; used only to refuse a second send, never to assert success. |
+| `APY21` | **documented refusal** — "Insufficient wallet balance." Azaman's wallet could not fund the payout, so no payout can exist. Raised as `DEFINITIVE_REJECTION` / `PROVIDER_REFUSED` with `refusalDocumented: true`, `dispatchProven: true`. |
+| `APY18` | **documented duplicate** — "External reference is required and must be unique." We never omit the reference, so on a transfer this means Moolre already holds it. Returned as `UNRESOLVED` / `DUPLICATE_REFERENCE`; the original reference is looked up, never resent. |
+| `APY17` | **documented but not decisive** — "Pay out Failed". Names a state without proving whether a payout exists, so it is preserved as `UNRESOLVED` / `PROVIDER_REPORTED_PAYOUT_FAILED_UNVERIFIED` and never authorises a reversal. |
+| `OTGH02` | **documented but not decisive** — "Pay out in Progress". `UNRESOLVED` / `PROVIDER_REPORTED_IN_PROGRESS`, never `PENDING` or `FAILED`. The reference's own gloss for this code is "when an unsupported channel is selected", which does not match the message, so it is treated as ambiguous rather than learned from. |
+| status not-found code | **none verified.** `DOCUMENTED_STATUS_NOT_FOUND` is empty. `AC03` ("Payment ID / Bank Account Not Found") is published for a different lookup, not for transfers, so `NOT_FOUND` is never claimed. |
+
+Source: `docs.moolre.com/ai/guides/errors-and-status-codes.md`, retrieved
+2026-11-04. That page warns codes can be returned by more than one operation, so
+each entry above is read with the transfer endpoint in context.
 
 An empty denial set is deliberate. A wrong `NOT_FOUND` would authorise a refund
 of money that already moved; a wrong "refused" would authorise a second payout.
+
+### 5.1 `txstatus` 0/1/2 is still NOT widened
+
+`/ai/live/list-account-transactions` documents its optional `status` **filter**
+as `0=Pending, 1=Successful, 2=Failed`, and its example rows carry a `txstatus`
+field. That is a different endpoint's request parameter, not a published
+statement about `data.txstatus` on a transfer status response, so the adapter
+still maps only `1`. Written confirmation remains the way to widen it.
 
 ## 6. Capability authorities
 
