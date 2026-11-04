@@ -365,10 +365,17 @@ exports.initiateTrade = async (req, res) => {
         
         const earningsSettings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
         const tierThreshold = Number(earningsSettings?.tierThreshold ?? 1000);
-        const platformFeePct = feeProfile.platformFeePct || Number(earningsSettings?.p2pFeePct ?? 0.02);
-        const vendorSplit = Number(newTrade.amountCrypto) >= tierThreshold
-            ? (feeProfile.vendorSplitPct || Number(earningsSettings?.vendorShareOver1k ?? 0.50))
-            : (feeProfile.vendorSplitPct || Number(earningsSettings?.vendorShareUnder1k ?? 0.40));
+        // Must agree with settlement: a matched profile's values apply exactly,
+        // including a legitimate 0; otherwise the GlobalSettings tier defaults.
+        const hasFeeProfile = feeProfile.matchedProfile === true;
+        const platformFeePct = hasFeeProfile
+            ? feeProfile.platformFeePct
+            : Number(earningsSettings?.p2pFeePct ?? 0.02);
+        const vendorSplit = hasFeeProfile
+            ? feeProfile.vendorSplitPct
+            : (Number(newTrade.amountCrypto) >= tierThreshold
+                ? Number(earningsSettings?.vendorShareOver1k ?? 0.50)
+                : Number(earningsSettings?.vendorShareUnder1k ?? 0.40));
         const expectedVendorEarningsUsdc = parseFloat((Number(newTrade.amountCrypto) * platformFeePct * vendorSplit).toFixed(6));
 
         res.status(201).json({

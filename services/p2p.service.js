@@ -754,14 +754,23 @@ const completeTrade = async (prisma, { tradeId, releasedByUserId, adminOverride 
         amountCrypto: Number(trade.amountCrypto)
     });
 
-    // Use profile values; fall back to GlobalSettings → hardcoded defaults
-    const p2pFeePct = feeProfile.platformFeePct || (settings?.p2pFeePct ?? FALLBACK_P2P_MARGIN_PCT);
+    // A MATCHED profile is authoritative, including its legitimate zeros; only
+    // a MISSED match falls back to GlobalSettings → hardcoded defaults. The
+    // matchedProfile flag is the signal, because a matched profile can itself
+    // carry 0 in every field.
+    const hasFeeProfile = feeProfile.matchedProfile === true;
+    const p2pFeePct = hasFeeProfile
+        ? feeProfile.platformFeePct
+        : (settings?.p2pFeePct ?? FALLBACK_P2P_MARGIN_PCT);
 
     // ── Per-payment-method fee override ───────────────────────────────────
     // If the trade's payment method has a specific fee rate configured,
     // use that instead of the global p2pFeePct.
     let effectiveFeePct = Number(p2pFeePct);
-    if (settings?.feeByPaymentMethod && trade.paymentMethod) {
+    // The per-method map is a GlobalSettings authority; a matched profile is
+    // more specific, so it is never overridden by it (otherwise a profile's
+    // intended 0 fee would be replaced by a configured method rate).
+    if (!hasFeeProfile && settings?.feeByPaymentMethod && trade.paymentMethod) {
         const methodMap = typeof settings.feeByPaymentMethod === 'string'
             ? JSON.parse(settings.feeByPaymentMethod)
             : settings.feeByPaymentMethod;
@@ -778,10 +787,14 @@ const completeTrade = async (prisma, { tradeId, releasedByUserId, adminOverride 
     const tierThreshold = Number(settings?.tierThreshold ?? FALLBACK_TIER_THRESHOLD);
 
     // Phase Q1: Admin/vendor split from fee profile (replaces hardcoded tiers)
-    const adminPct  = feeProfile.adminSplitPct || (Number(trade.amountCrypto) >= tierThreshold
+    // A profile's split is a PAIRED contract (admin + vendor = 1). Taking one
+    // side from the profile and the other from the legacy tier formula can
+    // over-allocate the fee, so both sides come from the same authority.
+    const legacyAdminPct = (Number(trade.amountCrypto) >= tierThreshold
         ? (1 - Number(settings?.vendorShareOver1k ?? (1 - FALLBACK_OVER_1K_ADMIN_PCT)))
         : (1 - Number(settings?.vendorShareUnder1k ?? (1 - FALLBACK_UNDER_1K_ADMIN_PCT))));
-    const vendorPct = feeProfile.vendorSplitPct || (1 - adminPct);
+    const adminPct  = hasFeeProfile ? feeProfile.adminSplitPct  : legacyAdminPct;
+    const vendorPct = hasFeeProfile ? feeProfile.vendorSplitPct : (1 - adminPct);
 
     // Fee split via the shared util (utils/feeMath) — the single source of truth
     // also used by __tests__/math.test.js. vendorPct is passed explicitly so a
