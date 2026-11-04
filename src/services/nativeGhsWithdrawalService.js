@@ -1086,6 +1086,93 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
   if (!row || row.type !== 'WITHDRAWAL_FIAT' || row.settlementCurrency !== SETTLEMENT_CURRENCY) {
     return { dispatched: false, reason: 'NOT_A_NATIVE_GHS_WITHDRAWAL' };
   }
+  // The canonical TransactionHistory status is the TransactionStatus ENUM
+  // (PENDING until a terminal outcome). The DISPATCH CLAIM lives on the
+  // Withdrawal mirror's String status — exactly like the fiat payout path:
+  // PENDING -> DISPATCHING is the single-winner dispatch authority, and the
+  // worker (-> PROCESSING) and admin (-> REJECTED) compete on the same row.
+  // §6 REVALIDATION BEFORE DISPATCH. Re-read the payer's saved beneficiary and
+  // prove it still resolves to the account captured at acceptance. A changed
+  // or deleted payee parks the payout for review — it is never sent to a
+  // destination the customer did not confirm.
+  const snapshotRow = await prisma.transactionHistory.findUnique({
+    where: { txHash: reference },
+    select: { metadata: true },
+  });
+  const snapshot = snapshotRow?.metadata?.bankDestinationSnapshot || null;
+  if (snapshot) {
+    let current = null;
+    let revalidationError = null;
+    try {
+      current = await savedBankBeneficiaryService.revealForPayout(prisma, row.userId, snapshot.beneficiaryId);
+    } catch (err) {
+      // Benign for the comparison (current stays null => parked for review),
+      // but the REASON is recorded: an operator must be able to tell a deleted
+      // payee from an unreadable ciphertext.
+      current = null;
+      revalidationError = { code: err?.code || err?.name || 'REVEAL_FAILED', message: String(err?.message || '').slice(0, 200) };
+    }
+    const currentFingerprint = current ? savedBankBeneficiaryService.fingerprint(current.accountNumber) : null;
+    if (!current || currentFingerprint !== snapshot.fingerprint || current.bankCode !== snapshot.bankCode) {
+      // NOT parkUncertainDispatch: that helper records
+      // STATUS_LOOKUP_ORIGINAL_REFERENCE, which would send an operator to poll
+      // a provider that was never called. Nobody can look this up — the payee
+      // itself has to be re-confirmed by the customer, so the row must leave
+      // the retry set and land in the human review queue instead.
+      await prisma.withdrawal.updateMany({
+        where: { transactionHistoryId: row.id, status: 'PENDING' },
+        data: { status: 'NEEDS_MANUAL_REVIEW' },
+      });
+      await prisma.$executeRawUnsafe(
+        'UPDATE "TransactionHistory" SET "metadata" = COALESCE("metadata", \'{}\'::jsonb) || jsonb_build_object($2::text, $3::jsonb) WHERE "txHash" = $1',
+        reference,
+        'bankDestinationRevalidation',
+        JSON.stringify({
+          code: 'BANK_DESTINATION_CHANGED',
+          at: new Date().toISOString(),
+          snapshotFingerprint: snapshot.fingerprint,
+          currentFingerprint,
+          revalidationError,
+          snapshotBankCode: snapshot.bankCode,
+          currentBankCode: current?.bankCode ?? null,
+          refunded: false,
+          resolution: 'PAYEE_MUST_BE_CONFIRMED',
+          nextStep: 'Customer re-confirms the bank destination; RESUME re-runs every gate.',
+        })
+      );
+      // Durable OPERATOR evidence, not just metadata. The admin review queue
+      // derives an operator's allowed actions from ReconciliationException
+      // rows; a park recorded only in metadata shows up as a row with no
+      // reason and no option but ESCALATE — which for this park would send an
+      // operator to poll a provider that was provably never called. The phase
+      // is PRE_DISPATCH because this check runs BEFORE the dispatch claim.
+      const mirror = await prisma.withdrawal.findFirst({
+        where: { transactionHistoryId: row.id },
+        select: { id: true },
+      });
+      if (mirror) {
+        await recordReconciliationException(prisma, {
+          entityType: 'WITHDRAWAL',
+          entityId: String(mirror.id),
+          reference,
+          reason: 'BANK_DESTINATION_CHANGED',
+          details: {
+            phase: 'PRE_DISPATCH',
+            settlementCurrency: SETTLEMENT_CURRENCY,
+            resolution: 'PAYEE_MUST_BE_CONFIRMED',
+            snapshotFingerprint: snapshot.fingerprint,
+            currentFingerprint,
+            snapshotBankCode: snapshot.bankCode,
+            currentBankCode: current?.bankCode ?? null,
+            revalidationError,
+            providerDispatched: false,
+            refunded: false,
+          },
+        });
+      }
+      return { dispatched: false, reason: 'BANK_DESTINATION_CHANGED' };
+    }
+  }
   // ── §ADDENDUM PRE-DISPATCH PROVIDER REVALIDATION ─────────────────────────
   //
   // Every check above is local: it proves the payee ROW still resolves to the
@@ -1184,93 +1271,6 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
   const providerValidatedAt = enquiryAt.toISOString();
   const providerValidatedName = enquiry.accountName;
 
-  // The canonical TransactionHistory status is the TransactionStatus ENUM
-  // (PENDING until a terminal outcome). The DISPATCH CLAIM lives on the
-  // Withdrawal mirror's String status — exactly like the fiat payout path:
-  // PENDING -> DISPATCHING is the single-winner dispatch authority, and the
-  // worker (-> PROCESSING) and admin (-> REJECTED) compete on the same row.
-  // §6 REVALIDATION BEFORE DISPATCH. Re-read the payer's saved beneficiary and
-  // prove it still resolves to the account captured at acceptance. A changed
-  // or deleted payee parks the payout for review — it is never sent to a
-  // destination the customer did not confirm.
-  const snapshotRow = await prisma.transactionHistory.findUnique({
-    where: { txHash: reference },
-    select: { metadata: true },
-  });
-  const snapshot = snapshotRow?.metadata?.bankDestinationSnapshot || null;
-  if (snapshot) {
-    let current = null;
-    let revalidationError = null;
-    try {
-      current = await savedBankBeneficiaryService.revealForPayout(prisma, row.userId, snapshot.beneficiaryId);
-    } catch (err) {
-      // Benign for the comparison (current stays null => parked for review),
-      // but the REASON is recorded: an operator must be able to tell a deleted
-      // payee from an unreadable ciphertext.
-      current = null;
-      revalidationError = { code: err?.code || err?.name || 'REVEAL_FAILED', message: String(err?.message || '').slice(0, 200) };
-    }
-    const currentFingerprint = current ? savedBankBeneficiaryService.fingerprint(current.accountNumber) : null;
-    if (!current || currentFingerprint !== snapshot.fingerprint || current.bankCode !== snapshot.bankCode) {
-      // NOT parkUncertainDispatch: that helper records
-      // STATUS_LOOKUP_ORIGINAL_REFERENCE, which would send an operator to poll
-      // a provider that was never called. Nobody can look this up — the payee
-      // itself has to be re-confirmed by the customer, so the row must leave
-      // the retry set and land in the human review queue instead.
-      await prisma.withdrawal.updateMany({
-        where: { transactionHistoryId: row.id, status: 'PENDING' },
-        data: { status: 'NEEDS_MANUAL_REVIEW' },
-      });
-      await prisma.$executeRawUnsafe(
-        'UPDATE "TransactionHistory" SET "metadata" = COALESCE("metadata", \'{}\'::jsonb) || jsonb_build_object($2::text, $3::jsonb) WHERE "txHash" = $1',
-        reference,
-        'bankDestinationRevalidation',
-        JSON.stringify({
-          code: 'BANK_DESTINATION_CHANGED',
-          at: new Date().toISOString(),
-          snapshotFingerprint: snapshot.fingerprint,
-          currentFingerprint,
-          revalidationError,
-          snapshotBankCode: snapshot.bankCode,
-          currentBankCode: current?.bankCode ?? null,
-          refunded: false,
-          resolution: 'PAYEE_MUST_BE_CONFIRMED',
-          nextStep: 'Customer re-confirms the bank destination; RESUME re-runs every gate.',
-        })
-      );
-      // Durable OPERATOR evidence, not just metadata. The admin review queue
-      // derives an operator's allowed actions from ReconciliationException
-      // rows; a park recorded only in metadata shows up as a row with no
-      // reason and no option but ESCALATE — which for this park would send an
-      // operator to poll a provider that was provably never called. The phase
-      // is PRE_DISPATCH because this check runs BEFORE the dispatch claim.
-      const mirror = await prisma.withdrawal.findFirst({
-        where: { transactionHistoryId: row.id },
-        select: { id: true },
-      });
-      if (mirror) {
-        await recordReconciliationException(prisma, {
-          entityType: 'WITHDRAWAL',
-          entityId: String(mirror.id),
-          reference,
-          reason: 'BANK_DESTINATION_CHANGED',
-          details: {
-            phase: 'PRE_DISPATCH',
-            settlementCurrency: SETTLEMENT_CURRENCY,
-            resolution: 'PAYEE_MUST_BE_CONFIRMED',
-            snapshotFingerprint: snapshot.fingerprint,
-            currentFingerprint,
-            snapshotBankCode: snapshot.bankCode,
-            currentBankCode: current?.bankCode ?? null,
-            revalidationError,
-            providerDispatched: false,
-            refunded: false,
-          },
-        });
-      }
-      return { dispatched: false, reason: 'BANK_DESTINATION_CHANGED' };
-    }
-  }
   const claim = await prisma.withdrawal.updateMany({
     where: { transactionHistoryId: row.id, status: 'PENDING', payoutMethod: 'BANK' },
     data: { status: 'DISPATCHING' },

@@ -2055,9 +2055,24 @@ exports.ghsWithdrawal = async (req, res) => {
         // evaluation was logged and ignored. It is now the shared asset-aware
         // seam, and it refuses BEFORE any debit, quote consumption, reservation
         // or dispatch.
+        // The amount is put into EXACT pesewas BEFORE any risk decision. The
+        // input contract accepts a string or a number, so `Number(...)` here
+        // could carry float noise into a threshold comparison; a value that is
+        // not exact pesewas is refused instead of silently rounded.
+        let riskAmountExact;
+        try {
+            riskAmountExact = nativeGhsWithdrawalService.toExactPesewa(req.body.amountGhs).toFixed(2);
+        } catch (amountError) {
+            res.locals.financialClaimRelease = true;
+            return res.status(422).json({
+                success: false,
+                code: amountError.code || 'NATIVE_GHS_AMOUNT_INVALID',
+                message: amountError.message || 'That amount is not a valid GHS pesewa figure.',
+            });
+        }
         const risk = await payoutRiskGate.evaluatePayoutRisk({
             userId,
-            amount: Number(req.body.amountGhs),
+            amount: riskAmountExact,
             asset: 'GHS',
             destination: target.destination,
             rail: 'MOMO',

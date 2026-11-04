@@ -119,13 +119,15 @@ maybe('BANK dispatch decides on the provider answer (real PostgreSQL)', () => {
         const before = await liquidity();
 
         const out = await dispatch(reference, facts, bank, {
-            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
+            validateAccount: async ({ accountNumber, bankCode }) => ({ status: 'OK', accountNumber, bankCode, accountName: bank.accountName || null, providerRef: 'MP-VALIDATED', validatedAt: new Date() }),
+            capabilities: () => ({ canInitiateBankPayout: true, canValidateAccount: true, mode: 'sandbox' }),
             initiateBankTransfer: async () => ({
-            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
+            validateAccount: async ({ accountNumber, bankCode }) => ({ status: 'OK', accountNumber, bankCode, accountName: bank.accountName || null, providerRef: 'MP-VALIDATED', validatedAt: new Date() }),
+            capabilities: () => ({ canInitiateBankPayout: true, canValidateAccount: true, mode: 'sandbox' }),
                 provider: 'MOOLRE_DISBURSEMENT',
                 rail: 'BANK',
                 referenceId: reference,
-                externalId: null,
+                externalId: reference,
                 providerRef: null,
                 status: 'UNRESOLVED',
                 amountGhsExact: null,
@@ -157,9 +159,11 @@ maybe('BANK dispatch decides on the provider answer (real PostgreSQL)', () => {
         const { bank, reference, mirror, facts } = await seedAcceptedPayout();
 
         const out = await dispatch(reference, facts, bank, {
-            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
+            validateAccount: async ({ accountNumber, bankCode }) => ({ status: 'OK', accountNumber, bankCode, accountName: bank.accountName || null, providerRef: 'MP-VALIDATED', validatedAt: new Date() }),
+            capabilities: () => ({ canInitiateBankPayout: true, canValidateAccount: true, mode: 'sandbox' }),
             initiateBankTransfer: async () => ({
-            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
+            validateAccount: async ({ accountNumber, bankCode }) => ({ status: 'OK', accountNumber, bankCode, accountName: bank.accountName || null, providerRef: 'MP-VALIDATED', validatedAt: new Date() }),
+            capabilities: () => ({ canInitiateBankPayout: true, canValidateAccount: true, mode: 'sandbox' }),
                 provider: 'MOOLRE_DISBURSEMENT',
                 rail: 'BANK',
                 referenceId: reference,
@@ -200,9 +204,11 @@ maybe('BANK dispatch decides on the provider answer (real PostgreSQL)', () => {
         const before = await liquidity();
 
         const out = await dispatch(reference, facts, bank, {
-            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
+            validateAccount: async ({ accountNumber, bankCode }) => ({ status: 'OK', accountNumber, bankCode, accountName: bank.accountName || null, providerRef: 'MP-VALIDATED', validatedAt: new Date() }),
+            capabilities: () => ({ canInitiateBankPayout: true, canValidateAccount: true, mode: 'sandbox' }),
             initiateBankTransfer: async () => ({
-            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
+            validateAccount: async ({ accountNumber, bankCode }) => ({ status: 'OK', accountNumber, bankCode, accountName: bank.accountName || null, providerRef: 'MP-VALIDATED', validatedAt: new Date() }),
+            capabilities: () => ({ canInitiateBankPayout: true, canValidateAccount: true, mode: 'sandbox' }),
                 provider: 'MOOLRE_DISBURSEMENT',
                 rail: 'BANK',
                 referenceId: reference,
@@ -236,9 +242,11 @@ maybe('BANK dispatch decides on the provider answer (real PostgreSQL)', () => {
         const { bank, reference, mirror, facts } = await seedAcceptedPayout();
 
         const out = await dispatch(reference, facts, bank, {
-            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
-            initiateBankTransfer: async () => ({ referenceId: reference, ...observation }),
-            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
+            validateAccount: async ({ accountNumber, bankCode }) => ({ status: 'OK', accountNumber, bankCode, accountName: bank.accountName || null, providerRef: 'MP-VALIDATED', validatedAt: new Date() }),
+            capabilities: () => ({ canInitiateBankPayout: true, canValidateAccount: true, mode: 'sandbox' }),
+            initiateBankTransfer: async () => ({ referenceId: reference, externalId: reference, ...observation }),
+            validateAccount: async ({ accountNumber, bankCode }) => ({ status: 'OK', accountNumber, bankCode, accountName: bank.accountName || null, providerRef: 'MP-VALIDATED', validatedAt: new Date() }),
+            capabilities: () => ({ canInitiateBankPayout: true, canValidateAccount: true, mode: 'sandbox' }),
         });
 
         expect(out.dispatched).toBe(false);
@@ -256,9 +264,11 @@ maybe('BANK dispatch decides on the provider answer (real PostgreSQL)', () => {
     test('D2: an echoed reference that is not ours is never adopted', async () => {
         const { bank, reference, facts } = await seedAcceptedPayout();
         const out = await dispatch(reference, facts, bank, {
-            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
+            validateAccount: async ({ accountNumber, bankCode }) => ({ status: 'OK', accountNumber, bankCode, accountName: bank.accountName || null, providerRef: 'MP-VALIDATED', validatedAt: new Date() }),
+            capabilities: () => ({ canInitiateBankPayout: true, canValidateAccount: true, mode: 'sandbox' }),
             initiateBankTransfer: async () => ({
-            capabilities: () => ({ canInitiateBankPayout: true, mode: 'sandbox' }),
+            validateAccount: async ({ accountNumber, bankCode }) => ({ status: 'OK', accountNumber, bankCode, accountName: bank.accountName || null, providerRef: 'MP-VALIDATED', validatedAt: new Date() }),
+            capabilities: () => ({ canInitiateBankPayout: true, canValidateAccount: true, mode: 'sandbox' }),
                 provider: 'MOOLRE_DISBURSEMENT',
                 rail: 'BANK',
                 referenceId: 'SOMEONE-ELSES-REFERENCE',

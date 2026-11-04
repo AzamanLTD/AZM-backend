@@ -60,6 +60,10 @@ async function evaluatePayoutRisk({
     db = null,
 } = {}) {
     const numeric = Number(amount);
+    // The exact figure as the caller stated it. A float is fine for a rough
+    // screen; it is NOT fine for deciding whether a GHS payout crosses a
+    // configured threshold, so the exact value travels with it.
+    const amountExact = amount === null || amount === undefined || amount === '' ? undefined : String(amount);
     let decision;
     try {
         decision = await fraudService.evaluate({
@@ -69,6 +73,7 @@ async function evaluatePayoutRisk({
             type: 'WITHDRAWAL',
             asset: String(asset || 'USDC').toUpperCase(),
             amount: Number.isFinite(numeric) ? numeric : undefined,
+            amountExact,
             destination: destination || undefined,
             rail: rail || undefined,
             accountAgeHours,
