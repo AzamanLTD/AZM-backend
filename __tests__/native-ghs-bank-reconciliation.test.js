@@ -98,9 +98,19 @@ maybe('BANK payouts reconcile on the BANK rail (real PostgreSQL)', () => {
             amountGhsExact: facts.recipientGhsExact,
             bank,
             port: {
+                // The REAL adapter contract (#391 @31a81cf): capabilities
+                // declare BOTH legs, validation answers with the holder name
+                // and NO account-number echo, and the directory is fresh.
                 capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true, mode: 'sandbox' }),
+                listBanks: async () => ({ stale: false, banks: [{ code: 'GCB', name: 'GCB Bank' }] }),
+                validateBankAccount: async ({ accountNumber, bankCode }) => ({
+                    valid: true,
+                    accountName: 'AMA MENSAH',
+                    bankCode,
+                    validatedAt: new Date().toISOString(),
+                    provider: 'MOOLRE',
+                }),
                 initiateBankTransfer: async () => ({
-                capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true, mode: 'sandbox' }),
                     provider: 'MOOLRE_DISBURSEMENT',
                     rail: 'BANK',
                     referenceId: reference,
