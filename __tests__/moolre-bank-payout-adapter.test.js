@@ -93,10 +93,15 @@ function fakeHttp(over = {}) {
 }
 
 function service(http, opts = {}) {
+    // Fixture confirmation only: these two gates stand in for written Moolre
+    // evidence and are OFF in every real environment. Individual tests unset
+    // them to prove the adapter refuses without that evidence.
     return new MoolreBankPayoutService({
         http,
         providerMode: 'LIVE',
         bankPayoutEnabled: true,
+        endpointFamilyConfirmed: true,
+        channel2EligibilityConfirmed: true,
         env: 'sandbox',
         apiUser: 'api-user',
         apiKey: 'private-key',
@@ -206,6 +211,12 @@ describe('A. provider interface', () => {
             bankPayoutEnabled: true,
             credentialsPresent: true,
             sourceAccountConfigured: true,
+            endpointFamilyConfirmed: true,
+            channel2EligibilityConfirmed: true,
+            canReadBankDirectory: true,
+            canValidateBankAccount: true,
+            canLookupBankTransferStatus: true,
+            canInitiateBankPayout: true,
             channel: 2,
             currency: 'GHS',
         });
@@ -658,7 +669,10 @@ describe('F. transfer status', () => {
         body.data.amount = 25.5;
         const out = await service(fakeHttp({ status: { status: 200, data: body } }))
             .getBankTransferStatus({ referenceId: REF });
-        expect(out.status).toBe('SUCCESSFUL');
+        // No provider amount means no settlement evidence, so a numeric JSON
+        // amount cannot be promoted to a terminal success either.
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.reason).toBe('AMOUNT_EVIDENCE_MISSING');
         expect(out.amountGhsExact).toBeNull();
     });
 
@@ -838,7 +852,12 @@ describe('I. capabilities() preflight contract', () => {
         expect(Object.keys(c).sort()).toEqual([
             'bankPayoutEnabled',
             'canInitiateBankPayout',
+            'canLookupBankTransferStatus',
+            'canReadBankDirectory',
+            'canValidateBankAccount',
+            'channel2EligibilityConfirmed',
             'credentialsPresent',
+            'endpointFamilyConfirmed',
             'host',
             'hostAllowed',
             'mode',
@@ -877,5 +896,126 @@ describe('I. capabilities() preflight contract', () => {
             });
             expect(http.transfers()).toHaveLength(0);
         }
+    });
+});
+
+// ── J. capability authorities are separate ──────────────────────────────────
+describe('J. capability authorities', () => {
+    test('each authority falls away on its own', () => {
+        const all = service(fakeHttp()).capabilities();
+        expect([all.canReadBankDirectory, all.canValidateBankAccount, all.canLookupBankTransferStatus, all.canInitiateBankPayout])
+            .toEqual([true, true, true, true]);
+
+        const noEligibility = service(fakeHttp(), { channel2EligibilityConfirmed: false }).capabilities();
+        expect(noEligibility).toMatchObject({
+            canReadBankDirectory: true,
+            canValidateBankAccount: true,
+            canLookupBankTransferStatus: true,
+            canInitiateBankPayout: false,
+        });
+
+        const noFamily = service(fakeHttp(), { endpointFamilyConfirmed: false }).capabilities();
+        expect(noFamily).toMatchObject({
+            canReadBankDirectory: true,
+            canValidateBankAccount: false,
+            canLookupBankTransferStatus: true,
+            canInitiateBankPayout: false,
+        });
+
+        const noCreds = service(fakeHttp(), { apiKey: '' }).capabilities();
+        expect(noCreds).toMatchObject({
+            canReadBankDirectory: true,
+            canValidateBankAccount: false,
+            canLookupBankTransferStatus: false,
+            canInitiateBankPayout: false,
+        });
+
+        const noIo = service(fakeHttp(), { providerMode: 'MOCK' }).capabilities();
+        expect(noIo).toMatchObject({
+            canReadBankDirectory: false,
+            canValidateBankAccount: false,
+            canLookupBankTransferStatus: false,
+            canInitiateBankPayout: false,
+        });
+    });
+
+    test('the payout kill switch never blinds reconciliation', async () => {
+        const http = fakeHttp();
+        const svc = service(http, { bankPayoutEnabled: false });
+
+        await expect(rejectOf(svc.initiateBankTransfer(baseInitiation)))
+            .resolves.toMatchObject({ outcome: 'NOT_DISPATCHED', code: 'BANK_PAYOUT_DISABLED' });
+
+        const status = await svc.getBankTransferStatus({ referenceId: REF });
+        expect(status.status).toBe('SUCCESSFUL');
+        expect(http.statuses()).toHaveLength(1);
+        expect(http.transfers()).toHaveLength(0);
+    });
+
+    test('unconfirmed channel-2 eligibility blocks the payout but not the read', async () => {
+        const http = fakeHttp();
+        const svc = service(http, { channel2EligibilityConfirmed: false });
+        await expect(rejectOf(svc.initiateBankTransfer(baseInitiation)))
+            .resolves.toMatchObject({ outcome: 'NOT_DISPATCHED', code: 'CHANNEL2_ELIGIBILITY_UNCONFIRMED' });
+        expect(http.transfers()).toHaveLength(0);
+        expect((await svc.getBankTransferStatus({ referenceId: REF })).status).toBe('SUCCESSFUL');
+    });
+
+    test('an unconfirmed endpoint family blocks every call to the disputed paths', async () => {
+        const http = fakeHttp();
+        const svc = service(http, { endpointFamilyConfirmed: false });
+
+        await expect(rejectOf(svc.validateBankAccount({ accountNumber: '0123456789012', bankCode: '030100' })))
+            .resolves.toMatchObject({ code: 'ENDPOINT_FAMILY_UNCONFIRMED' });
+        await expect(rejectOf(svc.initiateBankTransfer(baseInitiation)))
+            .resolves.toMatchObject({ code: 'ENDPOINT_FAMILY_UNCONFIRMED' });
+        expect(http.calls.filter((c) => c.method === 'POST')).toHaveLength(0);
+
+        expect((await svc.listBanks()).banks.length).toBeGreaterThan(0);
+        expect((await svc.getBankTransferStatus({ referenceId: REF })).status).toBe('SUCCESSFUL');
+    });
+
+    test('one initiation posts to one path, never to a fallback family', async () => {
+        const http = fakeHttp();
+        await service(http).initiateBankTransfer(baseInitiation);
+        const urls = http.calls.filter((c) => c.method === 'POST').map((c) => c.url);
+        expect(urls).toEqual(['https://sandbox.moolre.com/open/transact/transfer']);
+        expect(urls.some((u) => u.includes('/initiate'))).toBe(false);
+    });
+
+    test('an absent provider echo is unresolved on initiation, with the facts kept', async () => {
+        const transfer = JSON.parse(JSON.stringify(acceptedTransfer));
+        delete transfer.data.externalref;
+        const out = await service(fakeHttp({ transfer: { status: 200, data: transfer } }))
+            .initiateBankTransfer(baseInitiation);
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.reason).toBe('EXTERNAL_REFERENCE_ABSENT');
+        expect(out.externalId).toBeNull();
+        expect(out.referenceId).toBe(REF);
+        expect(out.providerStatusRaw).toBe('1');
+    });
+
+    test('an absent echo cannot promote a status lookup to terminal success', async () => {
+        const body = JSON.parse(JSON.stringify(statusBody));
+        delete body.data.externalref;
+        const out = await service(fakeHttp({ status: { status: 200, data: body } }))
+            .getBankTransferStatus({ referenceId: REF });
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.reason).toBe('EXTERNAL_REFERENCE_ABSENT');
+        expect(out.providerStatusRaw).toBe('1');
+    });
+
+    test('describe() reports the matrix without credentials or account numbers', () => {
+        const d = service(fakeHttp(), { bankPayoutEnabled: false }).describe();
+        expect(d).toMatchObject({
+            canInitiateBankPayout: false,
+            canLookupBankTransferStatus: true,
+            canValidateBankAccount: true,
+            channel: 2,
+            currency: 'GHS',
+        });
+        const s = JSON.stringify(d);
+        expect(s).not.toContain('private-key');
+        expect(s).not.toContain('100000100002');
     });
 });

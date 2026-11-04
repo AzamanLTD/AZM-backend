@@ -155,6 +155,23 @@ class MoolreBankPayoutService {
         this._bankFlagRaw = opts.bankPayoutEnabled ?? process.env.MOOLRE_BANK_PAYOUT_ENABLED;
         this._bankPayoutEnabled = String(this._bankFlagRaw ?? '').toLowerCase() === 'true';
 
+        // Two facts that only Moolre can supply, each defaulting OFF. The first
+        // records that the endpoint family is settled (machine-readable
+        // /transfer+/validate vs the guide's /initiate+/validate-name). The
+        // second records that Azaman's own account is enabled for channel 2.
+        // Neither follows from public documentation, and neither may be flipped
+        // by this repository on the provider's behalf.
+        this._endpointFamilyConfirmed = String(
+            opts.endpointFamilyConfirmed
+            ?? process.env.MOOLRE_BANK_ENDPOINT_FAMILY_CONFIRMED
+            ?? ''
+        ).toLowerCase() === 'true';
+        this._channel2EligibilityConfirmed = String(
+            opts.channel2EligibilityConfirmed
+            ?? process.env.MOOLRE_BANK_CHANNEL2_ELIGIBILITY_CONFIRMED
+            ?? ''
+        ).toLowerCase() === 'true';
+
         this._apiUser = opts.apiUser ?? process.env.MOOLRE_API_USER ?? '';
         this._apiKey = opts.apiKey ?? process.env.MOOLRE_API_KEY ?? '';
         this._accountNumber = opts.accountNumber ?? process.env.MOOLRE_ACCOUNT_NUMBER ?? '';
@@ -208,11 +225,34 @@ class MoolreBankPayoutService {
         const credentialsPresent = this._credentialsPresent();
         const sourceAccountConfigured = this._sourceAccountConfigured();
 
-        const canInitiateBankPayout = providerIoEnabled
-            && this._bankPayoutEnabled
+        // Reading the bank directory moves no money and needs no credential per
+        // the published reference, so it depends only on provider I/O + host.
+        const canReadBankDirectory = providerIoEnabled && hostAllowed;
+
+        // Name enquiry is a read, but it is provider I/O against the same
+        // disputed path family, so it requires the family confirmation and the
+        // credential/source account the request body needs. It does NOT require
+        // the payout switch or account eligibility: validating a beneficiary
+        // is not paying them.
+        const canValidateBankAccount = providerIoEnabled
+            && hostAllowed
             && credentialsPresent
             && sourceAccountConfigured
-            && hostAllowed;
+            && this._endpointFamilyConfirmed;
+
+        // Reconciliation of a payout already sent: deliberately independent of
+        // MOOLRE_BANK_PAYOUT_ENABLED, endpoint-family confirmation and account
+        // eligibility. Turning the initiation kill switch off must never blind
+        // the adapter to a payout Moolre may already hold.
+        const canLookupBankTransferStatus = providerIoEnabled
+            && hostAllowed
+            && credentialsPresent
+            && sourceAccountConfigured;
+
+        const canInitiateBankPayout = canLookupBankTransferStatus
+            && this._bankPayoutEnabled
+            && this._endpointFamilyConfirmed
+            && this._channel2EligibilityConfirmed;
 
         const mode = canInitiateBankPayout
             ? (this._env === 'production' ? 'production' : 'sandbox')
@@ -225,6 +265,11 @@ class MoolreBankPayoutService {
             sourceAccountConfigured,
             host,
             hostAllowed,
+            endpointFamilyConfirmed: this._endpointFamilyConfirmed,
+            channel2EligibilityConfirmed: this._channel2EligibilityConfirmed,
+            canReadBankDirectory,
+            canValidateBankAccount,
+            canLookupBankTransferStatus,
             canInitiateBankPayout,
             mode,
         };
@@ -242,25 +287,60 @@ class MoolreBankPayoutService {
             bankPayoutEnabled: c.bankPayoutEnabled,
             credentialsPresent: c.credentialsPresent,
             sourceAccountConfigured: c.sourceAccountConfigured,
+            endpointFamilyConfirmed: c.endpointFamilyConfirmed,
+            channel2EligibilityConfirmed: c.channel2EligibilityConfirmed,
+            canReadBankDirectory: c.canReadBankDirectory,
+            canValidateBankAccount: c.canValidateBankAccount,
+            canLookupBankTransferStatus: c.canLookupBankTransferStatus,
+            canInitiateBankPayout: c.canInitiateBankPayout,
             channel: 2,
             currency: CURRENCY,
         };
     }
 
-    _requireCapability(stage, referenceId = null) {
+    /**
+     * Each operation asks for its own authority. Sharing the initiation switch
+     * across them would either blind reconciliation when payouts are paused, or
+     * quietly let a read imply a payout is allowed.
+     */
+    _require(capabilityName, isAllowed, stage, referenceId = null) {
         const c = this.capabilities();
-        if (c.canInitiateBankPayout) return c;
+        if (isAllowed) return c;
         const reason = !c.providerIoEnabled ? 'PROVIDER_IO_DISABLED'
-            : !c.bankPayoutEnabled ? 'BANK_PAYOUT_DISABLED'
-                : !c.hostAllowed ? 'PROVIDER_HOST_NOT_ALLOWED'
-                    : !c.credentialsPresent ? 'PROVIDER_CREDENTIALS_MISSING'
-                        : 'PROVIDER_SOURCE_ACCOUNT_MISSING';
-        throw new MoolreBankPayoutError('Moolre bank payout is disabled by configuration.', {
+            : !c.hostAllowed ? 'PROVIDER_HOST_NOT_ALLOWED'
+                : !c.credentialsPresent ? 'PROVIDER_CREDENTIALS_MISSING'
+                    : !c.sourceAccountConfigured ? 'PROVIDER_SOURCE_ACCOUNT_MISSING'
+                        : stage === 'INITIATE' && !c.bankPayoutEnabled ? 'BANK_PAYOUT_DISABLED'
+                            : stage === 'INITIATE' && !c.endpointFamilyConfirmed ? 'ENDPOINT_FAMILY_UNCONFIRMED'
+                                : stage === 'INITIATE' && !c.channel2EligibilityConfirmed ? 'CHANNEL2_ELIGIBILITY_UNCONFIRMED'
+                                    : !c.endpointFamilyConfirmed ? 'ENDPOINT_FAMILY_UNCONFIRMED'
+                                        : capabilityName + '_DISABLED';
+        throw new MoolreBankPayoutError('Moolre ' + capabilityName.toLowerCase() + ' is disabled by configuration.', {
             outcome: PROVIDER_OUTCOMES.NOT_DISPATCHED,
             code: reason,
             stage,
             referenceId,
         });
+    }
+
+    _requireDirectory() {
+        const c = this.capabilities();
+        return this._require('BANK_DIRECTORY_READ', c.canReadBankDirectory, 'DIRECTORY');
+    }
+
+    _requireValidation() {
+        const c = this.capabilities();
+        return this._require('BANK_ACCOUNT_VALIDATION', c.canValidateBankAccount, 'VALIDATE');
+    }
+
+    _requireInitiation(referenceId) {
+        const c = this.capabilities();
+        return this._require('BANK_PAYOUT_INITIATION', c.canInitiateBankPayout, 'INITIATE', referenceId);
+    }
+
+    _requireStatusLookup(referenceId) {
+        const c = this.capabilities();
+        return this._require('BANK_TRANSFER_STATUS_LOOKUP', c.canLookupBankTransferStatus, 'STATUS', referenceId);
     }
 
     // ── HTTP ────────────────────────────────────────────────────────────────
@@ -435,7 +515,7 @@ class MoolreBankPayoutService {
      * stale:true, and validation/transfer refuse to use it.
      */
     async listBanks({ forceRefresh = false } = {}) {
-        this._requireCapability('DIRECTORY');
+        this._requireDirectory();
         const now = Date.now();
         const cache = this._directoryCache;
         if (!forceRefresh && cache && (now - cache.fetchedAtMs) < this._cacheTtlMs) {
@@ -505,7 +585,7 @@ class MoolreBankPayoutService {
     // ── account validation ──────────────────────────────────────────────────
 
     async validateBankAccount({ accountNumber, bankCode } = {}) {
-        this._requireCapability('VALIDATE');
+        this._requireValidation();
         const account = this._requireAccountNumber(accountNumber, 'accountNumber', 'VALIDATE', null);
         await this._requireKnownBank(bankCode, 'VALIDATE', null);
 
@@ -587,7 +667,7 @@ class MoolreBankPayoutService {
      */
     async initiateBankTransfer(input = {}) {
         const referenceId = this._requireReference(input.referenceId, 'INITIATE');
-        this._requireCapability('INITIATE', referenceId);
+        this._requireInitiation(referenceId);
 
         const amountIn = this._pickAlias(input, 'amountGhsExact', 'amountGhs', referenceId);
         const accountIn = this._pickAlias(input, 'recipientAccountNumber', 'accountNumber', referenceId);
@@ -700,6 +780,17 @@ class MoolreBankPayoutService {
             };
         }
 
+        if (echoedRef === null) {
+            // No echoed externalref. The reference in this result is the one we
+            // sent, so presenting it as provider-confirmed correlation would be
+            // our own copy dressed as evidence. Unresolved, facts retained.
+            return {
+                ...observation,
+                status: 'UNRESOLVED',
+                reason: 'EXTERNAL_REFERENCE_ABSENT',
+            };
+        }
+
         return { ...observation, status: mapped };
     }
 
@@ -790,7 +881,7 @@ class MoolreBankPayoutService {
      */
     async getBankTransferStatus({ referenceId } = {}) {
         const ref = this._requireReference(referenceId, 'STATUS');
-        this._requireCapability('STATUS', ref);
+        this._requireStatusLookup(ref);
 
         let res;
         try {
@@ -835,6 +926,30 @@ class MoolreBankPayoutService {
         }
         if (echoedRef !== null && echoedRef !== ref) {
             return this._statusResult(ref, { status: 'UNRESOLVED', reason: 'EXTERNAL_REFERENCE_MISMATCH', providerCode, providerStatusRaw: nestedRaw });
+        }
+
+        // A terminal SUCCESSFUL is settlement evidence, so it needs both facts:
+        // Moolre's own echo of this reference, and its own amount. Anything less
+        // stays unresolved and is reconciled, not settled and not refunded.
+        if (mapped === 'SUCCESSFUL' && echoedRef === null) {
+            return this._statusResult(ref, {
+                status: 'UNRESOLVED',
+                reason: 'EXTERNAL_REFERENCE_ABSENT',
+                providerCode,
+                providerStatusRaw: nestedRaw,
+                providerRef: this._providerRef(data),
+                amountGhsExact: this._exactString(data.amount),
+            });
+        }
+        if (mapped === 'SUCCESSFUL' && this._exactString(data.amount) === null) {
+            return this._statusResult(ref, {
+                status: 'UNRESOLVED',
+                reason: 'AMOUNT_EVIDENCE_MISSING',
+                providerCode,
+                providerStatusRaw: nestedRaw,
+                externalId: echoedRef,
+                providerRef: this._providerRef(data),
+            });
         }
 
         return this._statusResult(ref, {

@@ -194,27 +194,68 @@ reference, never a second POST with a new reference.
 An empty denial set is deliberate. A wrong `NOT_FOUND` would authorise a refund
 of money that already moved; a wrong "refused" would authorise a second payout.
 
-## 6. Configuration gate
+## 6. Capability authorities
 
-One authority, `capabilities()`, read by every method:
+Four operations, four separate authorities. One shared switch would either blind
+reconciliation whenever payouts are paused, or let a read imply a payout is
+allowed.
 
 ```
-providerIoEnabled      = MOOLRE_PROVIDER === 'LIVE'
-bankPayoutEnabled      = MOOLRE_BANK_PAYOUT_ENABLED === 'true'   (default false)
-credentialsPresent     = MOOLRE_API_USER && MOOLRE_API_KEY
-sourceAccountConfigured= MOOLRE_ACCOUNT_NUMBER
-hostAllowed            = https host in {sandbox.moolre.com, api.moolre.com}
-canInitiateBankPayout  = all of the above
+providerIoEnabled              = MOOLRE_PROVIDER === 'LIVE'
+hostAllowed                    = https host in {sandbox.moolre.com, api.moolre.com}
+credentialsPresent             = MOOLRE_API_USER && MOOLRE_API_KEY
+sourceAccountConfigured        = MOOLRE_ACCOUNT_NUMBER
+bankPayoutEnabled              = MOOLRE_BANK_PAYOUT_ENABLED                 (default false)
+endpointFamilyConfirmed        = MOOLRE_BANK_ENDPOINT_FAMILY_CONFIRMED     (default false)
+channel2EligibilityConfirmed   = MOOLRE_BANK_CHANNEL2_ELIGIBILITY_CONFIRMED (default false)
 ```
 
-`MOOLRE_PROVIDER=LIVE` alone is **not** enough: a business that enabled MoMo
-payouts has not thereby enabled bank payouts. With any condition false the
-adapter performs no I/O, throws `NOT_DISPATCHED`, and `describe()` reports
-`mode: 'disabled'`. There is no mock success path in any mode.
+| Operation | Requires |
+| --- | --- |
+| `listBanks` (directory) | provider I/O + allowed host |
+| `validateBankAccount` (name enquiry) | + credentials + source account + endpoint family |
+| `getBankTransferStatus` (reconciliation) | + credentials + source account |
+| `initiateBankTransfer` (money out) | all of the above + payout switch + **channel-2 eligibility** |
 
-`describe()` returns the provider, capability, mode, host, the individual flags,
-`channel: 2` and `currency: 'GHS'`. It never contains a credential or an account
-number.
+| Scenario | directory | validate | status | initiate |
+| --- | --- | --- | --- | --- |
+| nothing configured | no | no | no | no |
+| `MOOLRE_PROVIDER=LIVE`, creds, no switches | yes | no | yes | no |
+| + endpoint family confirmed | yes | yes | yes | no |
+| + payout switch, eligibility unconfirmed | yes | yes | yes | no |
+| + eligibility confirmed | yes | yes | yes | yes |
+| payout switch later turned **off** | yes | yes | **yes** | no |
+
+The last row is the reconciliation invariant, and a test drives it: a payout that
+Moolre may already hold must stay reconcilable while new payouts are stopped. Status
+lookup is read-only, never retries, never initiates and never invents a reference.
+
+`endpointFamilyConfirmed` and `channel2EligibilityConfirmed` record facts only
+Moolre can supply. Neither follows from public documentation, neither is set by
+this repository, and setting either without written confirmation would assert
+provider approval Azaman does not have. Until both are set, `initiateBankTransfer`
+refuses with `NOT_DISPATCHED` and `ENDPOINT_FAMILY_UNCONFIRMED` or
+`CHANNEL2_ELIGIBILITY_UNCONFIRMED`.
+
+`describe()` reports the four capability booleans, the two confirmation booleans,
+mode, host, `channel: 2` and `currency: 'GHS'`. It never contains a credential or an
+account number.
+
+## 6a. Evidence binding
+
+A result only becomes settlement evidence when Moolre supplies it, not when we
+echo ourselves back:
+
+- `externalId` is Moolre's echoed `externalref`. If the echo is **absent**, the
+  result is `UNRESOLVED` with reason `EXTERNAL_REFERENCE_ABSENT`: `referenceId` is
+  our own copy and cannot confirm its own correlation.
+- If the echo **differs**, the result is `UNRESOLVED` with
+  `EXTERNAL_REFERENCE_MISMATCH`. The reference is never silently replaced.
+- A status lookup reaches terminal `SUCCESSFUL` only with a published `txstatus`
+  of `1`, a matching echo, **and** a well-formed provider `amount`. Missing amount
+  evidence gives `UNRESOLVED` / `AMOUNT_EVIDENCE_MISSING` rather than promotion.
+- The requested amount is never substituted for the provider amount, and fees stay
+  three independent exact strings.
 
 ## 7. Safety bounds that are ours, not Moolre's
 
