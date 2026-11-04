@@ -120,9 +120,11 @@ if (hasDb) {
         const err = new Error('account not found');
         err.outcome = 'DEFINITIVE_REJECTION';
         err.code = 'ACCOUNT_NOT_FOUND';
-        err.refusalDocumented = true;
         err.dispatchProven = true;
-        err.provider = 'MOOLRE';
+        err.provider = 'MOOLRE_DISBURSEMENT';
+        // Moolre's OWN documented code, which the real adapter carries on the
+        // instance. The mapping requires it (see enquiryBankDestination).
+        err.providerCode = 'AVD02';
         return err;
     };
     const port = (validateBankAccountFn, overrides = {}) => ({

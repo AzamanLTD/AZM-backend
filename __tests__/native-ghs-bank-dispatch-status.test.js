@@ -121,9 +121,8 @@ maybe('BANK dispatch decides on the provider answer (real PostgreSQL)', () => {
         const out = await dispatch(reference, facts, bank, {
             validateBankAccount: async ({ accountNumber, bankCode }) => ({ valid: true, accountName: bank.accountName || null, bankCode, validatedAt: new Date().toISOString(), provider: 'MOOLRE' }),
             capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true, mode: 'sandbox' }),
+            listBanks: async () => ({ stale: false, banks: [{ code: 'GCB', name: 'GCB Bank' }] }),
             initiateBankTransfer: async () => ({
-            validateBankAccount: async ({ accountNumber, bankCode }) => ({ valid: true, accountName: bank.accountName || null, bankCode, validatedAt: new Date().toISOString(), provider: 'MOOLRE' }),
-            capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true, mode: 'sandbox' }),
                 provider: 'MOOLRE_DISBURSEMENT',
                 rail: 'BANK',
                 referenceId: reference,
@@ -146,10 +145,17 @@ maybe('BANK dispatch decides on the provider answer (real PostgreSQL)', () => {
         expect(th.metadata.dispatchException.refunded).toBe(false);
         expect(th.txHash).toBe(reference);                        // original reference retained
 
-        // Funds stay reserved; nothing moved to in-transit or paid out.
+        // The POST left the process, so the reservation advances RESERVED ->
+        // IN_TRANSIT exactly once: the funds are with the provider, neither
+        // spendable here nor refundable. What must NOT happen is any economic
+        // movement — no payout, no refund, no hold, no change to availability.
         const after = await liquidity();
-        expect(String(after.inTransitGhs)).toBe(String(before.inTransitGhs));
-        expect(new Prisma.Decimal(after.inTransitGhs || 0).toFixed(2)).toBe('0.00');
+        expect(new Prisma.Decimal(after.inTransitGhs || 0).toFixed(2)).toBe('80.00');
+        expect(new Prisma.Decimal(after.reservedGhs || 0).toFixed(2)).toBe('0.00');
+        expect(new Prisma.Decimal(after.paidOutGhs || 0).toFixed(2)).toBe('0.00');
+        expect(new Prisma.Decimal(after.reconciliationHeldGhs || 0).toFixed(2)).toBe('0.00');
+        expect(new Prisma.Decimal(after.availableGhs || 0).toFixed(2))
+            .toBe(new Prisma.Decimal(before.availableGhs || 0).toFixed(2));
 
         const exceptions = await openExceptions(reference);
         expect(exceptions.map(e => e.reason)).toContain('PROVIDER_DISPATCH_UNRESOLVED');
@@ -227,8 +233,16 @@ maybe('BANK dispatch decides on the provider answer (real PostgreSQL)', () => {
         expect(th.metadata.dispatch).toBeUndefined();
 
         const after = await liquidity();
-        expect(new Prisma.Decimal(after.inTransitGhs || 0).toFixed(2))
-            .toBe(new Prisma.Decimal(before.inTransitGhs || 0).toFixed(2));
+        // Same lifecycle rule as case A: a POST left the process, so the funds
+        // sit IN_TRANSIT at the provider. The status the provider reported is
+        // NOT acted on here — nothing is settled (SUCCESSFUL) or refunded
+        // (FAILED) until reconciliation resolves it against the same identity.
+        expect(new Prisma.Decimal(after.inTransitGhs || 0).toFixed(2)).toBe('80.00');
+        expect(new Prisma.Decimal(after.reservedGhs || 0).toFixed(2)).toBe('0.00');
+        expect(new Prisma.Decimal(after.paidOutGhs || 0).toFixed(2))
+            .toBe(new Prisma.Decimal(before.paidOutGhs || 0).toFixed(2));
+        expect(new Prisma.Decimal(after.reconciliationHeldGhs || 0).toFixed(2))
+            .toBe(new Prisma.Decimal(before.reconciliationHeldGhs || 0).toFixed(2));
         expect((await openExceptions(reference)).map(e => e.reason)).toContain('PROVIDER_TERMINAL_AT_INITIATION');
     });
 
@@ -244,9 +258,8 @@ maybe('BANK dispatch decides on the provider answer (real PostgreSQL)', () => {
         const out = await dispatch(reference, facts, bank, {
             validateBankAccount: async ({ accountNumber, bankCode }) => ({ valid: true, accountName: bank.accountName || null, bankCode, validatedAt: new Date().toISOString(), provider: 'MOOLRE' }),
             capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true, mode: 'sandbox' }),
+            listBanks: async () => ({ stale: false, banks: [{ code: 'GCB', name: 'GCB Bank' }] }),
             initiateBankTransfer: async () => ({ referenceId: reference, externalId: reference, ...observation }),
-            validateBankAccount: async ({ accountNumber, bankCode }) => ({ valid: true, accountName: bank.accountName || null, bankCode, validatedAt: new Date().toISOString(), provider: 'MOOLRE' }),
-            capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true, mode: 'sandbox' }),
         });
 
         expect(out.dispatched).toBe(false);

@@ -996,21 +996,26 @@ async function enquiryBankDestination(port, { accountNumber, bankCode, expectedA
   try {
     raw = await port.validateBankAccount({ accountNumber, bankCode });
   } catch (err) {
-    // A DOCUMENTED account-not-found is a definitive pre-dispatch negative only
-    // when the adapter proves it refused a real enquiry: typed outcome, its own
-    // code, and the "nothing was dispatched" evidence. Everything else — a
-    // timeout, AVD05 provider-unavailable, an untyped throw — stays inconclusive.
-    // The real #391 adapter (@31a81cf) proves it refused a real enquiry with
-    // the typed triple below. It passes `refusalDocumented` into its error
-    // constructor but never assigns it to the instance, so requiring it here
-    // would make every genuine AVD02 answer look inconclusive — a strictly
-    // worse outcome (funds held forever) than the documented refusal it is.
+    // A documented account-not-found is a definitive pre-dispatch negative only
+    // when it is the PROVIDER'S OWN documented refusal for THIS enquiry. #391's
+    // adapter (@31a81cf) expresses that refusal as four facts that must ALL be
+    // present: its provider identity, DEFINITIVE_REJECTION, code
+    // ACCOUNT_NOT_FOUND, and providerCode === 'AVD02' — Moolre's documented
+    // account-not-found answer. `refusalDocumented` is a CONSTRUCTOR ARGUMENT
+    // the adapter consumes to derive `dispatchProven`; it is deliberately not
+    // exposed on the instance, so this mapping keys on the derived
+    // `dispatchProven` plus the provider's own code, never on a field that does
+    // not exist. An ACCOUNT_NOT_FOUND that carries any other providerCode (or
+    // none) is a normalisation, not proof, and stays inconclusive: the funds
+    // are held rather than refunded on evidence the provider never gave.
     const providerFamily = String(err?.provider || '');
+    const providerCode = err?.providerCode == null ? '' : String(err.providerCode).trim();
     const definitive =
       err?.outcome === 'DEFINITIVE_REJECTION'
       && err?.code === 'ACCOUNT_NOT_FOUND'
       && err?.dispatchProven === true
-      && (providerFamily === '' || /^MOOLRE/i.test(providerFamily));
+      && providerCode === 'AVD02'
+      && /^MOOLRE/i.test(providerFamily);
     if (definitive) {
       return {
         decision: 'NEGATIVE',
@@ -1019,7 +1024,7 @@ async function enquiryBankDestination(port, { accountNumber, bankCode, expectedA
           provider: err?.provider ?? null,
           outcome: err?.outcome ?? null,
           dispatchProven: err?.dispatchProven === true,
-          providerCode: err?.providerCode ?? null,
+          providerCode,
         },
         providerStatusRaw: 'ACCOUNT_NOT_FOUND',
       };
@@ -1384,6 +1389,67 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
       amountGhsExact: amount.toFixed(2),
       extra: { reason: verdict.reason, providerCode: verdict.providerCode ?? null },
     });
+    // OWNERSHIP IS A FACT INDEPENDENT OF ACCEPTANCE. A POST left this process
+    // and the provider answered, so reconciliation must be able to ask THAT
+    // provider what happened. Without durable ownership the worker resolves
+    // UNKNOWN, refuses to guess a rail, and the payout is stranded with the
+    // customer's funds reserved indefinitely — the gap the integrated
+    // initiation->reconciliation proof catches. Record the same durable
+    // observation + ownership evidence the accepted path records; neither may
+    // settle or reverse anything.
+    // The provider's OWN reference only. Our echoed external reference is not a
+    // provider reference: stamping it into the reservation would make the
+    // provider's later answer (carrying its real reference) look like
+    // contradictory evidence for a payout that actually completed. A NULL slot
+    // is enriched by exactly one settling winner.
+    const parkedProviderRef = verdict.providerRef ?? null;
+    try {
+      await fiatLiquidity.recordProviderEvent(prisma, {
+        provider: BANK_PROVIDER_CANONICAL,
+        rail: BANK_RAIL,
+        direction: 'OUTBOUND',
+        status: 'PENDING',
+        providerRef: parkedProviderRef,
+        amountGhs: amount.toFixed(2),
+        dedupKey: `event:payout-dispatch:${BANK_PROVIDER_CANONICAL}:${reference}`,
+        relatedReference: reference,
+        raw: {
+          source: 'bank_dispatch_parked',
+          decision: verdict.decision,
+          reason: verdict.reason ?? null,
+          externalId: verdict.externalId ?? null,
+          providerStatusRaw: outbound?.providerStatusRaw ?? null,
+          bankCode: bank?.bankCode ?? null,
+        },
+      });
+    } catch (err) {
+      logger.error({ reference, err: err.message }, '[nativeGhsWithdrawal] parked BANK dispatch observation could not be persisted');
+    }
+    try {
+      await persistPayoutOwnership(prisma, {
+        reference,
+        failoverTag: BANK_PAYOUT_FAILOVER_TAG,
+        intendedProvider: BANK_PROVIDER_CANONICAL,
+        providerRef: parkedProviderRef,
+      });
+    } catch (err) {
+      logger.error({ reference, err: err.message }, '[nativeGhsWithdrawal] parked BANK payout ownership write failed');
+    }
+
+    // The POST left this process, so the P5-D lifecycle is IN_TRANSIT, not
+    // RESERVED: the funds are with the provider, neither spendable here nor
+    // refundable. Leaving the reservation RESERVED makes the provider's own
+    // later SUCCESSFUL answer contradict our recorded lifecycle, and the
+    // authority quarantines a payout that actually completed. Bookkeeping
+    // only — nothing settles or reverses here.
+    try {
+      await prisma.$transaction(async (tx) => {
+        await fiatLiquidity.markReservationInTransit(tx, { reference, providerRef: parkedProviderRef });
+      });
+    } catch (err) {
+      logger.error({ reference, err: err.message }, '[nativeGhsWithdrawal] parked BANK IN_TRANSIT transition failed');
+    }
+
     // The reservation deliberately STAYS reserved: the provider may hold the
     // payout. Nothing here settles, refunds or claims an acceptance.
     logger.warn(

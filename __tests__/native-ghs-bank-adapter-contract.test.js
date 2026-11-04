@@ -199,4 +199,40 @@ if (!hasAdapter) {
             .rejects.toMatchObject({ name: 'MoolreBankPayoutError', code: 'ACCOUNT_NOT_FOUND' });
         expect(typeof MoolreBankPayoutError).toBe('function');
     });
+
+    // The mapping must key on the PROVIDER'S OWN documented code (AVD02), not on
+    // a normalised error code alone. Both directions are proved against the real
+    // class, because only it decides which providerCode a failure carries.
+    test('8: only AVD02 is a definitive negative; another refusal code stays inconclusive', async () => {
+        const avd02 = adapter(transport({ validate: notFound }));
+        const negative = await svc.enquiryBankDestination(avd02, {
+            accountNumber: ACCOUNT, bankCode: BANK_CODE, expectedAccountName: ACCOUNT_NAME,
+        });
+        expect(negative.decision).toBe('NEGATIVE');
+        expect(negative.error.code).toBe('PROVIDER_ACCOUNT_NOT_FOUND');
+        expect(negative.error.providerCode).toBe('AVD02');
+
+        // Same HTTP shape, same status:0, different provider code. The provider
+        // has NOT documented an account-not-found answer, so nothing may be
+        // refunded on it.
+        const other = adapter(transport({ validate: () => ({ status: 400, data: { status: 0, code: 'AVD99', message: 'declined' } }) }));
+        const held = await svc.enquiryBankDestination(other, {
+            accountNumber: ACCOUNT, bankCode: BANK_CODE, expectedAccountName: ACCOUNT_NAME,
+        });
+        expect(held.decision).toBe('INCONCLUSIVE');
+        expect(held.decision).not.toBe('NEGATIVE');
+
+        // A bare ACCOUNT_NOT_FOUND with no provider code at all is a
+        // normalisation this branch produced — never a provider refusal.
+        const bare = new Error('not found');
+        bare.outcome = 'DEFINITIVE_REJECTION';
+        bare.code = 'ACCOUNT_NOT_FOUND';
+        bare.dispatchProven = true;
+        bare.provider = 'MOOLRE_DISBURSEMENT';
+        const bareVerdict = await svc.enquiryBankDestination(
+            { validateBankAccount: async () => { throw bare; } },
+            { accountNumber: ACCOUNT, bankCode: BANK_CODE, expectedAccountName: ACCOUNT_NAME }
+        );
+        expect(bareVerdict.decision).toBe('INCONCLUSIVE');
+    });
 });
