@@ -367,15 +367,20 @@ exports.initiateTrade = async (req, res) => {
         const tierThreshold = Number(earningsSettings?.tierThreshold ?? 1000);
         // Must agree with settlement: a matched profile's values apply exactly,
         // including a legitimate 0; otherwise the GlobalSettings tier defaults.
-        const hasFeeProfile = feeProfile.matchedProfile === true;
-        const platformFeePct = hasFeeProfile
-            ? feeProfile.platformFeePct
-            : Number(earningsSettings?.p2pFeePct ?? 0.02);
-        const vendorSplit = hasFeeProfile
-            ? feeProfile.vendorSplitPct
-            : (Number(newTrade.amountCrypto) >= tierThreshold
-                ? Number(earningsSettings?.vendorShareOver1k ?? 0.50)
-                : Number(earningsSettings?.vendorShareUnder1k ?? 0.40));
+        // Same resolver as settlement: a matched profile applies exactly
+        // (including 0), and the fallback path honours the payment-method
+        // override, so the advertised estimate cannot drift from what the
+        // completed trade actually pays.
+        const { resolveP2pFeePolicy } = require('../services/p2p/feePolicy');
+        const feePolicy = resolveP2pFeePolicy({
+            settings: earningsSettings,
+            feeProfile,
+            paymentMethod: newTrade.paymentMethod,
+            amountCrypto: newTrade.amountCrypto,
+            defaults: { p2pFeePct: 0.02, tierThreshold: 1000, adminOver1k: 0.50, adminUnder1k: 0.60 },
+        });
+        const platformFeePct = feePolicy.feePct;
+        const vendorSplit = feePolicy.vendorPct;
         const expectedVendorEarningsUsdc = parseFloat((Number(newTrade.amountCrypto) * platformFeePct * vendorSplit).toFixed(6));
 
         res.status(201).json({

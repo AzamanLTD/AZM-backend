@@ -758,43 +758,23 @@ const completeTrade = async (prisma, { tradeId, releasedByUserId, adminOverride 
     // a MISSED match falls back to GlobalSettings → hardcoded defaults. The
     // matchedProfile flag is the signal, because a matched profile can itself
     // carry 0 in every field.
-    const hasFeeProfile = feeProfile.matchedProfile === true;
-    const p2pFeePct = hasFeeProfile
-        ? feeProfile.platformFeePct
-        : (settings?.p2pFeePct ?? FALLBACK_P2P_MARGIN_PCT);
+    const { resolveP2pFeePolicy } = require('./p2p/feePolicy');
+    const feePolicy = resolveP2pFeePolicy({
+        settings,
+        feeProfile,
+        paymentMethod: trade.paymentMethod,
+        amountCrypto: trade.amountCrypto,
+        defaults: {
+            p2pFeePct:     FALLBACK_P2P_MARGIN_PCT,
+            tierThreshold: FALLBACK_TIER_THRESHOLD,
+            adminOver1k:   FALLBACK_OVER_1K_ADMIN_PCT,
+            adminUnder1k:  FALLBACK_UNDER_1K_ADMIN_PCT,
+        },
+    });
 
-    // ── Per-payment-method fee override ───────────────────────────────────
-    // If the trade's payment method has a specific fee rate configured,
-    // use that instead of the global p2pFeePct.
-    let effectiveFeePct = Number(p2pFeePct);
-    // The per-method map is a GlobalSettings authority; a matched profile is
-    // more specific, so it is never overridden by it (otherwise a profile's
-    // intended 0 fee would be replaced by a configured method rate).
-    if (!hasFeeProfile && settings?.feeByPaymentMethod && trade.paymentMethod) {
-        const methodMap = typeof settings.feeByPaymentMethod === 'string'
-            ? JSON.parse(settings.feeByPaymentMethod)
-            : settings.feeByPaymentMethod;
-        const methodKey = trade.paymentMethod.toUpperCase().replace(/[\s-]/g, '_');
-        if (methodMap[methodKey] !== undefined) {
-            effectiveFeePct = Number(methodMap[methodKey]);
-        }
-    }
-
-    // ── Phase F2: Flat USDC fee arithmetic (no GHS oracle math) ───────────
-    // P2P trades are USDC↔USD (1:1 parity). Fee is a flat % of amountCrypto.
-
-    // Phase ADMIN-CONTROL: Read tier threshold and splits from GlobalSettings
-    const tierThreshold = Number(settings?.tierThreshold ?? FALLBACK_TIER_THRESHOLD);
-
-    // Phase Q1: Admin/vendor split from fee profile (replaces hardcoded tiers)
-    // A profile's split is a PAIRED contract (admin + vendor = 1). Taking one
-    // side from the profile and the other from the legacy tier formula can
-    // over-allocate the fee, so both sides come from the same authority.
-    const legacyAdminPct = (Number(trade.amountCrypto) >= tierThreshold
-        ? (1 - Number(settings?.vendorShareOver1k ?? (1 - FALLBACK_OVER_1K_ADMIN_PCT)))
-        : (1 - Number(settings?.vendorShareUnder1k ?? (1 - FALLBACK_UNDER_1K_ADMIN_PCT))));
-    const adminPct  = hasFeeProfile ? feeProfile.adminSplitPct  : legacyAdminPct;
-    const vendorPct = hasFeeProfile ? feeProfile.vendorSplitPct : (1 - adminPct);
+    const effectiveFeePct = feePolicy.feePct;
+    const adminPct        = feePolicy.adminPct;
+    const vendorPct       = feePolicy.vendorPct;
 
     // Fee split via the shared util (utils/feeMath) — the single source of truth
     // also used by __tests__/math.test.js. vendorPct is passed explicitly so a
