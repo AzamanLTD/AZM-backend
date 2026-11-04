@@ -24,26 +24,40 @@
 //                   postgres image, and hold that address). A fabricated
 //                   expectation with no matching running container is refused.
 //
-//   local           a NATIVE local PostgreSQL cluster, proven by comparing the
-//                   connected server's 64-bit pg_control system identifier with
-//                   the identifier read locally from the cluster's own data
-//                   directory (pg_controldata + postmaster.pid). A remote server
-//                   cannot present the local cluster's system identifier, so a
-//                   tunnel, forwarded socket or proxy is refused. A caller-
-//                   supplied address is NEVER accepted as identity here, and a
-//                   unix-socket connection (SQL NULL) is not accepted on its own
-//                   either — it proves the transport, not the machine.
+//   local (Linux)   the INSTANCE, not the cluster. A physical standby, a clone or
+//                   a promoted standby keeps the SAME pg_control system
+//                   identifier, data directory path and port, so the cluster
+//                   identifier alone cannot tell two instances apart. The guard
+//                   therefore walks the backend the connection is actually
+//                   served by: pg_backend_pid() must be a live local PostgreSQL
+//                   process whose /proc ancestry reaches the exact postmaster PID
+//                   in the local postmaster.pid, that postmaster must be live and
+//                   started at pg_postmaster_start_time(), and its start ticks
+//                   must not have been reused. The system identifier stays as a
+//                   CONSISTENCY check only — never as instance identity. A
+//                   caller-supplied address is never accepted as identity, and a
+//                   unix socket (SQL NULL) proves the transport, not the machine.
+//
+//   The instance proof is Linux-specific (/proc). On any other platform local
+//   mode is REFUSED before any mutation, with no weaker fallback.
 //
 // SUPPORTED DEVELOPER MODES, stated plainly:
-//   - a native local PostgreSQL cluster whose data directory this process can
-//     read (run as the cluster owner, or with access to it);
+//   - Linux, with a native local PostgreSQL cluster whose data directory and
+//     /proc entries this process can read (run as the cluster owner, or root);
 //   - the CI lanes, which prove the service container by container identity.
-// NOT SUPPORTED (fail closed, deliberately): a local Docker/remote PostgreSQL, a
-// port-forward, an SSH tunnel, a proxy, a cloud database with a matching name,
-// and any target whose identity cannot be read. Supporting a local container
+// NOT SUPPORTED (fail closed, deliberately): macOS, Windows and any non-Linux
+// host; a local Docker or remote PostgreSQL; a port-forward, SSH tunnel or proxy;
+// a cloud database with a matching name or with the same cluster lineage; and any
+// target whose instance identity cannot be read. Supporting a local container
 // would need a repository-owned harness that launches it and proves the
 // connection belongs to it; inventing that proof from an environment variable
 // would be worse than refusing.
+//
+// CI PROVENANCE: GITHUB_ACTIONS=true alone is NOT authentication — any laptop can
+// set it. The CI branch is enabled only by a GitHub Actions OIDC token whose
+// RS256 signature verifies against GitHub's published JWKS and whose issuer,
+// audience, expiry, repository and workflow claims all match. A Docker label or a
+// GITHUB_RUN_ID is forgeable and is never treated as proof.
 //
 // Every error reports redacted diagnostics only — host:port/database or the
 // offending address. Usernames, passwords and full URLs never appear.
@@ -52,11 +66,20 @@
 const net = require('net');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+const https = require('https');
 const { execFileSync } = require('child_process');
 
 const EXPECTED_ADDRESS_ENV = 'AZM_EXPECTED_TEST_DB_ADDRESS';
 const CONTAINER_ID_ENV = 'AZM_TEST_PG_CONTAINER';
 const LOCAL_DATA_DIR_ENV = 'AZM_LOCAL_PG_DATA_DIR';
+const OIDC_TOKEN_PATH_ENV = 'AZM_CI_OIDC_TOKEN_PATH';
+const OIDC_AUDIENCE = 'azm-test-db-guard';
+const OIDC_ISSUER = 'https://token.actions.githubusercontent.com';
+const OIDC_JWKS_URL = `${OIDC_ISSUER}/.well-known/jwks`;
+const SERVICE_CONTAINER_ENV = 'AZM_CI_SERVICE_CONTAINER_ID';
+const START_TIME_TOLERANCE_SECONDS = 10;
+const CLOCK_TICKS_FALLBACK = 100;
 
 const refuse = (message) => { throw new Error(`[test-db-guard] refusing to run: ${message}`); };
 
@@ -211,7 +234,7 @@ function run(command, args) {
  * not evidence; this is what turns it into evidence, and it is why a local run
  * that fakes GITHUB_ACTIONS is refused when docker is unavailable.
  */
-function inspectContainerIdentity({ address, containerId }) {
+function inspectContainerIdentity({ address, containerId, serviceContainerId }) {
     if (!containerId || !/^[0-9a-f]{12,64}$/i.test(String(containerId).trim())) {
         refuse(`${CONTAINER_ID_ENV} is missing or is not a container id, so the expected address cannot be tied to a container.`);
     }
@@ -235,75 +258,262 @@ function inspectContainerIdentity({ address, containerId }) {
     if (!addresses.includes(address)) {
         refuse(`the container ${CONTAINER_ID_ENV} holds ${addresses.length ? addresses.join(', ') : 'no address'}, not the expected "${address}".`);
     }
-    return { containerId: String(container.Id || containerId).trim(), containerAddress: address, image: container.Config ? container.Config.Image : null };
+    const resolvedId = String(container.Id || containerId).trim();
+    // Where the workflow can supply the service-container id from the
+    // job.services context, the docker-selected container must be that one.
+    if (serviceContainerId && !resolvedId.startsWith(String(serviceContainerId).trim())) {
+        refuse(`the selected container ${resolvedId.slice(0, 12)} is not the service container ${String(serviceContainerId).slice(0, 12)} declared by the workflow job.`);
+    }
+    return { containerId: resolvedId, containerAddress: address, image: container.Config ? container.Config.Image : null };
 }
 
 // ---------------------------------------------------------------------------
-// Independent identity #2 (local): prove the cluster this process can SEE.
+// Independent identity #2 (local, Linux): prove the INSTANCE serving this
+// connection is a process on this machine that descends from the postmaster in
+// the local data directory's postmaster.pid.
+//
+// The cluster system identifier is NOT instance identity: a physical standby,
+// a clone or a promoted standby carries the same identifier, the same data
+// directory path and the same port. Identity comes from processes and clocks.
 // ---------------------------------------------------------------------------
 
 function findPgControldata() {
     if (process.env.PG_CONTROLDATA) return process.env.PG_CONTROLDATA;
-    const candidates = ['/usr/lib/postgresql'];
-    for (const root of candidates) {
-        let versions = [];
-        try { versions = fs.readdirSync(root).sort().reverse(); } catch (_) { continue; }
+    try {
+        const versions = fs.readdirSync('/usr/lib/postgresql').sort().reverse();
         for (const version of versions) {
-            const candidate = path.join(root, version, 'bin', 'pg_controldata');
+            const candidate = path.join('/usr/lib/postgresql', version, 'bin', 'pg_controldata');
             if (fs.existsSync(candidate)) return candidate;
         }
-    }
+    } catch (_) { /* fall through */ }
     return 'pg_controldata';
 }
 
 /**
- * Read the identity of the LOCAL cluster at `dataDirectory`.
- * A remote server cannot produce this: the system identifier lives in the local
- * cluster's pg_control and is unique per cluster (initdb).
+ * Parse /proc/<pid>/stat WITHOUT splitting the whole line on whitespace.
+ * Field 2 (comm) is parenthesised and may itself contain spaces and parentheses,
+ * so the split is anchored on the FIRST '(' and the LAST ')' in the line.
+ * Returns the fields this guard needs, and nothing derived from a guess.
  */
-function probeLocalCluster({ dataDirectory, port } = {}) {
-    const directory = String(dataDirectory || process.env[LOCAL_DATA_DIR_ENV] || '').trim();
-    if (!directory || !path.isAbsolute(directory)) {
-        refuse(`local mode needs the disposable cluster's data directory (${LOCAL_DATA_DIR_ENV}); none was provided, so the server's identity cannot be established.`);
+function readProcStat(pid) {
+    const id = Number(pid);
+    if (!Number.isInteger(id) || id <= 0) return null;
+    let raw;
+    try { raw = fs.readFileSync(`/proc/${id}/stat`, 'utf8'); } catch (err) {
+        if (err.code === 'ENOENT') return null;
+        refuse(`/proc/${id}/stat could not be read (${err.code || 'error'}).`);
     }
-    let stats;
-    try { stats = fs.statSync(directory); } catch (err) {
-        refuse(`the local cluster data directory "${directory}" is not readable by this process (${err.code || 'error'}). Run the suite as the cluster owner, or use the CI lanes, which prove the service container instead.`);
-    }
-    if (!stats.isDirectory()) refuse(`the local cluster data directory "${directory}" is not a directory.`);
+    const open = raw.indexOf('(');
+    const close = raw.lastIndexOf(')');
+    if (open === -1 || close === -1 || close < open) return null;
+    const comm = raw.slice(open + 1, close);
+    const rest = raw.slice(close + 2).trim().split(/\s+/);
+    // rest[0] is field 3 (state), so field N is rest[N - 3].
+    const state = rest[0];
+    const ppid = Number(rest[1]);
+    const starttime = Number(rest[19]);
+    if (!Number.isInteger(ppid) || !Number.isInteger(starttime)) return null;
+    return { pid: id, comm, state, ppid, starttime };
+}
 
+function clockTicks() {
+    if (process.env.AZM_CLOCK_TICKS) return Number(process.env.AZM_CLOCK_TICKS) || CLOCK_TICKS_FALLBACK;
+    try {
+        const raw = String(execFileSync('getconf', ['CLK_TCK'], { encoding: 'utf8', timeout: 5000 })).trim();
+        const value = Number(raw);
+        if (Number.isInteger(value) && value > 0) return value;
+    } catch (_) { /* fall back */ }
+    return CLOCK_TICKS_FALLBACK;
+}
+
+function bootEpoch() {
+    try {
+        const stat = fs.readFileSync('/proc/stat', 'utf8');
+        const match = /^btime\s+(\d+)$/m.exec(stat);
+        if (match) return Number(match[1]);
+    } catch (_) { /* fall through */ }
+    return null;
+}
+
+/** Wall-clock start of a process, from its start ticks and the boot time. */
+function processStartEpoch(stat, hz, btime) {
+    if (!stat || !btime) return null;
+    return btime + stat.starttime / hz;
+}
+
+/**
+ * Prove the backend that served this connection is a live local PostgreSQL
+ * backend descended from the local postmaster, and that both clocks agree.
+ *
+ * @param {object} args backendPid, postmasterStartTime, dataDirectory, port
+ */
+function probeLocalInstance({ backendPid, postmasterStartTime, dataDirectory, port } = {}, seams = {}) {
+    const platform = seams.platform || process.platform;
+    const readText = seams.readText || ((file) => fs.readFileSync(file, 'utf8'));
+    const readStat = seams.readProcStat || readProcStat;
+    const hz = seams.clockTicks || clockTicks();
+    const btime = seams.bootEpoch !== undefined ? seams.bootEpoch : bootEpoch();
+    if (platform !== 'linux') {
+        refuse(`local mode is only implemented for Linux (/proc process identity). This host is "${platform}"; there is no equivalent instance proof here, so it is refused rather than downgraded to the cluster-lineage check.`);
+    }
+    const directory = String(dataDirectory || '').trim();
+    if (!directory || !path.isAbsolute(directory)) {
+        refuse(`local mode needs the disposable instance's data directory; the server reported "${directory || 'nothing'}".`);
+    }
     let postmaster;
     try {
-        postmaster = fs.readFileSync(path.join(directory, 'postmaster.pid'), 'utf8').split('\n');
+        postmaster = readText(path.join(directory, 'postmaster.pid')).split('\n');
     } catch (err) {
-        refuse(`the local cluster "${directory}" has no readable postmaster.pid (${err.code || 'error'}), so it is not a running cluster on this machine.`);
+        refuse(`the data directory "${directory}" has no readable postmaster.pid (${err.code || 'error'}), so no postmaster on this machine is serving it.`);
     }
     const postmasterPid = Number(String(postmaster[0] || '').trim());
     const postmasterDirectory = String(postmaster[1] || '').trim();
+    const postmasterStartPid = Number(String(postmaster[2] || '').trim());
     const postmasterPort = String(postmaster[3] || '').trim();
-    if (!Number.isInteger(postmasterPid) || postmasterPid <= 0) refuse(`the local cluster "${directory}" has an unreadable postmaster pid.`);
-    if (postmasterDirectory !== directory) refuse(`the local cluster "${directory}" has a postmaster.pid written for "${postmasterDirectory}".`);
-    if (port && postmasterPort !== String(port)) refuse(`the local cluster "${directory}" listens on port ${postmasterPort}, not on the connected port ${port}.`);
+    if (!Number.isInteger(postmasterPid) || postmasterPid <= 0) refuse(`the postmaster.pid in "${directory}" has an unreadable pid.`);
+    if (postmasterDirectory !== directory) refuse(`the postmaster.pid in "${directory}" was written for "${postmasterDirectory}".`);
+    if (port && postmasterPort !== String(port)) refuse(`the local instance listens on port ${postmasterPort}, not on the connected port ${port}.`);
 
-    let controldata;
-    try {
-        controldata = run(findPgControldata(), [directory]);
-    } catch (err) {
-        refuse(`pg_controldata could not read the local cluster "${directory}" (${String(err.message || '').split('\n')[0].slice(0, 100)}). Local Docker or remote targets must use the CI lanes.`);
+    const postmasterStat = readStat(postmasterPid);
+    if (!postmasterStat) refuse(`no live local process ${postmasterPid} backs the postmaster.pid in "${directory}" — a stale PID file is not a running instance.`);
+    if (!/postgres/i.test(postmasterStat.comm)) refuse(`local process ${postmasterPid} is "${postmasterStat.comm}", not a PostgreSQL postmaster.`);
+    if (postmasterStat.state === 'Z') refuse(`local process ${postmasterPid} is a zombie, not a live postmaster.`);
+
+    let cmdline = '';
+    try { cmdline = readText(`/proc/${postmasterPid}/cmdline`); } catch (_) {
+        refuse(`/proc/${postmasterPid}/cmdline is unreadable, so the process behind "${directory}" cannot be confirmed as this instance.`);
     }
-    const match = /Database system identifier:\s*(\d+)/.exec(controldata);
-    if (!match) refuse(`pg_controldata did not report a system identifier for "${directory}".`);
+    if (!cmdline.includes(directory)) {
+        refuse(`the postmaster at ${postmasterPid} does not reference the data directory "${directory}".`);
+    }
 
-    // A live local postmaster process is the last piece: /proc on Linux.
-    if (process.platform === 'linux') {
-        let cmdline = '';
-        try { cmdline = fs.readFileSync(`/proc/${postmasterPid}/cmdline`, 'utf8'); } catch (_) {
-            refuse(`no local process ${postmasterPid} owns the postmaster.pid in "${directory}", so the cluster is not running on this machine.`);
+    const backend = readStat(backendPid);
+    if (!backend) refuse(`the connection reported backend pid ${backendPid}, which is not a live process on this machine. A remote, tunnelled or forwarded server cannot satisfy this.`);
+    if (!/postgres/i.test(backend.comm)) refuse(`local process ${backendPid} is "${backend.comm}", not a PostgreSQL backend.`);
+    if (backend.state === 'Z') refuse(`local process ${backendPid} is a zombie.`);
+
+    // Ancestry: the backend must descend from THIS postmaster, not merely exist.
+    let cursor = backend;
+    let reached = false;
+    const chain = [backend.pid];
+    for (let depth = 0; depth < 8 && cursor; depth += 1) {
+        if (cursor.ppid === postmasterPid) { reached = true; break; }
+        if (cursor.ppid <= 1) break;
+        cursor = readStat(cursor.ppid);
+        if (cursor) chain.push(cursor.pid);
+    }
+    if (!reached) {
+        refuse(`backend ${backendPid} does not descend from the postmaster ${postmasterPid} in "${directory}" (ancestry: ${chain.join(' -> ')}).`);
+    }
+
+    const postmasterStarted = processStartEpoch(postmasterStat, hz, btime);
+    if (postmasterStarted === null) refuse('the local postmaster start time could not be derived from /proc/stat btime and its start ticks.');
+
+    // PID reuse: the process must have started when the cluster says it did.
+    if (Number.isInteger(postmasterStartPid) && postmasterStartPid > 0) {
+        if (Math.abs(postmasterStartPid - postmasterStarted) > START_TIME_TOLERANCE_SECONDS) {
+            refuse(`the postmaster.pid records start time ${postmasterStartPid}, but process ${postmasterPid} started at ${Math.round(postmasterStarted)} — a reused PID or a stale file.`);
         }
-        if (!/postgres/i.test(cmdline)) refuse(`local process ${postmasterPid} is not a PostgreSQL process.`);
+    }
+    const reported = postmasterStartTime ? new Date(postmasterStartTime) : null;
+    if (!reported || Number.isNaN(reported.getTime())) {
+        refuse('the server did not report pg_postmaster_start_time(), so the instance clock cannot be checked.');
+    }
+    if (Math.abs(reported.getTime() / 1000 - postmasterStarted) > START_TIME_TOLERANCE_SECONDS) {
+        refuse(`the server reports a postmaster start time of ${reported.toISOString()}, but the local postmaster ${postmasterPid} started at ${new Date(postmasterStarted * 1000).toISOString()}. The connection is not being served by this instance.`);
     }
 
-    return { systemIdentifier: match[1], dataDirectory: directory, postmasterPid, port: postmasterPort };
+    return {
+        backendPid: backend.pid, postmasterPid, postmasterStarted: new Date(postmasterStarted * 1000).toISOString(),
+        dataDirectory: directory, port: postmasterPort, ancestry: chain, clockTicks: hz,
+    };
+}
+
+// ---------------------------------------------------------------------------
+// CI provenance: a GitHub Actions OIDC token, verified against GitHub's JWKS.
+// GITHUB_ACTIONS, a container label, a GITHUB_RUN_ID or a container id are all
+// settable by anyone and are never treated as authentication.
+// ---------------------------------------------------------------------------
+
+let jwksCache = null;
+
+function fetchGithubJwks() {
+    if (jwksCache) return Promise.resolve(jwksCache);
+    return new Promise((resolve, reject) => {
+        const request = https.get(OIDC_JWKS_URL, { timeout: 15000 }, (response) => {
+            if (response.statusCode !== 200) {
+                response.resume();
+                reject(new Error(`JWKS endpoint answered HTTP ${response.statusCode}`));
+                return;
+            }
+            let body = '';
+            response.setEncoding('utf8');
+            response.on('data', (chunk) => { body += chunk; });
+            response.on('end', () => {
+                try {
+                    const parsed = JSON.parse(body);
+                    if (!parsed || !Array.isArray(parsed.keys)) throw new Error('no keys');
+                    jwksCache = parsed;
+                    resolve(parsed);
+                } catch (err) { reject(new Error(`JWKS payload unreadable: ${err.message}`)); }
+            });
+        });
+        request.on('timeout', () => request.destroy(new Error('JWKS request timed out')));
+        request.on('error', reject);
+    });
+}
+
+function base64UrlToBuffer(part) {
+    return Buffer.from(String(part).replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+}
+
+function decodeJwt(token) {
+    const parts = String(token || '').trim().split('.');
+    if (parts.length !== 3) refuse('the GitHub Actions OIDC token is not a three-part JWT.');
+    let header, payload;
+    try {
+        header = JSON.parse(base64UrlToBuffer(parts[0]).toString('utf8'));
+        payload = JSON.parse(base64UrlToBuffer(parts[1]).toString('utf8'));
+    } catch (_) {
+        refuse('the GitHub Actions OIDC token header or payload is not readable JSON.');
+    }
+    return { header, payload, signingInput: `${parts[0]}.${parts[1]}`, signature: base64UrlToBuffer(parts[2]) };
+}
+
+/**
+ * Verify a GitHub Actions OIDC token. Signature first, then every claim that
+ * matters. Returns the verified identity; throws on any failure.
+ */
+function verifyRunnerIdentity({ token, jwks, now = Date.now(), audience = OIDC_AUDIENCE, repository = process.env.AZM_CI_REPOSITORY || 'AzamanLTD/AZM-backend' } = {}) {
+    if (!token) refuse('no GitHub Actions OIDC token was supplied, so the runner is not authenticated.');
+    const decoded = decodeJwt(token);
+    if (String(decoded.header.alg).toUpperCase() !== 'RS256') refuse(`the OIDC token uses ${decoded.header.alg}; only RS256 is accepted.`);
+    const keys = (jwks && Array.isArray(jwks.keys)) ? jwks.keys : null;
+    if (!keys) refuse('no GitHub signing keys are available to verify the OIDC token.');
+    const matching = keys.filter((key) => (decoded.header.kid ? key.kid === decoded.header.kid : true));
+    if (!matching.length) refuse(`the OIDC token is signed with key "${decoded.header.kid}", which is not among GitHub's published keys.`);
+    let verifiedSignature = false;
+    for (const key of matching) {
+        try {
+            const publicKey = crypto.createPublicKey({ key, format: 'jwk' });
+            if (crypto.verify('RSA-SHA256', Buffer.from(decoded.signingInput), publicKey, decoded.signature)) { verifiedSignature = true; break; }
+        } catch (_) { /* try the next key */ }
+    }
+    if (!verifiedSignature) refuse('the OIDC token signature does not verify against GitHub\'s published keys.');
+
+    const claims = decoded.payload;
+    if (claims.iss !== OIDC_ISSUER) refuse(`the OIDC token issuer is "${claims.iss}", not "${OIDC_ISSUER}".`);
+    const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
+    if (!audiences.includes(audience)) refuse(`the OIDC token audience is "${audiences.join(', ')}", not "${audience}".`);
+    if (!Number.isFinite(Number(claims.exp)) || Number(claims.exp) * 1000 <= now) refuse('the OIDC token has expired.');
+    if (Number.isFinite(Number(claims.nbf)) && Number(claims.nbf) * 1000 > now + 60000) refuse('the OIDC token is not valid yet.');
+    if (claims.repository !== repository) refuse(`the OIDC token names repository "${claims.repository}", not "${repository}".`);
+    const workflowRef = String(claims.workflow_ref || '');
+    if (!workflowRef.startsWith(`${repository}/.github/workflows/`)) {
+        refuse(`the OIDC token names workflow "${workflowRef || 'nothing'}", which is not a workflow of ${repository}.`);
+    }
+    if (!claims.run_id) refuse('the OIDC token carries no run id.');
+    return { runId: String(claims.run_id), workflow: workflowRef, repository: claims.repository, expiresAt: new Date(Number(claims.exp) * 1000).toISOString(), sha: claims.sha || null, ref: claims.ref || null };
 }
 
 // ---------------------------------------------------------------------------
@@ -311,13 +521,11 @@ function probeLocalCluster({ dataDirectory, port } = {}) {
 // ---------------------------------------------------------------------------
 
 /**
- * @param {object} prisma      client exposing $queryRawUnsafe
- * @param {object} [overrides] seams: { testUrl, databaseUrl, nodeEnv, expectedAddress,
- *                             containerId, localDataDir, githubActions, probeLocalCluster,
- *                             inspectContainerIdentity }
- * @returns {Promise<object>}  { database, host, identity, ... }
+ * @param {object} client      Prisma client OR an interactive transaction client
+ * @param {object} [overrides] seams
+ * @returns {Promise<object>}  identity evidence
  */
-async function assertDisposableTestDatabase(prisma, overrides = {}) {
+async function assertDisposableTestDatabase(client, overrides = {}) {
     const env = process.env;
     const pick = (key, fallback) => (overrides[key] !== undefined ? overrides[key] : fallback);
     const testUrl = String(pick('testUrl', env.TEST_DATABASE_URL || '')).trim();
@@ -326,6 +534,7 @@ async function assertDisposableTestDatabase(prisma, overrides = {}) {
     const githubActions = pick('githubActions', env.GITHUB_ACTIONS === 'true');
     const expectedRaw = pick('expectedAddress', env[EXPECTED_ADDRESS_ENV]);
     const containerId = pick('containerId', env[CONTAINER_ID_ENV]);
+    const serviceContainerId = pick('serviceContainerId', env[SERVICE_CONTAINER_ENV]);
     const localDataDir = pick('localDataDir', env[LOCAL_DATA_DIR_ENV]);
 
     if (!testUrl) refuse('TEST_DATABASE_URL is not set, so this process cannot prove which database it is connected to.');
@@ -339,20 +548,41 @@ async function assertDisposableTestDatabase(prisma, overrides = {}) {
         refuse(`the test database host "${target.host}" (${describeTarget(testUrl)}) is not a loopback address. This maintenance statement is local-only; a remote or private-network database is not a supported disposable target.`);
     }
 
-    // Identity expectations are resolved BEFORE any query.
+    // The CI expectation, when this is the CI branch. Resolved before any query.
     let expectedAddress = null;
+    let runner = null;
     if (githubActions) {
         expectedAddress = interpretExpectedAddress(expectedRaw);
         if (!expectedAddress) refuse(`${EXPECTED_ADDRESS_ENV} is not set, but this is a GitHub Actions run. The workflow must export the exact PostgreSQL service-container address; a missing expectation may not silently disable the identity check.`);
+        // GITHUB_ACTIONS is a claim. The runner is authenticated by OIDC or not at all.
+        const token = pick('oidcToken', (() => {
+            const tokenPath = pick('oidcTokenPath', env[OIDC_TOKEN_PATH_ENV]);
+            if (!tokenPath) return '';
+            try { return fs.readFileSync(String(tokenPath), 'utf8').trim(); } catch (_) { return ''; }
+        })());
+        const verifier = overrides.verifyRunnerIdentity || verifyRunnerIdentity;
+        let jwks = overrides.jwks || null;
+        if (!jwks) {
+            try {
+                jwks = overrides.fetchJwks ? await overrides.fetchJwks() : await fetchGithubJwks();
+            } catch (err) {
+                refuse(`GitHub's published signing keys could not be fetched, so the runner cannot be authenticated: ${String((err && err.message) || err).slice(0, 120)}`);
+            }
+        }
+        runner = verifier({ token, jwks, now: overrides.now || Date.now(), audience: overrides.audience || OIDC_AUDIENCE });
+        if (!runner || !runner.runId) refuse('the runner identity could not be verified.');
     } else if (String(expectedRaw === undefined || expectedRaw === null ? '' : expectedRaw).trim() !== '') {
-        // A locally supplied address is a CLAIM, never an identity.
-        refuse(`a locally set ${EXPECTED_ADDRESS_ENV} ("${String(expectedRaw).trim()}") is not an independently verified identity. Local mode proves the cluster itself; remove the variable instead of asserting an address.`);
+        refuse(`a locally set ${EXPECTED_ADDRESS_ENV} ("${String(expectedRaw).trim()}") is not an independently verified identity. Local mode proves the instance itself; remove the variable instead of asserting an address.`);
     }
 
-    const rows = await prisma.$queryRawUnsafe(
-        'SELECT current_database() AS database, inet_server_addr()::text AS server_address, '
-        + '(SELECT system_identifier::text FROM pg_control_system()) AS system_identifier, '
-        + "current_setting('data_directory') AS data_directory, current_setting('port') AS port"
+    const rows = await client.$queryRawUnsafe(
+        'SELECT pg_catalog.current_database() AS database, '
+        + 'pg_catalog.inet_server_addr()::text AS server_address, '
+        + '(SELECT system_identifier::text FROM pg_catalog.pg_control_system()) AS system_identifier, '
+        + "pg_catalog.current_setting('data_directory') AS data_directory, "
+        + "pg_catalog.current_setting('port') AS port, "
+        + 'pg_catalog.pg_backend_pid() AS backend_pid, '
+        + 'pg_catalog.pg_postmaster_start_time() AS postmaster_start_time'
     );
     const row = rows && rows[0] ? rows[0] : null;
     const connected = row ? row.database : null;
@@ -371,35 +601,51 @@ async function assertDisposableTestDatabase(prisma, overrides = {}) {
             refuse(`the server reports address "${server.address}", but the expected disposable database address is "${expectedAddress}". Identity mismatch.`);
         }
         const inspector = overrides.inspectContainerIdentity || inspectContainerIdentity;
-        const container = inspector({ address: expectedAddress, containerId });
+        const container = inspector({ address: expectedAddress, containerId, serviceContainerId });
         return {
             database: target.database, host: target.host, serverAddress: server.address,
             identity: 'ci-container-identity', containerAddress: container.containerAddress, containerId: container.containerId,
+            runner, backendPid: row ? Number(row.backend_pid) : null,
         };
     }
 
-    // LOCAL: the transport tells us nothing. Prove the cluster this machine owns.
-    // The data directory comes from the SERVER's own report unless overridden:
-    // reading it locally and comparing system identifiers is what closes the
-    // tunnel, because a remote cluster cannot present this machine's identifier.
-    const prober = overrides.probeLocalCluster || probeLocalCluster;
-    const dataDirectory = String(localDataDir || '').trim() || (row && row.data_directory ? String(row.data_directory) : '');
-    const local = prober({ dataDirectory, port: row ? row.port : target.port });
+    // LOCAL: the transport proves nothing; prove the instance.
+    const prober = overrides.probeLocalInstance || probeLocalInstance;
+    const instance = prober({
+        backendPid: row ? Number(row.backend_pid) : null,
+        postmasterStartTime: row ? row.postmaster_start_time : null,
+        dataDirectory: String(localDataDir || '').trim() || (row && row.data_directory ? String(row.data_directory) : ''),
+        port: row ? row.port : target.port,
+    });
+
     const serverSystemIdentifier = row && row.system_identifier ? String(row.system_identifier).trim() : '';
-    if (!serverSystemIdentifier) {
-        refuse('the connected server did not report its pg_control system identifier, so it cannot be matched to a local cluster.');
+    if (!serverSystemIdentifier) refuse('the connected server did not report its pg_control system identifier, so it cannot be checked against the local cluster.');
+
+    const controldata = (() => {
+        const reader = overrides.readClusterSystemIdentifier || ((directory) => {
+            let output;
+            try { output = run(findPgControldata(), [directory]); } catch (err) {
+                refuse(`pg_controldata could not read the local cluster "${directory}" (${String(err.message || '').split('\n')[0].slice(0, 100)}).`);
+            }
+            const match = /Database system identifier:\s*(\d+)/.exec(output);
+            if (!match) refuse(`pg_controldata did not report a system identifier for "${directory}".`);
+            return match[1];
+        });
+        return reader(instance.dataDirectory);
+    })();
+    // CONSISTENCY ONLY: a standby or clone shares this identifier, so it can
+    // corroborate the instance proof but never replace it.
+    if (serverSystemIdentifier !== controldata) {
+        refuse(`the connected server belongs to cluster ${serverSystemIdentifier}, but the local cluster at "${instance.dataDirectory}" is ${controldata}.`);
     }
-    if (serverSystemIdentifier !== local.systemIdentifier) {
-        refuse(`the connected server belongs to cluster ${serverSystemIdentifier}, but this machine's cluster at "${local.dataDirectory}" is ${local.systemIdentifier}. A forwarded, tunnelled or proxied server is not a disposable local target.`);
-    }
-    if (row && row.data_directory && String(row.data_directory) !== local.dataDirectory) {
-        refuse(`the connected server runs from "${row.data_directory}", not from the local cluster "${local.dataDirectory}".`);
-    }
+
     return {
         database: target.database, host: target.host,
         serverAddress: server.reported === false ? null : server.address,
-        identity: 'local-cluster-identity', systemIdentifier: local.systemIdentifier,
-        dataDirectory: local.dataDirectory, transport: server.reported === false ? 'unix-socket' : 'tcp',
+        identity: 'local-instance-identity', systemIdentifier: serverSystemIdentifier,
+        dataDirectory: instance.dataDirectory, transport: server.reported === false ? 'unix-socket' : 'tcp',
+        backendPid: instance.backendPid, postmasterPid: instance.postmasterPid,
+        postmasterStarted: instance.postmasterStarted, ancestry: instance.ancestry,
     };
 }
 
@@ -408,8 +654,12 @@ module.exports = {
     CONTAINER_ID_ENV,
     EXPECTED_ADDRESS_ENV,
     LOCAL_DATA_DIR_ENV,
+    OIDC_AUDIENCE,
+    OIDC_TOKEN_PATH_ENV,
+    SERVICE_CONTAINER_ENV,
     classifyAddress,
     databaseNameFromUrl: (raw) => { const parsed = parseTarget(raw); return parsed ? parsed.database : null; },
+    decodeJwt,
     describeTarget,
     findPgControldata,
     inspectContainerIdentity,
@@ -420,6 +670,8 @@ module.exports = {
     isLoopbackHost,
     isMappedIPv6,
     parseTarget,
-    probeLocalCluster,
+    probeLocalInstance,
+    readProcStat,
     splitCidr,
+    verifyRunnerIdentity,
 };

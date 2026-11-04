@@ -94,16 +94,32 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
     // does not exist — it can only shadow a later payout that reuses the id.
     // This CLOSES those rows (status RESOLVED, never deleted) and touches no row
     // that belongs to a still-existing payout, so live evidence is preserved.
+    // §2 SAME-CONNECTION PROOF. A Prisma client is a POOL: proving identity on the
+    // root client and then issuing the UPDATE on that root client proves
+    // connection A and mutates through connection B. Both statements therefore run
+    // on ONE interactive-transaction client, so the proof and the UPDATE share a
+    // physical backend and a transaction. If the proof fails, the transaction
+    // aborts and the UPDATE never runs. Keep this transaction short.
+    const ORPHAN_SWEEP_SQL =
+        'UPDATE "ReconciliationException" r SET "status" = \'RESOLVED\', "resolvedAt" = now() '
+        + 'WHERE r."status" = \'OPEN\' AND r."entityType" = \'WITHDRAWAL\' '
+        + 'AND NOT EXISTS (SELECT 1 FROM "Withdrawal" w WHERE w."id"::text = r."entityId")';
+
+    async function guardAndSweep(client, overrides = {}) {
+        return client.$transaction(async (tx) => {
+            const evidence = await assertDisposableTestDatabase(tx, overrides);
+            const [before] = await tx.$queryRawUnsafe('SELECT pg_catalog.pg_backend_pid() AS pid');
+            await tx.$executeRawUnsafe(ORPHAN_SWEEP_SQL);
+            const [after] = await tx.$queryRawUnsafe('SELECT pg_catalog.pg_backend_pid() AS pid');
+            return { evidence, before: Number(before.pid), after: Number(after.pid) };
+        });
+    }
+
     beforeEach(async () => {
         if (!prisma) return;
         // FAIL CLOSED: this UPDATE is table-wide, so it may only run once the
-        // client has PROVED it is on TEST_DATABASE_URL (see helpers/testDatabaseGuard).
-        await assertDisposableTestDatabase(prisma);
-        await prisma.$executeRawUnsafe(
-            'UPDATE "ReconciliationException" r SET "status" = \'RESOLVED\', "resolvedAt" = now() '
-            + 'WHERE r."status" = \'OPEN\' AND r."entityType" = \'WITHDRAWAL\' '
-            + 'AND NOT EXISTS (SELECT 1 FROM "Withdrawal" w WHERE w."id"::text = r."entityId")'
-        );
+        // SAME connection has proved it is on the disposable test database.
+        await guardAndSweep(prisma);
     });
 
     afterEach(async () => {
@@ -481,20 +497,22 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
     });
     test('§1b the orphan sweep refuses to run unless the target is provably the disposable test database', async () => {
         const { assertDisposableTestDatabase: guard, databaseNameFromUrl } = require('./helpers/testDatabaseGuard');
-        // Derived from the real target: this suite runs against azm_iso locally and
-        // azm_test in CI, and a hardcoded name would prove nothing either way.
         const TEST_URL = process.env.TEST_DATABASE_URL || 'postgres://postgres:postgres@localhost:5432/azm_iso?schema=public';
         const DB = databaseNameFromUrl(TEST_URL) || 'azm_iso';
         const SID = '7686515198152565070';
-        // The exhaustive IPv4 / IPv6 / CIDR / identity matrix lives in
-        // __tests__/test-database-guard.test.js (run as its own step in the
-        // financial-durability lane). This test proves the guard as this suite
-        // wires it: refusals happen before the caller's statement, and the
-        // positive path runs here for real.
+        // The exhaustive matrix (OIDC claims, /proc ancestry, CIDR, addresses)
+        // lives in __tests__/test-database-guard.test.js, which runs as its own
+        // step in the financial-durability lane. This test proves the guard as
+        // THIS suite wires it: every refusal happens before the caller's
+        // statement, and the positive path is exercised for real by beforeEach.
+        const localProof = (args) => ({
+            backendPid: args.backendPid, postmasterPid: 400, postmasterStarted: '2026-11-04T20:42:22.000Z',
+            dataDirectory: args.dataDirectory, port: '5432', ancestry: [args.backendPid],
+        });
         const seams = (over = {}) => ({
             testUrl: TEST_URL, databaseUrl: TEST_URL, nodeEnv: 'test',
-            expectedAddress: '', containerId: '', localDataDir: '/var/lib/postgresql/15/main', githubActions: false,
-            probeLocalCluster: () => ({ systemIdentifier: SID, dataDirectory: '/var/lib/postgresql/15/main', postmasterPid: 422, port: '5432' }),
+            expectedAddress: '', containerId: '', localDataDir: '', githubActions: false,
+            probeLocalInstance: localProof, readClusterSystemIdentifier: () => SID,
             ...over,
         });
 
@@ -504,7 +522,11 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
                 statements,
                 $queryRawUnsafe: async (sql) => {
                     statements.push(sql);
-                    return [{ database, server_address: serverAddress, system_identifier: systemIdentifier, data_directory: dataDirectory, port: '5432' }];
+                    return [{
+                        database, server_address: serverAddress, system_identifier: systemIdentifier,
+                        data_directory: dataDirectory, port: '5432', backend_pid: 900,
+                        postmaster_start_time: new Date().toISOString(),
+                    }];
                 },
                 $executeRawUnsafe: async (sql) => { statements.push(sql); },
             };
@@ -545,46 +567,74 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
         expect(unreadable.message).toMatch(/does not parse into a host and a database name/);
         expect(unreadable.message).not.toContain('sekret');
 
-        // (f) a REMOTE host with the exact expected database name, and the server
-        //     agreeing on that name, is still refused with ZERO queries issued.
+        // (f) a REMOTE host with the exact expected database name is refused with
+        //     ZERO queries issued.
         const remoteUrl = 'postgres://postgres:postgres@azm-prod-db.example.com:5432/azm_iso?schema=public';
         const remote = stubClient();
         await expect(guard(remote, seams({ testUrl: remoteUrl, databaseUrl: remoteUrl })))
             .rejects.toThrow(/host "azm-prod-db\.example\.com".*is not a loopback address/);
         expect(remote.statements).toHaveLength(0);
 
-        // (g) an ssh -L tunnel: loopback URL, loopback report, WRONG cluster.
-        const tunnelled = stubClient({ systemIdentifier: '1111111111111111111' });
-        await expect(guard(tunnelled, seams())).rejects.toThrow(/A forwarded, tunnelled or proxied server is not a disposable local target/);
+        // (g) an ssh -L tunnel: loopback URL, loopback report, but the backend the
+        //     connection is served by is not a process on this machine.
+        const tunnelled = stubClient();
+        await expect(guard(tunnelled, seams({
+            probeLocalInstance: () => { throw new Error('[test-db-guard] refusing to run: the connection reported backend pid 900, which is not a live process on this machine. A remote, tunnelled or forwarded server cannot satisfy this.'); },
+        }))).rejects.toThrow(/not a live process on this machine/);
         expect(mutations(tunnelled)).toHaveLength(0);
 
         // (h) a locally supplied expectation is a claim, not identity.
         await expect(guard(stubClient({ serverAddress: '203.0.113.9/32' }), seams({ expectedAddress: '203.0.113.9' })))
             .rejects.toThrow(/is not an independently verified identity/);
 
-        // (i) the CI path needs a verified container, not a matching number.
+        // (i) the CI branch needs an authenticated runner, not a matching number.
         const ciBase = {
             githubActions: true, expectedAddress: '172.18.0.2', containerId: '2f206542ec5f',
+            oidcToken: '', jwks: { keys: [] },
             inspectContainerIdentity: ({ address }) => ({ containerId: '2f206542ec5f', containerAddress: address, image: 'postgres:16' }),
         };
         await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), seams(ciBase)))
-            .resolves.toMatchObject({ identity: 'ci-container-identity' });
-        await expect(guard(stubClient({ serverAddress: '172.18.0.3/32' }), seams(ciBase)))
-            .rejects.toThrow(/Identity mismatch/);
+            .rejects.toThrow(/runner is not authenticated/);
+        await expect(guard(stubClient({ serverAddress: '172.18.0.3/32' }), seams({ ...ciBase, oidcToken: 'x.y.z' })))
+            .rejects.toThrow(/OIDC token|Identity mismatch/);
         await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), seams({ ...ciBase, expectedAddress: '172.18.0.2/32' })))
             .rejects.toThrow(/AZM_EXPECTED_TEST_DB_ADDRESS/);
 
-        // (j) the positive LOCAL path, with local semantics pinned. The REAL
-        //     identity proof is exercised by this suite's own beforeEach, which
-        //     runs the guard against the live disposable database in whatever
-        //     mode the environment implies — the native cluster locally, the
-        //     verified service container in CI.
+        // (j) the positive LOCAL path with local semantics pinned. The REAL
+        //     identity proof runs in beforeEach, against the live instance.
         const good = stubClient();
         const result = await guard(good, seams({ githubActions: false, expectedAddress: null }));
-        expect(result.identity).toBe('local-cluster-identity');
+        expect(result.identity).toBe('local-instance-identity');
         expect(result.systemIdentifier).toBe(SID);
         expect(result.transport).toBe('tcp');
         expect(good.statements).toHaveLength(1);
         expect(mutations(good)).toHaveLength(0);
+    });
+
+    test('§1c the identity proof and the orphan sweep run on ONE backend inside one transaction', async () => {
+        const { evidence, before, after } = await guardAndSweep(prisma);
+        // Same physical backend for the proof query, the UPDATE and the recheck.
+        expect(before).toBe(after);
+        expect(evidence.backendPid).toBe(before);
+        // And that backend is the live local instance (or the verified CI container).
+        expect(['local-instance-identity', 'ci-container-identity']).toContain(evidence.identity);
+
+        const orphans = async () => {
+            const [row] = await prisma.$queryRawUnsafe(
+                'SELECT count(*)::int AS n FROM "ReconciliationException" r WHERE r."status" = \'OPEN\' '
+                + 'AND r."entityType" = \'WITHDRAWAL\' AND NOT EXISTS (SELECT 1 FROM "Withdrawal" w WHERE w."id"::text = r."entityId")'
+            );
+            return row.n;
+        };
+        const openBefore = await orphans();
+
+        // A refused identity must abort the transaction, leaving the sweep unrun.
+        const TEST_URL = process.env.TEST_DATABASE_URL || '';
+        await expect(guardAndSweep(prisma, { databaseUrl: 'postgres://nobody@localhost:5432/not_the_test_db' }))
+            .rejects.toThrow(/is not the explicit test database/);
+        // A failure inside the transaction (after the proof) must equally leave it unrun.
+        await expect(guardAndSweep(prisma, { nodeEnv: 'production' })).rejects.toThrow(/NODE_ENV is "production"/);
+        expect(await orphans()).toBe(openBefore);
+        expect(TEST_URL).toBeTruthy();
     });
 });

@@ -41,6 +41,12 @@ jobs:
     # runner still only needs a fraction of the main lane's 90-minute budget.
     timeout-minutes: 45
 
+    # The database guard authenticates the runner with an OIDC token; without
+    # this permission the lane fails closed instead of guessing.
+    permissions:
+      contents: read
+      id-token: write
+
     services:
       postgres:
         image: postgres:16
@@ -78,6 +84,27 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: 'Guard: authenticate the runner (GitHub OIDC)'
+        # GITHUB_ACTIONS=true, a container label and a run id are all settable by
+        # anyone; none of them authenticates a runner. The database guard enables
+        # its CI branch only for a GitHub Actions OIDC token whose RS256 signature
+        # verifies against GitHub's published JWKS and whose issuer, audience,
+        # expiry, repository and workflow claims match. The token is written to a
+        # private file and never printed.
+        run: |
+          set -euo pipefail
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::This job cannot request an OIDC token (needs permissions: id-token: write). The database guard would refuse, so the lane stops here rather than degrading."
+            exit 1
+          fi
+          TOKEN_FILE="${RUNNER_TEMP:-/tmp}/azm-ci-oidc.jwt"
+          curl -sS -f -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=azm-test-db-guard" \
+            | node -e 'let body = ""; process.stdin.on("data", (chunk) => { body += chunk; }).on("end", () => { const token = JSON.parse(body).value; if (!token) process.exit(1); require("fs").writeFileSync(process.argv[1], token, { mode: 0o600 }); });' "$TOKEN_FILE"
+          test -s "$TOKEN_FILE"
+          echo "AZM_CI_OIDC_TOKEN_PATH=${TOKEN_FILE}" >> "$GITHUB_ENV"
+          echo "Runner OIDC token acquired (value never printed)."
+
       - name: 'Guard: identify the PostgreSQL service container (exact identity)'
         # §392 — the database guard compares the server's own reported address
         # against an INDEPENDENT expectation, never against a private subnet: a
@@ -110,6 +137,15 @@ jobs:
           echo "Exact expected database address: ${ADDRESS}"
           echo "AZM_TEST_PG_CONTAINER=${CONTAINER}" >> "$GITHUB_ENV"
           echo "AZM_EXPECTED_TEST_DB_ADDRESS=${ADDRESS}" >> "$GITHUB_ENV"
+          # The service-container id from the job.services context: where the
+          # workflow can supply it, the docker-selected container must be that one.
+          SERVICE_CONTAINER='${{ job.services.postgres.id }}'
+          if [ -n "$SERVICE_CONTAINER" ]; then
+            echo "AZM_CI_SERVICE_CONTAINER_ID=${SERVICE_CONTAINER}" >> "$GITHUB_ENV"
+            echo "Service container declared by the job: ${SERVICE_CONTAINER}"
+          else
+            echo "::warning::job.services.postgres.id was empty; falling back to the exactly-one docker selection."
+          fi
 
       - name: 'Guard: Postgres must be in production commit mode'
         # THE lane invariant. The main battery tunes synchronous_commit=off for
@@ -241,8 +277,8 @@ jobs:
         # never be green with the guard unproven.
         run: |
           set -euo pipefail
-          if [ -z "${AZM_EXPECTED_TEST_DB_ADDRESS:-}" ] || [ -z "${AZM_TEST_PG_CONTAINER:-}" ]; then
-            echo "::error::The PostgreSQL container identity is not established (AZM_EXPECTED_TEST_DB_ADDRESS / AZM_TEST_PG_CONTAINER). The guard would refuse, so the lane stops here."
+          if [ -z "${AZM_EXPECTED_TEST_DB_ADDRESS:-}" ] || [ -z "${AZM_TEST_PG_CONTAINER:-}" ] || [ -z "${AZM_CI_OIDC_TOKEN_PATH:-}" ]; then
+            echo "::error::The database identity is not established (AZM_EXPECTED_TEST_DB_ADDRESS / AZM_TEST_PG_CONTAINER / AZM_CI_OIDC_TOKEN_PATH). The guard would refuse, so the lane stops here."
             exit 1
           fi
           echo "Expected database address: ${AZM_EXPECTED_TEST_DB_ADDRESS} (container ${AZM_TEST_PG_CONTAINER})"

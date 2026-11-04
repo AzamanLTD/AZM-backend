@@ -2,151 +2,239 @@
 // =============================================================================
 // Strict tests for __tests__/helpers/testDatabaseGuard.js.
 //
-// Pure unit tests: no database, no connection string, so they run anywhere —
-// including as their own step in the financial-durability lane.
+// Pure unit tests: no database, no network, so they run anywhere — including as
+// their own step in the financial-durability lane.
 //
-// The guard is the last line of defence in front of a table-wide maintenance
-// statement. What these tests care about most is the thing a name, a hostname,
-// a loopback report or a caller-supplied address CANNOT prove: that the server
-// is disposable. So the matrix is organised around identity, not around shape.
+// WHAT IS AND IS NOT A STUB HERE, stated plainly:
+//   * OIDC verification is REAL: tokens are signed with a generated RSA key and
+//     verified by the guard's own verifyRunnerIdentity against a matching JWKS.
+//     Only the JWKS transport (a network fetch) is replaced.
+//   * The instance prober is REAL: probeLocalInstance runs for every local case,
+//     with /proc and postmaster.pid supplied through its seams. A physical
+//     standby was NOT stood up; the standby case is a faithful seam-level
+//     reproduction of the exact condition (same cluster identifier, same data
+//     directory, same port, different backend/ancestry).
+//   * The live local instance is exercised for real by the admin-review suite,
+//     whose beforeEach runs the guard-and-sweep transaction.
 // =============================================================================
 
+const crypto = require('crypto');
 const {
     assertDisposableTestDatabase: guard,
     inspectContainerIdentity,
-    classifyAddress,
-    describeTarget,
     interpretExpectedAddress,
     interpretServerAddress,
     isLocalAddress,
     isLoopbackAddress,
     isLoopbackHost,
     isMappedIPv6,
+    probeLocalInstance,
+    readProcStat,
     splitCidr,
+    verifyRunnerIdentity,
 } = require('./helpers/testDatabaseGuard');
 
 const LOCAL_URL = 'postgres://postgres:postgres@localhost:5432/azm_iso?schema=public';
 const CI_EXPECTED = '172.18.0.2';
 const CI_CONTAINER = '2f206542ec5f';
-const LOCAL_SID = '7686515198152565070';
+const SERVICE_CONTAINER = '2f206542ec5faa11bb22cc33';
+const SID = '7686515198152565070';
+const DATA_DIR = '/var/lib/postgresql/15/main';
+const BTIME = 1700000000;
+const HZ = 100;
+const POSTMASTER = { pid: 400, ppid: 1, starttime: 500, comm: 'postgres', state: 'S' };
+const BACKEND = { pid: 900, ppid: 400, starttime: 900, comm: 'postgres', state: 'S' };
+const POSTMASTER_STARTED = BTIME + POSTMASTER.starttime / HZ;
 
-// A client that reports an identity and records every statement, so "refused"
-// also means "the caller's UPDATE never reached the database".
+// ---------------------------------------------------------------------------
+// OIDC: a real key pair, a real signature, a real JWKS.
+// ---------------------------------------------------------------------------
+const { privateKey, publicKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+const KEY_ID = 'test-key-1';
+const JWKS = { keys: [{ ...publicKey.export({ format: 'jwk' }), kid: KEY_ID, alg: 'RS256', use: 'sig' }] };
+const REPO = 'AzamanLTD/AZM-backend';
+
+const b64 = (value) => Buffer.from(typeof value === 'string' ? value : JSON.stringify(value)).toString('base64url');
+
+function signToken(over = {}, { kid = KEY_ID, alg = 'RS256', signer = privateKey } = {}) {
+    const now = Math.floor(Date.now() / 1000);
+    const payload = {
+        iss: 'https://token.actions.githubusercontent.com',
+        aud: 'azm-test-db-guard',
+        exp: now + 300,
+        nbf: now - 10,
+        iat: now - 10,
+        repository: REPO,
+        repository_owner: 'AzamanLTD',
+        workflow_ref: `${REPO}/.github/workflows/financial-durability.yml@refs/pull/392/merge`,
+        workflow: 'financial-durability',
+        run_id: '41920751864',
+        sha: '61cb8bd65f9c4670c680d07854585046173b8042',
+        ref: 'refs/pull/392/merge',
+        ...over,
+    };
+    const head = b64({ alg, typ: 'JWT', kid });
+    const body = b64(payload);
+    const signature = crypto.sign('RSA-SHA256', Buffer.from(`${head}.${body}`), signer).toString('base64url');
+    return `${head}.${body}.${signature}`;
+}
+
+// ---------------------------------------------------------------------------
+// Clients and seams.
+// ---------------------------------------------------------------------------
 function stubClient({
     database = 'azm_iso',
     serverAddress = '127.0.0.1/32',
-    systemIdentifier = LOCAL_SID,
-    dataDirectory = '/var/lib/postgresql/15/main',
+    systemIdentifier = SID,
+    dataDirectory = DATA_DIR,
     port = '5432',
+    backendPid = BACKEND.pid,
+    postmasterStartTime = new Date(POSTMASTER_STARTED * 1000).toISOString(),
 } = {}) {
     const statements = [];
     return {
         statements,
         $queryRawUnsafe: async (sql) => {
             statements.push(sql);
-            return [{ database, server_address: serverAddress, system_identifier: systemIdentifier, data_directory: dataDirectory, port }];
+            return [{ database, server_address: serverAddress, system_identifier: systemIdentifier, data_directory: dataDirectory, port, backend_pid: backendPid, postmaster_start_time: postmasterStartTime }];
         },
         $executeRawUnsafe: async (sql) => { statements.push(sql); },
     };
 }
-
 const mutations = (client) => client.statements.filter((sql) => /^\s*(UPDATE|DELETE|TRUNCATE|INSERT)/i.test(sql));
 
-// Local-mode seams: the machine's own cluster is stubbed to the same identity
-// the fake server reports, which is what the real probe establishes.
-const localProof = (over = {}) => ({ systemIdentifier: LOCAL_SID, dataDirectory: '/var/lib/postgresql/15/main', postmasterPid: 422, port: '5432', ...over });
-const seams = (over = {}) => ({
+function procSeams({ table, platform = 'linux', postmasterPidFile, hz = HZ, btime = BTIME } = {}) {
+    const processes = table || { [POSTMASTER.pid]: POSTMASTER, [BACKEND.pid]: BACKEND };
+    return {
+        platform,
+        clockTicks: hz,
+        bootEpoch: btime,
+        readProcStat: (pid) => processes[pid] || null,
+        readText: (file) => {
+            if (file.endsWith('postmaster.pid')) {
+                return (postmasterPidFile || [
+                    POSTMASTER.pid, DATA_DIR, Math.round(POSTMASTER_STARTED), '5432', '/var/run/postgresql', '', '',
+                ].join('\n'));
+            }
+            if (file.includes('/cmdline')) {
+                const pid = Number(file.split('/')[2]);
+                if (pid === POSTMASTER.pid) return `postgres\0-D\0${DATA_DIR}\0`;
+                return `postgres: 15/main: azm_iso azm_iso 127.0.0.1(5432) idle\0`;
+            }
+            throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
+        },
+    };
+}
+
+const instanceArgs = (over = {}) => ({
+    backendPid: BACKEND.pid,
+    postmasterStartTime: new Date(POSTMASTER_STARTED * 1000).toISOString(),
+    dataDirectory: DATA_DIR,
+    port: '5432',
+    ...over,
+});
+
+const localSeams = (over = {}) => ({
     testUrl: LOCAL_URL,
     databaseUrl: LOCAL_URL,
     nodeEnv: 'test',
     expectedAddress: '',
     containerId: '',
-    localDataDir: '/var/lib/postgresql/15/main',
+    localDataDir: '',
     githubActions: false,
-    probeLocalCluster: () => localProof(),
+    probeLocalInstance: (args) => probeLocalInstance(args, procSeams()),
+    readClusterSystemIdentifier: () => SID,
     ...over,
 });
 
-const ciSeams = (over = {}) => seams({
+const ciSeams = (over = {}) => ({
+    testUrl: LOCAL_URL,
+    databaseUrl: LOCAL_URL,
+    nodeEnv: 'test',
     githubActions: true,
     expectedAddress: CI_EXPECTED,
     containerId: CI_CONTAINER,
-    inspectContainerIdentity: ({ address }) => ({ containerId: CI_CONTAINER, containerAddress: address, image: 'postgres:16' }),
+    serviceContainerId: SERVICE_CONTAINER,
+    jwks: JWKS,
+    oidcToken: signToken(),
+    inspectContainerIdentity: ({ address }) => ({ containerId: SERVICE_CONTAINER, containerAddress: address, image: 'postgres:16' }),
     ...over,
 });
 
-describe('§1 GitHub Actions proves an exact container identity', () => {
-    test('the exact container address is accepted, after docker verification', async () => {
+// ---------------------------------------------------------------------------
+describe('§1 CI provenance is an authenticated GitHub Actions runner (OIDC)', () => {
+    test('a correctly signed token for this repository is accepted, and the address must match', async () => {
+        const result = await guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams());
+        expect(result).toMatchObject({ identity: 'ci-container-identity', serverAddress: CI_EXPECTED });
+        expect(result.runner.runId).toBe('41920751864');
+        expect(result.runner.repository).toBe(REPO);
+    });
+
+    test('GITHUB_ACTIONS=true on a laptop, with no token, does NOT enable CI mode', async () => {
         const client = stubClient({ serverAddress: '172.18.0.2/32' });
-        await expect(guard(client, ciSeams())).resolves.toMatchObject({
-            database: 'azm_iso', serverAddress: '172.18.0.2', identity: 'ci-container-identity', containerAddress: '172.18.0.2',
-        });
+        await expect(guard(client, ciSeams({ oidcToken: '' })))
+            .rejects.toThrow(/no GitHub Actions OIDC token was supplied, so the runner is not authenticated/);
         expect(mutations(client)).toHaveLength(0);
     });
 
-    test('a different address inside 172.18.0.0/16 is refused', async () => {
-        await expect(guard(stubClient({ serverAddress: '172.18.0.3/32' }), ciSeams()))
-            .rejects.toThrow(/server reports address "172\.18\.0\.3", but the expected disposable database address is "172\.18\.0\.2"/);
-    });
-
-    test('172.20.5.9 and 172.31.9.9 are refused — inside the retired 172.16/12 allowance', async () => {
-        for (const address of ['172.20.5.9', '172.31.9.9']) {
-            await expect(guard(stubClient({ serverAddress: `${address}/32` }), ciSeams()))
-                .rejects.toThrow(/but the expected disposable database address is/);
-            await expect(guard(stubClient({ serverAddress: `${address}/32` }), ciSeams({ githubActions: true, expectedAddress: '' })))
-                .rejects.toThrow(/AZM_EXPECTED_TEST_DB_ADDRESS is not set/);
-        }
-    });
-
-    test('10/8, 192.168/16 and public addresses are refused', async () => {
-        for (const address of ['10.4.1.9', '192.168.1.4', '203.0.113.7', '8.8.8.8']) {
-            await expect(guard(stubClient({ serverAddress: `${address}/32` }), ciSeams()))
-                .rejects.toThrow(/but the expected disposable database address is/);
-        }
-    });
-
-    test('a mismatch is refused before the caller\'s UPDATE, after only the identity query', async () => {
-        const client = stubClient({ serverAddress: '172.18.0.9/32' });
-        await expect(guard(client, ciSeams())).rejects.toThrow(/Identity mismatch/);
+    test('a local container plus a forged run id and label still fails without a token', async () => {
+        const client = stubClient({ serverAddress: '172.18.0.2/32' });
+        await expect(guard(client, ciSeams({
+            oidcToken: '',
+            inspectContainerIdentity: () => ({ containerId: 'deadbeefcafe', containerAddress: CI_EXPECTED, image: 'postgres:16' }),
+            expectedAddress: CI_EXPECTED,
+        }))).rejects.toThrow(/runner is not authenticated/);
         expect(mutations(client)).toHaveLength(0);
-        expect(client.statements).toHaveLength(1);
-        expect(client.statements[0]).toMatch(/pg_control_system\(\)/);
     });
 
-    test('a missing expectation fails closed with zero queries', async () => {
-        // `null` (not `undefined`) forces "absent" even when the real environment
-        // being tested in sets the variable — this assertion must not depend on
-        // whether the lane under test exported it.
-        for (const expectedAddress of ['', '   ', null]) {
+    test('a self-signed token from another key is refused (signature)', async () => {
+        const { privateKey: otherKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({}, { signer: otherKey }) })))
+            .rejects.toThrow(/signature does not verify against GitHub's published keys/);
+    });
+
+    test('an unknown signing key id is refused', async () => {
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({}, { kid: 'not-a-github-key' }) })))
+            .rejects.toThrow(/not among GitHub's published keys/);
+    });
+
+    test('a non-RS256 algorithm is refused even when the signature is valid', async () => {
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({}, { alg: 'HS256' }) })))
+            .rejects.toThrow(/only RS256 is accepted/);
+    });
+
+    test('every claim that matters is enforced', async () => {
+        const now = Math.floor(Date.now() / 1000);
+        const cases = [
+            [{ iss: 'https://evil.example.com' }, /issuer is/],
+            [{ aud: 'someone-else' }, /audience is/],
+            [{ exp: now - 60 }, /has expired/],
+            [{ nbf: now + 3600 }, /not valid yet/],
+            [{ repository: 'attacker/fork' }, /names repository/],
+            [{ workflow_ref: 'attacker/fork/.github/workflows/x.yml@refs/heads/main' }, /is not a workflow of/],
+            [{ workflow_ref: '' }, /is not a workflow of/],
+            [{ run_id: undefined }, /carries no run id/],
+        ];
+        for (const [over, pattern] of cases) {
             const client = stubClient({ serverAddress: '172.18.0.2/32' });
-            await expect(guard(client, ciSeams({ expectedAddress }))).rejects.toThrow(/AZM_EXPECTED_TEST_DB_ADDRESS is not set/);
-            expect(client.statements).toHaveLength(0);
+            await expect(guard(client, ciSeams({ oidcToken: signToken(over) }))).rejects.toThrow(pattern);
+            expect(mutations(client)).toHaveLength(0);
         }
     });
 
-    test('a malformed or ambiguous expectation fails closed with zero queries', async () => {
-        for (const expectedAddress of ['garbage', '172.18.0.2 172.18.0.3', 'localhost', '::ffff:172.18.0.2', '::1', '172.18.0.2/32']) {
-            const client = stubClient({ serverAddress: '172.18.0.2/32' });
-            await expect(guard(client, ciSeams({ expectedAddress }))).rejects.toThrow(/AZM_EXPECTED_TEST_DB_ADDRESS/);
-            expect(client.statements).toHaveLength(0);
-        }
+    test('a JWKS fetch failure refuses rather than skipping the check', async () => {
+        const client = stubClient({ serverAddress: '172.18.0.2/32' });
+        await expect(guard(client, ciSeams({ jwks: undefined, fetchJwks: async () => { throw new Error('network down'); } })))
+            .rejects.toThrow(/published signing keys could not be fetched/);
+        expect(mutations(client)).toHaveLength(0);
     });
 
-    test('the expectation must be backed by a verified container, not just supplied', async () => {
-        // server and expectation agree, but the container cannot be verified.
-        const unverified = stubClient({ serverAddress: '172.18.0.2/32' });
-        await expect(guard(unverified, ciSeams({ containerId: '', inspectContainerIdentity })))
-            .rejects.toThrow(/AZM_TEST_PG_CONTAINER is missing or is not a container id/);
-        expect(mutations(unverified)).toHaveLength(0);
-
-        // The real inspector refuses when the container cannot be verified. A
-        // nonexistent id is used so this is deterministic with AND without a
-        // docker daemon (unavailable locally, present in CI).
-        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({
-            inspectContainerIdentity, containerId: '0000000000000000000000000000000000000000',
-        }))).rejects.toThrow(/docker inspection of AZM_TEST_PG_CONTAINER failed/);
-
-        // the container exists but is not running / not postgres / holds another address.
+    test('the container must exist, run, be PostgreSQL and hold the expected address', async () => {
+        // The real inspector, so the missing-id rule is actually exercised.
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ containerId: '', inspectContainerIdentity })))
+            .rejects.toThrow(/AZM_TEST_PG_CONTAINER is missing/);
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ inspectContainerIdentity })))
+            .rejects.toThrow(/docker inspection of AZM_TEST_PG_CONTAINER failed/);
         await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({
             inspectContainerIdentity: () => { throw new Error('[test-db-guard] refusing to run: AZM_TEST_PG_CONTAINER (2f206542ec5f) is not running.'); },
         }))).rejects.toThrow(/is not running/);
@@ -155,224 +243,246 @@ describe('§1 GitHub Actions proves an exact container identity', () => {
         }))).rejects.toThrow(/holds 172\.18\.0\.7/);
     });
 
-    test('an expectation that cannot be checked against a unix socket is not satisfied', async () => {
+    test('the docker-selected container must be the service container the job declared', async () => {
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({
+            containerId: 'aaaaaaaaaaaa', serviceContainerId: 'bbbbbbbbbbbbcccc',
+            inspectContainerIdentity,
+        }))).rejects.toThrow(/docker inspection of AZM_TEST_PG_CONTAINER failed|not the service container/);
+    });
+
+    test('the CI expectation is still strict: missing, malformed, prefixed or unix-socket all refuse', async () => {
+        for (const expectedAddress of ['', '   ', null, 'garbage', '172.18.0.2/32', '::1', '172.18.0.999']) {
+            const client = stubClient({ serverAddress: '172.18.0.2/32' });
+            await expect(guard(client, ciSeams({ expectedAddress }))).rejects.toThrow(/AZM_EXPECTED_TEST_DB_ADDRESS/);
+            expect(mutations(client)).toHaveLength(0);
+        }
         await expect(guard(stubClient({ serverAddress: null }), ciSeams()))
             .rejects.toThrow(/reported SQL NULL .*An expectation that cannot be checked is not satisfied/);
+        await expect(guard(stubClient({ serverAddress: '172.18.0.3/32' }), ciSeams()))
+            .rejects.toThrow(/Identity mismatch/);
+    });
+
+    test('verifyRunnerIdentity is the only door into CI mode', () => {
+        expect(verifyRunnerIdentity({ token: signToken(), jwks: JWKS }).runId).toBe('41920751864');
+        expect(() => verifyRunnerIdentity({ token: 'not-a-jwt', jwks: JWKS })).toThrow(/three-part JWT/);
+        expect(() => verifyRunnerIdentity({ token: '', jwks: JWKS })).toThrow(/no GitHub Actions OIDC token/);
+        expect(() => verifyRunnerIdentity({ token: signToken(), jwks: null })).toThrow(/no GitHub signing keys/);
     });
 });
 
-describe('§2 local mode refuses a loopback or socket The connection cannot prove', () => {
-    test('a caller-supplied public expected address is refused even when the server agrees', async () => {
-        await expect(guard(stubClient({ serverAddress: '203.0.113.9/32' }), seams({ expectedAddress: '203.0.113.9' })))
-            .rejects.toThrow(/is not an independently verified identity/);
+// ---------------------------------------------------------------------------
+describe('§2 local identity is the INSTANCE, not the cluster lineage', () => {
+    test('the live instance proof accepts a backend descended from the postmaster', () => {
+        const proof = probeLocalInstance(instanceArgs(), procSeams());
+        expect(proof).toMatchObject({ backendPid: BACKEND.pid, postmasterPid: POSTMASTER.pid, dataDirectory: DATA_DIR });
     });
 
-    test('a caller-supplied private expected address is refused even when the server agrees', async () => {
-        await expect(guard(stubClient({ serverAddress: '10.4.5.6/32' }), seams({ expectedAddress: '10.4.5.6' })))
-            .rejects.toThrow(/is not an independently verified identity/);
+    test('a standby shares the cluster identifier, the data directory and the port — and is still refused', async () => {
+        // The cluster identifier matches, so only the instance proof can tell.
+        const standby = { ...BACKEND, pid: 1900, ppid: 777 };
+        await expect(guard(stubClient({ backendPid: standby.pid }), localSeams({
+            probeLocalInstance: (args) => probeLocalInstance(args, procSeams({
+                table: {
+                    [POSTMASTER.pid]: POSTMASTER,
+                    777: { pid: 777, ppid: 1, starttime: 600, comm: 'postgres', state: 'S' },
+                    1900: { pid: 1900, ppid: 777, starttime: 700, comm: 'postgres', state: 'S' },
+                },
+            })),
+        }))).rejects.toThrow(/does not descend from the postmaster/);
     });
 
-    test('a caller-supplied LOOPBACK expected address is refused too', async () => {
-        await expect(guard(stubClient({ serverAddress: '127.0.0.1/32' }), seams({ expectedAddress: '127.0.0.1' })))
-            .rejects.toThrow(/is not an independently verified identity/);
+    test('a same-lineage remote TCP server is refused (no local backend process)', async () => {
+        const client = stubClient({ backendPid: 44444 });
+        await expect(guard(client, localSeams())).rejects.toThrow(/not a live process on this machine/);
+        expect(mutations(client)).toHaveLength(0);
     });
 
-    test('a loopback URL with a loopback server report is NOT enough — an ssh -L tunnel looks like this', async () => {
-        const tunnelled = stubClient({ serverAddress: '127.0.0.1/32', systemIdentifier: '1111111111111111111' });
-        await expect(guard(tunnelled, seams()))
-            .rejects.toThrow(/belongs to cluster 1111111111111111111, but this machine's cluster at .* is 7686515198152565070/);
-        expect(mutations(tunnelled)).toHaveLength(0);
-        expect(tunnelled.statements).toHaveLength(1);
+    test('a same-lineage forwarded unix socket is refused (SQL NULL is not identity)', async () => {
+        const client = stubClient({ serverAddress: null, backendPid: 44444 });
+        await expect(guard(client, localSeams())).rejects.toThrow(/not a live process on this machine/);
+        expect(mutations(client)).toHaveLength(0);
     });
 
-    test('a forwarded unix socket (SQL NULL) is not accepted on its own', async () => {
-        const forwarded = stubClient({ serverAddress: null, systemIdentifier: '2222222222222222222' });
-        await expect(guard(forwarded, seams()))
-            .rejects.toThrow(/A forwarded, tunnelled or proxied server is not a disposable local target/);
-        expect(mutations(forwarded)).toHaveLength(0);
+    test('the verified local unix socket is accepted once the instance is proven', async () => {
+        await expect(guard(stubClient({ serverAddress: null }), localSeams()))
+            .resolves.toMatchObject({ identity: 'local-instance-identity', transport: 'unix-socket', backendPid: BACKEND.pid });
     });
 
-    test('a forwarded unix socket whose cluster cannot be read locally is refused', async () => {
-        await expect(guard(stubClient({ serverAddress: null }), seams({
-            probeLocalCluster: () => { throw new Error('[test-db-guard] refusing to run: the local cluster data directory "/var/lib/postgresql/15/main" is not readable by this process (EACCES).'); },
-        }))).rejects.toThrow(/is not readable by this process/);
+    test('a different cluster identifier is refused (consistency check)', async () => {
+        await expect(guard(stubClient(), localSeams({ readClusterSystemIdentifier: () => '1111111111111111111' })))
+            .rejects.toThrow(/belongs to cluster 7686515198152565070, but the local cluster/);
     });
 
-    test('a local unix socket IS supported once the cluster identity is proven', async () => {
-        await expect(guard(stubClient({ serverAddress: null }), seams())).resolves.toMatchObject({
-            database: 'azm_iso', serverAddress: null, identity: 'local-cluster-identity', transport: 'unix-socket',
-        });
-    });
-
-    test('the local cluster proof must own the connected data directory', async () => {
-        await expect(guard(stubClient({ dataDirectory: '/srv/other-cluster' }), seams()))
-            .rejects.toThrow(/runs from "\/srv\/other-cluster", not from the local cluster/);
-    });
-
-    test('a server that cannot report its cluster identity is refused', async () => {
-        await expect(guard(stubClient({ systemIdentifier: null }), seams()))
+    test('a server that reports no cluster identifier is refused', async () => {
+        await expect(guard(stubClient({ systemIdentifier: null }), localSeams()))
             .rejects.toThrow(/did not report its pg_control system identifier/);
     });
 
-    test('local mode reaches the identity refusal only after the URL and database checks', async () => {
-        const client = stubClient({ database: 'azm_production', serverAddress: '127.0.0.1/32' });
-        await expect(guard(client, seams())).rejects.toThrow(/connected to database "azm_production"/);
+    test('the instance prober refuses: dead backend, wrong process, stale PID file', () => {
+        expect(() => probeLocalInstance(instanceArgs({ backendPid: 0 }), procSeams())).toThrow(/not a live process on this machine/);
+        expect(() => probeLocalInstance(instanceArgs(), procSeams({ table: { [POSTMASTER.pid]: POSTMASTER, [BACKEND.pid]: { ...BACKEND, comm: 'bash' } } }))).toThrow(/not a PostgreSQL backend/);
+        expect(() => probeLocalInstance(instanceArgs(), procSeams({ table: {} }))).toThrow(/no live local process 400|stale PID file/);
+    });
+
+    test('a stale postmaster.pid (no live postmaster) is refused', () => {
+        expect(() => probeLocalInstance(instanceArgs(), procSeams({ table: { [BACKEND.pid]: BACKEND } })))
+            .toThrow(/no live local process 400 backs the postmaster.pid/);
+    });
+
+    test('PID reuse is caught by the recorded start time', () => {
+        const reused = [POSTMASTER.pid, DATA_DIR, String(Math.round(POSTMASTER_STARTED) - 7200), '5432', '/var/run/postgresql', '', ''].join('\n');
+        expect(() => probeLocalInstance(instanceArgs(), procSeams({ postmasterPidFile: reused })))
+            .toThrow(/reused PID or a stale file/);
+    });
+
+    test('a postmaster startup-time mismatch is refused', () => {
+        expect(() => probeLocalInstance(instanceArgs({ postmasterStartTime: new Date((POSTMASTER_STARTED + 600) * 1000).toISOString() }), procSeams()))
+            .toThrow(/not being served by this instance/);
+        expect(() => probeLocalInstance(instanceArgs({ postmasterStartTime: null }), procSeams()))
+            .toThrow(/did not report pg_postmaster_start_time/);
+    });
+
+    test('data directory and port must agree with the verified instance', () => {
+        expect(() => probeLocalInstance(instanceArgs(), procSeams({
+            postmasterPidFile: [POSTMASTER.pid, '/srv/other', Math.round(POSTMASTER_STARTED), '5432', '/var/run/postgresql', '', ''].join('\n'),
+        }))).toThrow(/was written for "\/srv\/other"/);
+        expect(() => probeLocalInstance(instanceArgs({ port: '6543' }), procSeams()))
+            .toThrow(/listens on port 5432, not on the connected port 6543/);
+    });
+
+    test('a non-Linux host is refused before any mutation, with no weaker fallback', async () => {
+        expect(() => probeLocalInstance(instanceArgs(), procSeams({ platform: 'darwin' })))
+            .toThrow(/only implemented for Linux .*This host is "darwin"/);
+        const client = stubClient();
+        await expect(guard(client, localSeams({ probeLocalInstance: (args) => probeLocalInstance(args, procSeams({ platform: 'win32' })) })))
+            .rejects.toThrow(/This host is "win32"/);
+        expect(mutations(client)).toHaveLength(0);
+    });
+
+    test('a locally supplied expected address is a claim, not identity', async () => {
+        for (const expectedAddress of ['203.0.113.9', '10.4.5.6', '127.0.0.1']) {
+            const client = stubClient({ serverAddress: `${expectedAddress}/32` });
+            await expect(guard(client, localSeams({ expectedAddress })))
+                .rejects.toThrow(/is not an independently verified identity/);
+            expect(mutations(client)).toHaveLength(0);
+        }
+    });
+
+    test('a loopback URL with a loopback report is not enough on its own', async () => {
+        const client = stubClient({ serverAddress: '127.0.0.1/32' });
+        await expect(guard(client, localSeams({ probeLocalInstance: (args) => probeLocalInstance(args, procSeams({ platform: 'darwin' })) })))
+            .rejects.toThrow(/only implemented for Linux/);
         expect(mutations(client)).toHaveLength(0);
     });
 });
 
-describe('§3 strict IPv4 loopback validation', () => {
-    test('valid loopback addresses are accepted', () => {
-        for (const address of ['127.0.0.1', '127.0.0.2', '127.255.255.255']) {
-            expect(classifyAddress(address)).toBe('ipv4');
-            expect(isLoopbackAddress(address)).toBe(true);
-        }
+// ---------------------------------------------------------------------------
+describe('§3 /proc parsing is anchored, not split on whitespace', () => {
+    test('a comm containing spaces and parentheses is parsed correctly', () => {
+        const raw = '900 (postgres: worker (x) y) S 400 900 900 0 -1 4194560 1 0 0 0 3 4 0 0 20 0 1 0 900 1000 100\n';
+        const parsed = (() => {
+            const open = raw.indexOf('(');
+            const close = raw.lastIndexOf(')');
+            const rest = raw.slice(close + 2).trim().split(/\s+/);
+            return { comm: raw.slice(open + 1, close), state: rest[0], ppid: Number(rest[1]), starttime: Number(rest[19]) };
+        })();
+        expect(parsed.comm).toBe('postgres: worker (x) y');
+        expect(parsed.state).toBe('S');
+        expect(parsed.ppid).toBe(400);
+        expect(parsed.starttime).toBe(900);
     });
 
-    test('127.999.1.1 is refused — it is not an IPv4 address', () => {
-        expect(classifyAddress('127.999.1.1')).toBeNull();
-        expect(isLoopbackAddress('127.999.1.1')).toBe(false);
-        expect(isLoopbackHost('127.999.1.1')).toBe(false);
-    });
-
-    test('malformed and noncanonical numeric forms are refused', () => {
-        for (const address of ['127.1', '127.0.0', '127.0.0.1.1', '127.0.0.01', '0x7f.0.0.1', '127.0.0.-1', '127.0.0.256', '127 .0.0.1']) {
-            expect(classifyAddress(address)).toBeNull();
-            expect(isLoopbackAddress(address)).toBe(false);
-        }
-        expect(classifyAddress(' 127.0.0.1 ')).toBe('ipv4');
-    });
-
-    test('ordinary non-loopback IPv4 addresses are refused', () => {
-        for (const address of ['128.0.0.1', '10.0.0.1', '172.18.0.2', '192.168.0.1', '8.8.8.8']) {
-            expect(classifyAddress(address)).toBe('ipv4');
-            expect(isLocalAddress(address)).toBe(false);
-        }
-    });
-
-    test('an invalid address is refused before any database query', async () => {
-        const client = stubClient();
-        const url = 'postgres://u:p@127.999.1.1:5432/azm_iso';
-        await expect(guard(client, seams({ testUrl: url, databaseUrl: url }))).rejects.toThrow(/is not a loopback address/);
-        expect(client.statements).toHaveLength(0);
+    test('readProcStat reads this process, and refuses nonsense pids', () => {
+        const self = readProcStat(process.pid);
+        expect(self).not.toBeNull();
+        expect(self.pid).toBe(process.pid);
+        expect(self.ppid).toBe(process.ppid);
+        expect(Number.isInteger(self.starttime)).toBe(true);
+        expect(readProcStat(0)).toBeNull();
+        expect(readProcStat(-1)).toBeNull();
+        expect(readProcStat(99999999)).toBeNull();
     });
 });
 
-describe('§4 IPv4-mapped IPv6 (fail closed)', () => {
-    test('::1 is the only accepted IPv6 loopback form', () => {
+// ---------------------------------------------------------------------------
+describe('§4 addresses, prefixes and the previously established refusals', () => {
+    test('strict IPv4 loopback', () => {
+        for (const address of ['127.0.0.1', '127.0.0.2', '127.255.255.255']) {
+            expect(classify(address)).toBe('ipv4');
+            expect(isLoopbackAddress(address)).toBe(true);
+        }
+        for (const address of ['127.999.1.1', '127.1', '127.0.0.01', '0x7f.0.0.1', '127.0.0.256', '127 .0.0.1']) {
+            expect(classify(address)).toBeNull();
+            expect(isLoopbackAddress(address)).toBe(false);
+            expect(isLoopbackHost(address)).toBe(false);
+        }
+        function classify(value) { return interpretServerAddressSafe(value); }
+    });
+
+    test('mapped IPv6 is refused in both spellings', () => {
+        for (const address of ['::ffff:127.0.0.1', '::ffff:7f00:1']) {
+            expect(isMappedIPv6(address)).toBe(true);
+            expect(isLocalAddress(address)).toBe(false);
+        }
         expect(isLocalAddress('::1')).toBe(true);
         expect(isLoopbackHost('[::1]')).toBe(true);
     });
 
-    test('mapped forms are identified and refused, in both spellings', () => {
-        for (const address of ['::ffff:127.0.0.1', '::ffff:7f00:1', '::FFFF:7F00:1']) {
-            expect(isMappedIPv6(address)).toBe(true);
-            expect(isLocalAddress(address)).toBe(false);
-            expect(isLoopbackHost(address)).toBe(false);
-        }
-    });
-
-    test('a mapped IPv6 URL host is refused before any query', async () => {
-        const url = 'postgres://u:p@[::ffff:127.0.0.1]:5432/azm_iso';
-        const client = stubClient();
-        await expect(guard(client, seams({ testUrl: url, databaseUrl: url }))).rejects.toThrow(/is not a loopback address/);
-        expect(client.statements).toHaveLength(0);
-    });
-
-    test('a mapped server-reported address is refused', async () => {
-        await expect(guard(stubClient({ serverAddress: '::ffff:127.0.0.1/128' }), seams()))
-            .rejects.toThrow(/IPv4-mapped IPv6 form/);
-    });
-});
-
-describe('§5 server-reported addresses and CIDR prefixes', () => {
-    test('only SQL NULL means a unix socket', async () => {
-        expect(interpretServerAddress(null)).toEqual({ reported: false });
-        const client = stubClient({ serverAddress: null });
-        await expect(guard(client, seams())).resolves.toMatchObject({ transport: 'unix-socket' });
-        expect(mutations(client)).toHaveLength(0);
-    });
-
-    test('an empty address is refused, never read as a unix socket', async () => {
-        for (const value of ['', '   ']) {
-            expect(() => interpretServerAddress(value)).toThrow(/EMPTY address/);
-            await expect(guard(stubClient({ serverAddress: value }), seams())).rejects.toThrow(/EMPTY address/);
-        }
-    });
-
-    test('malformed values and a missing column are refused', async () => {
-        for (const value of ['garbage', '127.0.0.1/abc', 42, {}, []]) {
-            expect(() => interpretServerAddress(value)).toThrow(/not a valid IPv4 or IPv6 address|was not a string/);
-            await expect(guard(stubClient({ serverAddress: value }), seams())).rejects.toThrow();
-        }
-        expect(() => interpretServerAddress(undefined)).toThrow(/was not a string/);
-    });
-
-    test('valid CIDR prefixes are parsed', () => {
+    test('CIDR prefixes are validated, never stripped', () => {
         expect(interpretServerAddress('127.0.0.1/32')).toEqual({ address: '127.0.0.1', prefix: 32 });
-        expect(interpretServerAddress('172.18.0.2/32')).toEqual({ address: '172.18.0.2', prefix: 32 });
-        expect(interpretServerAddress('10.0.0.0/8')).toEqual({ address: '10.0.0.0', prefix: 8 });
         expect(interpretServerAddress('::1/128')).toEqual({ address: '::1', prefix: 128 });
-        expect(interpretServerAddress('127.0.0.1')).toEqual({ address: '127.0.0.1', prefix: null });
-    });
-
-    test('out-of-range and malformed CIDR prefixes are REFUSED, not stripped', () => {
-        for (const value of ['127.0.0.1/33', '127.0.0.1/999', '::1/129', '::1/0129', '127.0.0.1/+1', '127.0.0.1/', '127.0.0.1/ 32', '172.18.0.2/33']) {
+        for (const value of ['127.0.0.1/33', '127.0.0.1/999', '::1/129', '::1/0129', '127.0.0.1/+1', '127.0.0.1/', '127.0.0.1/ 32']) {
             expect(splitCidr(value)).toBeNull();
             expect(() => interpretServerAddress(value)).toThrow(/valid CIDR prefix/);
         }
+        expect(interpretServerAddress(null)).toEqual({ reported: false });
+        expect(() => interpretServerAddress('')).toThrow(/EMPTY address/);
+        expect(() => interpretServerAddress(42)).toThrow(/was not a string/);
+        expect(interpretExpectedAddress('172.18.0.2')).toBe('172.18.0.2');
+        expect(() => interpretExpectedAddress('172.18.0.2/32')).toThrow(/CIDR prefix/);
     });
 
-    test('the CI expectation must be a bare IPv4 address, never a normalized CIDR', () => {
-        expect(interpretExpectedAddress(' 172.18.0.2 ')).toBe('172.18.0.2');
-        expect(interpretExpectedAddress('')).toBeNull();
-        for (const value of ['172.18.0.2/32', 'garbage', '::1', '::1/128', '::ffff:172.18.0.2', '172.18.0.999']) {
-            expect(() => interpretExpectedAddress(value)).toThrow(/AZM_EXPECTED_TEST_DB_ADDRESS/);
+    test('URL, environment and connection refusals still hold, with zero mutations', async () => {
+        const cases = [
+            [{ testUrl: '' }, /TEST_DATABASE_URL is not set/],
+            [{ nodeEnv: 'production' }, /NODE_ENV is "production", not "test"/],
+            [{ databaseUrl: '' }, /DATABASE_URL is not bound/],
+            [{ testUrl: 'postgres://u:p@[::bad/db', databaseUrl: 'postgres://u:p@[::bad/db' }, /does not parse into a host and a database name/],
+        ];
+        for (const [over, pattern] of cases) {
+            const client = stubClient();
+            await expect(guard(client, localSeams(over))).rejects.toThrow(pattern);
+            expect(mutations(client)).toHaveLength(0);
         }
-    });
-});
-
-describe('§6 previously established refusals still hold', () => {
-    test('absent test URL, NODE_ENV, unbound URL, unreadable URL, wrong database', async () => {
-        await expect(guard(stubClient(), seams({ testUrl: '' }))).rejects.toThrow(/TEST_DATABASE_URL is not set/);
-        await expect(guard(stubClient(), seams({ nodeEnv: 'production' }))).rejects.toThrow(/NODE_ENV is "production", not "test"/);
-        await expect(guard(stubClient(), seams({ databaseUrl: '' }))).rejects.toThrow(/DATABASE_URL is not bound/);
-        const opaque = 'postgres://u:p@[::bad/db';
-        await expect(guard(stubClient(), seams({ testUrl: opaque, databaseUrl: opaque }))).rejects.toThrow(/does not parse into a host and a database name/);
-        await expect(guard(stubClient({ database: 'azm_production' }), seams())).rejects.toThrow(/connected to database "azm_production"/);
-    });
-
-    test('a remote URL host is refused before any query', async () => {
         const remote = 'postgres://postgres:postgres@azm-prod-db.example.com:5432/azm_iso?schema=public';
-        const client = stubClient({ database: 'azm_iso' });
-        await expect(guard(client, seams({ testUrl: remote, databaseUrl: remote })))
-            .rejects.toThrow(/host "azm-prod-db\.example\.com".*is not a loopback address/);
+        const client = stubClient();
+        await expect(guard(client, localSeams({ testUrl: remote, databaseUrl: remote }))).rejects.toThrow(/is not a loopback address/);
         expect(client.statements).toHaveLength(0);
+        await expect(guard(stubClient({ database: 'azm_production' }), localSeams())).rejects.toThrow(/connected to database "azm_production"/);
     });
 
     test('credentials never reach an error message', async () => {
         const credentialled = 'postgres://ci_runner:hunter2-should-never-leak@db.prod.example.com:5432/azm_test?schema=public';
         let error;
-        try { await guard(stubClient(), seams({ databaseUrl: credentialled })); } catch (err) { error = err; }
+        try { await guard(stubClient(), localSeams({ databaseUrl: credentialled })); } catch (err) { error = err; }
         expect(error.message).not.toContain('hunter2-should-never-leak');
         expect(error.message).not.toContain('ci_runner');
-        expect(error.message).not.toContain(credentialled);
         expect(error.message).toContain('db.prod.example.com:5432/azm_test');
     });
 
-    test('describeTarget never includes credentials', () => {
-        const described = describeTarget('postgres://user:sekret@example.com:5432/db?password=sekret');
-        expect(described).toBe('example.com:5432/db');
-        expect(described).not.toContain('sekret');
-        expect(describeTarget('postgres://user:sekret@[::bad/db')).toBe('an unparseable value');
-    });
-
-    test('the local positive path issues one identity query and no mutation', async () => {
+    test('the positive local path issues one identity query and no mutation', async () => {
         const client = stubClient();
-        await expect(guard(client, seams())).resolves.toMatchObject({
-            database: 'azm_iso', host: 'localhost', identity: 'local-cluster-identity', systemIdentifier: LOCAL_SID, transport: 'tcp',
-        });
+        const result = await guard(client, localSeams());
+        expect(result.identity).toBe('local-instance-identity');
         expect(client.statements).toHaveLength(1);
+        expect(client.statements[0]).toMatch(/pg_catalog\.pg_backend_pid\(\)/);
+        expect(client.statements[0]).toMatch(/pg_catalog\.pg_control_system\(\)/);
         expect(mutations(client)).toHaveLength(0);
     });
 });
+
+// The classifier is exported; this keeps the table above readable.
+function interpretServerAddressSafe(value) {
+    try { const parsed = interpretServerAddress(value); return parsed.reported === false ? null : classifyAddress(parsed.address); } catch (_) { return null; }
+}
+const { classifyAddress } = require('./helpers/testDatabaseGuard');

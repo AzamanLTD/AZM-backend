@@ -29,6 +29,12 @@ jobs:
     # finishes in ~10 min regardless.
     timeout-minutes: 90
 
+    # The database guard authenticates the runner with an OIDC token. This is a
+    # job-level block: it ADDS id-token: write to whatever the workflow grants.
+    permissions:
+      contents: read
+      id-token: write
+
     services:
       postgres:
         image: postgres:16
@@ -76,6 +82,27 @@ jobs:
         # name in the summary.
         run: npx prisma validate
 
+      - name: 'Guard: authenticate the runner (GitHub OIDC)'
+        # GITHUB_ACTIONS=true, a container label and a run id are all settable by
+        # anyone; none of them authenticates a runner. The database guard enables
+        # its CI branch only for a GitHub Actions OIDC token whose RS256 signature
+        # verifies against GitHub's published JWKS and whose issuer, audience,
+        # expiry, repository and workflow claims match. The token is written to a
+        # private file and never printed.
+        run: |
+          set -euo pipefail
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::This job cannot request an OIDC token (needs permissions: id-token: write). The database guard would refuse, so the lane stops here rather than degrading."
+            exit 1
+          fi
+          TOKEN_FILE="${RUNNER_TEMP:-/tmp}/azm-ci-oidc.jwt"
+          curl -sS -f -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=azm-test-db-guard" \
+            | node -e 'let body = ""; process.stdin.on("data", (chunk) => { body += chunk; }).on("end", () => { const token = JSON.parse(body).value; if (!token) process.exit(1); require("fs").writeFileSync(process.argv[1], token, { mode: 0o600 }); });' "$TOKEN_FILE"
+          test -s "$TOKEN_FILE"
+          echo "AZM_CI_OIDC_TOKEN_PATH=${TOKEN_FILE}" >> "$GITHUB_ENV"
+          echo "Runner OIDC token acquired (value never printed)."
+
       - name: 'Guard: identify the PostgreSQL service container (exact identity)'
         # §392 — __tests__/helpers/testDatabaseGuard.js refuses to run its
         # table-wide maintenance statement unless the server's OWN reported
@@ -109,6 +136,15 @@ jobs:
           echo "Exact expected database address: ${ADDRESS}"
           echo "AZM_TEST_PG_CONTAINER=${CONTAINER}" >> "$GITHUB_ENV"
           echo "AZM_EXPECTED_TEST_DB_ADDRESS=${ADDRESS}" >> "$GITHUB_ENV"
+          # The service-container id from the job.services context: where the
+          # workflow can supply it, the docker-selected container must be that one.
+          SERVICE_CONTAINER='${{ job.services.postgres.id }}'
+          if [ -n "$SERVICE_CONTAINER" ]; then
+            echo "AZM_CI_SERVICE_CONTAINER_ID=${SERVICE_CONTAINER}" >> "$GITHUB_ENV"
+            echo "Service container declared by the job: ${SERVICE_CONTAINER}"
+          else
+            echo "::warning::job.services.postgres.id was empty; falling back to the exactly-one docker selection."
+          fi
 
       - name: Apply database schema
         # CI uses a disposable PostgreSQL instance. Production remains managed
