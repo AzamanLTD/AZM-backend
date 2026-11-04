@@ -181,32 +181,49 @@ that may already have left. `UNRESOLVED` means "query the original reference".
 `retryable` is always `false`. A retry is a status lookup against the original
 reference, never a second POST with a new reference.
 
-## 5. Codes: what is verified and what is not
+## 5. Provider codes: what each one proves
 
-| Code | Status |
-| --- | --- |
-| `AVD01` | **documented success** for Validate Name. Never a refusal. |
-| `AVD02` | **documented account-not-found** for Validate Name → `ACCOUNT_NOT_FOUND`. |
-| `APY21` | **documented refusal** — "Insufficient wallet balance." Azaman's wallet could not fund the payout, so no payout can exist. Raised as `DEFINITIVE_REJECTION` / `PROVIDER_REFUSED` with `refusalDocumented: true`, `dispatchProven: true`. |
-| `APY18` | **documented duplicate** — "External reference is required and must be unique." We never omit the reference, so on a transfer this means Moolre already holds it. Returned as `UNRESOLVED` / `DUPLICATE_REFERENCE`; the original reference is looked up, never resent. |
-| `APY17` | **documented but not decisive** — "Pay out Failed". Names a state without proving whether a payout exists, so it is preserved as `UNRESOLVED` / `PROVIDER_REPORTED_PAYOUT_FAILED_UNVERIFIED` and never authorises a reversal. |
-| `OTGH02` | **documented but not decisive** — "Pay out in Progress". `UNRESOLVED` / `PROVIDER_REPORTED_IN_PROGRESS`, never `PENDING` or `FAILED`. The reference's own gloss for this code is "when an unsupported channel is selected", which does not match the message, so it is treated as ambiguous rather than learned from. |
-| status not-found code | **none verified.** `DOCUMENTED_STATUS_NOT_FOUND` is empty. `AC03` ("Payment ID / Bank Account Not Found") is published for a different lookup, not for transfers, so `NOT_FOUND` is never claimed. |
+Retrieved **2026-11-04** from
+`docs.moolre.com/ai/guides/errors-and-status-codes.html` (catalogue),
+`/ai/guides/supported-channels.html`, `/ai/guides/safe-retries.html`,
+`/ai/guides/idempotency-and-references.html`. Moolre states that codes can be
+returned by more than one operation and that endpoint context matters, so a code
+is only meaningful together with the operation that produced it.
 
-Source: `docs.moolre.com/ai/guides/errors-and-status-codes.md`, retrieved
-2026-11-04. That page warns codes can be returned by more than one operation, so
-each entry above is read with the transfer endpoint in context.
+| Code | Published wording | What the adapter concludes |
+| --- | --- | --- |
+| `AVD01` | Validate Name success | validation success (string `data` is the holder name) |
+| `AVD02` | Validate Name not found | `ACCOUNT_NOT_FOUND`, documented refusal |
+| `APY21` | Insufficient wallet balance | `DEFINITIVE_REJECTION` **only** on a clean application-level refusal (see below) |
+| `APY18` | External reference required and unique | `UNRESOLVED` / `DUPLICATE_REFERENCE`; reconcile the original reference, never resend |
+| `APY17` | Pay out Failed, condition unspecified | `UNRESOLVED` / `APY17_SEMANTICS_UNRESOLVED` |
+| `OTGH02` | "Pay out in Progress", condition "unsupported channel selected" | `UNRESOLVED` / `OTGH02_SEMANTICS_UNRESOLVED` |
 
-An empty denial set is deliberate. A wrong `NOT_FOUND` would authorise a refund
-of money that already moved; a wrong "refused" would authorise a second payout.
+`OTGH02`'s wording and condition contradict each other, so the adapter asserts
+neither; the reason names the ambiguity rather than claiming a payout is in
+progress. `APY17` says a payout failed without saying whether one ever existed,
+which is exactly the evidence needed to release a customer's money, so it stays
+unresolved.
 
-### 5.1 `txstatus` 0/1/2 is still NOT widened
+### 5.1 What makes a refusal provable
 
-`/ai/live/list-account-transactions` documents its optional `status` **filter**
-as `0=Pending, 1=Successful, 2=Failed`, and its example rows carry a `txstatus`
-field. That is a different endpoint's request parameter, not a published
-statement about `data.txstatus` on a transfer status response, so the adapter
-still maps only `1`. Written confirmation remains the way to widen it.
+`APY21` becomes a typed refusal only when all of these hold, evaluated in this
+order on the initiation operation only:
+
+1. the transport succeeded (HTTP 2xx) — a 5xx carrying `APY21` is a transport
+   failure (`PROVIDER_NON_2XX`, unresolved);
+2. the body parsed — an unparseable 2xx is `MALFORMED_PROVIDER_RESPONSE`;
+3. the envelope is an application refusal: `status === 0`;
+4. the code is exactly `APY21`;
+5. no payload contradicts it: no `txstatus`, `externalref`, `transactionid` or
+   `thirdpartyref` anywhere in `data`.
+
+If the code is right but any of 1–5 fails, the result is `UNRESOLVED` /
+`REFUSAL_NOT_PROVEN`. A refusal-shaped message without the code, or an unknown
+code, is `PROVIDER_STATUS_NOT_ACCEPTED`. Message text never proves anything.
+
+An empty denial set is deliberate throughout: a wrong "not found" authorises a
+refund of money that moved, and a wrong "refused" authorises a second payout.
 
 ## 6. Capability authorities
 

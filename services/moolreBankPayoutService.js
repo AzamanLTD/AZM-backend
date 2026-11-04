@@ -98,9 +98,13 @@ const DOCUMENTED_DUPLICATE_CODES = new Set(['APY18']);
 // Documented transfer codes that do NOT prove whether a payout exists: they are
 // preserved as reasons so reconciliation knows what Moolre said, and they never
 // authorise a reversal.
+// Named honestly: the reason says the SEMANTICS are unresolved, not what the
+// payout is doing. OTGH02's published wording is "Pay out in Progress" while its
+// published condition is "unsupported channel selected" — a documented
+// contradiction, so neither reading may be asserted.
 const AMBIGUOUS_PAYOUT_CODES = new Map([
-    ['APY17', 'PROVIDER_REPORTED_PAYOUT_FAILED_UNVERIFIED'], // "Pay out Failed"
-    ['OTGH02', 'PROVIDER_REPORTED_IN_PROGRESS'], // "Pay out in Progress"
+    ['APY17', 'APY17_SEMANTICS_UNRESOLVED'], // "Pay out Failed", condition unspecified
+    ['OTGH02', 'OTGH02_SEMANTICS_UNRESOLVED'], // "Pay out in Progress" / unsupported channel
 ]);
 const DUPLICATE_HINT = /(duplicate|already\s*(exists|used|processed)|re-?use[ds]?\s*(of\s*)?(the\s*)?(same\s*)?(external)?\s*ref)/i;
 
@@ -755,8 +759,16 @@ class MoolreBankPayoutService {
             if (providerCode && AMBIGUOUS_PAYOUT_CODES.has(providerCode)) {
                 return this._unresolved(referenceId, { reason: AMBIGUOUS_PAYOUT_CODES.get(providerCode), providerCode });
             }
-            // An explicit refusal we can prove: stay uncertain otherwise.
-            if (providerCode && DOCUMENTED_TRANSFER_REFUSALS.has(providerCode)) {
+            // A documented refusal counts only when the envelope is itself an
+            // application-level refusal and nothing in the payload suggests a
+            // payout exists. A refusal code stapled to transfer data is a
+            // contradiction, not proof, and stays unresolved.
+            const contradicted = data !== null && (
+                data.txstatus !== undefined || data.externalref !== undefined
+                || data.transactionid !== undefined || data.thirdpartyref !== undefined
+            );
+            const applicationRefusal = Number(body.status) === 0 && !contradicted;
+            if (providerCode && DOCUMENTED_TRANSFER_REFUSALS.has(providerCode) && applicationRefusal) {
                 throw new MoolreBankPayoutError('Moolre refused the transfer.', {
                     outcome: PROVIDER_OUTCOMES.DEFINITIVE_REJECTION,
                     code: 'PROVIDER_REFUSED',
@@ -765,6 +777,10 @@ class MoolreBankPayoutService {
                     providerCode,
                     refusalDocumented: true,
                 });
+            }
+            if (providerCode && DOCUMENTED_TRANSFER_REFUSALS.has(providerCode)) {
+                // Right code, wrong evidence: it must not become a reversal.
+                return this._unresolved(referenceId, { reason: 'REFUSAL_NOT_PROVEN', providerCode });
             }
             return this._unresolved(referenceId, { reason: 'PROVIDER_STATUS_NOT_ACCEPTED', providerCode });
         }

@@ -1165,7 +1165,7 @@ describe('M. documented provider codes', () => {
         const http = fakeHttp({ transfer: refused('APY17', 'Pay out Failed') });
         const out = await service(http).initiateBankTransfer({ ...baseInitiation });
         expect(out.status).toBe('UNRESOLVED');
-        expect(out.reason).toBe('PROVIDER_REPORTED_PAYOUT_FAILED_UNVERIFIED');
+        expect(out.reason).toBe('APY17_SEMANTICS_UNRESOLVED');
         expect(out.providerStatusRaw).toBeNull();
         expect(http.transfers()).toHaveLength(1);
     });
@@ -1174,7 +1174,7 @@ describe('M. documented provider codes', () => {
         const http = fakeHttp({ transfer: refused('OTGH02', 'Pay out in Progress') });
         const out = await service(http).initiateBankTransfer({ ...baseInitiation });
         expect(out.status).toBe('UNRESOLVED');
-        expect(out.reason).toBe('PROVIDER_REPORTED_IN_PROGRESS');
+        expect(out.reason).toBe('OTGH02_SEMANTICS_UNRESOLVED');
         expect(out.status).not.toBe('PENDING');
         expect(out.status).not.toBe('FAILED');
     });
@@ -1184,5 +1184,109 @@ describe('M. documented provider codes', () => {
         const out = await service(http).initiateBankTransfer({ ...baseInitiation });
         expect(out.status).toBe('UNRESOLVED');
         expect(out.reason).toBe('PROVIDER_STATUS_NOT_ACCEPTED');
+    });
+});
+
+// ── N. envelope contradictions and the no-repeat invariants ─────────────────
+describe('N. envelope contradictions', () => {
+    const initiate = (svc) => svc.initiateBankTransfer({
+        referenceId: REF,
+        amountGhsExact: '25.50',
+        recipientAccountNumber: '0123456789012',
+        bankCode: '030100',
+    });
+
+    test('a 500 carrying APY21 is a transport-level failure, not a refusal', async () => {
+        const http = fakeHttp({ transfer: { status: 500, data: { status: 0, code: 'APY21', message: 'Insufficient wallet balance' } } });
+        const out = await initiate(service(http));
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.reason).toBe('PROVIDER_NON_2XX');
+        expect(http.transfers()).toHaveLength(1);
+    });
+
+    test('a 200 with an unparseable body cannot be a refusal', async () => {
+        const http = fakeHttp({ transfer: { status: 200, data: null } });
+        const out = await initiate(service(http));
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.reason).toBe('MALFORMED_PROVIDER_RESPONSE');
+        expect(http.transfers()).toHaveLength(1);
+    });
+
+    test('refusal wording without the provider code proves nothing', async () => {
+        const http = fakeHttp({ transfer: { status: 200, data: { status: 0, message: 'Insufficient wallet balance' } } });
+        const out = await initiate(service(http));
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.reason).toBe('PROVIDER_STATUS_NOT_ACCEPTED');
+    });
+
+    test('refusal wording under an unknown code proves nothing', async () => {
+        const http = fakeHttp({ transfer: { status: 200, data: { status: 0, code: 'UNKNOWN', message: 'Payout failed' } } });
+        const out = await initiate(service(http));
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.reason).toBe('PROVIDER_STATUS_NOT_ACCEPTED');
+    });
+
+    test('APY21 attached to transfer data is a contradiction, not a refusal', async () => {
+        const http = fakeHttp({
+            transfer: { status: 200, data: { status: 0, code: 'APY21', data: { txstatus: 0, externalref: REF, transactionid: '31830714' } } },
+        });
+        const out = await initiate(service(http));
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.reason).toBe('REFUSAL_NOT_PROVEN');
+        expect(http.transfers()).toHaveLength(1);
+    });
+
+    test('a clean enveloped APY21 refusal is the only provable refusal', async () => {
+        const http = fakeHttp({ transfer: { status: 200, data: { status: 0, code: 'APY21', message: 'Insufficient wallet balance' } } });
+        await expect(initiate(service(http))).rejects.toMatchObject({
+            outcome: 'DEFINITIVE_REJECTION',
+            providerCode: 'APY21',
+            refusalDocumented: true,
+            dispatchProven: true,
+            retryable: false,
+            stage: 'INITIATE',
+        });
+        expect(http.transfers()).toHaveLength(1);
+    });
+});
+
+describe('N2. no repeat, no invented evidence', () => {
+    const initiate = (svc) => svc.initiateBankTransfer({
+        referenceId: REF,
+        amountGhsExact: '25.50',
+        recipientAccountNumber: '0123456789012',
+        bankCode: '030100',
+    });
+
+    test.each(['APY17', 'OTGH02', 'APY18'])('%s produces exactly one POST and no reversal signal', async (code) => {
+        const http = fakeHttp({ transfer: { status: 200, data: { status: 0, code, message: 'x' } } });
+        const out = await initiate(service(http));
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.referenceId).toBe(REF);
+        expect(http.transfers()).toHaveLength(1);
+        expect(http.calls.filter((c) => c.method === 'POST')).toHaveLength(1);
+        expect(http.transfers()[0].body.externalref).toBe(REF);
+    });
+
+    test('a timeout leaves one POST, one reference and no error a caller could reverse on', async () => {
+        const http = fakeHttp({ transferError: Object.assign(new Error('timeout'), { code: 'ECONNABORTED' }) });
+        const out = await initiate(service(http));
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.reason).toBe('PROVIDER_OUTCOME_UNKNOWN');
+        expect(http.transfers()).toHaveLength(1);
+    });
+
+    test('the provider amount is never backfilled from the request', async () => {
+        const body = { status: 1, code: 'OBGH01', data: { txstatus: 1, externalref: REF, transactionid: 'T1' } };
+        const out = await initiate(service(fakeHttp({ transfer: { status: 200, data: body } })));
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.amountGhsExact).toBeNull();
+        expect(out.reason).toBe('AMOUNT_EVIDENCE_MISSING');
+    });
+
+    test('fees Moolre did not send stay null rather than zero or summed', async () => {
+        const body = { status: 1, code: 'OBGH01', data: { txstatus: 1, externalref: REF, amount: '25.50', amountfee: '0.50' } };
+        const out = await initiate(service(fakeHttp({ transfer: { status: 200, data: body } })));
+        expect(out.fees).toEqual({ amountFee: '0.50', networkFee: null, fee: null });
     });
 });
