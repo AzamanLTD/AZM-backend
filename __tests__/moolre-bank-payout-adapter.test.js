@@ -1019,3 +1019,77 @@ describe('J. capability authorities', () => {
         expect(s).not.toContain('100000100002');
     });
 });
+
+// ── K. the published validation port contract ───────────────────────────────
+describe('K. validation port contract', () => {
+    const ACCOUNT = '0123456789';
+
+    test('success is exactly the published object and invents no provider echo', async () => {
+        const out = await service(fakeHttp()).validateBankAccount({ accountNumber: ACCOUNT, bankCode: '030100' });
+        expect(Object.keys(out).sort()).toEqual(['accountName', 'bankCode', 'provider', 'valid', 'validatedAt']);
+        expect(out.valid).toBe(true);
+        expect(out.accountName).toBe('AKOSUA MENSAH');
+        expect(out.bankCode).toBe('030100');
+        expect(out.provider).toBe('MOOLRE');
+        expect(out.validatedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+        // The documented response has no account-number echo, so none is returned.
+        expect(out).not.toHaveProperty('accountNumber');
+        expect(JSON.stringify(out)).not.toContain(ACCOUNT);
+    });
+
+    test('AVD02 is the typed documented refusal, not a validation failure guess', async () => {
+        const err = await rejectOf(
+            service(fakeHttp({ validate: { status: 200, data: { status: 0, code: 'AVD02', message: 'Account not found', data: null } } }))
+                .validateBankAccount({ accountNumber: ACCOUNT, bankCode: '030100' })
+        );
+        expect(err.provider).toBe('MOOLRE_DISBURSEMENT');
+        expect(err.outcome).toBe(PROVIDER_OUTCOMES.DEFINITIVE_REJECTION);
+        expect(err.code).toBe('ACCOUNT_NOT_FOUND');
+        expect(err.refusalDocumented).toBe(true);
+        expect(err.dispatchProven).toBe(true);
+        expect(err.retryable).toBe(false);
+        expect(err.stage).toBe('VALIDATE');
+        expect(JSON.stringify({ m: err.message, d: err.details })).not.toContain(ACCOUNT);
+    });
+
+    test('a timeout is provider unavailability, never account-not-found', async () => {
+        const err = await rejectOf(
+            service(fakeHttp({ validateError: Object.assign(new Error('timeout'), { code: 'ECONNABORTED' }) }))
+                .validateBankAccount({ accountNumber: ACCOUNT, bankCode: '030100' })
+        );
+        expect(err.outcome).toBe(PROVIDER_OUTCOMES.PROVIDER_UNAVAILABLE);
+        expect(err.providerOutcome).toBe(PROVIDER_OUTCOMES.PROVIDER_UNAVAILABLE);
+        expect(err.code).toBe('VALIDATION_UNDETERMINED');
+        expect(err.refusalDocumented).toBe(false);
+        expect(err.dispatchProven).toBe(false);
+    });
+
+    test('an unknown provider answer stays inconclusive', async () => {
+        for (const body of [
+            { status: 0, code: 'XX99', message: 'Something', data: null },
+            { status: 1, code: 'AVD01', message: 'ok', data: '   ' },
+            { status: 1, code: 'AVD01', message: 'ok', data: { accountname: 'X' } },
+        ]) {
+            const err = await rejectOf(
+                service(fakeHttp({ validate: { status: 200, data: body } }))
+                    .validateBankAccount({ accountNumber: ACCOUNT, bankCode: '030100' })
+            );
+            expect(err.outcome).toBe(PROVIDER_OUTCOMES.PROVIDER_UNAVAILABLE);
+            expect(err.code).not.toBe('ACCOUNT_NOT_FOUND');
+        }
+    });
+
+    test('no validation path ever posts a transfer', async () => {
+        const okHttp = fakeHttp();
+        await service(okHttp).validateBankAccount({ accountNumber: ACCOUNT, bankCode: '030100' });
+
+        const badHttp = fakeHttp({ validate: { status: 200, data: { status: 0, code: 'AVD02', data: null } } });
+        await rejectOf(service(badHttp).validateBankAccount({ accountNumber: ACCOUNT, bankCode: '030100' }));
+
+        for (const http of [okHttp, badHttp]) {
+            expect(http.transfers()).toHaveLength(0);
+            expect(http.validations()).toHaveLength(1);
+            expect(http.calls.every((c) => !c.url.endsWith('/transfer'))).toBe(true);
+        }
+    });
+});

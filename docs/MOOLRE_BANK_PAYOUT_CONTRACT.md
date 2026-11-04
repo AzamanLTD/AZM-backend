@@ -326,3 +326,98 @@ The audit gate is deliberately left as it is; remediation belongs to the
 dependency chain (#384), and no suppression or exemption was added here. A full
 CI test run on the final head is still required before this adapter is treated
 as verified.
+
+## 11. The bank-validation port contract
+
+`validateBankAccount({ accountNumber, bankCode })` is the name-enquiry port. It is
+a read, not a dispatch: it cannot move money and it never posts to `/transfer`.
+
+A successful result is exactly this object, with no additional fields:
+
+```js
+{
+  valid: true,
+  accountName: 'AKOSUA MENSAH',      // derived from Moolre's `data` string
+  bankCode: '030100',               // the code WE sent, retained, not echoed back
+  validatedAt: '2026-11-03T21:04:00.000Z', // our timestamp of this success
+  provider: 'MOOLRE',
+}
+```
+
+What the consumer must understand about each field:
+
+- `accountName` is the only provider-derived fact here. Moolre's Validate Name
+  response returns the holder name as a string in `data`; the adapter trims and
+  collapses internal whitespace for display, nothing else.
+- `bankCode` is **ours**: the code that was sent in `sublistid` and checked
+  against the current directory. Moolre does not echo it.
+- `validatedAt` is **ours**: the adapter's clock when the successful response was
+  read. It is not a provider timestamp.
+- The documented response contains **no account-number echo**. The adapter
+  therefore returns none, and nothing in this contract may be read as provider
+  confirmation of the account number.
+- A consumer must bind this result to the exact `accountNumber` and `bankCode`
+  it passed to this same call, and must not describe that local value as a
+  provider echo. If the stored destination later differs, the validation does
+  not carry over.
+
+Refusals are a different contract from success:
+
+```js
+{
+  provider: 'MOOLRE_DISBURSEMENT',
+  outcome: 'DEFINITIVE_REJECTION',
+  providerOutcome: 'DEFINITIVE_REJECTION',
+  code: 'ACCOUNT_NOT_FOUND',
+  refusalDocumented: true,   // AVD02 is a published answer
+  dispatchProven: true,      // proof about this validation, not about a payout
+  stage: 'VALIDATE',
+  retryable: false,
+}
+```
+
+Every other failure is `PROVIDER_UNAVAILABLE` / `VALIDATION_UNDETERMINED`:
+timeouts, transport errors, auth failures, rate limits, 5xx, unparseable bodies,
+an empty `data` string, or a `data` shape that is not a string. None of those is
+evidence that the account is invalid, and none may be reported as
+`ACCOUNT_NOT_FOUND`. `refusalDocumented` and `dispatchProven` exist so a caller
+can tell a published refusal from an inconclusive answer without string-matching
+the code.
+
+Validation capability (`canValidateBankAccount`) is deliberately independent of
+initiation capability (`canInitiateBankPayout`). Onboarding can confirm a
+destination while new bank payouts remain switched off.
+
+## 12. Owner-facing: written confirmations still required
+
+Nothing below can be settled from public documentation, a fixture test or an
+assumption. Each item needs written confirmation from Moolre, obtained by the
+account owner. This adapter does not send that request and holds no secret for
+it.
+
+1. **Endpoint family.** For Azaman's account, is the live family
+   `/open/transact/transfer` + `/open/transact/validate`, or
+   `/open/transact/initiate` + `/open/transact/validate-name`? Both appear in
+   official sources; only one can be correct for this account. Set
+   `MOOLRE_BANK_ENDPOINT_FAMILY_CONFIRMED=true` only after this is answered.
+2. **Channel-2 eligibility.** Is Azaman's Moolre account enabled for
+   `channel: "2"` Instant Bank Transfer? Public channel documentation describes
+   the capability, not this account's entitlement. Set
+   `MOOLRE_BANK_CHANNEL2_ELIGIBILITY_CONFIRMED=true` only after this is answered.
+3. **Status semantics.** What does every `data.txstatus` value mean for a bank
+   transfer (not for a List Transactions filter), and is an outer envelope code
+   such as `SS01` also required before a result is terminal?
+4. **Refusal codes.** Which transfer-response codes are published refusals that
+   prove no payout exists? Today the adapter treats every transfer-side refusal
+   as unresolved because none is verified.
+5. **Coverage and limits.** Which bank codes are live for this account, and what
+   per-instruction and daily limits apply?
+6. **Fees.** Which fees apply (`amountfee`, `networkfee`, `fee`), who bears each
+   one, and at what point they are deducted? The adapter reports the three values
+   separately and decides none of this.
+7. **Settlement and reconciliation.** What settlement timing, return/reversal
+   path and reconciliation evidence does Moolre provide for a bank transfer?
+
+Until 1 and 2 are answered in writing, bank payout initiation stays disabled by
+default and this adapter remains fixture-tested only. Nothing in the code implies
+that Moolre has approved Azaman for bank payouts.

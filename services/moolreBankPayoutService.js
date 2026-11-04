@@ -125,8 +125,11 @@ class MoolreBankPayoutError extends Error {
         // Nothing here is safe to blind-retry: a retry needs a human or a
         // status lookup against the ORIGINAL reference, never a new one.
         this.retryable = false;
+        // Published on the error so a consumer can tell a documented refusal
+        // from a guess without inferring it from the code string.
+        this.refusalDocumented = refusalDocumented === true;
         this.dispatchProven = outcome === PROVIDER_OUTCOMES.NOT_DISPATCHED
-            || (outcome === PROVIDER_OUTCOMES.DEFINITIVE_REJECTION && refusalDocumented === true);
+            || (outcome === PROVIDER_OUTCOMES.DEFINITIVE_REJECTION && this.refusalDocumented);
     }
 }
 
