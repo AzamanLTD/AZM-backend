@@ -233,6 +233,21 @@ jobs:
           fi
           echo "control-plane schema present."
 
+      - name: Test database identity guard (production commit mode)
+        # The guard in front of the table-wide orphan sweep is money-path
+        # infrastructure: its refusals are the only thing standing between that
+        # statement and a database that is not provably disposable. It runs here,
+        # as its own named step, before any integration suite, so this lane can
+        # never be green with the guard unproven.
+        run: |
+          set -euo pipefail
+          if [ -z "${AZM_EXPECTED_TEST_DB_ADDRESS:-}" ] || [ -z "${AZM_TEST_PG_CONTAINER:-}" ]; then
+            echo "::error::The PostgreSQL container identity is not established (AZM_EXPECTED_TEST_DB_ADDRESS / AZM_TEST_PG_CONTAINER). The guard would refuse, so the lane stops here."
+            exit 1
+          fi
+          echo "Expected database address: ${AZM_EXPECTED_TEST_DB_ADDRESS} (container ${AZM_TEST_PG_CONTAINER})"
+          npx jest __tests__/test-database-guard.test.js --runInBand --forceExit
+
       - name: Native-GHS financial-integrity suites (production commit mode)
         # §392 — the native-GHS money paths (park/review, pre-dispatch
         # revalidation, dispatch ownership, reconciliation, reversal atomicity,

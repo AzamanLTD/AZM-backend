@@ -482,21 +482,26 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
     test('§1b the orphan sweep refuses to run unless the target is provably the disposable test database', async () => {
         const { assertDisposableTestDatabase: guard } = require('./helpers/testDatabaseGuard');
         const TEST_URL = 'postgres://postgres:postgres@localhost:5432/azm_iso?schema=public';
-        // The exhaustive IPv4 / IPv6 / server-address matrix lives in
-        // __tests__/test-database-guard.test.js. This test proves the guard as
-        // the suite actually wires it: refusals happen before the caller's
-        // statement, and the positive path runs here for real.
+        const SID = '7686515198152565070';
+        // The exhaustive IPv4 / IPv6 / CIDR / identity matrix lives in
+        // __tests__/test-database-guard.test.js (run as its own step in the
+        // financial-durability lane). This test proves the guard as this suite
+        // wires it: refusals happen before the caller's statement, and the
+        // positive path runs here for real.
         const seams = (over = {}) => ({
-            testUrl: TEST_URL, databaseUrl: TEST_URL, nodeEnv: 'test', expectedAddress: '', githubActions: false, ...over,
+            testUrl: TEST_URL, databaseUrl: TEST_URL, nodeEnv: 'test',
+            expectedAddress: '', containerId: '', localDataDir: '/var/lib/postgresql/15/main', githubActions: false,
+            probeLocalCluster: () => ({ systemIdentifier: SID, dataDirectory: '/var/lib/postgresql/15/main', postmasterPid: 422, port: '5432' }),
+            ...over,
         });
 
-        function stubClient({ database = 'azm_iso', serverAddress = '127.0.0.1/32' } = {}) {
+        function stubClient({ database = 'azm_iso', serverAddress = '127.0.0.1/32', systemIdentifier = SID, dataDirectory = '/var/lib/postgresql/15/main' } = {}) {
             const statements = [];
             return {
                 statements,
                 $queryRawUnsafe: async (sql) => {
                     statements.push(sql);
-                    return [{ database, server_address: serverAddress }];
+                    return [{ database, server_address: serverAddress, system_identifier: systemIdentifier, data_directory: dataDirectory, port: '5432' }];
                 },
                 $executeRawUnsafe: async (sql) => { statements.push(sql); },
             };
@@ -504,12 +509,10 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
         const mutations = (stub) => stub.statements.filter((sql) => /^\s*(UPDATE|DELETE|TRUNCATE|INSERT)/i.test(sql));
 
         // (a) no explicit test database at all
-        await expect(guard(stubClient(), seams({ testUrl: '' })))
-            .rejects.toThrow(/TEST_DATABASE_URL is not set/);
+        await expect(guard(stubClient(), seams({ testUrl: '' }))).rejects.toThrow(/TEST_DATABASE_URL is not set/);
 
         // (b) not the test environment
-        await expect(guard(stubClient(), seams({ nodeEnv: 'production' })))
-            .rejects.toThrow(/NODE_ENV is "production", not "test"/);
+        await expect(guard(stubClient(), seams({ nodeEnv: 'production' }))).rejects.toThrow(/NODE_ENV is "production", not "test"/);
 
         // (c) bound elsewhere — the error must not leak that URL's credentials
         const credentialled = 'postgres://ci_runner:hunter2-should-never-leak@db.prod.example.com:5432/azm_test?schema=public';
@@ -542,25 +545,38 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
         // (f) a REMOTE host with the exact expected database name, and the server
         //     agreeing on that name, is still refused with ZERO queries issued.
         const remoteUrl = 'postgres://postgres:postgres@azm-prod-db.example.com:5432/azm_iso?schema=public';
-        const remote = stubClient({ database: 'azm_iso' });
+        const remote = stubClient();
         await expect(guard(remote, seams({ testUrl: remoteUrl, databaseUrl: remoteUrl })))
             .rejects.toThrow(/host "azm-prod-db\.example\.com".*is not a loopback address/);
         expect(remote.statements).toHaveLength(0);
 
-        // (g) the container address needs the EXACT expectation: without one it is
-        //     a non-local report, with a wrong one it is an identity mismatch, and
-        //     only the exact address passes.
-        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), seams()))
-            .rejects.toThrow(/neither loopback nor ::1/);
-        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), seams({ expectedAddress: '172.18.0.3' })))
-            .rejects.toThrow(/Identity mismatch/);
-        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), seams({ expectedAddress: '172.18.0.2' })))
-            .resolves.toEqual({ database: 'azm_iso', host: 'localhost', serverAddress: '172.18.0.2', identity: 'exact-expected-address' });
+        // (g) an ssh -L tunnel: loopback URL, loopback report, WRONG cluster.
+        const tunnelled = stubClient({ systemIdentifier: '1111111111111111111' });
+        await expect(guard(tunnelled, seams())).rejects.toThrow(/A forwarded, tunnelled or proxied server is not a disposable local target/);
+        expect(mutations(tunnelled)).toHaveLength(0);
 
-        // (h) the positive local path
+        // (h) a locally supplied expectation is a claim, not identity.
+        await expect(guard(stubClient({ serverAddress: '203.0.113.9/32' }), seams({ expectedAddress: '203.0.113.9' })))
+            .rejects.toThrow(/is not an independently verified identity/);
+
+        // (i) the CI path needs a verified container, not a matching number.
+        const ciBase = {
+            githubActions: true, expectedAddress: '172.18.0.2', containerId: '2f206542ec5f',
+            inspectContainerIdentity: ({ address }) => ({ containerId: '2f206542ec5f', containerAddress: address, image: 'postgres:16' }),
+        };
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), seams(ciBase)))
+            .resolves.toMatchObject({ identity: 'ci-container-identity' });
+        await expect(guard(stubClient({ serverAddress: '172.18.0.3/32' }), seams(ciBase)))
+            .rejects.toThrow(/Identity mismatch/);
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), seams({ ...ciBase, expectedAddress: '172.18.0.2/32' })))
+            .rejects.toThrow(/AZM_EXPECTED_TEST_DB_ADDRESS/);
+
+        // (j) the positive LOCAL path: this suite's own wiring, against the real
+        //     database, proving the cluster this machine owns.
         const good = stubClient();
-        await expect(guard(good, seams()))
-            .resolves.toEqual({ database: 'azm_iso', host: 'localhost', serverAddress: '127.0.0.1', identity: 'loopback-server-report' });
+        const result = await guard(good, { probeLocalCluster: require('./helpers/testDatabaseGuard').probeLocalCluster });
+        expect(result.identity).toBe('local-cluster-identity');
+        expect(result.systemIdentifier).toMatch(/^\d+$/);
         expect(good.statements).toHaveLength(1);
         expect(mutations(good)).toHaveLength(0);
     });
