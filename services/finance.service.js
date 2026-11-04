@@ -553,6 +553,13 @@ const completeFiatWithdrawal = async (prisma, reference, { providerTxId = null }
         // (IN_TRANSIT → PAID_OUT; contradictory or undelivered states
         // quarantine — never a throw on the mounted settle path, never a
         // rewrite of terminal history). Legacy withdrawals skip.
+        // A crash between the provider's answer and the dispatch lifecycle
+        // write leaves the reservation RESERVED while the money is with the
+        // provider. Repair that from the durable dispatch observation BEFORE
+        // settling, so the provider's own SUCCESS is not mistaken for a
+        // contradiction and quarantined. Without dispatch evidence nothing is
+        // repaired and the contradiction guard keeps its full meaning.
+        await fiatLiquidity.repairInTransitFromDispatchEvidence(tx, { reference, providerTxId });
         await fiatLiquidity.settleIfRecorded(tx, {
             reference,
             outcome: 'SUCCESSFUL',

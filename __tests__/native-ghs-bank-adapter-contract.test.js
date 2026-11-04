@@ -13,7 +13,7 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const ADAPTER_SHA = process.env.MOOLRE_ADAPTER_SHA || '31a81cfd5bec116b6b50414789ba709bc40cca85';
+const ADAPTER_SHA = process.env.MOOLRE_ADAPTER_SHA || '66a81b0914d52adc963b7eeb1f863cbed6ff0195';
 const REPO_ROOT = path.resolve(__dirname, '..');
 const TMP_DIR = path.join(REPO_ROOT, '.tmp-391-adapter');
 const ADAPTER_FILE = path.join(TMP_DIR, 'moolreBankPayoutService.js');
@@ -28,7 +28,20 @@ function materialiseAdapter() {
         fs.writeFileSync(ADAPTER_FILE, source);
         return source;
     } catch (err) {
-        return null;
+        // The exact commit may simply not be in a shallow CI clone. Fetch THAT
+        // object rather than skipping the proof: a money-moving lifecycle test
+        // that silently skips is worse than one that fails.
+        try {
+            execFileSync('git', ['fetch', '--depth=1', 'origin', ADAPTER_SHA], { cwd: REPO_ROOT, stdio: 'ignore' });
+            const source = execFileSync('git', ['show', `${ADAPTER_SHA}:services/moolreBankPayoutService.js`], {
+                cwd: REPO_ROOT, encoding: 'utf8',
+            });
+            fs.mkdirSync(TMP_DIR, { recursive: true });
+            fs.writeFileSync(ADAPTER_FILE, source);
+            return source;
+        } catch (fetchErr) {
+            return null;
+        }
     }
 }
 
@@ -159,10 +172,12 @@ if (!hasAdapter) {
 
         expect(verdict.decision).toBe('NEGATIVE');
         expect(verdict.error.code).toBe('PROVIDER_ACCOUNT_NOT_FOUND');
-        // NOTE: #391's error carries the typed outcome, dispatchProven and the
-        // Moolre provider identity, but does NOT expose refusalDocumented on the
-        // instance (it is passed to the constructor and dropped). Requiring it
-        // would have made a real AVD02 look inconclusive. Reported to Agent B.
+        // NOTE: at 31a81cf #391's error carried the typed outcome,
+        // dispatchProven and the Moolre provider identity but did NOT expose
+        // refusalDocumented (passed to the constructor and dropped), which is
+        // why the #392 mapping keys on `dispatchProven` plus the provider's own
+        // AVD02 code rather than the flag. At cafc0fa the adapter publishes the
+        // flag too; the mapping is unchanged and still holds on both heads.
         expect(verdict.error.provider).toBe('MOOLRE_DISBURSEMENT');
         expect(verdict.error.outcome).toBe('DEFINITIVE_REJECTION');
         expect(verdict.error.dispatchProven).toBe(true);

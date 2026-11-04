@@ -890,6 +890,16 @@ async function recordBankDispatchPark(prisma, {
       reference,
       provider: BANK_PROVIDER_CANONICAL,
       observedStatus: observation?.status ?? null,
+      // §2: four separate facts, never one boolean. An attempt is not an
+      // acceptance, an answer is not a terminal result, and an unresolved
+      // answer is never proof that no payout exists. `providerDispatched`
+      // stays for older readers; here it means "a POST left this process",
+      // which is exactly what parking after an answer establishes.
+      providerDispatchAttempted: true,
+      providerResponseReceived: observation != null,
+      providerAcceptanceConfirmed: false,
+      providerReportedStatus: observation?.status ?? null,
+      providerDispatched: true,
       providerRef: observation?.providerRef ?? null,
       externalId: observation?.externalId ?? null,
       observedAmountGhsExact: observation?.amountGhsExact ?? null,
@@ -900,8 +910,13 @@ async function recordBankDispatchPark(prisma, {
       bankCode: bank?.bankCode ?? null,
       at: new Date().toISOString(),
       resolution: 'RECONCILE_ORIGINAL_REFERENCE',
-      providerDispatched: false,
       refunded: false,
+      // `providerDispatched` is deliberately NOT defaulted here. A payout is
+      // parked on this path precisely because a POST left this process and the
+      // provider ANSWERED something we will not act on yet, so a constant
+      // `false` would tell an operator (and any future reader) that nothing was
+      // sent and a refund is safe. The caller states it; `parkUncertainDispatch`
+      // omits it because there it is genuinely unknown.
       ...extra,
     })
   );
@@ -998,16 +1013,18 @@ async function enquiryBankDestination(port, { accountNumber, bankCode, expectedA
   } catch (err) {
     // A documented account-not-found is a definitive pre-dispatch negative only
     // when it is the PROVIDER'S OWN documented refusal for THIS enquiry. #391's
-    // adapter (@31a81cf) expresses that refusal as four facts that must ALL be
+    // adapter (cafc0fa) expresses that refusal as facts that must ALL be
     // present: its provider identity, DEFINITIVE_REJECTION, code
     // ACCOUNT_NOT_FOUND, and providerCode === 'AVD02' — Moolre's documented
-    // account-not-found answer. `refusalDocumented` is a CONSTRUCTOR ARGUMENT
-    // the adapter consumes to derive `dispatchProven`; it is deliberately not
-    // exposed on the instance, so this mapping keys on the derived
-    // `dispatchProven` plus the provider's own code, never on a field that does
-    // not exist. An ACCOUNT_NOT_FOUND that carries any other providerCode (or
-    // none) is a normalisation, not proof, and stays inconclusive: the funds
-    // are held rather than refunded on evidence the provider never gave.
+    // account-not-found answer. At 31a81cf `refusalDocumented` was a
+    // CONSTRUCTOR ARGUMENT only, so this mapping keyed on the derived
+    // `dispatchProven`; from cafc0fa the adapter also publishes the flag on the
+    // error. This mapping deliberately keys on the DERIVED `dispatchProven`
+    // plus the provider's own code, which is true across both heads and never
+    // depends on a field that only one of them has. An ACCOUNT_NOT_FOUND that
+    // carries any other providerCode (or none) is a normalisation, not proof,
+    // and stays inconclusive: the funds are held rather than refunded on
+    // evidence the provider never gave.
     const providerFamily = String(err?.provider || '');
     const providerCode = err?.providerCode == null ? '' : String(err.providerCode).trim();
     const definitive =
@@ -1094,30 +1111,90 @@ async function enquiryBankDestination(port, { accountNumber, bankCode, expectedA
  * Durable pre-dispatch refusal evidence: a park that names itself as
  * PRE_DISPATCH so no operator is sent to poll a provider that was never called.
  */
-async function recordPreDispatchRefusal(prisma, { reference, rowId, code, disposition, details }) {
+async function recordPreDispatchRefusal(prisma, { reference, rowId, code, disposition, details, hold = false }) {
+  // §6: a PRE-DISPATCH hold is not a dispatched payout. Left PENDING, the worker
+  // treats it as a candidate and polls a provider status for a transfer that was
+  // never posted. The mirror is the lifecycle authority operators act on, so a
+  // hold CASes PENDING -> NEEDS_MANUAL_REVIEW before any evidence is written.
+  const failures = [];
+  let mirror = null;
+  try {
+    mirror = await prisma.withdrawal.findFirst({
+      where: { transactionHistoryId: rowId },
+      select: { id: true, status: true },
+    });
+  } catch (err) {
+    failures.push({ step: 'MIRROR_READ', error: err?.message || String(err) });
+  }
+
+  let held = false;
+  if (hold && mirror && mirror.status === 'PENDING') {
+    try {
+      const claim = await prisma.withdrawal.updateMany({
+        where: { id: mirror.id, status: 'PENDING' },
+        data: { status: 'NEEDS_MANUAL_REVIEW' },
+      });
+      if (claim.count === 1) {
+        held = true;
+      } else {
+        const now = await prisma.withdrawal.findUnique({ where: { id: mirror.id }, select: { status: true } });
+        held = now?.status === 'NEEDS_MANUAL_REVIEW';
+      }
+    } catch (err) {
+      failures.push({ step: 'MIRROR_HOLD', error: err?.message || String(err) });
+      logger.error({ reference, err: err?.message },
+        '[nativeGhsWithdrawal] pre-dispatch hold could not move the withdrawal mirror out of PENDING');
+    }
+  }
+
+  const facts = {
+    code,
+    disposition,
+    holdRequested: hold === true,
+    holdApplied: held,
+    mirrorStatus: held ? 'NEEDS_MANUAL_REVIEW' : (mirror?.status ?? null),
+    at: new Date().toISOString(),
+    ...(failures.length ? { bookkeepingFailures: failures } : {}),
+    ...details,
+  };
+
   try {
     await prisma.$executeRawUnsafe(
       'UPDATE "TransactionHistory" SET "metadata" = COALESCE("metadata", \'{}\'::jsonb) || jsonb_build_object($2::text, $3::jsonb) WHERE "id" = $1',
       rowId,
       'bankPreDispatchRefusal',
-      JSON.stringify({ code, disposition, at: new Date().toISOString(), ...details })
+      JSON.stringify(facts)
     );
-    const mirror = await prisma.withdrawal.findFirst({
-      where: { transactionHistoryId: rowId },
-      select: { id: true },
-    });
-    if (mirror) {
+  } catch (err) {
+    failures.push({ step: 'REFUSAL_METADATA', error: err?.message || String(err) });
+    logger.error({ reference, err: err?.message }, '[nativeGhsWithdrawal] could not record pre-dispatch refusal metadata');
+  }
+
+  if (mirror) {
+    try {
       await recordReconciliationException(prisma, {
         entityType: 'WITHDRAWAL',
         entityId: String(mirror.id),
         reference,
         reason: code,
-        details: { disposition, ...details },
+        details: {
+          ...facts,
+          bookkeepingFailures: failures.length ? failures : undefined,
+          note: failures.length
+            ? 'Some pre-dispatch evidence could NOT be written. No transfer was posted; do not infer a payout from a missing record.'
+            : undefined,
+        },
       });
+    } catch (err) {
+      failures.push({ step: 'REFUSAL_EXCEPTION', error: err?.message || String(err) });
+      logger.error({ reference, err: err?.message }, '[nativeGhsWithdrawal] could not record pre-dispatch refusal exception');
     }
-  } catch (err) {
-    logger.error({ reference, err: err?.message }, '[nativeGhsWithdrawal] could not record pre-dispatch refusal');
+  } else if (hold) {
+    logger.error({ reference },
+      '[nativeGhsWithdrawal] pre-dispatch hold has no withdrawal mirror — the payout cannot be surfaced to operators');
   }
+
+  return { held, mirrorStatus: held ? 'NEEDS_MANUAL_REVIEW' : (mirror?.status ?? null), failures };
 }
 
 async function dispatchNaturalGhsBankWithdrawal(prisma, {
@@ -1223,6 +1300,9 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
             snapshotBankCode: snapshot.bankCode,
             currentBankCode: current?.bankCode ?? null,
             revalidationError,
+            providerDispatchAttempted: false,
+            providerResponseReceived: false,
+            providerAcceptanceConfirmed: false,
             providerDispatched: false,
             refunded: false,
           },
@@ -1247,9 +1327,15 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
       rowId: row.id,
       code: 'BANK_REVALIDATION_CAPABILITY_UNAVAILABLE',
       disposition: 'HELD_FOR_REVIEW',
+      // §6: a rail that cannot answer is a HOLD, not a slot in the automatic
+      // reconciliation queue.
+      hold: true,
       details: {
         phase: 'PRE_DISPATCH',
         reason: 'The bank rail cannot revalidate the stored account immediately before dispatch, so it is not available.',
+        providerDispatchAttempted: false,
+        providerResponseReceived: false,
+        providerAcceptanceConfirmed: false,
         providerDispatched: false,
         refunded: false,
         resolution: 'RAIL_UNAVAILABLE',
@@ -1299,6 +1385,9 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
       rowId: row.id,
       code,
       disposition: refundable && reversal?.reversed ? 'REFUNDED_PRE_DISPATCH' : 'HELD_FOR_REVIEW',
+      // Only a completed pre-dispatch reversal is finished business. Anything
+      // else is held for an operator and must leave the worker's candidates.
+      hold: !(refundable && reversal?.reversed),
       details: {
         phase: 'PRE_DISPATCH',
         decision: enquiry.decision,
@@ -1310,6 +1399,9 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
         snapshotFingerprint: snapshot?.fingerprint ?? null,
         refundable,
         refunded: reversal?.reversed === true,
+        providerDispatchAttempted: false,
+        providerResponseReceived: false,
+        providerAcceptanceConfirmed: false,
         providerDispatched: false,
         resolution: refundable && reversal?.reversed ? 'REFUNDED' : 'RECONCILE_MANUALLY',
       },
@@ -1379,7 +1471,24 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
       : (verdict.reason === 'DISPATCH_TERMINAL_AT_INITIATION'
         ? 'PROVIDER_TERMINAL_AT_INITIATION'
         : 'DISPATCH_OBSERVATION_CONTRADICTION');
-    await recordBankDispatchPark(prisma, {
+    // §3 BOOKKEEPING FAILURE MODEL. Every write below is a SEPARATE authority
+    // and each may fail on its own. A POST has already left this process, so a
+    // bookkeeping failure here is never a reason to throw to the caller, never
+    // a reason to refund, and never a reason to POST again: it is recorded and
+    // reported. The failures are collected and, when any occurred, summarised
+    // in durable operator evidence with an explicit note about what could NOT
+    // be written.
+    const bookkeepingFailures = [];
+    const bookkeeping = async (name, fn) => {
+      try {
+        await fn();
+      } catch (err) {
+        bookkeepingFailures.push({ step: name, error: err?.message || String(err) });
+        logger.error({ reference, step: name, err: err?.message }, '[nativeGhsWithdrawal] parked BANK dispatch bookkeeping step failed');
+      }
+    };
+
+    await bookkeeping('PARK_METADATA', () => recordBankDispatchPark(prisma, {
       reference,
       rowId: row.id,
       code,
@@ -1387,24 +1496,28 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
       observation: verdict.observation || null,
       bank,
       amountGhsExact: amount.toFixed(2),
-      extra: { reason: verdict.reason, providerCode: verdict.providerCode ?? null },
-    });
+      extra: {
+        reason: verdict.reason,
+        providerCode: verdict.providerCode ?? null,
+        // The provider answered our POST. Recording anything else here would
+        // misdescribe the money.
+        providerDispatched: true,
+      },
+    }));
     // OWNERSHIP IS A FACT INDEPENDENT OF ACCEPTANCE. A POST left this process
     // and the provider answered, so reconciliation must be able to ask THAT
-    // provider what happened. Without durable ownership the worker resolves
-    // UNKNOWN, refuses to guess a rail, and the payout is stranded with the
-    // customer's funds reserved indefinitely — the gap the integrated
-    // initiation->reconciliation proof catches. Record the same durable
-    // observation + ownership evidence the accepted path records; neither may
-    // settle or reverse anything.
-    // The provider's OWN reference only. Our echoed external reference is not a
-    // provider reference: stamping it into the reservation would make the
+    // provider what happened. This path used to record neither ownership nor
+    // lifecycle, and the worker then resolved UNKNOWN, refused to guess a rail
+    // (correctly) and left the payout permanently unresolved — the gap the
+    // integrated initiation->reconciliation proof caught.
+    //
+    // The provider's OWN reference only: our echoed external reference is not a
+    // provider reference, and stamping it into the reservation made the
     // provider's later answer (carrying its real reference) look like
     // contradictory evidence for a payout that actually completed. A NULL slot
     // is enriched by exactly one settling winner.
     const parkedProviderRef = verdict.providerRef ?? null;
-    try {
-      await fiatLiquidity.recordProviderEvent(prisma, {
+    await bookkeeping('PROVIDER_EVENT', () => fiatLiquidity.recordProviderEvent(prisma, {
         provider: BANK_PROVIDER_CANONICAL,
         rail: BANK_RAIL,
         direction: 'OUTBOUND',
@@ -1421,20 +1534,13 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
           providerStatusRaw: outbound?.providerStatusRaw ?? null,
           bankCode: bank?.bankCode ?? null,
         },
-      });
-    } catch (err) {
-      logger.error({ reference, err: err.message }, '[nativeGhsWithdrawal] parked BANK dispatch observation could not be persisted');
-    }
-    try {
-      await persistPayoutOwnership(prisma, {
+    }));
+    await bookkeeping('OWNERSHIP', () => persistPayoutOwnership(prisma, {
         reference,
         failoverTag: BANK_PAYOUT_FAILOVER_TAG,
         intendedProvider: BANK_PROVIDER_CANONICAL,
         providerRef: parkedProviderRef,
-      });
-    } catch (err) {
-      logger.error({ reference, err: err.message }, '[nativeGhsWithdrawal] parked BANK payout ownership write failed');
-    }
+    }));
 
     // The POST left this process, so the P5-D lifecycle is IN_TRANSIT, not
     // RESERVED: the funds are with the provider, neither spendable here nor
@@ -1442,18 +1548,56 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
     // later SUCCESSFUL answer contradict our recorded lifecycle, and the
     // authority quarantines a payout that actually completed. Bookkeeping
     // only — nothing settles or reverses here.
-    try {
-      await prisma.$transaction(async (tx) => {
+    await bookkeeping('IN_TRANSIT', () => prisma.$transaction(async (tx) => {
         await fiatLiquidity.markReservationInTransit(tx, { reference, providerRef: parkedProviderRef });
-      });
-    } catch (err) {
-      logger.error({ reference, err: err.message }, '[nativeGhsWithdrawal] parked BANK IN_TRANSIT transition failed');
-    }
+    }));
 
-    // The reservation deliberately STAYS reserved: the provider may hold the
-    // payout. Nothing here settles, refunds or claims an acceptance.
+    // The reservation is IN_TRANSIT (see the transition above, and the
+    // recovery note below). The provider may hold the payout; nothing here
+    // settles, refunds or claims an acceptance. If the IN_TRANSIT transition
+    // above failed, the reservation is still RESERVED and the dispatch event
+    // is the only durable proof a POST happened — settlement repairs it from
+    // that event before judging the provider's answer
+    // (fiatLiquidity.repairInTransitFromDispatchEvidence).
+    if (bookkeepingFailures.length > 0) {
+      // Durable operator evidence, best effort: the park metadata may itself be
+      // one of the failed writes, so nothing here claims a full record exists.
+      // The one thing that must never be inferred from a missing write is that
+      // no payout exists.
+      const failedSteps = bookkeepingFailures.map((f) => f.step);
+      const recordedSteps = ['PARK_METADATA', 'PROVIDER_EVENT', 'OWNERSHIP', 'IN_TRANSIT'].filter((step) => !failedSteps.includes(step));
+      try {
+        const mirror = await prisma.withdrawal.findFirst({
+          where: { transactionHistoryId: row.id },
+          select: { id: true },
+        });
+        if (mirror) {
+          await recordReconciliationException(prisma, {
+            entityType: 'WITHDRAWAL',
+            entityId: String(mirror.id),
+            reference,
+            reason: 'PARK_BOOKKEEPING_INCOMPLETE',
+            details: {
+              phase: 'POST_DISPATCH_BOOKKEEPING',
+              decision: verdict.decision,
+              failedSteps,
+              recordedSteps,
+              failures: bookkeepingFailures,
+              note: 'A transfer POST left this process. A missing bookkeeping step is NOT evidence that no payout exists; recover only from durable evidence.',
+            },
+          });
+        } else {
+          logger.error({ reference, failedSteps, failures: bookkeepingFailures },
+            '[nativeGhsWithdrawal] park bookkeeping failed AND the withdrawal mirror is missing — no exception row could be written');
+        }
+      } catch (err) {
+        // The exception writer failed too. Say so instead of implying it worked.
+        logger.error({ reference, failedSteps, err: err?.message, failures: bookkeepingFailures },
+          '[nativeGhsWithdrawal] park bookkeeping failed and the failure record could not be written');
+      }
+    }
     logger.warn(
-      { reference, decision: verdict.decision, reason: verdict.reason },
+      { reference, decision: verdict.decision, reason: verdict.reason, bookkeepingFailures: bookkeepingFailures.map((f) => f.step) },
       '[nativeGhsWithdrawal] BANK dispatch not accepted by the provider answer — funds held, original reference retained'
     );
     return {
@@ -1463,6 +1607,9 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
       detail: verdict.reason,
       providerRef: verdict.providerRef || null,
       refunded: false,
+      // Never presented as a clean park: a caller (or an operator reading the
+      // result) must be able to see that the evidence is incomplete.
+      bookkeepingFailures: bookkeepingFailures.map((f) => f.step),
     };
   }
 

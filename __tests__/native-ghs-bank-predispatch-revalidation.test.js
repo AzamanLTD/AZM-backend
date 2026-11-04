@@ -271,6 +271,50 @@ if (hasDb) {
         expect(th.metadata.bankPreDispatchRefusal.code).toBe('BANK_PROVIDER_REVALIDATION_INCONCLUSIVE');
     });
 
+    test('§6 a pre-dispatch hold moves the withdrawal mirror to NEEDS_MANUAL_REVIEW and leaves the worker candidate set', async () => {
+        const { reference, facts, bank } = await acceptedBankPayout();
+        const p = port(async () => { throw new Error('provider timeout'); });
+        const out = await svc.dispatchNaturalGhsBankWithdrawal(prisma, {
+            reference, amountGhsExact: facts.recipientGhsExact, bank, port: p,
+        });
+        expect(out.disposition).toBe('HELD_FOR_REVIEW');
+        const { th, mirror, reservation } = await state(reference);
+
+        // The canonical row is untouched, the customer's money stays protected.
+        expect(th.status).toBe('PENDING');
+        expect(reservation.status).toBe('RESERVED');
+        // The LIFECYCLE mirror is where operators act, and where the worker
+        // decides. A hold that stays PENDING is a payout the worker will poll
+        // for a status of a transfer that never happened.
+        expect(mirror.status).toBe('NEEDS_MANUAL_REVIEW');
+        expect(th.metadata.bankPreDispatchRefusal.holdApplied).toBe(true);
+
+        const candidates = await prisma.withdrawal.count({
+            where: { id: mirror.id, status: { in: ['PENDING', 'PROCESSING', 'DISPATCHING', 'APPROVED'] } },
+        });
+        expect(candidates).toBe(0);
+
+        const queue = await prisma.$queryRawUnsafe(
+            'SELECT "reason" FROM "ReconciliationException" WHERE "entityId" = $1', String(mirror.id)
+        );
+        expect(queue.map((e) => e.reason)).toContain('BANK_PROVIDER_REVALIDATION_INCONCLUSIVE');
+        expect(p.initiateBankTransfer).not.toHaveBeenCalled();
+    });
+
+    test('§6 a rail that cannot revalidate also holds in the operator lane, with no transfer and no refund', async () => {
+        const { reference, facts, bank } = await acceptedBankPayout();
+        const noCapability = { capabilities: () => ({ canInitiateBankPayout: true }), initiateBankTransfer: jest.fn() };
+        const out = await svc.dispatchNaturalGhsBankWithdrawal(prisma, {
+            reference, amountGhsExact: facts.recipientGhsExact, bank, port: noCapability,
+        });
+        expect(out.reason).toBe('BANK_REVALIDATION_CAPABILITY_UNAVAILABLE');
+        const { th, mirror } = await state(reference);
+        expect(mirror.status).toBe('NEEDS_MANUAL_REVIEW');
+        expect(th.metadata.bankPreDispatchRefusal.holdApplied).toBe(true);
+        expect(th.metadata.bankPreDispatchRefusal.refunded).toBe(false);
+        expect(noCapability.initiateBankTransfer).not.toHaveBeenCalled();
+    });
+
     test('a malformed validation answer is inconclusive: held, no transfer', async () => {
         const { reference, facts, bank } = await acceptedBankPayout();
         for (const answer of [null, 'OK', {}, { valid: true }, { valid: true, bankCode: BANK_CODE }, { valid: true, accountName: ACCOUNT_NAME }, { valid: false }, { valid: true, accountName: ACCOUNT_NAME, bankCode: BANK_CODE, provider: 'SOMEONE_ELSE' }, { valid: true, accountName: ACCOUNT_NAME, bankCode: BANK_CODE, provider: 'MOOLRE', validatedAt: 'not-a-date' }]) {

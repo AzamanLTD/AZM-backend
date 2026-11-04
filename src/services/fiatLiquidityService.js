@@ -1441,6 +1441,88 @@ const settleIfRecorded = async (tx, args) => {
     return { skipped: false, ...(await settleReservation(tx, args)) };
 };
 
+/**
+ * REPAIR: advance a still-RESERVED reservation to IN_TRANSIT when the dispatch
+ * that moved the money is durably recorded but the lifecycle write never
+ * landed (a crash between the provider's answer and the bookkeeping).
+ *
+ * The dispatch observation is written BEFORE the lifecycle transition, so its
+ * presence is evidence that a POST left this process. Settlement requires
+ * IN_TRANSIT; without this repair a crash would make the provider's own
+ * SUCCESSFUL answer look like a contradiction and quarantine a completed
+ * payout.
+ *
+ * EVERY condition below is required, and anything unexpected fails closed:
+ *   - the exact payout reference, matched on the event's own related reference;
+ *   - a KNOWN provider identity (never an arbitrary string from a payload);
+ *   - BANK or MOMO rail, OUTBOUND direction, status still open;
+ *   - the exact dispatch-event identity for THIS provider and reference;
+ *   - the event amount equal to the reservation amount, to the pesewa;
+ *   - no contradictory event from a DIFFERENT provider for the same reference;
+ *   - the reservation is exactly RESERVED (single-winner compare-and-set).
+ *
+ * It never increases availableGhs, never refunds, never settles, never creates
+ * a reservation or reference, and never asks the provider anything.
+ */
+const KNOWN_PROVIDER_IDENTITIES = new Set(['MOOLRE_DISBURSEMENT', 'MTN_MOMO_DISBURSEMENT']);
+
+async function repairInTransitFromDispatchEvidence(tx, { reference, providerTxId = null } = {}) {
+    const refuse = (reason, extra = {}) => ({ repaired: false, reason, ...extra });
+    if (!reference) return refuse('NO_REFERENCE');
+    const ref = String(reference);
+
+    const reservation = await tx.fiatLiquidityReservation.findUnique({ where: { reference: ref } });
+    if (!reservation) return refuse('NO_RESERVATION');
+    if (reservation.status !== 'RESERVED') return refuse('NOT_RESERVED', { status: reservation.status });
+
+    const events = await tx.fiatProviderEvent.findMany({
+        where: { relatedReference: ref, direction: 'OUTBOUND' },
+        select: { id: true, provider: true, rail: true, status: true, amountGhs: true, dedupKey: true, relatedReference: true },
+    });
+
+    // A second provider holding evidence for this reference is a double
+    // dispatch or a rail-identity defect: never pick one, never repair.
+    const providers = new Set(events.map((e) => e.provider));
+    if (providers.size > 1) {
+        return refuse('CONFLICTING_PROVIDER_EVIDENCE', { providers: [...providers] });
+    }
+
+    const amountMatches = (event) => Number(event.amountGhs).toFixed(2) === Number(reservation.amountGhs).toFixed(2);
+    const evidence = events.find((event) => (
+        KNOWN_PROVIDER_IDENTITIES.has(event.provider)
+        && (event.rail === 'BANK' || event.rail === 'MOMO')
+        && event.relatedReference === ref
+        && event.dedupKey === `event:payout-dispatch:${event.provider}:${ref}`
+        && event.status !== 'SUCCESSFUL'
+        && event.status !== 'FAILED'
+    ));
+    if (!evidence) return refuse('NO_DISPATCH_EVIDENCE');
+    if (!amountMatches(evidence)) {
+        // The event is not about this amount: it is not proof about this money.
+        return refuse('AMOUNT_MISMATCH', { eventAmountGhs: String(evidence.amountGhs), reservationAmountGhs: String(reservation.amountGhs) });
+    }
+
+    const claim = await tx.fiatLiquidityReservation.updateMany({
+        where: { id: reservation.id, status: 'RESERVED' },
+        data: {
+            status: 'IN_TRANSIT',
+            ...(reservation.providerRef == null && providerTxId != null
+                ? { providerRef: String(providerTxId) }
+                : {}),
+        },
+    });
+    if (claim.count !== 1) return refuse('REPAIR_CLAIM_LOST');
+    await tx.fiatLiquidityState.update({
+        where: { id: 1 },
+        data: {
+            reservedGhs: { decrement: reservation.amountGhs },
+            inTransitGhs: { increment: reservation.amountGhs },
+        },
+    });
+    await syncPoolProjection(tx);
+    return { repaired: true, amountGhs: reservation.amountGhs, provider: evidence.provider };
+}
+
 const releaseIfRecorded = async (tx, args) => {
     const rz = await tx.fiatLiquidityReservation.findUnique({ where: { reference: args.reference } });
     if (!rz) return { skipped: true };
@@ -1641,6 +1723,7 @@ module.exports = {
     releaseReservation,
     inTransitIfRecorded,
     settleIfRecorded,
+    repairInTransitFromDispatchEvidence,
     releaseIfRecorded,
     reconcile,
     liquiditySummary,
