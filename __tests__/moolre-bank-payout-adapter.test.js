@@ -1093,3 +1093,43 @@ describe('K. validation port contract', () => {
         }
     });
 });
+
+// ── L. cross-check against the real consumer decision function ──────────────
+// #392's evaluateBankDispatchObservation is the thing that decides whether a
+// dispatch is accepted, parked or unresolved. These cases pin the adapter's
+// side of that handshake so a change here cannot silently change that decision.
+describe('L. observation handshake with the financial consumer', () => {
+    test('a provider acceptance with echo and amount is a complete observation', async () => {
+        const out = await service(fakeHttp()).initiateBankTransfer({ ...baseInitiation });
+        expect(out.status).toBe('SUCCESSFUL');
+        expect(out.externalId).toBe(out.referenceId);
+        expect(out.amountGhsExact).toBe('25.50');
+    });
+
+    test('a terminal success without provider amount evidence is not terminal', async () => {
+        const transfer = JSON.parse(JSON.stringify(acceptedTransfer));
+        delete transfer.data.amount;
+        const out = await service(fakeHttp({ transfer: { status: 200, data: transfer } }))
+            .initiateBankTransfer({ ...baseInitiation });
+        expect(out.status).toBe('UNRESOLVED');
+        expect(out.reason).toBe('AMOUNT_EVIDENCE_MISSING');
+        expect(out.amountGhsExact).toBeNull();
+        expect(out.providerStatusRaw).toBe('1');
+    });
+
+    test('every non-terminal answer carries what the consumer needs to park it', async () => {
+        const transfer = JSON.parse(JSON.stringify(acceptedTransfer));
+        delete transfer.data.externalref;
+        const out = await service(fakeHttp({ transfer: { status: 200, data: transfer } }))
+            .initiateBankTransfer({ ...baseInitiation });
+        expect(out).toMatchObject({
+            provider: 'MOOLRE_DISBURSEMENT',
+            rail: 'BANK',
+            status: 'UNRESOLVED',
+            reason: 'EXTERNAL_REFERENCE_ABSENT',
+            externalId: null,
+            referenceId: baseInitiation.referenceId,
+        });
+        expect(out.amountGhsExact).toBe('25.50');
+    });
+});

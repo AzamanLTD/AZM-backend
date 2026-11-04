@@ -772,6 +772,12 @@ class MoolreBankPayoutService {
             providerStatusRaw: nestedRaw,
         };
 
+        // A terminal success needs independent amount evidence, exactly as the
+        // status path does. txstatus 1 alone does not tell us what Moolre paid.
+        if (mapped === 'SUCCESSFUL' && observation.amountGhsExact === null) {
+            return { ...observation, status: 'UNRESOLVED', reason: 'AMOUNT_EVIDENCE_MISSING' };
+        }
+
         if (mapped === 'UNRESOLVED') {
             // Moolre accepted something, but the status value has no published
             // meaning, so this is an unresolved observation with every provider
