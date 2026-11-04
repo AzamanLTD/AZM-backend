@@ -13,7 +13,7 @@ const { execFileSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
-const ADAPTER_SHA = process.env.MOOLRE_ADAPTER_SHA || '66a81b0914d52adc963b7eeb1f863cbed6ff0195';
+const ADAPTER_SHA = process.env.MOOLRE_ADAPTER_SHA || 'ea0e580f2d507e242c4b18e62f2a52175f621d8a';
 const REPO_ROOT = path.resolve(__dirname, '..');
 const TMP_DIR = path.join(REPO_ROOT, '.tmp-391-adapter');
 const ADAPTER_FILE = path.join(TMP_DIR, 'moolreBankPayoutService.js');

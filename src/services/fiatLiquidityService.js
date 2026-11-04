@@ -1477,7 +1477,7 @@ async function repairInTransitFromDispatchEvidence(tx, { reference, providerTxId
 
     const events = await tx.fiatProviderEvent.findMany({
         where: { relatedReference: ref, direction: 'OUTBOUND' },
-        select: { id: true, provider: true, rail: true, status: true, amountGhs: true, dedupKey: true, relatedReference: true },
+        select: { id: true, provider: true, rail: true, status: true, amountGhs: true, dedupKey: true, relatedReference: true, raw: true },
     });
 
     // A second provider holding evidence for this reference is a double
@@ -1487,18 +1487,47 @@ async function repairInTransitFromDispatchEvidence(tx, { reference, providerTxId
         return refuse('CONFLICTING_PROVIDER_EVIDENCE', { providers: [...providers] });
     }
 
-    const amountMatches = (event) => Number(event.amountGhs).toFixed(2) === Number(reservation.amountGhs).toFixed(2);
+    // The rail this payout is canonically on, read from the authorities that own
+    // it. Without it an event on the other rail could "prove" a dispatch that
+    // never happened here.
+    const canonicalRow = await tx.transactionHistory.findUnique({
+        where: { txHash: ref },
+        select: { id: true, metadata: true },
+    });
+    if (!canonicalRow) return refuse('NO_CANONICAL_ROW');
+    const mirrorRow = await tx.withdrawal.findFirst({
+        where: { transactionHistoryId: canonicalRow.id },
+        select: { payoutMethod: true },
+    });
+    const expectedRail = String(canonicalRow.metadata?.rail || mirrorRow?.payoutMethod || '').toUpperCase();
+    if (expectedRail !== 'BANK' && expectedRail !== 'MOMO') return refuse('RAIL_CONTEXT_UNKNOWN');
+
+    const BANK_DISPATCH_SOURCES = new Set(['bank_dispatch_initiation', 'bank_dispatch_parked']);
+    const exactOf = (value) => toExactGhsDecimal(value);
+
     const evidence = events.find((event) => (
         KNOWN_PROVIDER_IDENTITIES.has(event.provider)
-        && (event.rail === 'BANK' || event.rail === 'MOMO')
+        && event.rail === expectedRail
         && event.relatedReference === ref
         && event.dedupKey === `event:payout-dispatch:${event.provider}:${ref}`
         && event.status !== 'SUCCESSFUL'
         && event.status !== 'FAILED'
+        // The event must actually be DISPATCH evidence from the path that posts,
+        // not an unrelated status observation that happens to share the key.
+        && (expectedRail === 'BANK'
+            ? BANK_DISPATCH_SOURCES.has(String(event.raw?.source || ''))
+            : true)
     ));
-    if (!evidence) return refuse('NO_DISPATCH_EVIDENCE');
-    if (!amountMatches(evidence)) {
-        // The event is not about this amount: it is not proof about this money.
+    if (!evidence) return refuse('NO_DISPATCH_EVIDENCE', { expectedRail });
+    let amountsEqual;
+    try {
+        // Exact decimal equality: never binary floating point for money.
+        amountsEqual = exactOf(evidence.amountGhs).equals(exactOf(reservation.amountGhs));
+    } catch (err) {
+        return refuse('AMOUNT_UNCOMPARABLE', { error: err?.message });
+    }
+    if (!amountsEqual) {
+        // One pesewa out is still not proof about this money.
         return refuse('AMOUNT_MISMATCH', { eventAmountGhs: String(evidence.amountGhs), reservationAmountGhs: String(reservation.amountGhs) });
     }
 

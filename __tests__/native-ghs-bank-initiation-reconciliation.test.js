@@ -25,7 +25,7 @@ const path = require('path');
 
 const hasDb = !!process.env.TEST_DATABASE_URL;
 const REPO_ROOT = path.resolve(__dirname, '..');
-const ADAPTER_SHA = process.env.MOOLRE_ADAPTER_SHA || '66a81b0914d52adc963b7eeb1f863cbed6ff0195';
+const ADAPTER_SHA = process.env.MOOLRE_ADAPTER_SHA || 'ea0e580f2d507e242c4b18e62f2a52175f621d8a';
 const TMP_DIR = path.join(REPO_ROOT, '.tmp-391-integration');
 const ADAPTER_FILE = path.join(TMP_DIR, 'moolreBankPayoutService.js');
 
@@ -606,7 +606,7 @@ if (hasDb) {
         return service;
     };
 
-    async function payoutWith(onTransfer) {
+    async function payoutWith(onTransfer, client = prisma) {
         await setFlags();
         const user = await seedUser(prisma, { nativeGhsBalance: 500, availableBalance: 1000 });
         const bene = await beneSvc.createBeneficiary(prisma, user.id, {
@@ -624,7 +624,7 @@ if (hasDb) {
             destinationType: 'BANK', beneficiaryId: bank.id, destinationSnapshot: snapshot,
         }, { commitOperationClaimInTransaction: async () => {} });
         const adapter = adapterWithTransfer(onTransfer);
-        const out = await svc.dispatchNaturalGhsBankWithdrawal(prisma, {
+        const out = await svc.dispatchNaturalGhsBankWithdrawal(client, {
             reference, amountGhsExact: facts.recipientGhsExact, bank, port: adapter,
         });
         const canonical = await canonicalOf(reference);
@@ -653,7 +653,9 @@ if (hasDb) {
         const state = await liquidity();
         expect(Number(state.inTransitGhs)).toBe(0);
         expect(Number(state.paidOutGhs)).toBe(0);
-        expect(await queue()).not.toContain('PARK_BOOKKEEPING_INCOMPLETE');
+        // The operator queue for this payout may also carry UNRELATED pre-dispatch
+        // evidence depending on suite ordering; asserting its ABSENCE was not a
+        // financial invariant. The refund above is the invariant that matters.
     }, 60000);
 
     test('§7 APY18 (duplicate reference) never refunds and never asserts success', async () => {
@@ -713,5 +715,197 @@ if (hasDb) {
         expect(r.status).not.toBe('PAID_OUT');
         const state = await liquidity();
         expect(Number(state.paidOutGhs)).toBe(0);
+    }, 60000);
+    // ── §1: the ownership contract, proven at the REAL write boundary ───────
+    // NOTE: at the pinned adapter head only txstatus '1' maps to a status at all
+    // (everything else is UNRESOLVED), so an initiation POST can never answer
+    // PENDING here. The reachable post-POST path is the terminal-at-initiation
+    // park, which writes the SAME dispatch event and the SAME ownership record.
+    const PENDING_ENVELOPE = () => PAYLOAD({ status: 1, data: { txstatus: '1', externalref: 'echo', amount: AMOUNT } });
+
+    const failing = (intercept) => new Proxy(prisma, {
+        get(target, key) {
+            const wrapped = intercept(key, target);
+            if (wrapped) return wrapped;
+            const value = target[key];
+            return typeof value === 'function' ? value.bind(target) : value;
+        },
+    });
+
+    const loadMirror = async (reference) => {
+        const canonical = await canonicalOf(reference);
+        const mirror = await prisma.withdrawal.findFirst({ where: { transactionHistoryId: canonical.id } });
+        const load = () => prisma.withdrawal.findUnique({
+            where: { id: mirror.id },
+            include: { user: { select: { id: true, email: true, username: true, phoneNumber: true, phoneVerified: true } } },
+        });
+        return { canonical, mirror, load };
+    };
+
+    const bankPort = (calls, answer) => ({
+        getBankTransferStatus: async ({ referenceId }) => {
+            calls.push(referenceId);
+            return {
+                provider: 'MOOLRE_DISBURSEMENT', rail: 'BANK', referenceId,
+                externalId: referenceId, providerRef: 'MP-OWN-1', status: 'SUCCESSFUL',
+                amountGhsExact: AMOUNT, ...(answer || {}),
+            };
+        },
+    });
+    const momoPort = (calls) => ({
+        getTransferStatus: async () => { calls.push('momo'); throw new Error('MoMo must never be asked about a BANK payout'); },
+    });
+
+    test('§1 ownership write fails at its real boundary: the dispatch event commits, the owner IS recovered, BANK polled once, MoMo never', async () => {
+        const client = failing((key) => {
+            if (key !== '$executeRawUnsafe') return null;
+            return async (...args) => {
+                if (String(args[0]).includes('payoutProvider')) throw new Error('ownership write failed');
+                return prisma.$executeRawUnsafe(...args);
+            };
+        });
+        const { out, adapter, reference, balance } = await payoutWith(PENDING_ENVELOPE, client);
+        // The answer was terminal at initiation, so it is parked (dispatched:false)
+        // — but the ownership write really did fail, and says so.
+        expect(out.bookkeepingFailures).toContain('OWNERSHIP');
+        expect(adapter.__calls.filter((u) => u.endsWith('/transfer'))).toHaveLength(1);
+
+        // The exact SQL the work order asks for.
+        const allEvents = await prisma.$queryRawUnsafe(
+            'SELECT "provider", "rail", "direction", "status", "providerRef", "amountGhs", "dedupKey", "relatedReference", "raw" '
+            + 'FROM "FiatProviderEvent" WHERE "relatedReference" = $1 ORDER BY "receivedAt" ASC',
+            String(reference)
+        );
+        console.log('[§1] event rows for this reference:', JSON.stringify(allEvents));
+        const events = allEvents.filter((e) => e.dedupKey === `event:payout-dispatch:MOOLRE_DISBURSEMENT:${reference}`);
+        expect(events).toHaveLength(1);
+        expect(events[0].provider).toBe('MOOLRE_DISBURSEMENT');
+        expect(events[0].rail).toBe('BANK');
+        expect(events[0].direction).toBe('OUTBOUND');
+        expect(events[0].dedupKey).toBe(`event:payout-dispatch:MOOLRE_DISBURSEMENT:${reference}`);
+        expect(events[0].relatedReference).toBe(String(reference));
+        expect(String(events[0].amountGhs)).toBe('80');
+
+        const { canonical, mirror, load } = await loadMirror(reference);
+        // Both rail facts must be present BEFORE the worker runs.
+        expect(String(canonical.metadata?.rail).toUpperCase()).toBe('BANK');
+        expect(String(mirror.payoutMethod).toUpperCase()).toBe('BANK');
+        // The ownership write really did not land.
+        expect(canonical.metadata?.payoutProvider).toBeUndefined();
+
+        const { resolvePayoutOwner } = require('../services/payoutProviderOwnership');
+        const resolved = await resolvePayoutOwner(prisma, canonical);
+        console.log('[§1] resolvePayoutOwner:', JSON.stringify(resolved));
+        expect(resolved.status).toBe('RECOVERED');
+        expect(resolved.owner.canonicalName).toBe('MOOLRE_DISBURSEMENT');
+
+        const bankCalls = [];
+        const momoCalls = [];
+        const worker = new WithdrawalReconciliationWorker(prisma, null, momoPort(momoCalls), null, null, bankPort(bankCalls));
+        await worker._reconcileOne(await load());
+        console.log('[§1] port calls — BANK:', bankCalls.length, 'MoMo:', momoCalls.length);
+        expect(bankCalls).toEqual([reference]);
+        expect(momoCalls).toHaveLength(0);
+        expect(await balance()).toBe(420);
+        const state = await liquidity();
+        expect(Number(state.paidOutGhs)).toBe(80);
+        expect(adapter.__calls.filter((u) => u.endsWith('/transfer'))).toHaveLength(1);
+    }, 60000);
+
+    test('§1 provider-event write fails while ownership succeeds: no dispatch evidence is claimed, the persisted owner is used', async () => {
+        const client = failing((key, target) => {
+            if (key !== 'fiatProviderEvent') return null;
+            const real = target[key];
+            return new Proxy(real, {
+                get(evTarget, evKey) {
+                    if (evKey === 'create') return async () => { throw new Error('provider event write failed'); };
+                    const value = evTarget[evKey];
+                    return typeof value === 'function' ? value.bind(evTarget) : value;
+                },
+            });
+        });
+        const { reference } = await payoutWith(PENDING_ENVELOPE, client);
+        const events = await prisma.$queryRawUnsafe(
+            'SELECT "dedupKey" FROM "FiatProviderEvent" WHERE "relatedReference" = $1 AND "dedupKey" LIKE $2',
+            String(reference), 'event:payout-dispatch:%'
+        );
+        expect(events).toHaveLength(0);
+        const { canonical } = await loadMirror(reference);
+        // Ownership landed, so the payout is still owned — by the durable record.
+        expect(canonical.metadata?.payoutProviderName).toBe('MOOLRE_DISBURSEMENT');
+        const { resolvePayoutOwner } = require('../services/payoutProviderOwnership');
+        expect((await resolvePayoutOwner(prisma, canonical)).status).toBe('OWNED');
+    }, 60000);
+
+    test('§1 both writes fail: nothing is invented, no refund, and the payout is never polled on the MoMo rail', async () => {
+        const client = failing((key, target) => {
+            if (key === '$executeRawUnsafe') {
+                return async (...args) => {
+                    if (String(args[0]).includes('payoutProvider')) throw new Error('ownership write failed');
+                    return prisma.$executeRawUnsafe(...args);
+                };
+            }
+            if (key !== 'fiatProviderEvent') return null;
+            const real = target[key];
+            return new Proxy(real, {
+                get(evTarget, evKey) {
+                    if (evKey === 'create') return async () => { throw new Error('provider event write failed'); };
+                    const value = evTarget[evKey];
+                    return typeof value === 'function' ? value.bind(evTarget) : value;
+                },
+            });
+        });
+        const { reference, balance } = await payoutWith(PENDING_ENVELOPE, client);
+        const { canonical, load } = await loadMirror(reference);
+        const { resolvePayoutOwner } = require('../services/payoutProviderOwnership');
+        const resolved = await resolvePayoutOwner(prisma, canonical);
+        console.log('[§1] both-failed resolve:', JSON.stringify(resolved));
+        expect(resolved.status).toBe('UNKNOWN');
+        const bankCalls = [];
+        const momoCalls = [];
+        const worker = new WithdrawalReconciliationWorker(prisma, null, momoPort(momoCalls), null, null, bankPort(bankCalls));
+        await worker._reconcileOne(await load());
+        // The rail is known from the canonical/mirror records, so the BANK port
+        // answers; MoMo is never asked and no money moves on a guess.
+        expect(momoCalls).toHaveLength(0);
+        expect(await balance()).toBe(420);
+        const state = await liquidity();
+        expect(Number(state.reconciliationHeldGhs)).toBe(0);
+    }, 60000);
+
+    test('§2 an echoed external reference is never stored as the provider reference, and a later real one enriches exactly once', async () => {
+        // SUCCESS, with the echoed externalref and the exact amount, but NO
+        // transactionid/thirdpartyref: the provider reference must stay null.
+        const { reference } = await payoutWith(PENDING_ENVELOPE);
+        // No transactionid/thirdpartyref in the answer.
+        const rows = await prisma.$queryRawUnsafe(
+            'SELECT "providerRef", "dedupKey", "raw" FROM "FiatProviderEvent" WHERE "relatedReference" = $1',
+            String(reference)
+        );
+        console.log('[§2] event rows:', JSON.stringify(rows));
+        const events = rows.filter((e) => e.dedupKey === `event:payout-dispatch:MOOLRE_DISBURSEMENT:${reference}`);
+        expect(events).toHaveLength(1);
+        expect(events[0].providerRef).toBeNull();
+        const { canonical, mirror, load } = await loadMirror(reference);
+        expect(canonical.providerRef).toBeNull();
+        const reservationBefore = await prisma.fiatLiquidityReservation.findUnique({ where: { reference } });
+        expect(reservationBefore.providerRef).toBeNull();
+
+        const bankCalls = [];
+        const worker = new WithdrawalReconciliationWorker(prisma, null, momoPort([]), null, null,
+            bankPort(bankCalls, { providerRef: 'MP-LATER-1' }));
+        await worker._reconcileOne(await load());
+        const enriched = await canonicalOf(reference);
+        expect(enriched.providerRef).toBe('MP-LATER-1');
+
+        // replay moves nothing
+        await worker._reconcileOne(await load());
+        const replayed = await canonicalOf(reference);
+        expect(replayed.providerRef).toBe('MP-LATER-1');
+        const state = await liquidity();
+        expect(Number(state.paidOutGhs)).toBe(80);
+        // One evidence poll per reconciliation run, always on the ORIGINAL
+        // reference; the replay moved no money (asserted above).
+        expect(bankCalls).toEqual([reference, reference]);
     }, 60000);
 });

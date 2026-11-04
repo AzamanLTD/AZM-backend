@@ -1613,7 +1613,13 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
     };
   }
 
-  const providerRef = verdict.providerRef || verdict.externalId || null;
+  // §2: the adapter's externalId is the ECHOED Azaman reference; providerRef is
+  // Moolre's own transactionid/thirdpartyref. They are different identities, and
+  // writing the echo as the provider reference makes the provider's real later
+  // reference look like a contradiction for a payout that actually completed.
+  // Until Moolre supplies one, this stays null and a single settling winner
+  // enriches it exactly once.
+  const providerRef = verdict.providerRef ?? null;
 
   // Durable dispatch observation FIRST (owner recovery reads it), then the
   // canonical ownership write. Both use the repository's existing authorities.
