@@ -79,6 +79,16 @@ const OIDC_ISSUER = 'https://token.actions.githubusercontent.com';
 const OIDC_JWKS_URL = `${OIDC_ISSUER}/.well-known/jwks`;
 const SERVICE_CONTAINER_ENV = 'AZM_CI_SERVICE_CONTAINER_ID';
 const START_TIME_TOLERANCE_SECONDS = 10;
+// The only workflows whose tokens may authenticate the CI branch. Exact paths,
+// bound to the workflow display name each file declares.
+const ALLOWED_WORKFLOWS = Object.freeze({
+    '.github/workflows/financial-durability.yml': 'financial-durability',
+    '.github/workflows/test.yml': 'Azaman Test Suite',
+});
+// Deliberately narrow: GitHub-issued tokens are short-lived and the runner clock
+// is the same host that signs the request.
+const CLOCK_SKEW_SECONDS = 60;
+const CONTAINER_ID_PATTERN = /^[0-9a-f]{64}$/;
 const CLOCK_TICKS_FALLBACK = 100;
 
 const refuse = (message) => { throw new Error(`[test-db-guard] refusing to run: ${message}`); };
@@ -258,11 +268,20 @@ function inspectContainerIdentity({ address, containerId, serviceContainerId }) 
     if (!addresses.includes(address)) {
         refuse(`the container ${CONTAINER_ID_ENV} holds ${addresses.length ? addresses.join(', ') : 'no address'}, not the expected "${address}".`);
     }
-    const resolvedId = String(container.Id || containerId).trim();
-    // Where the workflow can supply the service-container id from the
-    // job.services context, the docker-selected container must be that one.
-    if (serviceContainerId && !resolvedId.startsWith(String(serviceContainerId).trim())) {
-        refuse(`the selected container ${resolvedId.slice(0, 12)} is not the service container ${String(serviceContainerId).slice(0, 12)} declared by the workflow job.`);
+    const resolvedId = String(container.Id || containerId).trim().toLowerCase();
+    // The job-declared service container is mandatory and must BE this container.
+    const declared = String(serviceContainerId === undefined || serviceContainerId === null ? '' : serviceContainerId).trim().toLowerCase();
+    if (!declared) {
+        refuse(`AZM_CI_SERVICE_CONTAINER_ID is not set. The workflow must export job.services.postgres.id; the guard will not fall back to a docker ps selection alone.`);
+    }
+    if (!CONTAINER_ID_PATTERN.test(declared)) {
+        refuse(`AZM_CI_SERVICE_CONTAINER_ID ("${declared}") is not a full 64-character container id, so it cannot identify a container unambiguously.`);
+    }
+    if (!CONTAINER_ID_PATTERN.test(resolvedId)) {
+        refuse(`the inspected container reported id "${resolvedId}", which is not a full 64-character container id.`);
+    }
+    if (resolvedId !== declared) {
+        refuse(`the inspected container ${resolvedId} is not the service container ${declared} declared by the workflow job.`);
     }
     return { containerId: resolvedId, containerAddress: address, image: container.Config ? container.Config.Image : null };
 }
@@ -366,11 +385,19 @@ function probeLocalInstance({ backendPid, postmasterStartTime, dataDirectory, po
     } catch (err) {
         refuse(`the data directory "${directory}" has no readable postmaster.pid (${err.code || 'error'}), so no postmaster on this machine is serving it.`);
     }
-    const postmasterPid = Number(String(postmaster[0] || '').trim());
+    const rawPid = String(postmaster[0] || '').trim();
+    const rawStart = String(postmaster[2] || '').trim();
     const postmasterDirectory = String(postmaster[1] || '').trim();
-    const postmasterStartPid = Number(String(postmaster[2] || '').trim());
     const postmasterPort = String(postmaster[3] || '').trim();
-    if (!Number.isInteger(postmasterPid) || postmasterPid <= 0) refuse(`the postmaster.pid in "${directory}" has an unreadable pid.`);
+    if (!/^\d+$/.test(rawPid) || Number(rawPid) <= 0) refuse(`the postmaster.pid in "${directory}" has an unreadable pid ("${rawPid || 'empty'}").`);
+    const postmasterPid = Number(rawPid);
+    // The third line is the postmaster's start time. A missing, blank or
+    // malformed value cannot exclude PID reuse, so it is refused rather than
+    // skipping the comparison.
+    if (!/^\d+$/.test(rawStart) || Number(rawStart) <= 0) {
+        refuse(`the postmaster.pid in "${directory}" has no valid start time on its third line ("${rawStart || 'empty'}"), so PID reuse cannot be excluded.`);
+    }
+    const postmasterStartPid = Number(rawStart);
     if (postmasterDirectory !== directory) refuse(`the postmaster.pid in "${directory}" was written for "${postmasterDirectory}".`);
     if (port && postmasterPort !== String(port)) refuse(`the local instance listens on port ${postmasterPort}, not on the connected port ${port}.`);
 
@@ -410,7 +437,7 @@ function probeLocalInstance({ backendPid, postmasterStartTime, dataDirectory, po
     if (postmasterStarted === null) refuse('the local postmaster start time could not be derived from /proc/stat btime and its start ticks.');
 
     // PID reuse: the process must have started when the cluster says it did.
-    if (Number.isInteger(postmasterStartPid) && postmasterStartPid > 0) {
+    {
         if (Math.abs(postmasterStartPid - postmasterStarted) > START_TIME_TOLERANCE_SECONDS) {
             refuse(`the postmaster.pid records start time ${postmasterStartPid}, but process ${postmasterPid} started at ${Math.round(postmasterStarted)} — a reused PID or a stale file.`);
         }
@@ -484,14 +511,22 @@ function decodeJwt(token) {
  * Verify a GitHub Actions OIDC token. Signature first, then every claim that
  * matters. Returns the verified identity; throws on any failure.
  */
-function verifyRunnerIdentity({ token, jwks, now = Date.now(), audience = OIDC_AUDIENCE, repository = process.env.AZM_CI_REPOSITORY || 'AzamanLTD/AZM-backend' } = {}) {
+function verifyRunnerIdentity({
+    token, jwks, now = Date.now(),
+    audience = OIDC_AUDIENCE,
+    repository = process.env.AZM_CI_REPOSITORY || 'AzamanLTD/AZM-backend',
+    runId, runAttempt, sha, ref,
+} = {}) {
     if (!token) refuse('no GitHub Actions OIDC token was supplied, so the runner is not authenticated.');
     const decoded = decodeJwt(token);
-    if (String(decoded.header.alg).toUpperCase() !== 'RS256') refuse(`the OIDC token uses ${decoded.header.alg}; only RS256 is accepted.`);
+    // Exact algorithm, not a case-normalized guess.
+    if (decoded.header.alg !== 'RS256') refuse(`the OIDC token uses ${JSON.stringify(decoded.header.alg)}; only RS256 is accepted.`);
+    const kid = typeof decoded.header.kid === 'string' ? decoded.header.kid.trim() : '';
+    if (!kid) refuse('the OIDC token header carries no key id (kid), so the signing key cannot be identified.');
     const keys = (jwks && Array.isArray(jwks.keys)) ? jwks.keys : null;
     if (!keys) refuse('no GitHub signing keys are available to verify the OIDC token.');
-    const matching = keys.filter((key) => (decoded.header.kid ? key.kid === decoded.header.kid : true));
-    if (!matching.length) refuse(`the OIDC token is signed with key "${decoded.header.kid}", which is not among GitHub's published keys.`);
+    const matching = keys.filter((key) => key && key.kid === kid);
+    if (!matching.length) refuse(`the OIDC token is signed with key "${kid}", which is not among GitHub's published keys.`);
     let verifiedSignature = false;
     for (const key of matching) {
         try {
@@ -505,15 +540,65 @@ function verifyRunnerIdentity({ token, jwks, now = Date.now(), audience = OIDC_A
     if (claims.iss !== OIDC_ISSUER) refuse(`the OIDC token issuer is "${claims.iss}", not "${OIDC_ISSUER}".`);
     const audiences = Array.isArray(claims.aud) ? claims.aud : [claims.aud];
     if (!audiences.includes(audience)) refuse(`the OIDC token audience is "${audiences.join(', ')}", not "${audience}".`);
-    if (!Number.isFinite(Number(claims.exp)) || Number(claims.exp) * 1000 <= now) refuse('the OIDC token has expired.');
-    if (Number.isFinite(Number(claims.nbf)) && Number(claims.nbf) * 1000 > now + 60000) refuse('the OIDC token is not valid yet.');
+
+    // § standard time claims, all required and all numeric.
+    const numeric = (name) => {
+        const value = claims[name];
+        if (!Number.isInteger(value)) refuse(`the OIDC token's "${name}" claim is ${JSON.stringify(value === undefined ? null : value)}; a numeric ${name} is required.`);
+        return value;
+    };
+    const exp = numeric('exp');
+    const nbf = numeric('nbf');
+    const iat = numeric('iat');
+    const nowSeconds = Math.floor(now / 1000);
+    const skew = CLOCK_SKEW_SECONDS;
+    if (exp <= nowSeconds) refuse(`the OIDC token expired at ${new Date(exp * 1000).toISOString()}.`);
+    if (nbf > nowSeconds + skew) refuse(`the OIDC token is not valid until ${new Date(nbf * 1000).toISOString()}, beyond the ${skew}s clock-skew allowance.`);
+    if (iat > nowSeconds + skew) refuse(`the OIDC token was issued at ${new Date(iat * 1000).toISOString()}, in the future beyond the ${skew}s clock-skew allowance.`);
+    if (nbf > exp) refuse('the OIDC token is inconsistent: nbf is after exp.');
+    if (iat > exp) refuse('the OIDC token is inconsistent: iat is after exp.');
+
     if (claims.repository !== repository) refuse(`the OIDC token names repository "${claims.repository}", not "${repository}".`);
+
+    // § only the workflows that own this lane may authenticate it.
     const workflowRef = String(claims.workflow_ref || '');
-    if (!workflowRef.startsWith(`${repository}/.github/workflows/`)) {
-        refuse(`the OIDC token names workflow "${workflowRef || 'nothing'}", which is not a workflow of ${repository}.`);
+    const at = workflowRef.lastIndexOf('@');
+    const pathAndRepo = at > 0 ? workflowRef.slice(0, at) : workflowRef;
+    const prefix = `${repository}/`;
+    if (!pathAndRepo.startsWith(prefix)) refuse(`the OIDC token names workflow "${workflowRef || 'nothing'}", which does not belong to ${repository}.`);
+    const workflowPath = pathAndRepo.slice(prefix.length);
+    if (!Object.prototype.hasOwnProperty.call(ALLOWED_WORKFLOWS, workflowPath)) {
+        refuse(`the OIDC token was issued to workflow "${workflowPath || 'unknown'}", which is not one of the workflows allowed to authenticate this database (${Object.keys(ALLOWED_WORKFLOWS).join(', ')}).`);
     }
-    if (!claims.run_id) refuse('the OIDC token carries no run id.');
-    return { runId: String(claims.run_id), workflow: workflowRef, repository: claims.repository, expiresAt: new Date(Number(claims.exp) * 1000).toISOString(), sha: claims.sha || null, ref: claims.ref || null };
+    const expectedWorkflowName = ALLOWED_WORKFLOWS[workflowPath];
+    if (claims.workflow !== expectedWorkflowName) {
+        refuse(`the OIDC token was issued to workflow "${workflowPath}", whose name is "${expectedWorkflowName}", but the token claims workflow "${claims.workflow}".`);
+    }
+
+    // § the token must belong to THIS run and THIS attempt, as reported by the
+    // runner runtime — never by the token itself.
+    const runtimeRunId = String(runId === undefined || runId === null ? '' : runId).trim();
+    const runtimeAttempt = String(runAttempt === undefined || runAttempt === null ? '' : runAttempt).trim();
+    if (!/^\d+$/.test(runtimeRunId)) refuse('the current runner did not supply a numeric GITHUB_RUN_ID, so the token cannot be bound to this run.');
+    if (!/^\d+$/.test(runtimeAttempt)) refuse('the current runner did not supply a numeric GITHUB_RUN_ATTEMPT, so the token cannot be bound to this attempt.');
+    const tokenRunId = claims.run_id === undefined || claims.run_id === null ? '' : String(claims.run_id).trim();
+    const tokenAttempt = claims.run_attempt === undefined || claims.run_attempt === null ? '' : String(claims.run_attempt).trim();
+    if (!/^\d+$/.test(tokenRunId)) refuse(`the OIDC token carries no valid run_id (${JSON.stringify(claims.run_id === undefined ? null : claims.run_id)}).`);
+    if (!/^\d+$/.test(tokenAttempt)) refuse(`the OIDC token carries no valid run_attempt (${JSON.stringify(claims.run_attempt === undefined ? null : claims.run_attempt)}).`);
+    if (tokenRunId !== runtimeRunId) refuse(`the OIDC token was issued for run ${tokenRunId}, but this runner is run ${runtimeRunId}.`);
+    if (tokenAttempt !== runtimeAttempt) refuse(`the OIDC token was issued for attempt ${tokenAttempt}, but this runner is attempt ${runtimeAttempt}.`);
+    // § and to the current commit/ref where the runtime supplies them.
+    const runtimeSha = String(sha === undefined || sha === null ? '' : sha).trim();
+    if (runtimeSha && claims.sha !== runtimeSha) refuse(`the OIDC token names commit "${claims.sha || ''}", but this runner is at "${runtimeSha}".`);
+    const runtimeRef = String(ref === undefined || ref === null ? '' : ref).trim();
+    if (runtimeRef && claims.ref !== runtimeRef) refuse(`the OIDC token names ref "${claims.ref || ''}", but this runner is on "${runtimeRef}".`);
+
+    return {
+        runId: tokenRunId, runAttempt: tokenAttempt, workflow: workflowRef, workflowPath,
+        workflowName: expectedWorkflowName, repository: claims.repository,
+        expiresAt: new Date(exp * 1000).toISOString(), issuedAt: new Date(iat * 1000).toISOString(),
+        sha: claims.sha || null, ref: claims.ref || null,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -569,7 +654,14 @@ async function assertDisposableTestDatabase(client, overrides = {}) {
                 refuse(`GitHub's published signing keys could not be fetched, so the runner cannot be authenticated: ${String((err && err.message) || err).slice(0, 120)}`);
             }
         }
-        runner = verifier({ token, jwks, now: overrides.now || Date.now(), audience: overrides.audience || OIDC_AUDIENCE });
+        runner = verifier({
+            token, jwks, now: overrides.now || Date.now(), audience: overrides.audience || OIDC_AUDIENCE,
+            // From the runner runtime, never from the token.
+            runId: pick('runId', env.GITHUB_RUN_ID),
+            runAttempt: pick('runAttempt', env.GITHUB_RUN_ATTEMPT),
+            sha: pick('sha', env.GITHUB_SHA),
+            ref: pick('ref', env.GITHUB_REF),
+        });
         if (!runner || !runner.runId) refuse('the runner identity could not be verified.');
     } else if (String(expectedRaw === undefined || expectedRaw === null ? '' : expectedRaw).trim() !== '') {
         refuse(`a locally set ${EXPECTED_ADDRESS_ENV} ("${String(expectedRaw).trim()}") is not an independently verified identity. Local mode proves the instance itself; remove the variable instead of asserting an address.`);
@@ -600,8 +692,23 @@ async function assertDisposableTestDatabase(client, overrides = {}) {
         if (server.address !== expectedAddress) {
             refuse(`the server reports address "${server.address}", but the expected disposable database address is "${expectedAddress}". Identity mismatch.`);
         }
+        // The job-declared service container is validated BEFORE any docker call,
+        // so a missing or misshapen declaration refuses on its own terms.
+        const declared = String(serviceContainerId === undefined || serviceContainerId === null ? '' : serviceContainerId).trim().toLowerCase();
+        if (!declared) {
+            refuse('AZM_CI_SERVICE_CONTAINER_ID is not set. The workflow must export job.services.postgres.id; the guard will not fall back to a docker ps selection alone.');
+        }
+        if (!CONTAINER_ID_PATTERN.test(declared)) {
+            refuse(`AZM_CI_SERVICE_CONTAINER_ID ("${declared}") is not a full 64-character container id, so it cannot identify a container unambiguously.`);
+        }
         const inspector = overrides.inspectContainerIdentity || inspectContainerIdentity;
-        const container = inspector({ address: expectedAddress, containerId, serviceContainerId });
+        const container = inspector({ address: expectedAddress, containerId, serviceContainerId: declared });
+        // Enforced here as well as inside the inspector, so a replaced inspector
+        // cannot return a container that is not the declared one.
+        const inspectedId = String((container && container.containerId) || '').trim().toLowerCase();
+        if (inspectedId !== declared) {
+            refuse(`the inspected container ${inspectedId || '(none)'} is not the service container ${declared} declared by the workflow job.`);
+        }
         return {
             database: target.database, host: target.host, serverAddress: server.address,
             identity: 'ci-container-identity', containerAddress: container.containerAddress, containerId: container.containerId,
@@ -654,6 +761,8 @@ module.exports = {
     CONTAINER_ID_ENV,
     EXPECTED_ADDRESS_ENV,
     LOCAL_DATA_DIR_ENV,
+    ALLOWED_WORKFLOWS,
+    CLOCK_SKEW_SECONDS,
     OIDC_AUDIENCE,
     OIDC_TOKEN_PATH_ENV,
     SERVICE_CONTAINER_ENV,

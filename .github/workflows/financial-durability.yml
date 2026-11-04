@@ -140,12 +140,24 @@ jobs:
           # The service-container id from the job.services context: where the
           # workflow can supply it, the docker-selected container must be that one.
           SERVICE_CONTAINER='${{ job.services.postgres.id }}'
-          if [ -n "$SERVICE_CONTAINER" ]; then
-            echo "AZM_CI_SERVICE_CONTAINER_ID=${SERVICE_CONTAINER}" >> "$GITHUB_ENV"
-            echo "Service container declared by the job: ${SERVICE_CONTAINER}"
-          else
-            echo "::warning::job.services.postgres.id was empty; falling back to the exactly-one docker selection."
+          # MANDATORY. The guard will not fall back to a docker ps selection: the
+          # container it verifies must be the service container this job declared.
+          if [ -z "$SERVICE_CONTAINER" ]; then
+            echo "::error::job.services.postgres.id is empty. This job declares services.postgres, so the service container id must be available; refusing rather than falling back to a docker ps selection."
+            exit 1
           fi
+          case "$SERVICE_CONTAINER" in
+            *[!0-9a-fA-F]*)
+              echo "::error::job.services.postgres.id (${SERVICE_CONTAINER}) is not a hexadecimal container id."
+              exit 1
+              ;;
+          esac
+          if [ "${#SERVICE_CONTAINER}" -ne 64 ]; then
+            echo "::error::job.services.postgres.id (${SERVICE_CONTAINER}) is ${#SERVICE_CONTAINER} characters, not a full 64-character container id."
+            exit 1
+          fi
+          echo "AZM_CI_SERVICE_CONTAINER_ID=${SERVICE_CONTAINER}" >> "$GITHUB_ENV"
+          echo "Service container declared by the job: ${SERVICE_CONTAINER}"
 
       - name: 'Guard: Postgres must be in production commit mode'
         # THE lane invariant. The main battery tunes synchronous_commit=off for
@@ -277,8 +289,8 @@ jobs:
         # never be green with the guard unproven.
         run: |
           set -euo pipefail
-          if [ -z "${AZM_EXPECTED_TEST_DB_ADDRESS:-}" ] || [ -z "${AZM_TEST_PG_CONTAINER:-}" ] || [ -z "${AZM_CI_OIDC_TOKEN_PATH:-}" ]; then
-            echo "::error::The database identity is not established (AZM_EXPECTED_TEST_DB_ADDRESS / AZM_TEST_PG_CONTAINER / AZM_CI_OIDC_TOKEN_PATH). The guard would refuse, so the lane stops here."
+          if [ -z "${AZM_EXPECTED_TEST_DB_ADDRESS:-}" ] || [ -z "${AZM_TEST_PG_CONTAINER:-}" ] || [ -z "${AZM_CI_OIDC_TOKEN_PATH:-}" ] || [ -z "${AZM_CI_SERVICE_CONTAINER_ID:-}" ]; then
+            echo "::error::The database identity is not established (AZM_EXPECTED_TEST_DB_ADDRESS / AZM_TEST_PG_CONTAINER / AZM_CI_OIDC_TOKEN_PATH / AZM_CI_SERVICE_CONTAINER_ID). The guard would refuse, so the lane stops here."
             exit 1
           fi
           echo "Expected database address: ${AZM_EXPECTED_TEST_DB_ADDRESS} (container ${AZM_TEST_PG_CONTAINER})"

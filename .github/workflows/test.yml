@@ -139,12 +139,24 @@ jobs:
           # The service-container id from the job.services context: where the
           # workflow can supply it, the docker-selected container must be that one.
           SERVICE_CONTAINER='${{ job.services.postgres.id }}'
-          if [ -n "$SERVICE_CONTAINER" ]; then
-            echo "AZM_CI_SERVICE_CONTAINER_ID=${SERVICE_CONTAINER}" >> "$GITHUB_ENV"
-            echo "Service container declared by the job: ${SERVICE_CONTAINER}"
-          else
-            echo "::warning::job.services.postgres.id was empty; falling back to the exactly-one docker selection."
+          # MANDATORY. The guard will not fall back to a docker ps selection: the
+          # container it verifies must be the service container this job declared.
+          if [ -z "$SERVICE_CONTAINER" ]; then
+            echo "::error::job.services.postgres.id is empty. This job declares services.postgres, so the service container id must be available; refusing rather than falling back to a docker ps selection."
+            exit 1
           fi
+          case "$SERVICE_CONTAINER" in
+            *[!0-9a-fA-F]*)
+              echo "::error::job.services.postgres.id (${SERVICE_CONTAINER}) is not a hexadecimal container id."
+              exit 1
+              ;;
+          esac
+          if [ "${#SERVICE_CONTAINER}" -ne 64 ]; then
+            echo "::error::job.services.postgres.id (${SERVICE_CONTAINER}) is ${#SERVICE_CONTAINER} characters, not a full 64-character container id."
+            exit 1
+          fi
+          echo "AZM_CI_SERVICE_CONTAINER_ID=${SERVICE_CONTAINER}" >> "$GITHUB_ENV"
+          echo "Service container declared by the job: ${SERVICE_CONTAINER}"
 
       - name: Apply database schema
         # CI uses a disposable PostgreSQL instance. Production remains managed

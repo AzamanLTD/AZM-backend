@@ -36,8 +36,17 @@ const {
 
 const LOCAL_URL = 'postgres://postgres:postgres@localhost:5432/azm_iso?schema=public';
 const CI_EXPECTED = '172.18.0.2';
-const CI_CONTAINER = '2f206542ec5f';
-const SERVICE_CONTAINER = '2f206542ec5faa11bb22cc33';
+// A full 64-character container id, as the real job supplied.
+const CI_CONTAINER = 'a2b412d028b26fe9f9ff87b5ecc36e145ba8e3d02c493768d60c96f0219aa744';
+const SERVICE_CONTAINER = CI_CONTAINER;
+// The run this fixture binds to, supplied to the guard as the RUNNER runtime
+// would (never read back out of the token it is checking).
+const RUN_ID = '90000000123';
+const RUN_ATTEMPT = '2';
+const RUN_SHA = 'a1b2c3d4e5f60718293a4b5c6d7e8f9012345678';
+const RUN_REF = 'refs/pull/392/merge';
+const FD_WORKFLOW = '.github/workflows/financial-durability.yml';
+const TEST_WORKFLOW = '.github/workflows/test.yml';
 const SID = '7686515198152565070';
 const DATA_DIR = '/var/lib/postgresql/15/main';
 const BTIME = 1700000000;
@@ -66,11 +75,12 @@ function signToken(over = {}, { kid = KEY_ID, alg = 'RS256', signer = privateKey
         iat: now - 10,
         repository: REPO,
         repository_owner: 'AzamanLTD',
-        workflow_ref: `${REPO}/.github/workflows/financial-durability.yml@refs/pull/392/merge`,
+        workflow_ref: `${REPO}/${FD_WORKFLOW}@${RUN_REF}`,
         workflow: 'financial-durability',
-        run_id: '41920751864',
-        sha: '61cb8bd65f9c4670c680d07854585046173b8042',
-        ref: 'refs/pull/392/merge',
+        run_id: RUN_ID,
+        run_attempt: RUN_ATTEMPT,
+        sha: RUN_SHA,
+        ref: RUN_REF,
         ...over,
     };
     const head = b64({ alg, typ: 'JWT', kid });
@@ -157,20 +167,165 @@ const ciSeams = (over = {}) => ({
     serviceContainerId: SERVICE_CONTAINER,
     jwks: JWKS,
     oidcToken: signToken(),
+    // The runner's own identity, as the workflow runtime reports it.
+    runId: RUN_ID,
+    runAttempt: RUN_ATTEMPT,
+    sha: RUN_SHA,
+    ref: RUN_REF,
     inspectContainerIdentity: ({ address }) => ({ containerId: SERVICE_CONTAINER, containerAddress: address, image: 'postgres:16' }),
     ...over,
 });
 
 // ---------------------------------------------------------------------------
-describe('§1 CI provenance is an authenticated GitHub Actions runner (OIDC)', () => {
-    test('a correctly signed token for this repository is accepted, and the address must match', async () => {
+describe('§1 CI provenance is an authenticated, run-bound GitHub Actions runner (OIDC)', () => {
+    test('a correctly signed token for this repository, this run and this attempt is accepted', async () => {
         const result = await guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams());
         expect(result).toMatchObject({ identity: 'ci-container-identity', serverAddress: CI_EXPECTED });
-        expect(result.runner.runId).toBe('41920751864');
+        expect(result.runner.runId).toBe(RUN_ID);
+        expect(result.runner.runAttempt).toBe(RUN_ATTEMPT);
+        expect(result.runner.workflowPath).toBe(FD_WORKFLOW);
         expect(result.runner.repository).toBe(REPO);
     });
 
-    test('GITHUB_ACTIONS=true on a laptop, with no token, does NOT enable CI mode', async () => {
+    test('both allowed workflows pass: financial-durability.yml and test.yml', async () => {
+        const fd = await guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams());
+        expect(fd.runner.workflowName).toBe('financial-durability');
+
+        const testLane = await guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({
+            oidcToken: signToken({ workflow_ref: `${REPO}/${TEST_WORKFLOW}@${RUN_REF}`, workflow: 'Azaman Test Suite' }),
+        }));
+        expect(testLane.runner.workflowPath).toBe(TEST_WORKFLOW);
+        expect(testLane.runner.workflowName).toBe('Azaman Test Suite');
+    });
+
+    test('another workflow in the same repository is refused, even correctly signed', async () => {
+        const client = stubClient({ serverAddress: '172.18.0.2/32' });
+        await expect(guard(client, ciSeams({
+            oidcToken: signToken({ workflow_ref: `${REPO}/.github/workflows/release.yml@${RUN_REF}`, workflow: 'release' }),
+        }))).rejects.toThrow(/is not one of the workflows allowed to authenticate this database/);
+        expect(mutations(client)).toHaveLength(0);
+
+        // A nested path that merely begins with the allowed prefix is not allowed either.
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({
+            oidcToken: signToken({ workflow_ref: `${REPO}/.github/workflows/financial-durability.yml/extra@${RUN_REF}`, workflow: 'financial-durability' }),
+        }))).rejects.toThrow(/is not one of the workflows allowed/);
+    });
+
+    test('an allowed path with the wrong workflow NAME is refused', async () => {
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({
+            oidcToken: signToken({ workflow: 'Financial Durability' }),
+        }))).rejects.toThrow(/but the token claims workflow "Financial Durability"/);
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({
+            oidcToken: signToken({ workflow_ref: `${REPO}/${TEST_WORKFLOW}@${RUN_REF}`, workflow: 'financial-durability' }),
+        }))).rejects.toThrow(/whose name is "Azaman Test Suite", but the token claims workflow "financial-durability"/);
+    });
+
+    test('a token from another RUN is refused', async () => {
+        const client = stubClient({ serverAddress: '172.18.0.2/32' });
+        await expect(guard(client, ciSeams({ oidcToken: signToken({ run_id: '90000000999' }) })))
+            .rejects.toThrow(/issued for run 90000000999, but this runner is run 90000000123/);
+        expect(mutations(client)).toHaveLength(0);
+        // And the runtime value must come from the runner, not the token.
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ runId: undefined, oidcToken: signToken() })))
+            .rejects.toThrow(/runner did not supply a numeric GITHUB_RUN_ID/);
+    });
+
+    test('a token from another ATTEMPT is refused', async () => {
+        const client = stubClient({ serverAddress: '172.18.0.2/32' });
+        await expect(guard(client, ciSeams({ oidcToken: signToken({ run_attempt: '1' }) })))
+            .rejects.toThrow(/issued for attempt 1, but this runner is attempt 2/);
+        expect(mutations(client)).toHaveLength(0);
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ runAttempt: '', oidcToken: signToken() })))
+            .rejects.toThrow(/runner did not supply a numeric GITHUB_RUN_ATTEMPT/);
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({ run_attempt: undefined }) })))
+            .rejects.toThrow(/carries no valid run_attempt/);
+    });
+
+    test('the token is bound to this commit and ref as well', async () => {
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({ sha: 'b'.repeat(40) }) })))
+            .rejects.toThrow(/but this runner is at/);
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({ ref: 'refs/heads/main' }) })))
+            .rejects.toThrow(/but this runner is on/);
+    });
+
+    test('nbf is REQUIRED and must be numeric', async () => {
+        for (const nbf of [undefined, null, 'soon', '', 0.5]) {
+            const client = stubClient({ serverAddress: '172.18.0.2/32' });
+            await expect(guard(client, ciSeams({ oidcToken: signToken({ nbf }) })))
+                .rejects.toThrow(/"nbf" claim is .*a numeric nbf is required/);
+            expect(mutations(client)).toHaveLength(0);
+        }
+    });
+
+    test('iat is REQUIRED and must be numeric', async () => {
+        for (const iat of [undefined, null, 'yesterday', '']) {
+            const client = stubClient({ serverAddress: '172.18.0.2/32' });
+            await expect(guard(client, ciSeams({ oidcToken: signToken({ iat }) })))
+                .rejects.toThrow(/"iat" claim is .*a numeric iat is required/);
+            expect(mutations(client)).toHaveLength(0);
+        }
+    });
+
+    test('exp is REQUIRED, must be numeric, and must be in the future', async () => {
+        const now = Math.floor(Date.now() / 1000);
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({ exp: undefined }) })))
+            .rejects.toThrow(/"exp" claim is .*a numeric exp is required/);
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({ exp: 'later' }) })))
+            .rejects.toThrow(/"exp" claim is/);
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({ exp: now - 1 }) })))
+            .rejects.toThrow(/expired at/);
+    });
+
+    test('future iat and future nbf beyond the documented skew are refused', async () => {
+        const now = Math.floor(Date.now() / 1000);
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({ iat: now + 600 }) })))
+            .rejects.toThrow(/in the future beyond the 60s clock-skew allowance/);
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({ nbf: now + 600 }) })))
+            .rejects.toThrow(/not valid until .*beyond the 60s clock-skew allowance/);
+        // Within the allowance is accepted.
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({ nbf: now + 20, iat: now + 20 }) })))
+            .resolves.toMatchObject({ identity: 'ci-container-identity' });
+    });
+
+    test('inconsistent time ordering is refused', async () => {
+        const now = Math.floor(Date.now() / 1000);
+        // nbf within the skew allowance but after exp.
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({ exp: now + 10, nbf: now + 20 }) })))
+            .rejects.toThrow(/nbf is after exp/);
+        // iat within the skew allowance but after exp.
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({ exp: now + 10, iat: now + 20 }) })))
+            .rejects.toThrow(/iat is after exp/);
+    });
+
+    test('the algorithm and key id are exact', async () => {
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({}, { alg: 'rs256' }) })))
+            .rejects.toThrow(/uses "rs256"; only RS256 is accepted/);
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({}, { alg: 'HS256' }) })))
+            .rejects.toThrow(/only RS256 is accepted/);
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({}, { kid: '' }) })))
+            .rejects.toThrow(/carries no key id \(kid\)/);
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({}, { kid: 'not-a-github-key' }) })))
+            .rejects.toThrow(/not among GitHub's published keys/);
+    });
+
+    test('issuer, audience, repository and signature are still enforced', async () => {
+        const { privateKey: otherKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+        const cases = [
+            [{ iss: 'https://evil.example.com' }, /issuer is/],
+            [{ aud: 'someone-else' }, /audience is/],
+            [{ repository: 'attacker/fork' }, /names repository/],
+            [{ workflow_ref: 'attacker/fork/.github/workflows/test.yml@main', workflow: 'Azaman Test Suite' }, /does not belong to/],
+        ];
+        for (const [over, pattern] of cases) {
+            const client = stubClient({ serverAddress: '172.18.0.2/32' });
+            await expect(guard(client, ciSeams({ oidcToken: signToken(over) }))).rejects.toThrow(pattern);
+            expect(mutations(client)).toHaveLength(0);
+        }
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({}, { signer: otherKey }) })))
+            .rejects.toThrow(/signature does not verify against GitHub's published keys/);
+    });
+
+    test('GITHUB_ACTIONS=true on a laptop without a token does NOT enable CI mode', async () => {
         const client = stubClient({ serverAddress: '172.18.0.2/32' });
         await expect(guard(client, ciSeams({ oidcToken: '' })))
             .rejects.toThrow(/no GitHub Actions OIDC token was supplied, so the runner is not authenticated/);
@@ -181,45 +336,9 @@ describe('§1 CI provenance is an authenticated GitHub Actions runner (OIDC)', (
         const client = stubClient({ serverAddress: '172.18.0.2/32' });
         await expect(guard(client, ciSeams({
             oidcToken: '',
-            inspectContainerIdentity: () => ({ containerId: 'deadbeefcafe', containerAddress: CI_EXPECTED, image: 'postgres:16' }),
-            expectedAddress: CI_EXPECTED,
+            inspectContainerIdentity: () => ({ containerId: CI_CONTAINER, containerAddress: CI_EXPECTED, image: 'postgres:16' }),
         }))).rejects.toThrow(/runner is not authenticated/);
         expect(mutations(client)).toHaveLength(0);
-    });
-
-    test('a self-signed token from another key is refused (signature)', async () => {
-        const { privateKey: otherKey } = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
-        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({}, { signer: otherKey }) })))
-            .rejects.toThrow(/signature does not verify against GitHub's published keys/);
-    });
-
-    test('an unknown signing key id is refused', async () => {
-        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({}, { kid: 'not-a-github-key' }) })))
-            .rejects.toThrow(/not among GitHub's published keys/);
-    });
-
-    test('a non-RS256 algorithm is refused even when the signature is valid', async () => {
-        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({}, { alg: 'HS256' }) })))
-            .rejects.toThrow(/only RS256 is accepted/);
-    });
-
-    test('every claim that matters is enforced', async () => {
-        const now = Math.floor(Date.now() / 1000);
-        const cases = [
-            [{ iss: 'https://evil.example.com' }, /issuer is/],
-            [{ aud: 'someone-else' }, /audience is/],
-            [{ exp: now - 60 }, /has expired/],
-            [{ nbf: now + 3600 }, /not valid yet/],
-            [{ repository: 'attacker/fork' }, /names repository/],
-            [{ workflow_ref: 'attacker/fork/.github/workflows/x.yml@refs/heads/main' }, /is not a workflow of/],
-            [{ workflow_ref: '' }, /is not a workflow of/],
-            [{ run_id: undefined }, /carries no run id/],
-        ];
-        for (const [over, pattern] of cases) {
-            const client = stubClient({ serverAddress: '172.18.0.2/32' });
-            await expect(guard(client, ciSeams({ oidcToken: signToken(over) }))).rejects.toThrow(pattern);
-            expect(mutations(client)).toHaveLength(0);
-        }
     });
 
     test('a JWKS fetch failure refuses rather than skipping the check', async () => {
@@ -229,28 +348,45 @@ describe('§1 CI provenance is an authenticated GitHub Actions runner (OIDC)', (
         expect(mutations(client)).toHaveLength(0);
     });
 
+    test('the job service-container id is MANDATORY, full-length and exactly equal', async () => {
+        const cases = [
+            [{ serviceContainerId: '' }, /AZM_CI_SERVICE_CONTAINER_ID is not set/],
+            [{ serviceContainerId: '   ' }, /AZM_CI_SERVICE_CONTAINER_ID is not set/],
+            [{ serviceContainerId: CI_CONTAINER.slice(0, 12) }, /is not a full 64-character container id/],
+            [{ serviceContainerId: `${CI_CONTAINER}00` }, /is not a full 64-character container id/],
+            [{ serviceContainerId: 'z'.repeat(64) }, /is not a full 64-character container id/],
+            // A different but valid full id: the guard's own equality check refuses,
+            // independently of which container it inspected.
+            [{ serviceContainerId: 'b'.repeat(64), inspectContainerIdentity: ({ address }) => ({ containerId: CI_CONTAINER, containerAddress: address, image: 'postgres:16' }) }, /is not the service container/],
+        ];
+        for (const [over, pattern] of cases) {
+            const client = stubClient({ serverAddress: '172.18.0.2/32' });
+            await expect(guard(client, ciSeams({ inspectContainerIdentity, ...over }))).rejects.toThrow(pattern);
+            expect(mutations(client)).toHaveLength(0);
+        }
+        // A prefix match is NOT equality: a container whose id merely begins with
+        // the declared one is refused.
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({
+            inspectContainerIdentity: ({ address }) => ({ containerId: `ffff${CI_CONTAINER.slice(4)}`, containerAddress: address, image: 'postgres:16' }),
+        }))).rejects.toThrow(/declared by the workflow job/);
+    });
+
     test('the container must exist, run, be PostgreSQL and hold the expected address', async () => {
-        // The real inspector, so the missing-id rule is actually exercised.
         await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ containerId: '', inspectContainerIdentity })))
             .rejects.toThrow(/AZM_TEST_PG_CONTAINER is missing/);
-        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ inspectContainerIdentity })))
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ containerId: '0'.repeat(64), inspectContainerIdentity })))
             .rejects.toThrow(/docker inspection of AZM_TEST_PG_CONTAINER failed/);
         await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({
-            inspectContainerIdentity: () => { throw new Error('[test-db-guard] refusing to run: AZM_TEST_PG_CONTAINER (2f206542ec5f) is not running.'); },
+            containerId: '0'.repeat(64),
+            inspectContainerIdentity: () => { throw new Error('[test-db-guard] refusing to run: AZM_TEST_PG_CONTAINER (0000) is not running.'); },
         }))).rejects.toThrow(/is not running/);
+        // The inspector's own address check refusing is fatal too.
         await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({
             inspectContainerIdentity: () => { throw new Error('[test-db-guard] refusing to run: the container AZM_TEST_PG_CONTAINER holds 172.18.0.7, not the expected "172.18.0.2".'); },
         }))).rejects.toThrow(/holds 172\.18\.0\.7/);
     });
 
-    test('the docker-selected container must be the service container the job declared', async () => {
-        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({
-            containerId: 'aaaaaaaaaaaa', serviceContainerId: 'bbbbbbbbbbbbcccc',
-            inspectContainerIdentity,
-        }))).rejects.toThrow(/docker inspection of AZM_TEST_PG_CONTAINER failed|not the service container/);
-    });
-
-    test('the CI expectation is still strict: missing, malformed, prefixed or unix-socket all refuse', async () => {
+    test('the address expectation is still strict: missing, malformed, prefixed or unix-socket all refuse', async () => {
         for (const expectedAddress of ['', '   ', null, 'garbage', '172.18.0.2/32', '::1', '172.18.0.999']) {
             const client = stubClient({ serverAddress: '172.18.0.2/32' });
             await expect(guard(client, ciSeams({ expectedAddress }))).rejects.toThrow(/AZM_EXPECTED_TEST_DB_ADDRESS/);
@@ -263,10 +399,12 @@ describe('§1 CI provenance is an authenticated GitHub Actions runner (OIDC)', (
     });
 
     test('verifyRunnerIdentity is the only door into CI mode', () => {
-        expect(verifyRunnerIdentity({ token: signToken(), jwks: JWKS }).runId).toBe('41920751864');
-        expect(() => verifyRunnerIdentity({ token: 'not-a-jwt', jwks: JWKS })).toThrow(/three-part JWT/);
-        expect(() => verifyRunnerIdentity({ token: '', jwks: JWKS })).toThrow(/no GitHub Actions OIDC token/);
-        expect(() => verifyRunnerIdentity({ token: signToken(), jwks: null })).toThrow(/no GitHub signing keys/);
+        const runtime = { runId: RUN_ID, runAttempt: RUN_ATTEMPT, sha: RUN_SHA, ref: RUN_REF };
+        expect(verifyRunnerIdentity({ token: signToken(), jwks: JWKS, ...runtime }).runId).toBe(RUN_ID);
+        expect(() => verifyRunnerIdentity({ token: 'not-a-jwt', jwks: JWKS, ...runtime })).toThrow(/three-part JWT/);
+        expect(() => verifyRunnerIdentity({ token: '', jwks: JWKS, ...runtime })).toThrow(/no GitHub Actions OIDC token/);
+        expect(() => verifyRunnerIdentity({ token: signToken(), jwks: null, ...runtime })).toThrow(/no GitHub signing keys/);
+        expect(() => verifyRunnerIdentity({ token: signToken(), jwks: JWKS })).toThrow(/did not supply a numeric GITHUB_RUN_ID/);
     });
 });
 
@@ -327,6 +465,17 @@ describe('§2 local identity is the INSTANCE, not the cluster lineage', () => {
     test('a stale postmaster.pid (no live postmaster) is refused', () => {
         expect(() => probeLocalInstance(instanceArgs(), procSeams({ table: { [BACKEND.pid]: BACKEND } })))
             .toThrow(/no live local process 400 backs the postmaster.pid/);
+    });
+
+    test('a missing, blank or malformed postmaster.pid start time is REFUSED, never skipped', () => {
+        for (const line of ['', '   ', 'not-a-timestamp', '0', '-5', '1700000005abc', '1.5']) {
+            const file = [POSTMASTER.pid, DATA_DIR, line, '5432', '/var/run/postgresql', '', ''].join('\n');
+            expect(() => probeLocalInstance(instanceArgs(), procSeams({ postmasterPidFile: file })))
+                .toThrow(/no valid start time on its third line/);
+        }
+        const blankPid = ['', DATA_DIR, String(Math.round(POSTMASTER_STARTED)), '5432', '', '', ''].join('\n');
+        expect(() => probeLocalInstance(instanceArgs(), procSeams({ postmasterPidFile: blankPid })))
+            .toThrow(/unreadable pid/);
     });
 
     test('PID reuse is caught by the recorded start time', () => {
