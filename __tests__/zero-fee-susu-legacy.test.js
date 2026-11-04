@@ -109,9 +109,28 @@ describeOrSkip('Legacy Susu payout fee semantics (real PostgreSQL)', () => {
         // Recipient contributed 10 from a 10 balance, then receives the 30 pool.
         expect((await bal(recipient.id)).toFixed(8)).toBe(pooled.toFixed(8));
 
-        // No positive fee anywhere: no AdminProfitLog row of profit, and the
-        // payout posting carries NO revenue:fees line at all (zero-value lines
-        // are filtered out, not posted as 0).
+        // Secondary records ARE written even at zero, with zero amounts —
+        // asserted below rather than assumed absent. Only the authoritative
+        // ledger filters zero-value lines outright.
+        // Secondary representations: rows exist, amounts are exactly zero.
+        const profitLogs = await prisma.adminProfitLog.findMany({ where: { source: 'SUSU_FEE' } });
+        expect(profitLogs).toHaveLength(1);
+        expect(new Prisma.Decimal(profitLogs[0].amountUsdc).toFixed(8)).toBe('0.00000000');
+
+        const profitHist = await prisma.transactionHistory.findMany({
+            where: { userId: recipient.id, type: 'SUSU_PROFIT' },
+        });
+        expect(profitHist).toHaveLength(1);
+        expect(new Prisma.Decimal(profitHist[0].amountUsdc).toFixed(8)).toBe('0.00000000');
+
+        const payoutHist = await prisma.transactionHistory.findMany({
+            where: { userId: recipient.id, type: 'SUSU_PAYOUT' },
+        });
+        expect(payoutHist).toHaveLength(1);
+        expect(new Prisma.Decimal(payoutHist[0].amountUsdc).toFixed(8)).toBe(pooled.toFixed(8));
+
+        // Authoritative ledger: the zero fee posts NO revenue:fees line at all
+        // (zero-value lines are filtered, never posted as 0).
         const posting = await payoutPosting(cycle.id);
         expect(posting).not.toBeNull();
         const feesLines = posting.journalEntries.filter((e) => e.account === 'revenue:fees');

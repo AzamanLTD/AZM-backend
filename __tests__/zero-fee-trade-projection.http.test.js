@@ -193,8 +193,8 @@ describeOrSkip('Trade-creation earnings projection agrees with settlement (real 
         expect(res.body.earnings.expectedVendorEarningsUsdc).toBeCloseTo(await settledVendorCut(), 6);
     });
 
-    test('a matched zero profile is not overridden by the payment-method map', async () => {
-        await configure({ feeByPaymentMethod: { BANK_TRANSFER: 0.05 } });
+    test('a matched zero profile with no method entry projects zero', async () => {
+        await configure();
         await profile({ platformFeePct: 0, adminSplitPct: 0.6, vendorSplitPct: 0.4 });
         const ctx = await seedContext();
 
@@ -202,7 +202,54 @@ describeOrSkip('Trade-creation earnings projection agrees with settlement (real 
         expect(res.status).toBe(201);
         expect(res.body.earnings.platformFeePct).toBe(0);
         expect(res.body.earnings.expectedVendorEarningsUsdc).toBe(0);
-        // Settlement agrees: the profile's zero wins over the 5% method rate.
         expect(await settledVendorCut()).toBe(0);
+    });
+
+    test('a matched zero profile WITH a method entry uses the override', async () => {
+        // Preserved legacy precedence: an explicit per-method rate outranks the
+        // profile's base rate, including a legitimate zero.
+        await configure({ feeByPaymentMethod: { BANK_TRANSFER: 0.05 } });
+        await profile({ platformFeePct: 0, adminSplitPct: 0.6, vendorSplitPct: 0.4 });
+        const ctx = await seedContext();
+
+        const res = await initiate(ctx);
+        expect(res.status).toBe(201);
+        expect(res.body.earnings.platformFeePct).toBeCloseTo(0.05, 8);
+        // 100 * 5% * 0.4 (profile vendor split) = 2.00
+        expect(res.body.earnings.expectedVendorEarningsUsdc).toBeCloseTo(2, 6);
+        expect(res.body.earnings.expectedVendorEarningsUsdc).toBeCloseTo(await settledVendorCut(), 6);
+    });
+
+    test('a matched non-zero profile WITH a method entry uses the override', async () => {
+        await configure({ feeByPaymentMethod: { BANK_TRANSFER: 0.05 } });
+        await profile({ platformFeePct: 0.02, adminSplitPct: 0.6, vendorSplitPct: 0.4 });
+        const ctx = await seedContext();
+
+        const res = await initiate(ctx);
+        expect(res.status).toBe(201);
+        expect(res.body.earnings.platformFeePct).toBeCloseTo(0.05, 8);
+        expect(res.body.earnings.expectedVendorEarningsUsdc).toBeCloseTo(2, 6);
+        expect(res.body.earnings.expectedVendorEarningsUsdc).toBeCloseTo(await settledVendorCut(), 6);
+    });
+
+    test('the seeded System Default ALL profile plus an override agrees end to end', async () => {
+        // Production shape after migration 20260525_phase_q1_admin_fee_profiles:
+        // an active ALL profile matches every trade, so this is the case that
+        // the old !hasProfile gate silently broke.
+        await configure({ feeByPaymentMethod: { BANK_TRANSFER: 0.05 } });
+        await prisma.adminFeeProfile.create({
+            data: {
+                name: `System Default ${tag()}`, targetScope: 'ALL', priority: 0, isActive: true,
+                platformFeePct: 0.02, adminSplitPct: 0.6, vendorSplitPct: 0.4, exitFeePct: 0.02,
+            },
+        });
+        const ctx = await seedContext();
+
+        const res = await initiate(ctx);
+        expect(res.status).toBe(201);
+        expect(res.body.earnings.platformFeePct).toBeCloseTo(0.05, 8);
+        expect(res.body.earnings.vendorSplitPct).toBeCloseTo(0.4, 8);
+        expect(res.body.earnings.expectedVendorEarningsUsdc).toBeCloseTo(2, 6);
+        expect(res.body.earnings.expectedVendorEarningsUsdc).toBeCloseTo(await settledVendorCut(), 6);
     });
 });

@@ -9,10 +9,16 @@
 // matched, while the projection ignored that map and advertised a different
 // number from the one the trade would actually pay.
 //
-// Precedence is unchanged and deliberate:
-//   1. A MATCHED AdminFeeProfile is authoritative, including legitimate 0.
-//   2. Otherwise GlobalSettings.p2pFeePct, then a per-payment-method override.
-//   3. Otherwise the caller's hard-coded fallbacks.
+// Precedence is UNCHANGED from the pre-refactor settlement path and deliberate:
+//   1. The BASE rate is a MATCHED AdminFeeProfile's platformFeePct, including a
+//      legitimate 0; otherwise GlobalSettings.p2pFeePct; otherwise the caller's
+//      hard-coded fallback.
+//   2. A configured GlobalSettings.feeByPaymentMethod entry for the trade's
+//      method then OVERRIDES that base rate, whether or not a profile matched.
+//      This is the pre-existing contract: the per-method map is an explicit,
+//      narrowly-scoped admin rate and outranks the profile's default rate.
+//   3. Splits come from the matched profile (paired admin+vendor), otherwise
+//      the legacy tier formula.
 //
 // `matchedProfile` is the ONLY signal of a match: a matched profile can carry
 // 0 in every field, so zero must never be read as "no profile".
@@ -42,9 +48,11 @@ function resolveP2pFeePolicy({ settings, feeProfile, paymentMethod, amountCrypto
     let feePct = baseFeePct;
     let feeSource = hasProfile ? 'FEE_PROFILE' : 'GLOBAL_SETTINGS';
 
-    // A matched profile is more specific than the per-method map, so the map
-    // only applies on the fallback path.
-    if (!hasProfile && paymentMethod && settings?.feeByPaymentMethod) {
+    // The per-method map applies to ANY resolved base rate, including one from a
+    // matched profile. Gating this on !hasProfile suppressed overrides for every
+    // ordinary trade, because the seeded active `System Default` ALL profile
+    // (platformFeePct 0.02) matches by default.
+    if (paymentMethod && settings?.feeByPaymentMethod) {
         let methodMap = null;
         try {
             methodMap = typeof settings.feeByPaymentMethod === 'string'

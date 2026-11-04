@@ -79,6 +79,23 @@ describeOrSkip('P2P zero-value fee profiles (real PostgreSQL)', () => {
     const E = async (id) => Number((await prisma.user.findUnique({ where: { id } })).escrowLockedBalance);
     const fees = async () => Number((await prisma.systemProfitFees.findUnique({ where: { id: 1 } })).balance);
 
+    // The migration seed 20260525_phase_q1_admin_fee_profiles installs exactly
+    // this active ALL profile (id default-fee-profile, priority 0, 2%). It
+    // matches EVERY trade, so "no profiles exist" is not the production shape.
+    async function systemDefaultProfile(over = {}) {
+        return prisma.adminFeeProfile.create({
+            data: {
+                name: `System Default ${Date.now()}_${Math.random().toString(36).slice(2, 6)}`, targetScope: 'ALL', priority: 0, isActive: true,
+                platformFeePct: 0.02, adminSplitPct: 0.6, vendorSplitPct: 0.4, exitFeePct: 0.02,
+                ...over,
+            },
+        });
+    }
+
+    const setMethodFee = (map) => prisma.globalSettings.update({
+        where: { id: 1 }, data: { feeByPaymentMethod: map },
+    });
+
     test('1. no profile: GlobalSettings percentage and tier split still apply', async () => {
         const s = await seedBuyTrade({ amountCrypto: 100 });
         await p2pService.completeTrade(prisma, { tradeId: s.trade.id, releasedByUserId: s.user.id });
@@ -241,6 +258,67 @@ describeOrSkip('P2P zero-value fee profiles (real PostgreSQL)', () => {
         const credit = posting.journalEntries.reduce((a, e) => a + Number(e.credit), 0);
         expect(debit).toBeCloseTo(100, 8);
         expect(credit).toBeCloseTo(100, 8);
+    });
+
+    test('7e. matched zero profile + method override: the override applies', async () => {
+        // The zero profile supplies the base rate; an explicitly configured
+        // per-method rate outranks it, exactly as settlement did before the
+        // resolver refactor.
+        await profile({ platformFeePct: 0, adminSplitPct: 0.6, vendorSplitPct: 0.4 });
+        await setMethodFee({ BANK_TRANSFER: 0.05 });
+        const s = await seedBuyTrade({ amountCrypto: 100 });
+        await p2pService.completeTrade(prisma, { tradeId: s.trade.id, releasedByUserId: s.user.id });
+
+        // 5% of 100 = 5.00 fee; profile split 60/40 -> admin 3.00, vendor 2.00
+        expect(await fees()).toBeCloseTo(3, 6);
+        expect(await B(s.vendor.id)).toBeCloseTo(97, 6);
+    });
+
+    test('7f. matched non-zero profile + method override: the override applies', async () => {
+        await profile({ platformFeePct: 0.02, adminSplitPct: 0.6, vendorSplitPct: 0.4 });
+        await setMethodFee({ BANK_TRANSFER: 0.05 });
+        const s = await seedBuyTrade({ amountCrypto: 100 });
+        await p2pService.completeTrade(prisma, { tradeId: s.trade.id, releasedByUserId: s.user.id });
+
+        expect(await fees()).toBeCloseTo(3, 6);  // 5.00 fee * 60%
+        expect(await B(s.vendor.id)).toBeCloseTo(97, 6);
+    });
+
+    test('7g. a matched profile with NO method entry keeps its own rate', async () => {
+        await profile({ platformFeePct: 0.02, adminSplitPct: 0.6, vendorSplitPct: 0.4 });
+        await setMethodFee({ CARD: 0.09 });   // unrelated method
+        const s = await seedBuyTrade({ amountCrypto: 100 });
+        await p2pService.completeTrade(prisma, { tradeId: s.trade.id, releasedByUserId: s.user.id });
+
+        expect(await fees()).toBeCloseTo(1.2, 6);   // 2.00 fee * 60%
+        expect(await B(s.vendor.id)).toBeCloseTo(98.8, 6);
+    });
+
+    test('7h. the seeded System Default ALL profile + override uses the override', async () => {
+        // Production shape: the migration's active ALL profile matches every
+        // trade, so the override must still win.
+        await systemDefaultProfile();
+        await setMethodFee({ BANK_TRANSFER: 0.05 });
+        const s = await seedBuyTrade({ amountCrypto: 100 });
+
+        const resolved = await resolveFeeProfile(prisma, {
+            vendorId: s.vendor.id, buyerId: s.user.id, amountCrypto: 100,
+        });
+        expect(resolved.matchedProfile).toBe(true);
+        expect(Number(resolved.platformFeePct)).toBeCloseTo(0.02, 8);
+
+        await p2pService.completeTrade(prisma, { tradeId: s.trade.id, releasedByUserId: s.user.id });
+        expect(await fees()).toBeCloseTo(3, 6);       // 5.00 * 60% from the profile split
+        expect(await B(s.vendor.id)).toBeCloseTo(97, 6);
+    });
+
+    test('7i. the seeded System Default alone charges its own 2%', async () => {
+        await systemDefaultProfile();
+        const s = await seedBuyTrade({ amountCrypto: 100 });
+        await p2pService.completeTrade(prisma, { tradeId: s.trade.id, releasedByUserId: s.user.id });
+
+        expect(await fees()).toBeCloseTo(1.2, 6);     // 2.00 fee * 60%
+        expect(await B(s.vendor.id)).toBeCloseTo(98.8, 6);
     });
 
     test('8. repeated completion cannot post the fee twice', async () => {
