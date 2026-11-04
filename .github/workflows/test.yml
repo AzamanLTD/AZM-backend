@@ -76,6 +76,40 @@ jobs:
         # name in the summary.
         run: npx prisma validate
 
+      - name: 'Guard: identify the PostgreSQL service container (exact identity)'
+        # §392 — __tests__/helpers/testDatabaseGuard.js refuses to run its
+        # table-wide maintenance statement unless the server's OWN reported
+        # address matches an independent expectation. That expectation is this
+        # container's address, read from docker itself. Without this step a
+        # GitHub Actions run has no expectation and the guard fails closed, so
+        # the identity is established here for this lane too, exactly as the
+        # financial-durability lane does.
+        #
+        # Ambiguity is fatal: zero or several candidates, or several network
+        # addresses, means the target cannot be proven.
+        run: |
+          set -euo pipefail
+          mapfile -t CANDIDATES < <(docker ps -q --filter "ancestor=postgres:16")
+          if [ "${#CANDIDATES[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one postgres:16 service container, found ${#CANDIDATES[@]}. The database identity cannot be established."
+            exit 1
+          fi
+          CONTAINER="${CANDIDATES[0]}"
+          mapfile -t ADDRESSES < <(docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "$CONTAINER" | sed '/^[[:space:]]*$/d')
+          if [ "${#ADDRESSES[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one network address for container ${CONTAINER}, found ${#ADDRESSES[@]}. Refusing to guess."
+            exit 1
+          fi
+          ADDRESS="${ADDRESSES[0]}"
+          if ! printf '%s' "$ADDRESS" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+            echo "::error::Container address '${ADDRESS}' is not a dotted IPv4 address."
+            exit 1
+          fi
+          echo "PostgreSQL service container: ${CONTAINER}"
+          echo "Exact expected database address: ${ADDRESS}"
+          echo "AZM_TEST_PG_CONTAINER=${CONTAINER}" >> "$GITHUB_ENV"
+          echo "AZM_EXPECTED_TEST_DB_ADDRESS=${ADDRESS}" >> "$GITHUB_ENV"
+
       - name: Apply database schema
         # CI uses a disposable PostgreSQL instance. Production remains managed
         # by the repository's established db-push release process.
@@ -194,7 +228,9 @@ jobs:
         # ALTER SYSTEM cannot run inside one (run 35367906505), so run
         # psql inside the service container directly.
         run: |
-          CONTAINER=$(docker ps --filter "ancestor=postgres:16" --format "{{ .ID }}" | head -1)
+          # Reuse the container the identity step selected: one way to decide
+          # which PostgreSQL this lane is talking to.
+          CONTAINER="${AZM_TEST_PG_CONTAINER:?the identity step must export AZM_TEST_PG_CONTAINER}"
           docker exec "$CONTAINER" psql -U postgres -d azm_test \
             -c "ALTER SYSTEM SET synchronous_commit = off" \
             -c "SELECT pg_reload_conf();" \
@@ -218,6 +254,10 @@ jobs:
         # genuine test failures must reproduce and still fail the job.
         run: |
           set +e
+          if [ -z "${AZM_EXPECTED_TEST_DB_ADDRESS:-}" ]; then
+            echo "::error::AZM_EXPECTED_TEST_DB_ADDRESS is not set; the database identity guard would refuse. Fix the identity step."
+            exit 1
+          fi
           npm test -- --runInBand --forceExit
           code=$?
           if [ $code -ne 0 ]; then

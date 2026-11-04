@@ -78,12 +78,53 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: 'Guard: identify the PostgreSQL service container (exact identity)'
+        # §392 — the database guard compares the server's own reported address
+        # against an INDEPENDENT expectation, never against a private subnet: a
+        # remote server behind a loopback port-forward or tunnel sits inside any
+        # subnet we might allow. That expectation is this container's address,
+        # read from docker itself, and exported to the test steps.
+        #
+        # Ambiguity is fatal on purpose: zero or several candidates, or several
+        # network addresses, means the identity cannot be established, and an
+        # unclear expectation must never silently disable the check.
+        run: |
+          set -euo pipefail
+          mapfile -t CANDIDATES < <(docker ps -q --filter "ancestor=postgres:16")
+          if [ "${#CANDIDATES[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one postgres:16 service container, found ${#CANDIDATES[@]}. The database identity cannot be established; refusing to run with an unprovable target."
+            exit 1
+          fi
+          CONTAINER="${CANDIDATES[0]}"
+          mapfile -t ADDRESSES < <(docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "$CONTAINER" | sed '/^[[:space:]]*$/d')
+          if [ "${#ADDRESSES[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one network address for container ${CONTAINER}, found ${#ADDRESSES[@]}. Refusing to guess."
+            exit 1
+          fi
+          ADDRESS="${ADDRESSES[0]}"
+          if ! printf '%s' "$ADDRESS" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+            echo "::error::Container address '${ADDRESS}' is not a dotted IPv4 address."
+            exit 1
+          fi
+          echo "PostgreSQL service container: ${CONTAINER}"
+          echo "Exact expected database address: ${ADDRESS}"
+          echo "AZM_TEST_PG_CONTAINER=${CONTAINER}" >> "$GITHUB_ENV"
+          echo "AZM_EXPECTED_TEST_DB_ADDRESS=${ADDRESS}" >> "$GITHUB_ENV"
+
       - name: 'Guard: Postgres must be in production commit mode'
         # THE lane invariant. The main battery tunes synchronous_commit=off for
         # speed on its disposable database — that tuning must NEVER leak here.
         # If this step fails, someone tuned this lane's database: revert it.
         run: |
-          CONTAINER=$(docker ps --filter "ancestor=postgres:16" --format "{{ .ID }}" | head -1)
+          set -euo pipefail
+          # Reuse the container the identity step selected. There is ONE way this
+          # lane decides which PostgreSQL it is talking to.
+          CONTAINER="${AZM_TEST_PG_CONTAINER:?the identity step must export AZM_TEST_PG_CONTAINER}"
+          ADDRESS=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "$CONTAINER" | sed '/^[[:space:]]*$/d')
+          if [ "${ADDRESS}" != "${AZM_EXPECTED_TEST_DB_ADDRESS:?the identity step must export AZM_EXPECTED_TEST_DB_ADDRESS}" ]; then
+            echo "::error::The service container address is '${ADDRESS}', not the expected '${AZM_EXPECTED_TEST_DB_ADDRESS}'. The database identity is unstable; refusing to run."
+            exit 1
+          fi
           MODE=$(docker exec "$CONTAINER" psql -U postgres -d azm_test -tAc "SHOW synchronous_commit")
           echo "synchronous_commit = ${MODE}"
           if [ "${MODE}" != "on" ]; then
@@ -226,6 +267,13 @@ jobs:
             "__tests__/native-ghs-risk-hardening.test.js"
             "__tests__/native-ghs-trusted-age-risk.test.js"
           )
+          # Fail before jest if the identity expectation is missing: the suites
+          # themselves refuse under GitHub Actions, but the lane must not depend
+          # on a test file to notice that its own wiring is broken.
+          if [ -z "${AZM_EXPECTED_TEST_DB_ADDRESS:-}" ]; then
+            echo "::error::AZM_EXPECTED_TEST_DB_ADDRESS is not set. The native-GHS suites must run against a proven database identity."
+            exit 1
+          fi
           npx jest --runInBand --forceExit "${NG_SUITES[@]}"
 
       - name: Financial-integrity suites (production commit mode)
@@ -336,10 +384,17 @@ jobs:
 
       - name: 'Guard: re-verify commit mode was never relaxed mid-run'
         run: |
-          CONTAINER=$(docker ps --filter "ancestor=postgres:16" --format "{{ .ID }}" | head -1)
+          set -euo pipefail
+          CONTAINER="${AZM_TEST_PG_CONTAINER:?the identity step must export AZM_TEST_PG_CONTAINER}"
+          ADDRESS=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "$CONTAINER" | sed '/^[[:space:]]*$/d')
+          if [ "${ADDRESS}" != "${AZM_EXPECTED_TEST_DB_ADDRESS:?the identity step must export AZM_EXPECTED_TEST_DB_ADDRESS}" ]; then
+            echo "::error::The service container address changed during the run (now: '${ADDRESS}', expected '${AZM_EXPECTED_TEST_DB_ADDRESS}'). The database identity was not stable; the rehearsal is invalid."
+            exit 1
+          fi
           MODE=$(docker exec "$CONTAINER" psql -U postgres -d azm_test -tAc "SHOW synchronous_commit")
           if [ "${MODE}" != "on" ]; then
             echo "::error::synchronous_commit was relaxed during the run (now: ${MODE}). The durability rehearsal is invalid."
             exit 1
           fi
+          echo "Database identity held at ${AZM_EXPECTED_TEST_DB_ADDRESS} for the whole run."
           echo "Durability rehearsal completed in production commit mode (synchronous_commit=on)."
