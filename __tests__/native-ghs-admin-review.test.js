@@ -574,12 +574,16 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
         await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), seams({ ...ciBase, expectedAddress: '172.18.0.2/32' })))
             .rejects.toThrow(/AZM_EXPECTED_TEST_DB_ADDRESS/);
 
-        // (j) the positive LOCAL path: this suite's own wiring, against the real
-        //     database, proving the cluster this machine owns.
+        // (j) the positive LOCAL path, with local semantics pinned. The REAL
+        //     identity proof is exercised by this suite's own beforeEach, which
+        //     runs the guard against the live disposable database in whatever
+        //     mode the environment implies — the native cluster locally, the
+        //     verified service container in CI.
         const good = stubClient();
-        const result = await guard(good, { probeLocalCluster: require('./helpers/testDatabaseGuard').probeLocalCluster });
+        const result = await guard(good, seams({ githubActions: false, expectedAddress: null }));
         expect(result.identity).toBe('local-cluster-identity');
-        expect(result.systemIdentifier).toMatch(/^\d+$/);
+        expect(result.systemIdentifier).toBe(SID);
+        expect(result.transport).toBe('tcp');
         expect(good.statements).toHaveLength(1);
         expect(mutations(good)).toHaveLength(0);
     });
