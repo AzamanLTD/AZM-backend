@@ -50,6 +50,14 @@ const IAT_TOLERANCE_SECONDS = 60;
 // Fallback only. Google's Cache-Control max-age governs the real lifetime.
 const DEFAULT_JWKS_TTL_MS = 60 * 60 * 1000;
 const DEFAULT_JWKS_TIMEOUT_MS = 5000;
+// A token naming an unknown kid forces a refresh (that is how Google rotation
+// is picked up). Left unbounded, an attacker mints tokens with random kids and
+// drives one Google request per attempt. One forced refresh per interval keeps
+// rotation working while capping the amplification.
+const MIN_REFRESH_INTERVAL_MS = 10 * 1000;
+// Firebase ID tokens are ~1-2 KB. Refusing absurd input keeps JSON.parse and
+// base64 decoding away from attacker-chosen sizes.
+const MAX_TOKEN_LENGTH = 16 * 1024;
 const ACCEPTED_ALG = 'RS256';
 
 class IdTokenError extends Error {
@@ -84,6 +92,9 @@ function decodeSegment(segment, label) {
 function splitToken(idToken) {
     if (typeof idToken !== 'string') {
         throw new IdTokenError('ID_TOKEN_MALFORMED', 'ID token is not a string.');
+    }
+    if (idToken.length > MAX_TOKEN_LENGTH) {
+        throw new IdTokenError('ID_TOKEN_TOO_LARGE', 'ID token exceeds the maximum accepted length.');
     }
     const parts = idToken.split('.');
     if (parts.length !== 3) {
@@ -230,7 +241,13 @@ function normalizeKeySet(rawKeys) {
  *  - concurrent callers share ONE in-flight fetch
  *  - an unknown kid triggers exactly one refetch (Google rotation), then fails
  */
-function createKeyResolver({ jwksUrl = GOOGLE_JWKS_URL, fetcher, ttlMs = DEFAULT_JWKS_TTL_MS, now = () => Date.now() } = {}) {
+function createKeyResolver({
+    jwksUrl = GOOGLE_JWKS_URL,
+    fetcher,
+    ttlMs = DEFAULT_JWKS_TTL_MS,
+    minRefreshIntervalMs = MIN_REFRESH_INTERVAL_MS,
+    now = () => Date.now(),
+} = {}) {
     if (typeof fetcher !== 'function') {
         throw new Error('createKeyResolver requires a fetcher(url) -> Promise<{keys}>');
     }
@@ -238,6 +255,7 @@ function createKeyResolver({ jwksUrl = GOOGLE_JWKS_URL, fetcher, ttlMs = DEFAULT
     let fetchedAt = 0;
     let expiresAt = 0;
     let inFlight = null;
+    let lastFetchAt = 0;
 
     async function fetchOnce() {
         if (inFlight) return inFlight;
@@ -249,6 +267,7 @@ function createKeyResolver({ jwksUrl = GOOGLE_JWKS_URL, fetcher, ttlMs = DEFAULT
             const cacheAge = maxAgeFromCacheControl(result.cacheControl);
             keys = normalizeKeySet(doc.keys);
             fetchedAt = now();
+            lastFetchAt = fetchedAt;
             expiresAt = cacheAge === null ? fetchedAt : fetchedAt + (cacheAge === undefined ? ttlMs : cacheAge);
             return keys;
         })();
@@ -264,7 +283,7 @@ function createKeyResolver({ jwksUrl = GOOGLE_JWKS_URL, fetcher, ttlMs = DEFAULT
     return async function resolve(kid) {
         if (isStale()) await fetchOnce();
         let match = keys.find((k) => k.kid === kid);
-        if (!match) {
+        if (!match && now() - lastFetchAt >= minRefreshIntervalMs) {
             await fetchOnce();
             match = keys.find((k) => k.kid === kid);
         }
@@ -302,7 +321,8 @@ async function verifyIdToken(idToken, { projectId, resolveKey, now = () => Date.
     const claims = decodeSegment(parts.payloadB64, 'Payload');
 
     if (header.alg !== ACCEPTED_ALG) {
-        throw new IdTokenError('ID_TOKEN_BAD_ALG', 'Unsupported algorithm: ' + String(header.alg) + '.');
+        const shown = String(header.alg).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 32);
+        throw new IdTokenError('ID_TOKEN_BAD_ALG', 'Unsupported algorithm: ' + (shown || '(unprintable)') + '.');
     }
     if (typeof header.kid !== 'string' || header.kid.length === 0) {
         throw new IdTokenError('ID_TOKEN_NO_KID', 'Token header has no key id.');
@@ -351,6 +371,8 @@ module.exports = {
     maxAgeFromCacheControl,
     normalizeKeySet,
     MIN_RSA_MODULUS_BITS,
+    MAX_TOKEN_LENGTH,
+    MIN_REFRESH_INTERVAL_MS,
     IdTokenError,
     GOOGLE_JWKS_URL,
     ACCEPTED_ALG,

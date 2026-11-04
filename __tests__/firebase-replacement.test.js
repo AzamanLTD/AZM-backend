@@ -5,9 +5,11 @@
 jest.mock('../src/config/logger', () => ({ info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() }));
 
 const crypto = require('crypto');
+const path = require('path');
 const {
     verifyIdToken, createKeyResolver, createDefaultFetcher, maxAgeFromCacheControl,
     normalizeKeySet, EXP_SKEW_SECONDS, IAT_TOLERANCE_SECONDS,
+    MAX_TOKEN_LENGTH, MIN_REFRESH_INTERVAL_MS,
 } = require('../services/firebase/idTokenVerifier');
 const {
     createFcmClient, buildAssertion, classifySendFailure, parseRetryAfter, createHttpTransport,
@@ -224,11 +226,34 @@ describe('JWKS: cache lifetime, dedupe and rotation', () => {
         expect(calls).toBe(1);
     });
 
-    test('an unknown kid triggers exactly one refetch, then fails closed', async () => {
+    test('an unknown kid triggers one bounded refetch, then fails closed', async () => {
+        let clock = NOW;
         const fetcher = jest.fn(async () => ({ keys: [jwk] }));
-        const resolve = createKeyResolver({ fetcher, now: nowFn });
+        const resolve = createKeyResolver({ fetcher, now: () => clock });
+        // First call populates the cache.
+        await expect(resolve('rotated-kid')).rejects.toMatchObject({ code: 'ID_TOKEN_UNKNOWN_KEY' });
+        expect(fetcher).toHaveBeenCalledTimes(1);
+        // Inside the interval the resolver must NOT hit Google again.
+        clock += MIN_REFRESH_INTERVAL_MS - 1;
+        await expect(resolve('rotated-kid')).rejects.toMatchObject({ code: 'ID_TOKEN_UNKNOWN_KEY' });
+        expect(fetcher).toHaveBeenCalledTimes(1);
+        // Past the interval a real rotation is picked up.
+        clock += 2;
         await expect(resolve('rotated-kid')).rejects.toMatchObject({ code: 'ID_TOKEN_UNKNOWN_KEY' });
         expect(fetcher).toHaveBeenCalledTimes(2);
+    });
+
+    test('random kids cannot drive one Google request per attempt', async () => {
+        let clock = NOW;
+        const fetcher = jest.fn(async () => ({ keys: [jwk] }));
+        const resolve = createKeyResolver({ fetcher, now: () => clock });
+        await resolve(KID); // warm the cache with a real fetch
+        const baseline = fetcher.mock.calls.length;
+        for (let i = 0; i < 50; i += 1) {
+            clock += 10; // 500ms of attacker traffic, well inside the interval
+            await expect(resolve('bogus-' + i)).rejects.toMatchObject({ code: 'ID_TOKEN_UNKNOWN_KEY' });
+        }
+        expect(fetcher.mock.calls.length).toBe(baseline);
     });
 
     test('a genuine new RSA keypair signs a token that verifies, and the old key cannot', async () => {
@@ -950,7 +975,21 @@ describe('credentials — production priority order', () => {
 
   test('falls back to the local file last', () => {
     const out = resolveServiceAccount({ env: {}, readFile: () => asJson });
-    expect(out.source).toBe('file:service-account.json');
+    expect(out.source).toMatch(/^file:.*service-account\.json$/);
+  });
+
+  test('the local credential path is module-relative, not working-directory relative', () => {
+    let seen = null;
+    resolveServiceAccount({ env: {}, readFile: (p) => { seen = p; return asJson; } });
+    // Production resolves utils/../service-account.json, i.e. the repo root.
+    // A CWD-relative default would silently read a different file.
+    expect(path.isAbsolute(seen)).toBe(true);
+    expect(seen.endsWith(path.join('service-account.json'))).toBe(true);
+    expect(seen).not.toBe('service-account.json');
+  });
+
+  test('an absent local file is treated as no credential, not a crash', () => {
+    expect(() => resolveServiceAccount({ env: {} })).toThrow(CREDENTIAL_MISSING);
   });
 
   test('a missing credential is a distinct error', () => {
@@ -1048,4 +1087,57 @@ describe('messaging parity — Flutter click routing and uid alias', () => {
     expect(claims.uid).toBe(claims.sub);
     expect(claims.uid).toBe('user-123');
   });
+});
+
+// =============================================================================
+// Security review additions (2026-11-04). Each of these was a defect found by
+// reading the verifier, not by writing a test for behaviour that already worked.
+// =============================================================================
+describe('verifier hardening — size bounds and error hygiene', () => {
+    test('an oversized token is refused before any decoding work', async () => {
+        const huge = 'a'.repeat(MAX_TOKEN_LENGTH + 1);
+        await expect(verify(huge)).rejects.toMatchObject({ code: 'ID_TOKEN_TOO_LARGE' });
+    });
+
+    test('a legal-sized token is still accepted', async () => {
+        const out = await verify(mint());
+        expect(out.sub).toBe('user-123');
+    });
+
+    test('the rejected algorithm is echoed bounded and printable', async () => {
+        const hostile = 'X'.repeat(5000) + '\n\r\u0000';
+        const token = mint({ header: { alg: hostile } });
+        await expect(verify(token)).rejects.toMatchObject({ code: 'ID_TOKEN_BAD_ALG' });
+        await verify(token).catch((err) => {
+            expect(err.message.length).toBeLessThan(120);
+            expect(err.message).not.toContain('\n');
+            expect(err.message).not.toContain('\u0000');
+        });
+    });
+});
+
+describe('resolver — cache lifetime edges', () => {
+    test('max-age=0 means every verification refetches', async () => {
+        let clock = NOW;
+        const fetcher = jest.fn(async () => ({ keys: [jwk], cacheControl: 'max-age=0' }));
+        const resolve = createKeyResolver({ fetcher, now: () => clock });
+        await resolve(KID);
+        clock += 1;
+        await resolve(KID);
+        expect(fetcher).toHaveBeenCalledTimes(2);
+    });
+
+    test('a failing refresh leaves the previous keys usable, then fails closed once stale', async () => {
+        let clock = NOW;
+        let fail = false;
+        const fetcher = jest.fn(async () => {
+            if (fail) throw new Error('network down');
+            return { keys: [jwk], cacheControl: 'max-age=60' };
+        });
+        const resolve = createKeyResolver({ fetcher, now: () => clock });
+        await resolve(KID);
+        fail = true;
+        clock += 61_000; // stale, refresh will throw
+        await expect(resolve(KID)).rejects.toThrow(/network down/);
+    });
 });
