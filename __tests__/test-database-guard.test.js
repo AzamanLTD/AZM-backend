@@ -114,7 +114,10 @@ describe('§1 GitHub Actions proves an exact container identity', () => {
     });
 
     test('a missing expectation fails closed with zero queries', async () => {
-        for (const expectedAddress of ['', '   ', undefined]) {
+        // `null` (not `undefined`) forces "absent" even when the real environment
+        // being tested in sets the variable — this assertion must not depend on
+        // whether the lane under test exported it.
+        for (const expectedAddress of ['', '   ', null]) {
             const client = stubClient({ serverAddress: '172.18.0.2/32' });
             await expect(guard(client, ciSeams({ expectedAddress }))).rejects.toThrow(/AZM_EXPECTED_TEST_DB_ADDRESS is not set/);
             expect(client.statements).toHaveLength(0);
@@ -136,9 +139,12 @@ describe('§1 GitHub Actions proves an exact container identity', () => {
             .rejects.toThrow(/AZM_TEST_PG_CONTAINER is missing or is not a container id/);
         expect(mutations(unverified)).toHaveLength(0);
 
-        // docker itself is unavailable (a local machine faking GITHUB_ACTIONS).
-        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ inspectContainerIdentity })))
-            .rejects.toThrow(/docker inspection of AZM_TEST_PG_CONTAINER failed/);
+        // The real inspector refuses when the container cannot be verified. A
+        // nonexistent id is used so this is deterministic with AND without a
+        // docker daemon (unavailable locally, present in CI).
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({
+            inspectContainerIdentity, containerId: '0000000000000000000000000000000000000000',
+        }))).rejects.toThrow(/docker inspection of AZM_TEST_PG_CONTAINER failed/);
 
         // the container exists but is not running / not postgres / holds another address.
         await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({
