@@ -56,6 +56,27 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
     // TRUNCATE, never an identity reset.
     const ownedReferences = new Set();
 
+    // Rows this suite created EXPLICITLY, tracked by primary key. A synthetic row
+    // written for a foreign payout (the §P1-2 stale-evidence case) carries a
+    // reference that belongs to no payout this suite seeded, so a
+    // reference-based sweep alone would leave it behind — and because its
+    // entityId still names a live Withdrawal, the orphan sweep would not close it
+    // either. Ownership is therefore recorded in two ways and cleanup uses both:
+    // exact row ids for every explicit write, and references for rows the
+    // production path wrote for this suite's own payouts.
+    const ownedExceptionIds = new Set();
+
+    /**
+     * The production authority for exception writes, plus test ownership: the
+     * returned row's id is remembered so cleanup can delete THAT row and nothing
+     * else, whatever reference it was written against.
+     */
+    async function recordOwnedException(args) {
+        const row = await recordReconciliationException(prisma, args);
+        if (row && row.id) ownedExceptionIds.add(String(row.id));
+        return row;
+    }
+
     // §1 ORPHAN SWEEP (disposable test database). An OPEN row whose numeric
     // entityId no longer names a live withdrawal is evidence for a payout that
     // does not exist — it can only shadow a later payout that reuses the id.
@@ -71,13 +92,25 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
     });
 
     afterEach(async () => {
-        if (!prisma || ownedReferences.size === 0) return;
+        if (!prisma) return;
+        const ids = [...ownedExceptionIds];
         const refs = [...ownedReferences];
+        ownedExceptionIds.clear();
         ownedReferences.clear();
-        await prisma.$executeRawUnsafe(
-            'DELETE FROM "ReconciliationException" WHERE "entityType" = $1 AND "reference" = ANY($2::text[])',
-            'WITHDRAWAL', refs
-        );
+        // exact rows first: this is what removes synthetic cross-payout evidence
+        if (ids.length) {
+            await prisma.$executeRawUnsafe(
+                'DELETE FROM "ReconciliationException" WHERE "id" = ANY($1::uuid[])',
+                ids
+            );
+        }
+        // then anything the production path wrote for this suite's own payouts
+        if (refs.length) {
+            await prisma.$executeRawUnsafe(
+                'DELETE FROM "ReconciliationException" WHERE "entityType" = $1 AND "reference" = ANY($2::text[])',
+                'WITHDRAWAL', refs
+            );
+        }
     });
 
     async function setFlags() {
@@ -236,7 +269,7 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
         // A row written for some OTHER payout that happens to share this numeric
         // id. Written through the production authority (upsert on the OPEN
         // uniqueness rule) so a re-run cannot collide with 23505.
-        await recordReconciliationException(prisma, {
+        await recordOwnedException({
             entityType: 'WITHDRAWAL',
             entityId: mirror.id,
             reference: staleReference,
@@ -268,7 +301,7 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
         // The row shape is produced by the real dispatch path (proven in the
         // initiation suite); this inserts the SAME shape with hostile extras so
         // the read projection's allowlist is what is under test.
-        await recordReconciliationException(prisma, {
+        await recordOwnedException({
             entityType: 'WITHDRAWAL',
             entityId: mirror.id,
             reference: String(reference),
@@ -382,7 +415,7 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
             data: { payoutMethod: 'MOMO', destination: '0244123456' },
         });
         // Hostile exception evidence carrying a raw account number.
-        await recordReconciliationException(prisma, {
+        await recordOwnedException({
             entityType: 'WITHDRAWAL',
             entityId: legacy.mirror.id,
             reference: String(legacy.reference),
