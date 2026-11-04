@@ -127,4 +127,23 @@ describe('SSO fallback — current behaviour (documents the weakness)', () => {
         const res = await callWith({ ...baseEnv, NODE_ENV: 'development' }, { token: forgedToken({ exp: undefined }), prisma });
         expect(res.statusCode).toBe(201);
     });
+
+  test('NODE_ENV UNSET is treated as development, so the guard is opt-in to safety', async () => {
+    // The guard tests `NODE_ENV === 'production'`, not "is this a deployment".
+    // A host that leaves NODE_ENV unset is therefore on the unsafe side of the
+    // comparison, which is the opposite of the usual safe default.
+    const saved = { ...process.env };
+    delete process.env.NODE_ENV;
+    try {
+      const prisma = prismaStub();
+      const res = await callWith(
+          { SSO_DEV_FALLBACK: '1', SSO_EXPECTED_AUD: PROJECT },
+          { token: forgedToken({ exp: undefined }), prisma }
+      );
+      expect(res.statusCode).toBe(201);
+    } finally {
+      process.env = saved;
+    }
+  });
+
 });

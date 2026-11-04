@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-04
 **Branch:** `exp/firebase-admin-replacement` (isolated, not wired into production)
-**Reviewed head:** `602ea858fad0043139f34c0a27ddb7be4fdee049`
+**Reviewed head:** `602ea858fad0043139f34c0a27ddb7be4fdee049` (reviewed), fix landed at `b8006f7` and current head
 **Production reference:** `main` @ `0edefa1dbe056343080f2d762d89a1b0936c109c`
 **PR #384 head (unchanged):** `73109beabbe8cc362c6274963901043ce2d84678`
 
@@ -181,3 +181,29 @@ device, which this review deliberately does not exercise.
 5. The verifier is only as good as its wiring. If a caller resolves keys from a
    caller-supplied URL, or skips `verifyIdToken` for a "fast path", none of the
    above matters.
+
+## Addendum 2026-11-04 — exposure assessment of the SSO fallback
+
+Verified against production, not just the PR branch:
+
+- `controllers/ssoController.js` is **byte-identical** on `main` `0edefa1d` and on
+  `#384` `73109be` (empty `git diff`), so the weakness is live production code.
+- `SSO_DEV_FALLBACK` appears **only** inside that controller. It is set in neither
+  `.env.example` nor `render.yaml`, so no committed configuration enables it.
+- `render.yaml` pins `NODE_ENV: production`, which short-circuits the branch to a
+  503. Current production exposure is therefore **low and configuration-dependent**,
+  not an open door today.
+- The route is throttled: `src/routes/index.js` mounts `/api/auth` behind
+  `authLimiter` (5 requests/minute per IP), so token spraying is bounded.
+  Caveat: `authLimiter` is wrapped in `_failOpen`, so a Redis outage disables
+  throttling for the whole process until restart. That is an availability trade
+  and should be a conscious one.
+
+The guard is also the wrong polarity: it tests `NODE_ENV === 'production'`, so an
+unset `NODE_ENV` counts as safe-to-bypass. Characterisation test added proving a
+token with **no `exp` claim** is accepted when `NODE_ENV` is unset and the flag is
+on. Any host that forgets to set `NODE_ENV` is on the unsafe side by default.
+
+Conclusion: the risk today is configuration drift, not an active exploit. It stops
+being theoretical the moment `SSO_DEV_FALLBACK=1` reaches any non-production
+deployment, and the fallback must be deleted rather than re-gated.
