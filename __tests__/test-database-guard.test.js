@@ -226,7 +226,10 @@ describe('§1 CI provenance is an authenticated, run-bound GitHub Actions runner
             .rejects.toThrow(/issued for run 90000000999, but this runner is run 90000000123/);
         expect(mutations(client)).toHaveLength(0);
         // And the runtime value must come from the runner, not the token.
-        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ runId: undefined, oidcToken: signToken() })))
+        // `''` (not `undefined`) forces "absent": the seam resolver treats
+        // undefined as "not overridden" and would fall back to the real
+        // GITHUB_RUN_ID, which the lane exports.
+        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ runId: '', oidcToken: signToken() })))
             .rejects.toThrow(/runner did not supply a numeric GITHUB_RUN_ID/);
     });
 
