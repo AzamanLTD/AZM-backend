@@ -520,7 +520,7 @@ if (hasDb) {
         const queue = await prisma.$queryRawUnsafe(
             'SELECT "reason", "reference", "details" FROM "ReconciliationException" WHERE "entityId" = $1', String(mirror.id)
         );
-        const booking = queue.find((e) => e.reason === 'PARK_BOOKKEEPING_INCOMPLETE');
+        const booking = await bookingEvidenceFor(prisma, mirror.id, reference);
         expect(booking).toBeTruthy();
         // §1 identity: it names THIS payout's canonical reference.
         expect(booking.reference).toBe(String(reference));
@@ -731,6 +731,23 @@ if (hasDb) {
     // (everything else is UNRESOLVED), so an initiation POST can never answer
     // PENDING here. The reachable post-POST path is the terminal-at-initiation
     // park, which writes the SAME dispatch event and the SAME ownership record.
+
+/**
+ * The bookkeeping evidence for THIS payout. entityId is a bare numeric string
+ * with no foreign key, so a shared database can hold an older row for a payout
+ * that used the same id — matching on entityId alone picks the stale one. The
+ * row is matched on the payout's own canonical reference instead, and its status
+ * is not constrained: the case may already have been resolved by the worker.
+ */
+async function bookingEvidenceFor(prisma, withdrawalId, reference) {
+    const rows = await prisma.$queryRawUnsafe(
+        'SELECT "reason", "reference", "details", "status" FROM "ReconciliationException" '
+        + 'WHERE "entityType" = \'WITHDRAWAL\' AND "entityId" = $1 AND "reason" = $2',
+        String(withdrawalId), 'PARK_BOOKKEEPING_INCOMPLETE'
+    );
+    return rows.find((row) => String(row.reference) === String(reference)) || null;
+}
+
     const PENDING_ENVELOPE = (_body, ref) => PAYLOAD({
         status: 1,
         // echo this payout's reference, so the answer is judged on its merits
@@ -847,11 +864,13 @@ if (hasDb) {
         expect(adapter.__calls.filter((u) => u.endsWith('/transfer'))).toHaveLength(1);
 
         // §1 the durable operator evidence names this payout and its real steps.
-        const rows = await prisma.$queryRawUnsafe(
-            'SELECT "reason", "reference", "details" FROM "ReconciliationException" WHERE "entityId" = $1',
-            String(mirror.id)
-        );
-        const booking = rows.find((e) => e.reason === 'PARK_BOOKKEEPING_INCOMPLETE');
+        // entityId is a bare numeric string with no foreign key, so a shared
+        // database can hold an older row for a payout that used the same id.
+        // The evidence for THIS payout is the OPEN row naming THIS reference —
+        // matching on entityId alone picked a stale row and looked like a
+        // callback failure. The assertion is unchanged in strength: if the fresh
+        // evidence is missing, nothing matches and this fails.
+        const booking = await bookingEvidenceFor(prisma, mirror.id, reference);
         expect(booking).toBeTruthy();
         expect(booking.reference).toBe(String(reference));
         expect(booking.details.phase).toBe('POST_DISPATCH_BOOKKEEPING');

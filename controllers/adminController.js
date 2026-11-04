@@ -1438,7 +1438,7 @@ exports.getPendingWithdrawals = async (req, res) => {
         return res.status(200).json({
             success: true,
             data: {
-                pending,
+                pending: pending.map(projectWithdrawalForOperator),
                 frozen,
                 counts: {
                     // Page length only — the original contract.
@@ -2382,6 +2382,42 @@ exports.updatePayoutSettings = async (req, res) => {
  * Returns withdrawals flagged as NEEDS_MANUAL_REVIEW.
  * Supports cursor pagination.
  */
+// ── OPERATOR DISPLAY PROJECTION ─────────────────────────────────────────────
+// A legacy BANK withdrawal row can store a FULL account number in `destination`
+// (masking was added later; old rows were never rewritten). Both operator read
+// paths return the stored Withdrawal object, so without a projection the queue
+// hands the review client a complete account number. This is a DISPLAY
+// projection: it never touches the row, the beneficiary, dispatch, the provider
+// or reconciliation — only what an operator is shown.
+const ACCOUNT_MASK_VISIBLE_DIGITS = 4;
+
+function maskBankDestinationForDisplay(value) {
+    if (value === null || value === undefined) return null;
+    const raw = String(value).trim();
+    if (raw === '') return null;
+    // Already masked: preserve the existing representation rather than
+    // degrading it (re-masking "*********0123" would shorten its shield).
+    if (raw.includes('*')) return raw;
+    const digits = raw.replace(/\D/g, '');
+    if (!digits) return null; // nothing displayable, and nothing to guess at
+    if (digits.length <= ACCOUNT_MASK_VISIBLE_DIGITS) return `****${digits}`;
+    const visible = digits.slice(-ACCOUNT_MASK_VISIBLE_DIGITS);
+    const hidden = Math.min(12, digits.length - ACCOUNT_MASK_VISIBLE_DIGITS);
+    return `${'*'.repeat(hidden)}${visible}`;
+}
+
+/**
+ * Returns the withdrawal safe for an operator response. BANK destinations are
+ * masked; every other payout type (MoMo, crypto) is passed through untouched so
+ * a wallet address or phone number is never mangled into a bank mask.
+ */
+function projectWithdrawalForOperator(withdrawal) {
+    if (!withdrawal) return withdrawal;
+    const isBank = String(withdrawal.payoutMethod || '').toUpperCase() === 'BANK';
+    if (!isBank) return { ...withdrawal };
+    return { ...withdrawal, destination: maskBankDestinationForDisplay(withdrawal.destination) };
+}
+
 exports.getNeedsManualReview = async (req, res) => {
     const prisma = getReadPrisma(req.app);
 
@@ -2437,10 +2473,11 @@ exports.getNeedsManualReview = async (req, res) => {
         for (const w of withdrawals) {
             w.manualReview = parkingEvidence.get(w.id) || { reasons: [], resolutionOptions: ['ESCALATE'] };
         }
+        const projected = withdrawals.map(projectWithdrawalForOperator);
 
         return res.status(200).json({
             success: true,
-            withdrawals,
+            withdrawals: projected,
             count: withdrawals.length,
             pagination: envelope
         });
