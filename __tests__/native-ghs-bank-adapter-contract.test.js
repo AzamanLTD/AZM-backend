@@ -46,13 +46,24 @@ function materialiseAdapter() {
 }
 
 const adapterSource = materialiseAdapter();
+const hasDb = !!process.env.TEST_DATABASE_URL || !!process.env.DATABASE_URL;
 const hasAdapter = !!adapterSource;
+if (hasDb && !hasAdapter) {
+    // fail at collection time, not by skipping
+    throw new Error(
+        `[adapter-contract] REQUIRED adapter ${ADAPTER_SHA} is not available in this clone while a test database is configured. `
+        + 'Fetch that exact commit; a money-path contract proof must not be skipped.'
+    );
+}
 
 if (!hasAdapter) {
     console.warn(`[adapter-contract] ${ADAPTER_SHA} is not available in this clone — skipping (the #391 branch was not fetched).`);
 }
 
-(hasAdapter ? describe : describe.skip)('#391 MoolreBankPayoutService meets the #392 pre-dispatch contract', () => {
+// A database-configured run is expected to execute this contract. Skipping it
+// there would let CI report green without ever proving the adapter identity the
+// dispatch path depends on, so the gate fails instead of skipping.
+(hasDb ? describe : describe.skip)('#391 MoolreBankPayoutService meets the #392 pre-dispatch contract', () => {
     const svc = require('../src/services/nativeGhsWithdrawalService');
 
     let MoolreBankPayoutService;
@@ -172,11 +183,11 @@ if (!hasAdapter) {
 
         expect(verdict.decision).toBe('NEGATIVE');
         expect(verdict.error.code).toBe('PROVIDER_ACCOUNT_NOT_FOUND');
-        // NOTE: at 31a81cf #391's error carried the typed outcome,
+        // NOTE: at an early #391 head the error carried the typed outcome,
         // dispatchProven and the Moolre provider identity but did NOT expose
         // refusalDocumented (passed to the constructor and dropped), which is
         // why the #392 mapping keys on `dispatchProven` plus the provider's own
-        // AVD02 code rather than the flag. At cafc0fa the adapter publishes the
+        // AVD02 code rather than the flag. At the pinned head the adapter publishes the
         // flag too; the mapping is unchanged and still holds on both heads.
         expect(verdict.error.provider).toBe('MOOLRE_DISBURSEMENT');
         expect(verdict.error.outcome).toBe('DEFINITIVE_REJECTION');

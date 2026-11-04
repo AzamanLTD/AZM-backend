@@ -877,7 +877,7 @@ function evaluateBankDispatchObservation(outbound, { reference, amountGhsExact }
  * safe operator action is escalation/reconciliation on the original reference.
  */
 async function recordBankDispatchPark(prisma, {
-  reference, rowId, code, decision, observation, bank, amountGhsExact, extra = {},
+  reference, rowId, code, decision, observation, observedStatus = null, bank, amountGhsExact, extra = {},
 }) {
   await prisma.$executeRawUnsafe(
     'UPDATE "TransactionHistory" SET "metadata" = COALESCE("metadata", \'{}\'::jsonb) || jsonb_build_object($2::text, $3::jsonb) WHERE "id" = $1',
@@ -890,15 +890,22 @@ async function recordBankDispatchPark(prisma, {
       reference,
       provider: BANK_PROVIDER_CANONICAL,
       observedStatus: observation?.status ?? null,
-      // §2: four separate facts, never one boolean. An attempt is not an
-      // acceptance, an answer is not a terminal result, and an unresolved
-      // answer is never proof that no payout exists. `providerDispatched`
-      // stays for older readers; here it means "a POST left this process",
-      // which is exactly what parking after an answer establishes.
+      // §2: separate facts, each with ONE meaning. An attempt is not an answer,
+      // an answer is not a local settlement authorisation, and parking a
+      // provider-reported SUCCESSFUL is a decision about SETTLEMENT EVIDENCE —
+      // never a claim that the provider did not report success. The superseded
+      // `providerAcceptanceConfirmed: false` conflated those two and could read
+      // as "the provider never confirmed an outcome" for a successful response.
       providerDispatchAttempted: true,
-      providerResponseReceived: observation != null,
-      providerAcceptanceConfirmed: false,
+      // A response was received whenever the provider told us SOMETHING: an
+      // observation object or a recognised status is both an answer. Keying this
+      // off the object alone under-reported an answer we had plainly seen.
+      providerResponseReceived: observation != null || observedStatus != null,
       providerReportedStatus: observation?.status ?? null,
+      providerOutcomeTerminalReported: ['SUCCESSFUL', 'FAILED'].includes(
+        String(observation?.status || '').toUpperCase()
+      ),
+      settlementAuthorized: false,
       providerDispatched: true,
       providerRef: observation?.providerRef ?? null,
       externalId: observation?.externalId ?? null,
@@ -971,7 +978,7 @@ async function recordBankDispatchPark(prisma, {
  * we refuse rather than dispatch on the strength of the earlier timestamp.
  */
 function bankRevalidationCapability(port) {
-  // AGENT B'S PUBLISHED ADAPTER CONTRACT (#391 @ 31a81cf):
+  // AGENT B'S PUBLISHED ADAPTER CONTRACT (#391 @ pinned head):
   //   capabilities().canValidateBankAccount === true
   //   validateBankAccount({ accountNumber, bankCode })
   // Anything else — a missing method, a missing capability, a throwing
@@ -1013,12 +1020,12 @@ async function enquiryBankDestination(port, { accountNumber, bankCode, expectedA
   } catch (err) {
     // A documented account-not-found is a definitive pre-dispatch negative only
     // when it is the PROVIDER'S OWN documented refusal for THIS enquiry. #391's
-    // adapter (cafc0fa) expresses that refusal as facts that must ALL be
+    // adapter at the pinned head expresses that refusal as facts that must ALL be
     // present: its provider identity, DEFINITIVE_REJECTION, code
     // ACCOUNT_NOT_FOUND, and providerCode === 'AVD02' — Moolre's documented
-    // account-not-found answer. At 31a81cf `refusalDocumented` was a
+    // account-not-found answer. On the earlier head `refusalDocumented` was a
     // CONSTRUCTOR ARGUMENT only, so this mapping keyed on the derived
-    // `dispatchProven`; from cafc0fa the adapter also publishes the flag on the
+    // `dispatchProven`; at the pinned head the adapter also publishes the flag on the
     // error. This mapping deliberately keys on the DERIVED `dispatchProven`
     // plus the provider's own code, which is true across both heads and never
     // depends on a field that only one of them has. An ACCOUNT_NOT_FOUND that
@@ -1302,7 +1309,8 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
             revalidationError,
             providerDispatchAttempted: false,
             providerResponseReceived: false,
-            providerAcceptanceConfirmed: false,
+            providerOutcomeTerminalReported: false,
+            settlementAuthorized: false,
             providerDispatched: false,
             refunded: false,
           },
@@ -1335,7 +1343,8 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
         reason: 'The bank rail cannot revalidate the stored account immediately before dispatch, so it is not available.',
         providerDispatchAttempted: false,
         providerResponseReceived: false,
-        providerAcceptanceConfirmed: false,
+        providerOutcomeTerminalReported: false,
+        settlementAuthorized: false,
         providerDispatched: false,
         refunded: false,
         resolution: 'RAIL_UNAVAILABLE',
@@ -1401,7 +1410,8 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
         refunded: reversal?.reversed === true,
         providerDispatchAttempted: false,
         providerResponseReceived: false,
-        providerAcceptanceConfirmed: false,
+        providerOutcomeTerminalReported: false,
+        settlementAuthorized: false,
         providerDispatched: false,
         resolution: refundable && reversal?.reversed ? 'REFUNDED' : 'RECONCILE_MANUALLY',
       },
@@ -1494,6 +1504,7 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
       code,
       decision: verdict.decision,
       observation: verdict.observation || null,
+      observedStatus: verdict.observedStatus ?? null,
       bank,
       amountGhsExact: amount.toFixed(2),
       extra: {

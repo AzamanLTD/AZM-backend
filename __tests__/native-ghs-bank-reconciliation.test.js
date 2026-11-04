@@ -98,7 +98,7 @@ maybe('BANK payouts reconcile on the BANK rail (real PostgreSQL)', () => {
             amountGhsExact: facts.recipientGhsExact,
             bank,
             port: {
-                // The REAL adapter contract (#391 @31a81cf): capabilities
+                // The REAL adapter contract (#391 @ pinned head): capabilities
                 // declare BOTH legs, validation answers with the holder name
                 // and NO account-number echo, and the directory is fresh.
                 capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true, mode: 'sandbox' }),

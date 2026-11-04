@@ -1464,7 +1464,14 @@ const settleIfRecorded = async (tx, args) => {
  * It never increases availableGhs, never refunds, never settles, never creates
  * a reservation or reference, and never asks the provider anything.
  */
-const KNOWN_PROVIDER_IDENTITIES = new Set(['MOOLRE_DISBURSEMENT', 'MTN_MOMO_DISBURSEMENT']);
+// The provider identity allowed to prove a dispatch is bound to the RAIL, not
+// merely "a known provider". An event claiming MTN_MOMO_DISBURSEMENT with a BANK
+// rail and a copied BANK source is not proof that the BANK rail ever posted.
+const PROVIDER_FOR_RAIL = Object.freeze({
+    BANK: 'MOOLRE_DISBURSEMENT',
+    MOMO: 'MTN_MOMO_DISBURSEMENT',
+});
+const KNOWN_PROVIDER_IDENTITIES = new Set(Object.values(PROVIDER_FOR_RAIL));
 
 async function repairInTransitFromDispatchEvidence(tx, { reference, providerTxId = null } = {}) {
     const refuse = (reason, extra = {}) => ({ repaired: false, reason, ...extra });
@@ -1505,8 +1512,9 @@ async function repairInTransitFromDispatchEvidence(tx, { reference, providerTxId
     const BANK_DISPATCH_SOURCES = new Set(['bank_dispatch_initiation', 'bank_dispatch_parked']);
     const exactOf = (value) => toExactGhsDecimal(value);
 
+    const expectedProvider = PROVIDER_FOR_RAIL[expectedRail];
     const evidence = events.find((event) => (
-        KNOWN_PROVIDER_IDENTITIES.has(event.provider)
+        event.provider === expectedProvider
         && event.rail === expectedRail
         && event.relatedReference === ref
         && event.dedupKey === `event:payout-dispatch:${event.provider}:${ref}`

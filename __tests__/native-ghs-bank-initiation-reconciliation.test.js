@@ -518,9 +518,16 @@ if (hasDb) {
         const canonical = await canonicalOf(reference);
         const mirror = await prisma.withdrawal.findFirst({ where: { transactionHistoryId: canonical.id } });
         const queue = await prisma.$queryRawUnsafe(
-            'SELECT "reason" FROM "ReconciliationException" WHERE "entityId" = $1', String(mirror.id)
+            'SELECT "reason", "reference", "details" FROM "ReconciliationException" WHERE "entityId" = $1', String(mirror.id)
         );
-        expect(queue.map((e) => e.reason)).toContain('PARK_BOOKKEEPING_INCOMPLETE');
+        const booking = queue.find((e) => e.reason === 'PARK_BOOKKEEPING_INCOMPLETE');
+        expect(booking).toBeTruthy();
+        // §1 identity: it names THIS payout's canonical reference.
+        expect(booking.reference).toBe(String(reference));
+        expect(booking.details.phase).toBe('POST_DISPATCH_BOOKKEEPING');
+        expect(booking.details.failedSteps).toEqual(['PARK_METADATA']);
+        expect(booking.details.recordedSteps).toEqual(['PROVIDER_EVENT', 'OWNERSHIP', 'IN_TRANSIT']);
+        expect(['PARKED', 'UNRESOLVED']).toContain(booking.details.decision);
     }, 60000);
 
     test('§4 the repair is evidence-gated: wrong amount, wrong identity, conflicting provider and replay all fail closed', async () => {
@@ -578,18 +585,18 @@ if (hasDb) {
         expect(Number((await liquidity()).paidOutGhs)).toBe(0);
     }, 60000);
     // ── §7: the provider's DOCUMENTED transfer-code vocabulary ──────────────
-    // One payout per code, through the REAL adapter at 66a81b0. Each case pins
+    // One payout per code, through the REAL adapter at the pinned #391 head. Each case pins
     // what the money does, what the provider was asked, and whether a reversal
     // was authorised. The only code that proves no payout can exist may refund.
     const adapterWithTransfer = (onTransfer) => {
         const calls = [];
         const transport = {
-            post: async (url) => {
+            post: async (url, body) => {
                 calls.push(url);
                 if (url.endsWith('/validate')) {
                     return { status: 200, data: { status: 1, code: 'AVD01', data: ACCOUNT_NAME } };
                 }
-                return onTransfer(calls);
+                return onTransfer(calls, body);
             },
             get: async (url) => { calls.push(url); throw new Error(`unexpected GET ${url}`); },
         };
@@ -623,7 +630,10 @@ if (hasDb) {
             amountGhs: AMOUNT, destination: bank.accountNumberMasked, reference,
             destinationType: 'BANK', beneficiaryId: bank.id, destinationSnapshot: snapshot,
         }, { commitOperationClaimInTransaction: async () => {} });
-        const adapter = adapterWithTransfer(onTransfer);
+        // the answer factory also receives this payout's reference, so a test can
+        // echo it exactly as Moolre does (the adapter's own body key is not the
+        // contract under test here)
+        const adapter = adapterWithTransfer((calls, body) => onTransfer(calls, body, reference));
         const out = await svc.dispatchNaturalGhsBankWithdrawal(client, {
             reference, amountGhsExact: facts.recipientGhsExact, bank, port: adapter,
         });
@@ -721,7 +731,11 @@ if (hasDb) {
     // (everything else is UNRESOLVED), so an initiation POST can never answer
     // PENDING here. The reachable post-POST path is the terminal-at-initiation
     // park, which writes the SAME dispatch event and the SAME ownership record.
-    const PENDING_ENVELOPE = () => PAYLOAD({ status: 1, data: { txstatus: '1', externalref: 'echo', amount: AMOUNT } });
+    const PENDING_ENVELOPE = (_body, ref) => PAYLOAD({
+        status: 1,
+        // echo this payout's reference, so the answer is judged on its merits
+        data: { txstatus: '1', externalref: ref, amount: AMOUNT },
+    });
 
     const failing = (intercept) => new Proxy(prisma, {
         get(target, key) {
@@ -786,6 +800,27 @@ if (hasDb) {
         expect(events[0].relatedReference).toBe(String(reference));
         expect(String(events[0].amountGhs)).toBe('80');
 
+        // §2 the metadata separates "the provider reported a terminal outcome"
+        // from "the application has authorised settlement".
+        const metadata = await prisma.$queryRawUnsafe(
+            'SELECT COALESCE("metadata", \'{}\'::jsonb)->\'dispatchException\' AS park FROM "TransactionHistory" WHERE "txHash" = $1',
+            String(reference)
+        );
+        const park = metadata[0].park;
+        console.log('[§2] park metadata for', reference, ':', JSON.stringify(park));
+        expect(park.providerDispatchAttempted).toBe(true);
+        expect(park.providerResponseReceived).toBe(true);
+        // The flag mirrors the PROVIDER's reported status; it is never a local
+        // settlement decision. A provider-reported SUCCESSFUL is terminal AND
+        // unsettled, which is exactly what these two fields keep apart.
+        expect(park.providerOutcomeTerminalReported).toBe(
+            ['SUCCESSFUL', 'FAILED'].includes(String(park.observedStatus || '').toUpperCase())
+        );
+        expect(park.settlementAuthorized).toBe(false);
+        expect(park.providerReportedStatus).toBe(park.observedStatus);
+        expect(park).not.toHaveProperty('providerAcceptanceConfirmed');
+        expect(park.providerDispatched).toBe(true);
+
         const { canonical, mirror, load } = await loadMirror(reference);
         // Both rail facts must be present BEFORE the worker runs.
         expect(String(canonical.metadata?.rail).toUpperCase()).toBe('BANK');
@@ -810,6 +845,18 @@ if (hasDb) {
         const state = await liquidity();
         expect(Number(state.paidOutGhs)).toBe(80);
         expect(adapter.__calls.filter((u) => u.endsWith('/transfer'))).toHaveLength(1);
+
+        // §1 the durable operator evidence names this payout and its real steps.
+        const rows = await prisma.$queryRawUnsafe(
+            'SELECT "reason", "reference", "details" FROM "ReconciliationException" WHERE "entityId" = $1',
+            String(mirror.id)
+        );
+        const booking = rows.find((e) => e.reason === 'PARK_BOOKKEEPING_INCOMPLETE');
+        expect(booking).toBeTruthy();
+        expect(booking.reference).toBe(String(reference));
+        expect(booking.details.phase).toBe('POST_DISPATCH_BOOKKEEPING');
+        expect(booking.details.failedSteps).toEqual(['OWNERSHIP']);
+        expect(booking.details.recordedSteps).toEqual(['PARK_METADATA', 'PROVIDER_EVENT', 'IN_TRANSIT']);
     }, 60000);
 
     test('§1 provider-event write fails while ownership succeeds: no dispatch evidence is claimed, the persisted owner is used', async () => {
@@ -835,6 +882,20 @@ if (hasDb) {
         expect(canonical.metadata?.payoutProviderName).toBe('MOOLRE_DISBURSEMENT');
         const { resolvePayoutOwner } = require('../services/payoutProviderOwnership');
         expect((await resolvePayoutOwner(prisma, canonical)).status).toBe('OWNED');
+
+        // Drive the ACTUAL worker: the persisted owner must produce exactly one
+        // BANK status poll, no MoMo poll, and a single settlement.
+        const { load } = await loadMirror(reference);
+        const bankCalls = [];
+        const momoCalls = [];
+        const worker = new WithdrawalReconciliationWorker(prisma, null, momoPort(momoCalls), null, null, bankPort(bankCalls));
+        await worker._reconcileOne(await load());
+        console.log('[§5] event-lost worker — BANK:', bankCalls.length, 'MoMo:', momoCalls.length);
+        expect(bankCalls).toEqual([reference]);
+        expect(momoCalls).toHaveLength(0);
+        const state = await liquidity();
+        expect(Number(state.paidOutGhs)).toBe(80);
+        expect(Number(state.inTransitGhs)).toBe(0);
     }, 60000);
 
     test('§1 both writes fail: nothing is invented, no refund, and the payout is never polled on the MoMo rail', async () => {
@@ -866,10 +927,17 @@ if (hasDb) {
         const worker = new WithdrawalReconciliationWorker(prisma, null, momoPort(momoCalls), null, null, bankPort(bankCalls));
         await worker._reconcileOne(await load());
         // The rail is known from the canonical/mirror records, so the BANK port
-        // answers; MoMo is never asked and no money moves on a guess.
+        // answers with the provider's own success; MoMo is never asked.
+        expect(bankCalls).toEqual([reference]);
         expect(momoCalls).toHaveLength(0);
         expect(await balance()).toBe(420);
         const state = await liquidity();
+        // The provider's answer is sufficient evidence to settle, even with no
+        // local ownership record: it settles ONCE, nothing stays in flight, and
+        // nothing is quarantined on a guess.
+        expect(Number(state.paidOutGhs)).toBe(80);
+        expect(Number(state.inTransitGhs)).toBe(0);
+        expect(Number(state.reservedGhs)).toBe(0);
         expect(Number(state.reconciliationHeldGhs)).toBe(0);
     }, 60000);
 
@@ -908,4 +976,138 @@ if (hasDb) {
         // reference; the replay moved no money (asserted above).
         expect(bankCalls).toEqual([reference, reference]);
     }, 60000);
+    test('§2 an UNRESOLVED provider answer is neither terminal nor settled, and says so', async () => {
+        const { reference } = await payoutWith(() => PAYLOAD({
+            status: 0, code: 'APY18', message: 'External reference is required and must be unique',
+        }));
+        const rows = await prisma.$queryRawUnsafe(
+            'SELECT COALESCE("metadata", \'{}\'::jsonb)->\'dispatchException\' AS park FROM "TransactionHistory" WHERE "txHash" = $1',
+            String(reference)
+        );
+        const park = rows[0].park;
+        console.log('[§2] unresolved park:', JSON.stringify(park));
+        expect(park.providerDispatchAttempted).toBe(true);
+        expect(park.providerResponseReceived).toBe(true);
+        expect(park.providerOutcomeTerminalReported).toBe(false);
+        expect(park.settlementAuthorized).toBe(false);
+        expect(park.providerReportedStatus).toBe('UNRESOLVED');
+        expect(park.providerDispatched).toBe(true);
+    }, 60000);
+
+    test('§3 a MOMO provider claiming a BANK rail with a copied BANK source is refused by the repair', async () => {
+        const fiatLiquidity = require('../src/services/fiatLiquidityService');
+        const { reference } = await payoutWith(PENDING_ENVELOPE);
+        // Manufacture the exact impostor: right reference, right amount, right
+        // dedup shape and source, but the WRONG provider identity for the rail.
+        await prisma.fiatLiquidityReservation.updateMany({ where: { reference }, data: { status: 'RESERVED' } });
+        await prisma.$executeRawUnsafe(
+            'UPDATE "FiatLiquidityState" SET "reservedGhs" = "reservedGhs" + 80, "inTransitGhs" = "inTransitGhs" - 80 WHERE "id" = 1'
+        );
+        await prisma.fiatProviderEvent.deleteMany({ where: { relatedReference: String(reference) } });
+        await prisma.fiatProviderEvent.create({
+            data: {
+                provider: 'MTN_MOMO_DISBURSEMENT', rail: 'BANK', direction: 'OUTBOUND', status: 'PENDING',
+                amountGhs: '80.00',
+                dedupKey: `event:payout-dispatch:MTN_MOMO_DISBURSEMENT:${reference}`,
+                relatedReference: String(reference),
+                raw: { source: 'bank_dispatch_parked' },
+            },
+        });
+        const result = await prisma.$transaction((tx) => fiatLiquidity.repairInTransitFromDispatchEvidence(tx, { reference }));
+        console.log('[§3] impostor repair result:', JSON.stringify(result));
+        expect(result.repaired).toBe(false);
+        expect(result.reason).toBe('NO_DISPATCH_EVIDENCE');
+        const state = await liquidity();
+        expect(Number(state.reservedGhs)).toBe(80);
+        expect(Number(state.inTransitGhs)).toBe(0);
+        const reservation = await prisma.fiatLiquidityReservation.findUnique({ where: { reference } });
+        expect(reservation.status).toBe('RESERVED');
+    }, 60000);
+    test('§4 the full refusal matrix: canonical, rail, source, status and concurrency', async () => {
+        const fiatLiquidity = require('../src/services/fiatLiquidityService');
+        const { reference } = await payoutWith(PENDING_ENVELOPE);
+        const repair = () => prisma.$transaction((tx) => fiatLiquidity.repairInTransitFromDispatchEvidence(tx, { reference }));
+        const resetToReserved = async () => {
+            await prisma.fiatLiquidityReservation.updateMany({ where: { reference }, data: { status: 'RESERVED' } });
+            await prisma.$executeRawUnsafe(
+                'UPDATE "FiatLiquidityState" SET "reservedGhs" = "reservedGhs" + 80, "inTransitGhs" = "inTransitGhs" - 80 WHERE "id" = 1'
+            );
+        };
+        const eventKey = `event:payout-dispatch:MOOLRE_DISBURSEMENT:${reference}`;
+        // update by ID: one of the cases below deliberately rewrites the related
+        // reference, which would make a reference-filtered restore a silent no-op
+        const dispatchEvent = await prisma.fiatProviderEvent.findFirst({ where: { dedupKey: eventKey }, select: { id: true } });
+        const setEvent = (data) => prisma.fiatProviderEvent.update({ where: { id: dispatchEvent.id }, data });
+
+        await resetToReserved();
+
+        // missing reference
+        expect((await prisma.$transaction((tx) => fiatLiquidity.repairInTransitFromDispatchEvidence(tx, {}))).reason).toBe('NO_REFERENCE');
+
+        // missing reservation
+        expect((await prisma.$transaction((tx) => fiatLiquidity.repairInTransitFromDispatchEvidence(tx, { reference: 'no-such-payout' }))).reason).toBe('NO_RESERVATION');
+
+        // missing canonical transaction
+        await prisma.$executeRawUnsafe('UPDATE "TransactionHistory" SET "txHash" = $1 WHERE "txHash" = $2', `${reference}-moved`, String(reference));
+        expect((await repair()).reason).toBe('NO_CANONICAL_ROW');
+        await prisma.$executeRawUnsafe('UPDATE "TransactionHistory" SET "txHash" = $1 WHERE "txHash" = $2', String(reference), `${reference}-moved`);
+
+        // unknown rail context
+        await prisma.$executeRawUnsafe(
+            'UPDATE "TransactionHistory" SET "metadata" = COALESCE("metadata", \'{}\'::jsonb) || jsonb_build_object(\'rail\', \'CARD\') WHERE "txHash" = $1',
+            String(reference)
+        );
+        await prisma.withdrawal.updateMany({ where: { transactionHistoryId: (await canonicalOf(reference)).id }, data: { payoutMethod: 'CARD' } });
+        expect((await repair()).reason).toBe('RAIL_CONTEXT_UNKNOWN');
+        await prisma.$executeRawUnsafe(
+            'UPDATE "TransactionHistory" SET "metadata" = COALESCE("metadata", \'{}\'::jsonb) || jsonb_build_object(\'rail\', \'BANK\') WHERE "txHash" = $1',
+            String(reference)
+        );
+        await prisma.withdrawal.updateMany({ where: { transactionHistoryId: (await canonicalOf(reference)).id }, data: { payoutMethod: 'BANK' } });
+
+        // wrong event rail
+        await setEvent({ rail: 'MOMO' });
+        expect((await repair()).reason).toBe('NO_DISPATCH_EVIDENCE');
+        await setEvent({ rail: 'BANK' });
+
+        // wrong dispatch source
+        await setEvent({ raw: { source: 'momo_status_poll' } });
+        expect((await repair()).reason).toBe('NO_DISPATCH_EVIDENCE');
+        await setEvent({ raw: { source: 'bank_dispatch_parked' } });
+
+        // terminal event status
+        await setEvent({ status: 'SUCCESSFUL' });
+        expect((await repair()).reason).toBe('NO_DISPATCH_EVIDENCE');
+        await setEvent({ status: 'PENDING' });
+
+        // wrong reference on the event
+        await setEvent({ relatedReference: 'someone-elses-reference' });
+        expect((await repair()).reason).toBe('NO_DISPATCH_EVIDENCE');
+        await setEvent({ relatedReference: String(reference), dedupKey: eventKey });
+
+        // terminal reservation
+        await prisma.fiatLiquidityReservation.updateMany({ where: { reference }, data: { status: 'PAID_OUT' } });
+        expect((await repair()).reason).toBe('NOT_RESERVED');
+        await prisma.fiatLiquidityReservation.updateMany({ where: { reference }, data: { status: 'RESERVED' } });
+
+        // one pesewa out
+        await setEvent({ amountGhs: '80.01' });
+        expect((await repair()).reason).toBe('AMOUNT_MISMATCH');
+        await setEvent({ amountGhs: '80.00' });
+
+        // concurrent repair: exactly one winner, aggregates move once
+        const before = await liquidity();
+        const results = await Promise.all([repair(), repair(), repair()]);
+        const repaired = results.filter((r) => r.repaired === true).length;
+        const losers = results.filter((r) => r.repaired === false);
+        console.log('[§4] concurrent repairs:', JSON.stringify(results));
+        expect(repaired).toBe(1);
+        expect(losers.every((r) => ['NOT_RESERVED', 'REPAIR_CLAIM_LOST'].includes(r.reason))).toBe(true);
+        const after = await liquidity();
+        expect(Number(after.inTransitGhs)).toBe(Number(before.inTransitGhs) + 80);
+        expect(Number(after.reservedGhs)).toBe(Number(before.reservedGhs) - 80);
+        // customer money untouched throughout
+        expect(Number(after.paidOutGhs)).toBe(0);
+        expect(Number(after.availableGhs)).toBe(Number(before.availableGhs));
+    }, 90000);
 });

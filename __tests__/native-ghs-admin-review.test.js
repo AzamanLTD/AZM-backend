@@ -221,6 +221,63 @@ maybe('native-GHS payout in the operator review queue (real PostgreSQL)', () => 
         }
     });
 
+    test('§1 bookkeeping failure is visible to operators, allowlisted, and never leaks or attaches elsewhere', async () => {
+        await setFlags();
+        const { mirror, reference } = await seedParkedPayout();
+        const other = await seedParkedPayout();
+        // The row shape is produced by the real dispatch path (proven in the
+        // initiation suite); this inserts the SAME shape with hostile extras so
+        // the read projection's allowlist is what is under test.
+        await prisma.$executeRawUnsafe(
+            'INSERT INTO "ReconciliationException" ("id","entityType","entityId","reference","reason","details","status","firstSeenAt","lastSeenAt") '
+            + "VALUES (gen_random_uuid(),'WITHDRAWAL',$1,$2,'PARK_BOOKKEEPING_INCOMPLETE',$3::jsonb,'OPEN',now(),now())",
+            String(mirror.id), String(reference), JSON.stringify({
+                phase: 'POST_DISPATCH_BOOKKEEPING',
+                decision: 'UNRESOLVED',
+                failedSteps: ['OWNERSHIP', 'RAW_SQL_UPDATE', 42],
+                recordedSteps: ['PARK_METADATA', 'PROVIDER_EVENT', 'IN_TRANSIT'],
+                error: 'connect ECONNREFUSED 10.0.0.1:5432',
+                sql: 'UPDATE "TransactionHistory" SET "metadata" = $1',
+                providerRaw: { authorization: 'Bearer sk_live_deadbeef' },
+                accountNumber: '1234567890123',
+            })
+        );
+
+        const admin = await seedUser(prisma, { role: 'ADMIN' });
+        const app = buildApp({ capabilities: () => ({ canInitiateBankPayout: true, canValidateBankAccount: true, mode: 'sandbox' }), initiateBankTransfer: jest.fn() });
+        const list = await request(app)
+            .get('/api/admin/payouts/needs-review')
+            .set('Authorization', `Bearer ${tokenFor(admin)}`);
+        expect([200, 403]).toContain(list.status);
+        if (list.status !== 200) return;
+
+        const row = (list.body.withdrawals || []).find((w) => w.id === mirror.id);
+        expect(row).toBeTruthy();
+        const evidence = (row.manualReview.reasons || []).find((r) => r.reason === 'PARK_BOOKKEEPING_INCOMPLETE');
+        expect(evidence).toBeTruthy();
+        // identity: this payout's own canonical reference
+        expect(evidence.reference).toBe(String(reference));
+        expect(evidence.phase).toBe('POST_DISPATCH_BOOKKEEPING');
+        expect(evidence.decision).toBe('UNRESOLVED');
+        // allowlist: unknown step names and non-strings are dropped, not echoed
+        expect(evidence.failedSteps).toEqual(['OWNERSHIP']);
+        expect(evidence.recordedSteps).toEqual(['PARK_METADATA', 'PROVIDER_EVENT', 'IN_TRANSIT']);
+
+        // no leakage of errors, SQL, credentials or customer bank data in THIS
+        // payout's evidence (other queued rows are not what this test creates)
+        const blob = JSON.stringify(evidence);
+        expect(blob).not.toContain('ECONNREFUSED');
+        expect(blob).not.toContain('sk_live_deadbeef');
+        expect(blob).not.toContain('1234567890123');
+        expect(blob).not.toContain('RAW_SQL_UPDATE');
+
+        // an unrelated payout never receives another payout's bookkeeping failure
+        const otherRow = (list.body.withdrawals || []).find((w) => w.id === other.mirror.id);
+        if (otherRow) {
+            expect((otherRow.manualReview.reasons || []).map((r) => r.reason)).not.toContain('PARK_BOOKKEEPING_INCOMPLETE');
+        }
+    });
+
     test('§4.4 operator REJECT refunds the real GHS exactly once and touches no USDC', async () => {
         await setFlags();
         const { user, reference, mirror } = await seedParkedPayout();

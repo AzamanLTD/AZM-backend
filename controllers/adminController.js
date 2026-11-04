@@ -2564,6 +2564,20 @@ const REVIEW_SAFE_PHASES = new Set(['PRE_DISPATCH', 'DISPATCH_FAILED_PROVEN']);
  * bucketed for the review listing. Raw SQL — the exception queue is a
  * migration-backed table without a Prisma model.
  */
+/**
+ * Allowlist for the post-dispatch bookkeeping steps an operator may see. Any
+ * value that is not a known step name is dropped rather than echoed: the
+ * projection must never become a channel for raw error text.
+ */
+const BOOKKEEPING_STEPS = new Set(['PARK_METADATA', 'PROVIDER_EVENT', 'OWNERSHIP', 'IN_TRANSIT']);
+
+function _allowlistedBookkeepingSteps(value) {
+    if (!Array.isArray(value)) return [];
+    return value
+        .map((step) => String(step))
+        .filter((step) => BOOKKEEPING_STEPS.has(step));
+}
+
 async function _manualReviewParkingEvidence(prisma, withdrawals) {
     const evidence = new Map();
     const rows = Array.isArray(withdrawals) ? withdrawals : [];
@@ -2610,13 +2624,25 @@ async function _manualReviewParkingEvidence(prisma, withdrawals) {
             continue;
         }
         const entry = evidence.get(id) || { reasons: [], resolutionOptions: ['ESCALATE'] };
-        entry.reasons.push({
+        const projected = {
             reason: String(row.reason),
             phase: row.details?.phase || null,
             reference: rowReference,
             firstSeenAt: row.firstSeenAt,
             lastSeenAt: row.lastSeenAt
-        });
+        };
+        // §1 OPERATOR VISIBILITY. A bookkeeping failure after a transfer POST is
+        // only useful to an operator if they can see WHICH steps landed. Read-only
+        // projection: allowlisted step names and a decision only. Raw database
+        // errors, SQL, payloads, account numbers and beneficiary data stay in the
+        // durable row and are never sent to the review client.
+        if (String(row.reason) === 'PARK_BOOKKEEPING_INCOMPLETE') {
+            const detail = row.details || {};
+            projected.failedSteps = _allowlistedBookkeepingSteps(detail.failedSteps);
+            projected.recordedSteps = _allowlistedBookkeepingSteps(detail.recordedSteps);
+            projected.decision = typeof detail.decision === 'string' ? detail.decision.slice(0, 40) : null;
+        }
+        entry.reasons.push(projected);
         evidence.set(id, entry);
     }
     return evidence;
