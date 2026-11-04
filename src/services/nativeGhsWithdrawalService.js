@@ -44,6 +44,10 @@ const LEDGER_KEY_PREFIX = 'ledger:wallet:withdrawal-ghs:';
 const FUNDING_LEDGER_KEY_PREFIX = 'ledger:wallet:withdrawal-ghs-funding:';
 const REVERSAL_KEY_PREFIX = 'ledger:reversal:withdrawal-ghs:';
 const FUNDING_REVERSAL_KEY_PREFIX = 'ledger:reversal:withdrawal-ghs-funding:';
+// The reversal is its OWN exchange, not a replay of the funding: the ledger
+// enforces uniqueness of conversionIdentity, so reusing the funding identity
+// would make every mixed-funded reversal fail (and the refund roll back).
+const FUNDING_REVERSAL_CONVERSION_PREFIX = 'withdrawal-ghs-funding-reversal:';
 const REVERSAL_MARKER = 'nativeGhsWithdrawalReversal';
 
 // v1 fee policy (issue #389 / #382 open question 4): the Moolre MoMo payout
@@ -55,6 +59,15 @@ const REVERSAL_MARKER = 'nativeGhsWithdrawalReversal';
 // assumption baked into the module. Unset => the BANK leg refuses (see the
 // guard in processNativeGhsWithdrawal) instead of inheriting the MoMo
 // zero-fee contract, which is a different provider leg entirely.
+/**
+ * The MoMo payout fee policy — the OTHER rail's contract. The MoMo shortfall
+ * plan and the MoMo payout must both read this, so a bank fee setting (or its
+ * absence) can never move a MoMo quote.
+ */
+function momoPayoutFeePolicy() {
+  return GHS_NATIVE_FEE_POLICY;
+}
+
 function bankPayoutFeePolicy() {
   const raw = process.env.BANK_PAYOUT_FEE_GHS;
   if (raw === undefined || raw === null || String(raw).trim() === '') return null;
@@ -307,8 +320,24 @@ async function processNativeGhsWithdrawal(prisma, userId, args, opts = {}) {
       if (!shortfallGhs.equals(shortfallGhs.toDecimalPlaces(2)) || shortfallGhs.lessThanOrEqualTo(0)) {
         throw new NativeGhsWithdrawalError('quote shortfall is not exact pesewas', 'NATIVE_GHS_QUOTE_INVALID');
       }
-      if (usdcDebit.lessThan(0)) {
+      // §5 A POSITIVE QUOTIENT CAN ROUND TO ZERO at 8dp. A zero (or negative)
+      // debit must never fund a positive GHS shortfall: the customer would
+      // receive GHS for no USDC. Refuse BEFORE any mutation or ledger post —
+      // this is a typed refusal, not a floor invented out of thin air.
+      if (!usdcDebit.isFinite() || usdcDebit.isNegative()) {
         throw new NativeGhsWithdrawalError('quote USDC amount is invalid', 'NATIVE_GHS_QUOTE_INVALID');
+      }
+      if (usdcDebit.isZero()) {
+        throw new NativeGhsWithdrawalError(
+          'This funding amount is too small to express in USDC at the quoted rate, so nothing was converted.',
+          'NATIVE_GHS_USDC_DEBIT_ROUNDED_TO_ZERO',
+          {
+            quotedUsdcAmount: String(consumed.usdcAmount),
+            roundedUsdcAmount: usdcDebit.toFixed(8),
+            shortfallGhs: shortfallGhs.toFixed(2),
+            rateGhsPerUsdcExact: new Prisma.Decimal(consumed.rateGhsPerUsdc).toFixed(8),
+          }
+        );
       }
       // USDC CAS debit — one atomic claim, no negative balance.
       const debited = await tx.user.updateMany({
@@ -662,6 +691,21 @@ const BANK_RAIL = 'BANK';
 const BANK_OBSERVATION_STATUSES = new Set(['PENDING', 'SUCCESSFUL', 'FAILED', 'UNRESOLVED']);
 const BANK_TERMINAL_OBSERVATIONS = new Set(['SUCCESSFUL', 'FAILED']);
 
+/**
+ * The individual provider fee fields, exactly as reported. Never summed, never
+ * re-labelled as a customer fee, never substituted for a missing one: summing
+ * them would invent a fee-payer, which is a policy decision nobody has made.
+ */
+function _providerFeeFacts(observation) {
+  if (!observation || typeof observation !== 'object') return null;
+  const facts = {};
+  for (const [key, value] of Object.entries(observation)) {
+    if (!/fee/i.test(key) || value === undefined) continue;
+    facts[key] = value;
+  }
+  return Object.keys(facts).length ? facts : null;
+}
+
 function _sameExactGhs(a, b) {
   if (a == null || b == null) return false;
   try {
@@ -726,7 +770,9 @@ function evaluateBankDispatchObservation(outbound, { reference, amountGhsExact }
     };
   }
 
-  // Echoed business reference. Never adopt a different reference silently.
+  // `referenceId` is the adapter's LOCAL copy of what we asked for — it is not
+  // provider evidence and can never establish acceptance on its own. A local
+  // copy that contradicts us is still a contradiction, so it parks.
   if (outbound.referenceId != null && String(outbound.referenceId) !== String(reference)) {
     return {
       decision: 'PARKED',
@@ -744,6 +790,32 @@ function evaluateBankDispatchObservation(outbound, { reference, amountGhsExact }
       observation: outbound,
       observedStatus: status,
       providerCode: outbound.providerCode ?? null,
+    };
+  }
+
+  // The provider's OWN echo (Moolre's `externalref`) must be present and equal
+  // to our Azaman reference before any non-UNRESOLVED observation can be
+  // treated as evidence of acceptance. A locally copied referenceId is not an
+  // echo: without the echoed externalref we cannot tell "the provider accepted
+  // our payout" from "our adapter echoed our own request back".
+  const providerEcho = outbound.externalId == null ? null : String(outbound.externalId).trim();
+  if (!providerEcho) {
+    return {
+      decision: 'PARKED',
+      reason: 'PROVIDER_ECHO_MISSING',
+      observation: outbound,
+      observedStatus: status,
+      providerFeeFacts: _providerFeeFacts(outbound),
+    };
+  }
+  if (providerEcho !== String(reference)) {
+    return {
+      decision: 'PARKED',
+      reason: 'PROVIDER_ECHO_MISMATCH',
+      observation: outbound,
+      observedStatus: status,
+      observedExternalId: providerEcho,
+      providerFeeFacts: _providerFeeFacts(outbound),
     };
   }
 
@@ -783,8 +855,11 @@ function evaluateBankDispatchObservation(outbound, { reference, amountGhsExact }
     observation: outbound,
     observedStatus: status,
     providerRef: outbound.providerRef ?? null,
-    externalId: outbound.externalId ?? null,
+    externalId: providerEcho,
+    providerEchoAtInitiation: providerEcho,
     amountGhsExact: outbound.amountGhsExact,
+    providerStatusRaw: outbound.providerStatusRaw ?? null,
+    providerFeeFacts: _providerFeeFacts(outbound),
   };
 }
 
@@ -812,6 +887,9 @@ async function recordBankDispatchPark(prisma, {
       externalId: observation?.externalId ?? null,
       observedAmountGhsExact: observation?.amountGhsExact ?? null,
       requestedAmountGhsExact: amountGhsExact,
+      providerStatusRaw: observation?.providerStatusRaw ?? null,
+      // individual fee fields, exactly as reported: never summed into a fee
+      providerFeeFacts: _providerFeeFacts(observation),
       bankCode: bank?.bankCode ?? null,
       at: new Date().toISOString(),
       resolution: 'RECONCILE_ORIGINAL_REFERENCE',
@@ -853,6 +931,137 @@ async function recordBankDispatchPark(prisma, {
  * adapter; this module owns the state machine). Same single-winner claim,
  * same reversal authority, same evidence — only the provider call differs.
  */
+
+/**
+ * §ADDENDUM: THE DESTINATION MUST BE PROVIDER-VALIDATED IMMEDIATELY BEFORE THE
+ * TRANSFER POST.
+ *
+ * The route validates the payee at quote time and again at acceptance, and the
+ * pre-dispatch block re-reads the STORED beneficiary and compares its
+ * fingerprint. That comparison is a local integrity check on our own row — it
+ * proves the account we are about to pay is the account we recorded, NOT that
+ * the bank currently holds it. There is no owner-approved validation TTL, so
+ * no freshness window is invented here: the only safe rule is a fresh enquiry
+ * against the provider for the exact stored number and bank code.
+ *
+ * If the adapter cannot perform that enquiry (no capability, no method, a
+ * throwing capability or a malformed answer) the BANK rail stays UNAVAILABLE:
+ * we refuse rather than dispatch on the strength of the earlier timestamp.
+ */
+function bankRevalidationCapability(port) {
+  if (!port || typeof port.capabilities !== 'function' || typeof port.validateAccount !== 'function') {
+    return false;
+  }
+  try {
+    return port.capabilities()?.canValidateAccount === true;
+  } catch (_) {
+    return false;
+  }
+}
+
+/**
+ * One provider enquiry, bound to the STORED destination. Nothing here is taken
+ * from the client and no requested amount is substituted for provider evidence.
+ *
+ * Returns { decision, accountName, providerValidatedAt, error }:
+ *   CONFIRMED   — provider returned the SAME account number and bank code.
+ *   NEGATIVE    — provider proves the account does not exist / does not match.
+ *   NAME_MISMATCH — same number, DIFFERENT account name than the accepted
+ *                 evidence: never dispatched, a human decides.
+ *   INCONCLUSIVE — unavailable, malformed or unreadable answer.
+ */
+async function enquiryBankDestination(port, { accountNumber, bankCode, expectedAccountName }) {
+  let raw;
+  try {
+    raw = await port.validateAccount({ accountNumber, bankCode });
+  } catch (err) {
+    return {
+      decision: 'INCONCLUSIVE',
+      error: { code: err?.code || err?.name || 'VALIDATION_FAILED', message: String(err?.message || '').slice(0, 200) },
+    };
+  }
+  if (!raw || typeof raw !== 'object') {
+    return { decision: 'INCONCLUSIVE', error: { code: 'VALIDATION_RESPONSE_MALFORMED' } };
+  }
+  const status = typeof raw.status === 'string' ? raw.status.toUpperCase() : null;
+  if (status === 'NOT_FOUND' || status === 'ACCOUNT_NOT_FOUND') {
+    return { decision: 'NEGATIVE', error: { code: 'PROVIDER_ACCOUNT_NOT_FOUND' }, providerStatusRaw: status };
+  }
+  if (status === 'ACCOUNT_MISMATCH' || status === 'MISMATCH') {
+    return { decision: 'NEGATIVE', error: { code: 'PROVIDER_ACCOUNT_MISMATCH' }, providerStatusRaw: status };
+  }
+  const echoedNumber = raw.accountNumber == null ? null : String(raw.accountNumber).replace(/\D/g, '');
+  const echoedBank = raw.bankCode == null ? null : String(raw.bankCode).trim();
+  // A response for a DIFFERENT account or bank is not evidence about this one.
+  if (!echoedNumber || echoedNumber !== String(accountNumber).replace(/\D/g, '')) {
+    return {
+      decision: 'INCONCLUSIVE',
+      error: { code: 'VALIDATION_ACCOUNT_ECHO_MISSING_OR_DIFFERENT' },
+      echoedAccountNumber: echoedNumber,
+      providerStatusRaw: status,
+    };
+  }
+  if (!echoedBank || echoedBank !== String(bankCode).trim()) {
+    return {
+      decision: 'NEGATIVE',
+      error: { code: 'PROVIDER_BANK_CODE_MISMATCH' },
+      echoedBankCode: echoedBank,
+      providerStatusRaw: status,
+    };
+  }
+  const accountName = raw.accountName == null ? null : String(raw.accountName).trim();
+  if (!accountName) {
+    return { decision: 'INCONCLUSIVE', error: { code: 'VALIDATION_ACCOUNT_NAME_MISSING' }, providerStatusRaw: status };
+  }
+  if (expectedAccountName && accountName.toUpperCase() !== String(expectedAccountName).trim().toUpperCase()) {
+    return {
+      decision: 'NAME_MISMATCH',
+      accountName,
+      expectedAccountName,
+      providerStatusRaw: status,
+      providerValidatedAt: raw.validatedAt ? new Date(raw.validatedAt) : new Date(),
+    };
+  }
+  return {
+    decision: 'CONFIRMED',
+    accountName,
+    providerStatusRaw: status,
+    providerRef: raw.providerRef ?? null,
+    providerValidatedAt: raw.validatedAt ? new Date(raw.validatedAt) : new Date(),
+  };
+}
+
+
+/**
+ * Durable pre-dispatch refusal evidence: a park that names itself as
+ * PRE_DISPATCH so no operator is sent to poll a provider that was never called.
+ */
+async function recordPreDispatchRefusal(prisma, { reference, rowId, code, disposition, details }) {
+  try {
+    await prisma.$executeRawUnsafe(
+      'UPDATE "TransactionHistory" SET "metadata" = COALESCE("metadata", \'{}\'::jsonb) || jsonb_build_object($2::text, $3::jsonb) WHERE "id" = $1',
+      rowId,
+      'bankPreDispatchRefusal',
+      JSON.stringify({ code, disposition, at: new Date().toISOString(), ...details })
+    );
+    const mirror = await prisma.withdrawal.findFirst({
+      where: { transactionHistoryId: rowId },
+      select: { id: true },
+    });
+    if (mirror) {
+      await recordReconciliationException(prisma, {
+        entityType: 'WITHDRAWAL',
+        entityId: String(mirror.id),
+        reference,
+        reason: code,
+        details: { disposition, ...details },
+      });
+    }
+  } catch (err) {
+    logger.error({ reference, err: err?.message }, '[nativeGhsWithdrawal] could not record pre-dispatch refusal');
+  }
+}
+
 async function dispatchNaturalGhsBankWithdrawal(prisma, {
   reference,
   amountGhsExact,
@@ -877,6 +1086,104 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
   if (!row || row.type !== 'WITHDRAWAL_FIAT' || row.settlementCurrency !== SETTLEMENT_CURRENCY) {
     return { dispatched: false, reason: 'NOT_A_NATIVE_GHS_WITHDRAWAL' };
   }
+  // ── §ADDENDUM PRE-DISPATCH PROVIDER REVALIDATION ─────────────────────────
+  //
+  // Every check above is local: it proves the payee ROW still resolves to the
+  // accepted fingerprint. None of it proves the BANK still holds that account
+  // right now, and there is no approved validation TTL to lean on. So the
+  // exact stored account number and bank code are put to the provider one last
+  // time, immediately before the transfer post.
+  //
+  // A rail that cannot answer that question does not dispatch: "validated at
+  // quote time" is a timestamp, not evidence.
+  if (!bankRevalidationCapability(port)) {
+    await recordPreDispatchRefusal(prisma, {
+      reference,
+      rowId: row.id,
+      code: 'BANK_REVALIDATION_CAPABILITY_UNAVAILABLE',
+      disposition: 'HELD_FOR_REVIEW',
+      details: {
+        phase: 'PRE_DISPATCH',
+        reason: 'The bank rail cannot revalidate the stored account immediately before dispatch, so it is not available.',
+        providerDispatched: false,
+        refunded: false,
+        resolution: 'RAIL_UNAVAILABLE',
+      },
+    });
+    logger.warn(
+      { reference, rail: BANK_RAIL },
+      '[nativeGhsWithdrawal] BANK rail has no pre-dispatch account-enquiry capability — refusing to dispatch'
+    );
+    return {
+      dispatched: false,
+      reason: 'BANK_REVALIDATION_CAPABILITY_UNAVAILABLE',
+      disposition: 'HELD_FOR_REVIEW',
+      refunded: false,
+    };
+  }
+
+  const enquiry = await enquiryBankDestination(port, {
+    accountNumber: bank.accountNumber,
+    bankCode: bank.bankCode,
+    expectedAccountName: bank.accountName || bank.verifiedName || null,
+  });
+  const enquiryAt = enquiry.providerValidatedAt || new Date();
+  if (enquiry.decision !== 'CONFIRMED') {
+    // NOT a provider payout outcome: nothing was sent. A DEFINITIVE negative
+    // (no such account / different bank) is safe to refund through the same
+    // canonical reversal the MoMo leg uses, because no payout can exist. An
+    // INCONCLUSIVE or NAME_MISMATCH answer is HELD: we cannot prove the payee
+    // is wrong and we must never pay it, so a human reconciles.
+    const refundable = enquiry.decision === 'NEGATIVE';
+    const code = enquiry.decision === 'NEGATIVE'
+      ? (enquiry.error?.code || 'PROVIDER_ACCOUNT_NOT_FOUND')
+      : (enquiry.decision === 'NAME_MISMATCH'
+        ? 'BANK_PROVIDER_ACCOUNT_NAME_MISMATCH'
+        : 'BANK_PROVIDER_REVALIDATION_INCONCLUSIVE');
+    let reversal = null;
+    if (refundable) {
+      reversal = await reverseNativeGhsWithdrawal(prisma, {
+        reference,
+        reason: `pre_dispatch_validation_negative:${code}`,
+        allowedMirrorStatuses: ['PENDING'],
+      });
+    }
+    await recordPreDispatchRefusal(prisma, {
+      reference,
+      rowId: row.id,
+      code,
+      disposition: refundable && reversal?.reversed ? 'REFUNDED_PRE_DISPATCH' : 'HELD_FOR_REVIEW',
+      details: {
+        phase: 'PRE_DISPATCH',
+        decision: enquiry.decision,
+        errorCode: enquiry.error?.code ?? null,
+        echoedAccountNumber: enquiry.echoedAccountNumber ?? null,
+        echoedBankCode: enquiry.echoedBankCode ?? null,
+        providerStatusRaw: enquiry.providerStatusRaw ?? null,
+        providerValidatedAt: enquiryAt.toISOString(),
+        snapshotFingerprint: snapshot?.fingerprint ?? null,
+        refundable,
+        refunded: reversal?.reversed === true,
+        providerDispatched: false,
+        resolution: refundable && reversal?.reversed ? 'REFUNDED' : 'RECONCILE_MANUALLY',
+      },
+    });
+    logger.warn(
+      { reference, decision: enquiry.decision, code },
+      '[nativeGhsWithdrawal] pre-dispatch account revalidation refused the BANK payout — no transfer was posted'
+    );
+    return {
+      dispatched: false,
+      reason: code,
+      decision: enquiry.decision,
+      disposition: refundable && reversal?.reversed ? 'REFUNDED_PRE_DISPATCH' : 'HELD_FOR_REVIEW',
+      refunded: reversal?.reversed === true,
+      providerDispatched: false,
+    };
+  }
+  const providerValidatedAt = enquiryAt.toISOString();
+  const providerValidatedName = enquiry.accountName;
+
   // The canonical TransactionHistory status is the TransactionStatus ENUM
   // (PENDING until a terminal outcome). The DISPATCH CLAIM lives on the
   // Withdrawal mirror's String status — exactly like the fiat payout path:
@@ -1116,8 +1423,18 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
         provider: BANK_PROVIDER_CANONICAL,
         providerRef,
         externalId: verdict.externalId ?? null,
+        providerEchoAtInitiation: verdict.providerEchoAtInitiation ?? null,
         observedStatus: verdict.observedStatus,
+        providerStatusRaw: verdict.providerStatusRaw ?? null,
         amountGhsExact: verdict.amountGhsExact,
+        // §ADDENDUM: the provider's OWN validation moment, bound to the SAME
+        // immutable destination the payout is bound to. A later reader can tell
+        // which account+bank+name the provider confirmed for THIS dispatch.
+        providerValidatedAt,
+        providerValidatedAccountName: providerValidatedName,
+        providerValidatedAccountFingerprint: snapshot?.fingerprint ?? null,
+        providerValidatedBankCode: snapshot?.bankCode ?? bank.bankCode,
+        providerFeeFacts: verdict.providerFeeFacts ?? null,
         idempotency: 'canonical-reference',
       },
     })
@@ -1153,7 +1470,106 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
 const REVERSIBLE_MIRROR_STATES = Object.freeze(['PENDING', 'DISPATCHING']);
 const NON_REVERSIBLE_TERMINAL_STATES = Object.freeze(['COMPLETED', 'PAID_OUT', 'SUCCESS', 'SETTLED']);
 
-async function reverseNativeGhsWithdrawal(prisma, { reference, reason, allowedMirrorStatuses = [] }) {
+function _exactDecimalOrNull(value) {
+  if (value === undefined || value === null || value === '') return null;
+  try {
+    const d = new Prisma.Decimal(String(value));
+    return d.isFinite() ? d : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/**
+ * Read the recorded funding evidence BEFORE reversing a penny of it.
+ *
+ * The metadata is EVIDENCE, not a trusted instruction: a missing, malformed,
+ * non-positive or self-contradictory funding record must refuse the whole
+ * reversal (and leave durable reconciliation evidence behind) rather than
+ * inventing an amount. Every value used below is the recorded one — never a
+ * recomputation from today's rate configuration or market price.
+ */
+function readFundingReversalEvidence(funding, { refundGhs }) {
+  const fail = (why, details = {}) => {
+    throw new NativeGhsWithdrawalError(
+      `the recorded shortfall funding evidence cannot be reversed (${why})`,
+      'NATIVE_GHS_FUNDING_EVIDENCE_INVALID',
+      { reason: why, ...details }
+    );
+  };
+  if (!funding || typeof funding !== 'object') fail('FUNDING_EVIDENCE_MISSING');
+  if (funding.mode !== 'USDC_SHORTFALL_FUNDED') {
+    fail('FUNDING_MODE_UNRECOGNISED', { mode: funding.mode == null ? null : String(funding.mode) });
+  }
+  const shortfall = _exactDecimalOrNull(funding.shortfallGhs);
+  const usdc = _exactDecimalOrNull(funding.usdcDebitedExact);
+  const rate = _exactDecimalOrNull(funding.rateGhsPerUsdcExact);
+  if (!shortfall) fail('SHORTFALL_UNREADABLE', { recorded: funding.shortfallGhs == null ? null : String(funding.shortfallGhs) });
+  if (!shortfall.greaterThan(0)) fail('SHORTFALL_NOT_POSITIVE', { recorded: shortfall.toFixed(8) });
+  if (!shortfall.equals(shortfall.toDecimalPlaces(2))) fail('SHORTFALL_NOT_EXACT_PESEWAS', { recorded: shortfall.toFixed(8) });
+  if (!usdc) fail('USDC_DEBIT_UNREADABLE', { recorded: funding.usdcDebitedExact == null ? null : String(funding.usdcDebitedExact) });
+  if (!usdc.greaterThan(0)) fail('USDC_DEBIT_NOT_POSITIVE', { recorded: usdc.toFixed(8) });
+  if (!usdc.equals(usdc.toDecimalPlaces(8))) fail('USDC_DEBIT_NOT_LEDGER_PRECISION', { recorded: usdc.toFixed(8) });
+  if (!rate) fail('RATE_UNREADABLE', { recorded: funding.rateGhsPerUsdcExact == null ? null : String(funding.rateGhsPerUsdcExact) });
+  if (!rate.greaterThan(0)) fail('RATE_NOT_POSITIVE', { recorded: rate.toFixed(8) });
+  if (!rate.equals(rate.toDecimalPlaces(8))) fail('RATE_NOT_LEDGER_PRECISION', { recorded: rate.toFixed(8) });
+  const quoteId = funding.quoteId == null ? '' : String(funding.quoteId).trim();
+  if (!quoteId) fail('QUOTE_REFERENCE_MISSING');
+  // Self-consistency. The funded GHS cannot exceed the GHS the refund restores,
+  // and the two recorded amounts must describe the SAME conversion at the
+  // recorded rate (8dp USDC rounding puts them within a pesewa of each other).
+  const restoredGhs = refundGhs || null;
+  if (restoredGhs && shortfall.greaterThan(restoredGhs)) {
+    fail('SHORTFALL_EXCEEDS_REFUND', {
+      shortfallGhs: shortfall.toFixed(2),
+      refundGhs: restoredGhs.toFixed(2),
+    });
+  }
+  const impliedGhs = usdc.times(rate);
+  if (impliedGhs.minus(shortfall).abs().greaterThan(new Prisma.Decimal('0.01'))) {
+    fail('FUNDING_EVIDENCE_INCONSISTENT', {
+      shortfallGhs: shortfall.toFixed(2),
+      usdcDebitedExact: usdc.toFixed(8),
+      rateGhsPerUsdcExact: rate.toFixed(8),
+      impliedGhsFromDebit: impliedGhs.toFixed(4),
+    });
+  }
+  return { shortfall, usdc: usdc.toDecimalPlaces(8), rate, quoteId };
+}
+
+async function reverseNativeGhsWithdrawal(prisma, opts = {}) {
+  const { reference, reason } = opts;
+  try {
+    return await _reverseNativeGhsWithdrawalTx(prisma, opts);
+  } catch (err) {
+    // Funding evidence that cannot be reversed is a reconciliation matter: the
+    // transaction has already rolled back, so the evidence is written on its
+    // own connection and the row stays held for a human decision.
+    if (err && err.code === 'NATIVE_GHS_FUNDING_EVIDENCE_INVALID') {
+      try {
+        await recordReconciliationException(prisma, {
+          entityType: 'TRANSACTION',
+          entityId: String(reference),
+          reference: String(reference),
+          reason: 'NATIVE_GHS_FUNDING_EVIDENCE_INVALID',
+          details: {
+            stage: 'REVERSAL',
+            settlementCurrency: SETTLEMENT_CURRENCY,
+            ...(err.details && typeof err.details === 'object' ? err.details : {}),
+          },
+        });
+      } catch (evidenceError) {
+        logger.error(
+          { reference, err: evidenceError?.message },
+          '[nativeGhsWithdrawal] could not record invalid funding evidence'
+        );
+      }
+    }
+    throw err;
+  }
+}
+
+async function _reverseNativeGhsWithdrawalTx(prisma, { reference, reason, allowedMirrorStatuses = [] }) {
   return prisma.$transaction(async (tx) => {
     const row = await tx.transactionHistory.findUnique({
       where: { txHash: reference },
@@ -1235,13 +1651,47 @@ async function reverseNativeGhsWithdrawal(prisma, { reference, reason, allowedMi
       metadata: { settlementCurrency: SETTLEMENT_CURRENCY, reversalReason: String(reason ?? 'definitive_failure') },
     });
 
-    // Funded shortfall → the customer's USDC must come back exactly once.
-    const funding = row.metadata?.funding;
-    if (funding && funding.mode === 'USDC_SHORTFALL_FUNDED' && funding.usdcDebitedExact) {
-      const usdc = new Prisma.Decimal(funding.usdcDebitedExact);
-      const shortfall = new Prisma.Decimal(funding.shortfallGhs);
-      const rate = new Prisma.Decimal(funding.rateGhsPerUsdcExact ?? 0);
-      await tx.user.update({ where: { id: row.userId }, data: { availableBalance: { increment: usdc } } });
+    // ── Funded shortfall → the EXACT INVERSE of the original conversion ────
+    //
+    // Two defects lived here.
+    //   (1) The reversal reused the funding conversion identity, and the ledger
+    //       enforces uniqueness of conversionIdentity: every mixed-funded
+    //       reversal threw and the refund rolled back with it.
+    //   (2) The refund above credits the FULL debit to nativeGhsBalance, but
+    //       part of that debit was never the customer's GHS — it was converted
+    //       from USDC. Reversing the GHS ledger leg without decrementing the
+    //       spendable projection left the wallet saying 50 while the liability
+    //       account said 20.
+    //
+    // The refund is therefore split explicitly and in one atomic boundary:
+    //   full debit → nativeGhsBalance (the payout debit reversed), then
+    //   shortfall  → out of nativeGhsBalance and back into USDC.
+    // Each leg is exact, and the reversal is its own exchange with its own
+    // durable identity that names the original.
+    const reversalReason = String(reason ?? 'definitive_failure');
+    let fundingReversal = null;
+    const recordedFunding = row.metadata?.funding;
+    if (recordedFunding) {
+      const evidence = readFundingReversalEvidence(recordedFunding, { refundGhs });
+      const originalConversionIdentity = `withdrawal-ghs-funding:${reference}`;
+      const reversalConversionIdentity = `${FUNDING_REVERSAL_CONVERSION_PREFIX}${reference}`;
+
+      // 1. The customer's exact USDC debit comes back, at ledger precision.
+      const restored = await tx.user.update({
+        where: { id: row.userId },
+        data: { availableBalance: { increment: evidence.usdc } },
+        select: { availableBalance: true },
+      });
+      if (!restored) {
+        throw new NativeGhsWithdrawalError(
+          'the customer row could not be restored for the funding reversal',
+          'NATIVE_GHS_FUNDING_REVERSAL_USDC_FAILED',
+          { reference }
+        );
+      }
+
+      // 2. Exact inverse posting, asset by asset, under its OWN identity and
+      //    linked back to the funding exchange it reverses.
       await ledger.post(tx, {
         idempotencyKey: `${FUNDING_REVERSAL_KEY_PREFIX}${reference}`,
         entryType: 'ASSET_CONVERSION',
@@ -1249,15 +1699,59 @@ async function reverseNativeGhsWithdrawal(prisma, { reference, reason, allowedMi
         userId: row.userId,
         reference,
         relatedEntity: 'transactionHistory',
-        conversion: { identity: `withdrawal-ghs-funding:${reference}`, rate, quoteReference: funding.quoteId ?? null },
+        relatedEntityId: row.id,
+        conversion: {
+          identity: reversalConversionIdentity,
+          rate: evidence.rate,
+          quoteReference: evidence.quoteId,
+        },
         lines: [
-          { account: 'clearing:conversion', debit: usdc },
-          { account: `user:${row.userId}:liability`, credit: usdc },
-          { account: `ghs:user:${row.userId}:liability`, debit: shortfall },
-          { account: 'fiat:momo:ghs', credit: shortfall },
+          { account: `user:${row.userId}:liability`, credit: evidence.usdc },
+          { account: 'clearing:conversion', debit: evidence.usdc },
+          { account: `ghs:user:${row.userId}:liability`, debit: evidence.shortfall },
+          { account: 'fiat:momo:ghs', credit: evidence.shortfall },
         ],
-        metadata: { settlementCurrency: SETTLEMENT_CURRENCY, reversal: true },
+        metadata: {
+          settlementCurrency: SETTLEMENT_CURRENCY,
+          reversal: true,
+          reversalReason,
+          reversesConversionIdentity: originalConversionIdentity,
+          originalFundingLedgerKey: `${FUNDING_LEDGER_KEY_PREFIX}${reference}`,
+          shortfallGhs: evidence.shortfall.toFixed(2),
+          usdcRestoredExact: evidence.usdc.toFixed(8),
+          rateGhsPerUsdcExact: evidence.rate.toFixed(8),
+          quoteId: evidence.quoteId,
+        },
       });
+
+      // 3. The projection moves WITH the ledger, exactly once, in this same
+      //    transaction. The CAS floor means a projection that cannot absorb the
+      //    subtraction rolls the whole reversal back instead of driving the
+      //    spendable balance negative or leaving it overstated.
+      const projected = await tx.user.updateMany({
+        where: { id: row.userId, nativeGhsBalance: { gte: evidence.shortfall } },
+        data: { nativeGhsBalance: { decrement: evidence.shortfall } },
+      });
+      if (projected.count !== 1) {
+        throw new NativeGhsWithdrawalError(
+          'the funded shortfall could not be removed from the GHS projection — the reversal was rolled back',
+          'NATIVE_GHS_FUNDING_REVERSAL_PROJECTION_FAILED',
+          {
+            reference,
+            shortfallGhs: evidence.shortfall.toFixed(2),
+            requiresNativeGhsAtLeast: evidence.shortfall.toFixed(2),
+          }
+        );
+      }
+
+      fundingReversal = {
+        shortfallGhs: evidence.shortfall.toFixed(2),
+        usdcRestoredExact: evidence.usdc.toFixed(8),
+        rateGhsPerUsdcExact: evidence.rate.toFixed(8),
+        quoteId: evidence.quoteId,
+        conversionIdentity: reversalConversionIdentity,
+        reversesConversionIdentity: originalConversionIdentity,
+      };
     }
 
     // The liquidity authority transition is part of the SAME atomic boundary as
@@ -1284,8 +1778,13 @@ async function reverseNativeGhsWithdrawal(prisma, { reference, reason, allowedMi
     if (mirror && mirrorFlip.count !== 1) {
       throw new NativeGhsWithdrawalError('payout mirror moved during reversal', 'NATIVE_GHS_REVERSAL_RACED');
     }
-    return { reversed: true, amountGhs: amountGhs.toFixed(2) };
-  });
+    return {
+      reversed: true,
+      amountGhs: amountGhs.toFixed(2),
+      refundGhs: refundGhs.toFixed(2),
+      fundingReversal,
+    };
+  }, { timeout: 20000 });
 }
 
 /**
@@ -1333,6 +1832,7 @@ module.exports = {
   // §P0-2/§P1-3: the quote and the payout must resolve the SAME rail fee
   // policy, so it is exported rather than re-derived by callers.
   bankPayoutFeePolicy,
+  momoPayoutFeePolicy,
   GHS_NATIVE_FEE_POLICY,
   buildMomoDestinationSnapshot,
   SETTLEMENT_CURRENCY,
@@ -1352,5 +1852,9 @@ module.exports = {
   REVERSIBLE_MIRROR_STATES,
   NON_REVERSIBLE_TERMINAL_STATES,
   reverseNativeGhsWithdrawal,
+  // exported for consumer-side contract tests (§7 provider echo binding)
+  evaluateBankDispatchObservation,
+  bankRevalidationCapability,
+  enquiryBankDestination,
   reconcileNativeGhsWithdrawals,
 };

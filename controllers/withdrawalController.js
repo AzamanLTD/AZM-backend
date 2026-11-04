@@ -2085,10 +2085,15 @@ exports.ghsWithdrawal = async (req, res) => {
         // §P0-2 the plan must use the fee the QUOTE was minted with, or the
         // shortfall the customer consented to and the shortfall we recompute
         // would differ by the fee.
-        const bankFeePolicy = nativeGhsWithdrawalService.bankPayoutFeePolicy();
+        // §6 MoMo IS NOT THE BANK RAIL. This plan funds a MoMo payout and the
+        // service will charge the MoMo fee policy; reading the BANK policy here
+        // made a BANK_PAYOUT_FEE_GHS value — or its absence — change a MoMo
+        // quote and its consent-bound shortfall. Cross-rail pricing is not a
+        // configuration detail, it is a different contract.
+        const momoFeePolicy = nativeGhsWithdrawalService.momoPayoutFeePolicy();
         const plan = ghsFundingPlanner.planGhsPayoutFunding({
             amountGhs: req.body.amountGhs,
-            feeGhs: bankFeePolicy ? bankFeePolicy.feeGhs : 0,
+            feeGhs: momoFeePolicy.feeGhs,
             availableNativeGhs: user?.nativeGhsBalance ?? 0,
         });
         if (plan.requiresQuote && !req.body.quoteId) {
