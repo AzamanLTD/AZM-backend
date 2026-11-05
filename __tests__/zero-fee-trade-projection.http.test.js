@@ -56,6 +56,10 @@ describeOrSkip('Trade-creation earnings projection agrees with settlement (real 
     afterAll(async () => { if (prisma) await prisma.$disconnect(); });
 
     afterEach(async () => {
+        // Leave no payment-method override behind: another suite's settlement
+        // expectations assume the GlobalSettings fallback, and a leftover
+        // override silently changes the fee they see (measured: 5% vs 1%).
+        await prisma.globalSettings.updateMany({ data: { feeByPaymentMethod: null } });
         await prisma.adminFeeProfile.deleteMany();
         await prisma.$executeRawUnsafe(
             'TRUNCATE TABLE "User", "Trade", "Ad", "TransactionHistory", "AdminProfitLog", "SystemProfitFees", '
@@ -86,10 +90,6 @@ describeOrSkip('Trade-creation earnings projection agrees with settlement (real 
         where: { id: 1 },
         update: { p2pFeePct: 0.01, tierThreshold: 1000, vendorShareUnder1k: 0.4, vendorShareOver1k: 0.5, feeByPaymentMethod: null, ...over },
         create: { id: 1, p2pFeePct: 0.01, tierThreshold: 1000, vendorShareUnder1k: 0.4, vendorShareOver1k: 0.5, feeByPaymentMethod: null, ...over },
-        // Leave no payment-method override behind: another suite's settlement
-        // expectations assume the GlobalSettings fallback, and a leftover
-        // override silently changes the fee they see (measured: 5% vs 1%).
-        await prisma.globalSettings.updateMany({ data: { feeByPaymentMethod: null } });
     });
 
     const profile = (over = {}) => prisma.adminFeeProfile.create({
