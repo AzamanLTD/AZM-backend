@@ -155,6 +155,13 @@ jobs:
           # jest receives one broken regex matching nothing (run 35512019320).
           SUITES=(
             "__tests__/p2p-settlement-integrity.test.js"
+            # Zero-value fee semantics (PR #394): a configured 0 must mean 0
+            # while the GlobalSettings fallback stays intact. These are real
+            # PostgreSQL suites; they must run in this lane, not by hand.
+            "__tests__/zero-fee-p2p-profiles.test.js"
+            "__tests__/zero-fee-susu-semantics.test.js"
+            "__tests__/zero-fee-susu-legacy.test.js"
+            "__tests__/zero-fee-trade-projection.http.test.js"
             "__tests__/azm-auction-settlement-integrity.test.js"
             "__tests__/dine-in-customer-order-settlement.test.js"
             "__tests__/p5e-model-b-settlement.test.js"
