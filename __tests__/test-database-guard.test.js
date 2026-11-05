@@ -245,10 +245,28 @@ describe('§1 CI provenance is an authenticated, run-bound GitHub Actions runner
     });
 
     test('the token is bound to this commit and ref as well', async () => {
-        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({ sha: 'b'.repeat(40) }) })))
-            .rejects.toThrow(/but this runner is at/);
-        await expect(guard(stubClient({ serverAddress: '172.18.0.2/32' }), ciSeams({ oidcToken: signToken({ ref: 'refs/heads/main' }) })))
-            .rejects.toThrow(/but this runner is on/);
+        // Mismatch, with a correctly signed token: the runner's own values win.
+        for (const [claims, pattern] of [
+            [{ sha: 'b'.repeat(40) }, /but this runner is at/],
+            [{ ref: 'refs/heads/main' }, /but this runner is on/],
+        ]) {
+            const client = stubClient({ serverAddress: '172.18.0.2/32' });
+            await expect(guard(client, ciSeams({ oidcToken: signToken(claims) }))).rejects.toThrow(pattern);
+            expect(mutations(client)).toHaveLength(0);
+        }
+    });
+
+    test('a MISSING runtime commit or ref is refused, never skipped', async () => {
+        // `''` (not undefined) forces absence: undefined means "not overridden"
+        // and would fall back to the real GITHUB_SHA / GITHUB_REF.
+        for (const [over, pattern] of [
+            [{ sha: '' }, /did not supply GITHUB_SHA/],
+            [{ ref: '' }, /did not supply GITHUB_REF/],
+        ]) {
+            const client = stubClient({ serverAddress: '172.18.0.2/32' });
+            await expect(guard(client, ciSeams({ ...over, oidcToken: signToken() }))).rejects.toThrow(pattern);
+            expect(mutations(client)).toHaveLength(0);
+        }
     });
 
     test('nbf is REQUIRED and must be numeric', async () => {

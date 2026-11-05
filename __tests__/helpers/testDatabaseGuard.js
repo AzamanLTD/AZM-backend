@@ -588,10 +588,15 @@ function verifyRunnerIdentity({
     if (tokenRunId !== runtimeRunId) refuse(`the OIDC token was issued for run ${tokenRunId}, but this runner is run ${runtimeRunId}.`);
     if (tokenAttempt !== runtimeAttempt) refuse(`the OIDC token was issued for attempt ${tokenAttempt}, but this runner is attempt ${runtimeAttempt}.`);
     // § and to the current commit/ref where the runtime supplies them.
+    // The commit and ref are MANDATORY runtime values: a token is only bound to
+    // this run if the runner can say which commit and ref it is on. Treating an
+    // absent value as "nothing to compare" would let a runner skip the check.
     const runtimeSha = String(sha === undefined || sha === null ? '' : sha).trim();
-    if (runtimeSha && claims.sha !== runtimeSha) refuse(`the OIDC token names commit "${claims.sha || ''}", but this runner is at "${runtimeSha}".`);
+    if (!runtimeSha) refuse('the runner did not supply GITHUB_SHA, so the token cannot be bound to this commit.');
+    if (String(claims.sha || '') !== runtimeSha) refuse(`the OIDC token names commit "${claims.sha || ''}", but this runner is at "${runtimeSha}".`);
     const runtimeRef = String(ref === undefined || ref === null ? '' : ref).trim();
-    if (runtimeRef && claims.ref !== runtimeRef) refuse(`the OIDC token names ref "${claims.ref || ''}", but this runner is on "${runtimeRef}".`);
+    if (!runtimeRef) refuse('the runner did not supply GITHUB_REF, so the token cannot be bound to this ref.');
+    if (String(claims.ref || '') !== runtimeRef) refuse(`the OIDC token names ref "${claims.ref || ''}", but this runner is on "${runtimeRef}".`);
 
     return {
         runId: tokenRunId, runAttempt: tokenAttempt, workflow: workflowRef, workflowPath,
