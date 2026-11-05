@@ -17,7 +17,8 @@ function freshCrypto(env = {}) {
     jest.resetModules();
     process.env.SAVED_SERVICE_ENCRYPTION_KEY = env.encKey === undefined ? KEY : env.encKey;
     process.env.SAVED_SERVICE_FINGERPRINT_KEY = env.fpKey === undefined ? FP_KEY : env.fpKey;
-    process.env.SAVED_SERVICE_ENCRYPTION_KEY_VERSION = env.version || '1';
+    process.env.SAVED_SERVICE_ENCRYPTION_KEY_VERSION = env.version === undefined ? '1' : env.version;
+    process.env.SAVED_SERVICE_ENCRYPTION_KEYS_JSON = env.ring || '';
     return require('../services/bills/savedServiceCrypto');
 }
 
@@ -72,50 +73,51 @@ function fakePrisma(seed = []) {
     };
 }
 
+const OWNER = { userId: 1, serviceCode: 'ECG_PREPAID' };
 const ECG = { serviceCode: 'ECG_PREPAID', providerCode: 'ECG', nickname: 'Home meter', accountFields: { meterNumber: '1234567890' } };
 
 describe('saved service cryptography', () => {
     test('round-trips account fields', () => {
         const c = freshCrypto();
-        const sealed = c.encryptAccountData({ meterNumber: '1234567890' });
-        expect(sealed.startsWith('senc:v1:1:')).toBe(true);
+        const sealed = c.encryptAccountData({ meterNumber: '1234567890' }, OWNER);
+        expect(sealed.startsWith('senc:v2:1:')).toBe(true);
         expect(sealed).not.toContain('1234567890');
-        expect(c.decryptAccountData(sealed)).toEqual({ meterNumber: '1234567890' });
+        expect(c.decryptAccountData(sealed, OWNER)).toEqual({ meterNumber: '1234567890' });
     });
 
     test('random IV means equal plaintext yields different ciphertext', () => {
         const c = freshCrypto();
-        const a = c.encryptAccountData({ meterNumber: '1234567890' });
-        const b = c.encryptAccountData({ meterNumber: '1234567890' });
+        const a = c.encryptAccountData({ meterNumber: '1234567890' }, OWNER);
+        const b = c.encryptAccountData({ meterNumber: '1234567890' }, OWNER);
         expect(a).not.toBe(b);
     });
 
     test('tampering is detected', () => {
         const c = freshCrypto();
-        const sealed = c.encryptAccountData({ meterNumber: '1234567890' });
+        const sealed = c.encryptAccountData({ meterNumber: '1234567890' }, OWNER);
         const parts = sealed.split(':');
         const raw = Buffer.from(parts[5], 'base64');
         raw[0] ^= 0xff;
         parts[5] = raw.toString('base64');
-        expect(() => c.decryptAccountData(parts.join(':'))).toThrow(/authentication/);
+        expect(() => c.decryptAccountData(parts.join(':'), OWNER)).toThrow(/authentication/);
     });
 
     test('a different key fails', () => {
         const c = freshCrypto();
-        const sealed = c.encryptAccountData({ meterNumber: '1234567890' });
+        const sealed = c.encryptAccountData({ meterNumber: '1234567890' }, OWNER);
         const other = freshCrypto({ encKey: crypto.randomBytes(32).toString('hex') });
-        expect(() => other.decryptAccountData(sealed)).toThrow(/authentication/);
+        expect(() => other.decryptAccountData(sealed, OWNER)).toThrow(/authentication/);
     });
 
     test('a missing key refuses work instead of writing plaintext', () => {
         const c = freshCrypto({ encKey: '' });
-        expect(() => c.encryptAccountData({ meterNumber: '1' })).toThrow(/not set/);
-        expect(() => c.encryptAccountData({ meterNumber: '1' })).toThrow(expect.objectContaining({ code: 'SAVED_SERVICE_KEY_MISSING' }));
+        expect(() => c.encryptAccountData({ meterNumber: '1' }, OWNER)).toThrow(/not set/);
+        expect(() => c.encryptAccountData({ meterNumber: '1' }, OWNER)).toThrow(expect.objectContaining({ code: 'SAVED_SERVICE_KEY_MISSING' }));
     });
 
     test('a malformed key is refused', () => {
         const c = freshCrypto({ encKey: 'deadbeef' });
-        expect(() => c.encryptAccountData({ meterNumber: '1' })).toThrow(/32 bytes/);
+        expect(() => c.encryptAccountData({ meterNumber: '1' }, OWNER)).toThrow(/32 bytes/);
     });
 
     test('fingerprints are stable and scoped to user, service and provider', () => {
@@ -130,7 +132,7 @@ describe('saved service cryptography', () => {
 
     test('the key version is retained in the envelope', () => {
         const c = freshCrypto({ version: '7' });
-        const sealed = c.encryptAccountData({ meterNumber: '1' });
+        const sealed = c.encryptAccountData({ meterNumber: '1' }, OWNER);
         expect(c.parseEnvelope(sealed).keyVersion).toBe('7');
     });
 
@@ -162,7 +164,7 @@ describe('saved service accounts', () => {
         expect(JSON.stringify(out)).not.toContain('1234567890');
         expect(out.capabilities).toEqual({ saveAccount: true, lookupAccount: false, quote: false, payment: false });
         const row = prisma._rows[0];
-        expect(row.accountDataCiphertext).toContain('senc:v1:');
+        expect(row.accountDataCiphertext).toContain('senc:v2:');
         expect(JSON.stringify(row)).not.toContain('1234567890');
     });
 
@@ -357,24 +359,24 @@ describe('key ring and rotation', () => {
     const c = require('../services/bills/savedServiceCrypto');
 
     test('ciphertext records the key version that produced it', () => {
-        const envelope = c.encryptAccountData({ meterNumber: '1234567890' });
+        const envelope = c.encryptAccountData({ meterNumber: '1234567890' }, OWNER);
         expect(c.parseEnvelope(envelope).keyVersion).toBe(c.keyVersion());
     });
 
     test('a rotated current key cannot open ciphertext from the previous version', () => {
-        const envelope = c.encryptAccountData({ meterNumber: '1234567890' });
+        const envelope = c.encryptAccountData({ meterNumber: '1234567890' }, OWNER);
         const previous = process.env.SAVED_SERVICE_ENCRYPTION_KEY;
         process.env.SAVED_SERVICE_ENCRYPTION_KEY_VERSION = '2';
         process.env.SAVED_SERVICE_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('hex');
         let code;
-        try { c.decryptAccountData(envelope); } catch (e) { code = e.code; }
+        try { c.decryptAccountData(envelope, OWNER); } catch (e) { code = e.code; }
         process.env.SAVED_SERVICE_ENCRYPTION_KEY = previous;
         process.env.SAVED_SERVICE_ENCRYPTION_KEY_VERSION = '1';
         expect(code).toBe('SAVED_SERVICE_KEY_VERSION_UNKNOWN');
     });
 
     test('an old key supplied in the ring still decrypts old ciphertext', () => {
-        const envelope = c.encryptAccountData({ meterNumber: '1234567890' });
+        const envelope = c.encryptAccountData({ meterNumber: '1234567890' }, OWNER);
         const current = process.env.SAVED_SERVICE_ENCRYPTION_KEY;
         const oldMaterial = Buffer.alloc(32, 3).toString('hex');
 
@@ -382,7 +384,7 @@ describe('key ring and rotation', () => {
         process.env.SAVED_SERVICE_ENCRYPTION_KEY = Buffer.alloc(32, 7).toString('hex');
         process.env.SAVED_SERVICE_ENCRYPTION_KEYS_JSON = JSON.stringify({ 1: current });
 
-        const opened = c.decryptAccountData(envelope);
+        const opened = c.decryptAccountData(envelope, OWNER);
         delete process.env.SAVED_SERVICE_ENCRYPTION_KEYS_JSON;
         process.env.SAVED_SERVICE_ENCRYPTION_KEY = current;
         process.env.SAVED_SERVICE_ENCRYPTION_KEY_VERSION = '1';
@@ -429,9 +431,9 @@ describe('public template contract', () => {
 
         const water = await svc.createAccount({
             userId: 1, serviceCode: 'GHANA_WATER', providerCode: 'GHANA_WATER', nickname: 'Home',
-            accountFields: { customerReference: '100200300400500600' },
+            accountFields: { customerReference: '1002003004005006007008' }, // 22 digits, the stated boundary
         });
-        expect(water.accountMask).not.toBe('100200300400500600');
+        expect(water.accountMask).not.toBe('1002003004005006007008');
         expect(water.verificationStatus).toBe('UNVERIFIED');
     });
 });
@@ -456,5 +458,167 @@ describe('mask boundaries at every length', () => {
 
     test('a long numeric meter shows only the last four', () => {
         expect(maskIdentity('123456789012')).toBe('••••••••9012');
+    });
+});
+
+describe('published bounds are the accepted bounds', () => {
+    const { publicTemplates } = require('../services/bills/serviceRegistry');
+    const { createService } = require('../services/bills/savedServiceAccountService');
+
+    test('every declared pattern maximum equals the advertised maxLength', () => {
+        // The longest string a pattern can accept must be exactly maxLength,
+        // branch by branch: an alternation like (0\d{9}|\+233\d{9}) tops out at
+        // 13 characters, not at its widest digit run.
+        const longest = (pattern) => {
+            const body = String(pattern)
+                .replace(/^\^/, '').replace(/\$$/, '')
+                .replace(/[()]/g, '').replace(/\?:/g, '');
+            let best = 0;
+            for (const branch of body.split('|')) {
+                let n = 0;
+                for (let i = 0; i < branch.length;) {
+                    if (branch[i] === '\\') {
+                        const atom = /^\\(\w)(\{(\d+)(?:,(\d+))?\})?/.exec(branch.slice(i));
+                        if (atom) {
+                            n += atom[3] ? Number(atom[4] || atom[3]) : 1;
+                            i += atom[0].length;
+                            continue;
+                        }
+                        n += 1; i += 2; continue;
+                    }
+                    if (branch[i] === '[') { n += 1; i = branch.indexOf(']', i) + 1; continue; }
+                    if (branch[i] === '{') {
+                        const j = branch.indexOf('}', i);
+                        const parts = branch.slice(i + 1, j).split(',');
+                        const upper = Number(parts[1] || parts[0]);
+                        n += upper - 1; i = j + 1; continue;
+                    }
+                    n += 1; i += 1;
+                }
+                best = Math.max(best, n);
+            }
+            return best;
+        };
+
+        const offenders = [];
+        for (const category of publicTemplates().categories) {
+            for (const svc of category.services) {
+                for (const field of svc.fields) {
+                    if (!field.pattern || !field.maxLength) continue;
+                    const upper = longest(field.pattern);
+                    if (upper !== field.maxLength) {
+                        offenders.push(`${svc.serviceCode}.${field.key}: pattern accepts ${upper}, advertised ${field.maxLength}`);
+                    }
+                }
+            }
+        }
+        expect(offenders).toEqual([]);
+    });
+
+    const build = () => {
+        jest.resetModules();
+        process.env.SAVED_SERVICE_ENCRYPTION_KEY = KEY;
+        process.env.SAVED_SERVICE_FINGERPRINT_KEY = FP_KEY;
+        return createService({ prisma: fakePrisma([]) });
+    };
+
+    test.each([
+        ['GHANA_WATER', 'GHANA_WATER', 'customerReference', 24],
+        ['ECG_PREPAID', 'ECG', 'meterNumber', 24],
+        ['DSTV', 'DSTV', 'smartcardNumber', 16],
+        ['BROADBAND', 'GENERIC_BROADBAND', 'serviceReference', 32],
+    ])('%s accepts exactly %i characters and refuses %i', async (serviceCode, providerCode, key, max) => {
+        const svc = build();
+        const atLimit = key === 'serviceReference' ? 'A'.repeat(max) : '7'.repeat(max);
+        const saved = await svc.createAccount({
+            userId: 1, serviceCode, providerCode, nickname: 'limit',
+            accountFields: { [key]: atLimit },
+        });
+        expect(saved.id).toBeTruthy();
+
+        const over = key === 'serviceReference' ? 'A'.repeat(max + 1) : '7'.repeat(max + 1);
+        await expect(svc.createAccount({
+            userId: 2, serviceCode, providerCode, nickname: 'over',
+            accountFields: { [key]: over },
+        })).rejects.toMatchObject({ code: 'INVALID_ACCOUNT_FIELD' });
+    });
+
+    test('a phone number is accepted at its documented maximum and not beyond', async () => {
+        const svc = build();
+        const saved = await svc.createAccount({
+            userId: 1, serviceCode: 'AIRTIME', providerCode: 'MTN', nickname: 'intl',
+            accountFields: { recipientPhone: '+233244123456' },
+        });
+        expect(saved.id).toBeTruthy();
+        await expect(svc.createAccount({
+            userId: 2, serviceCode: 'AIRTIME', providerCode: 'MTN', nickname: 'long',
+            accountFields: { recipientPhone: '+2332441234567' },
+        })).rejects.toMatchObject({ code: 'INVALID_ACCOUNT_FIELD' });
+    });
+});
+
+describe('key configuration refuses before anything is written', () => {
+    const { createService } = require('../services/bills/savedServiceAccountService');
+
+    const serviceWith = (env) => {
+        jest.resetModules();
+        process.env.SAVED_SERVICE_ENCRYPTION_KEY = KEY;
+        process.env.SAVED_SERVICE_FINGERPRINT_KEY = FP_KEY;
+        process.env.SAVED_SERVICE_ENCRYPTION_KEY_VERSION = env.version ?? '1';
+        process.env.SAVED_SERVICE_ENCRYPTION_KEYS_JSON = env.ring ?? '';
+        const prisma = fakePrisma([]);
+        return { prisma, svc: createService({ prisma }) };
+    };
+
+    test.each([
+        ['empty', '   '],
+        ['colon-bearing', '1:evil'],
+        ['over long', 'v'.repeat(17)],
+        ['path-like', '../1'],
+    ])('a %s key version refuses and writes no row', async (_label, version) => {
+        const { prisma, svc } = serviceWith({ version });
+        await expect(svc.createAccount({ userId: 1, ...ECG }))
+            .rejects.toMatchObject({ code: 'SAVED_SERVICE_KEY_INVALID' });
+        expect(prisma._rows).toHaveLength(0);
+    });
+
+    test('a historical entry that repeats the current version refuses instead of replacing the key', async () => {
+        const { prisma, svc } = serviceWith({
+            version: '1',
+            ring: JSON.stringify({ 1: crypto.randomBytes(32).toString('hex') }),
+        });
+        await expect(svc.createAccount({ userId: 1, ...ECG }))
+            .rejects.toMatchObject({ code: 'SAVED_SERVICE_KEY_DUPLICATE_VERSION' });
+        expect(prisma._rows).toHaveLength(0);
+    });
+
+    test('a historical entry with an unusable version name refuses', async () => {
+        const { svc } = serviceWith({ version: '2', ring: JSON.stringify({ '1:2': KEY }) });
+        await expect(svc.createAccount({ userId: 1, ...ECG }))
+            .rejects.toMatchObject({ code: 'SAVED_SERVICE_KEY_INVALID' });
+    });
+
+    test('a valid rotation still opens ciphertext written under the old version', () => {
+        const old = freshCrypto({ version: '1' });
+        const sealed = old.encryptAccountData({ meterNumber: '999' }, OWNER);
+
+        const rotated = freshCrypto({
+            version: '2',
+            ring: JSON.stringify({ 1: KEY }),
+        });
+        expect(rotated.decryptAccountData(sealed, OWNER)).toEqual({ meterNumber: '999' });
+        expect(() => rotated.decryptAccountData('senc:v2:9:AAAA:AAAA:AAAA', OWNER))
+            .toThrow(expect.objectContaining({ code: 'SAVED_SERVICE_KEY_VERSION_UNKNOWN' }));
+    });
+
+    test('ciphertext is bound to its member and service', () => {
+        const c = freshCrypto();
+        const sealed = c.encryptAccountData({ meterNumber: '1234567890' }, OWNER);
+        expect(() => c.decryptAccountData(sealed, { userId: 2, serviceCode: 'ECG_PREPAID' }))
+            .toThrow(/authentication/);
+        expect(() => c.decryptAccountData(sealed, { userId: 1, serviceCode: 'ECG_POSTPAID' }))
+            .toThrow(/authentication/);
+        expect(() => c.encryptAccountData({ meterNumber: '1' }))
+            .toThrow(expect.objectContaining({ code: 'SAVED_SERVICE_IDENTITY_REQUIRED' }));
     });
 });

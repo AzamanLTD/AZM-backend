@@ -34,7 +34,39 @@ const crypto = require('crypto');
 const ALGO = 'aes-256-gcm';
 const IV_BYTES = 12;
 const ENVELOPE_PREFIX = 'senc';
-const ENVELOPE_VERSION = 'v1';
+// v1 encrypted the payload alone. v2 additionally binds the ciphertext to the
+// owning member and service through AES-GCM AAD, so a row copied onto another
+// member's account (a bad migration, a replication mix-up, an operator with
+// database write access) fails authentication instead of decrypting into the
+// wrong tenant's UI.
+const ENVELOPE_VERSION_LEGACY = 'v1';
+const ENVELOPE_VERSION = 'v2';
+const SUPPORTED_ENVELOPE_VERSIONS = new Set([ENVELOPE_VERSION_LEGACY, ENVELOPE_VERSION]);
+// Key-version names are envelope segments: a colon would add a field, so the
+// alphabet is deliberately narrow.
+const VERSION_RE = /^[A-Za-z0-9_-]{1,16}$/;
+
+function assertVersionName(value, label) {
+    const name = String(value == null ? '' : value).trim();
+    if (!VERSION_RE.test(name)) {
+        const err = new Error(`${label} must match ${VERSION_RE} (got ${JSON.stringify(value)}).`);
+        err.code = 'SAVED_SERVICE_KEY_INVALID';
+        throw err;
+    }
+    return name;
+}
+
+function aadFor(identity) {
+    const userId = identity && identity.userId != null ? String(identity.userId) : '';
+    const serviceCode = identity && identity.serviceCode ? String(identity.serviceCode) : '';
+    if (!userId || !serviceCode) {
+        // Fail closed: an unbound envelope is exactly the weakness v2 removes.
+        const err = new Error('Saved service account data must be bound to a member and service.');
+        err.code = 'SAVED_SERVICE_IDENTITY_REQUIRED';
+        throw err;
+    }
+    return Buffer.from(`saved-service-account|${userId}|${serviceCode}`, 'utf8');
+}
 
 function _decodeKey(raw, name) {
     if (typeof raw !== 'string' || raw.trim().length === 0) {
@@ -72,7 +104,8 @@ function fingerprintKey() {
  */
 function keyRing() {
     const ring = {};
-    ring[keyVersion()] = encryptionKey();
+    const current = keyVersion();
+    ring[current] = encryptionKey();
     const extra = process.env.SAVED_SERVICE_ENCRYPTION_KEYS_JSON;
     if (extra) {
         let parsed;
@@ -84,7 +117,18 @@ function keyRing() {
             throw err;
         }
         for (const [version, material] of Object.entries(parsed || {})) {
-            ring[String(version).slice(0, 16)] = _decodeKey(material, `keys.${version}`);
+            const name = assertVersionName(version, 'SAVED_SERVICE_ENCRYPTION_KEYS_JSON version');
+            if (Object.prototype.hasOwnProperty.call(ring, name)) {
+                // A historical entry naming the CURRENT version would silently
+                // replace the live encryption key and orphan every row.
+                const err = new Error(
+                    `SAVED_SERVICE_ENCRYPTION_KEYS_JSON repeats version "${name}"; `
+                    + 'historical keys must use distinct version names.',
+                );
+                err.code = 'SAVED_SERVICE_KEY_DUPLICATE_VERSION';
+                throw err;
+            }
+            ring[name] = _decodeKey(material, `keys.${name}`);
         }
     }
     return ring;
@@ -103,24 +147,34 @@ function resolveKey(version) {
 }
 
 function keyVersion() {
-    return String(process.env.SAVED_SERVICE_ENCRYPTION_KEY_VERSION || '1').trim().slice(0, 16);
+    // Validated, never truncated: a silently shortened or colon-bearing name
+    // would corrupt the colon-delimited envelope.
+    return assertVersionName(process.env.SAVED_SERVICE_ENCRYPTION_KEY_VERSION ?? '1',
+        'SAVED_SERVICE_ENCRYPTION_KEY_VERSION');
 }
 
 /**
  * @param {object} payload account fields, already validated
- * @returns {string} senc:v1:<keyVersion>:<iv>:<tag>:<ciphertext> (all base64)
+ * @returns {string} senc:v2:<keyVersion>:<iv>:<tag>:<ciphertext> (all base64)
+ *   v2 binds the ciphertext to userId + serviceCode through AAD; v1 envelopes
+ *   (no binding) still decrypt so pre-rotation rows keep working.
  */
-function encryptAccountData(payload) {
-    const key = encryptionKey();
+function encryptAccountData(payload, identity) {
+    const version = keyVersion();
+    const aad = aadFor(identity);
+    // Resolve through the ring so a malformed rotation configuration fails
+    // HERE, before a row exists, instead of at the first later read.
+    const key = resolveKey(version);
     const iv = crypto.randomBytes(IV_BYTES);
     const cipher = crypto.createCipheriv(ALGO, key, iv);
+    cipher.setAAD(aad);
     const plaintext = JSON.stringify(payload);
     const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
     const tag = cipher.getAuthTag();
     return [
         ENVELOPE_PREFIX,
         ENVELOPE_VERSION,
-        keyVersion(),
+        version,
         iv.toString('base64'),
         tag.toString('base64'),
         ciphertext.toString('base64'),
@@ -131,11 +185,12 @@ function encryptAccountData(payload) {
 function parseEnvelope(envelope) {
     if (typeof envelope !== 'string') return null;
     const parts = envelope.split(':');
-    if (parts.length !== 6 || parts[0] !== ENVELOPE_PREFIX || parts[1] !== ENVELOPE_VERSION) return null;
-    return { keyVersion: parts[2], iv: parts[3], tag: parts[4], ciphertext: parts[5] };
+    if (parts.length !== 6 || parts[0] !== ENVELOPE_PREFIX) return null;
+    if (!SUPPORTED_ENVELOPE_VERSIONS.has(parts[1])) return null;
+    return { envelopeVersion: parts[1], keyVersion: parts[2], iv: parts[3], tag: parts[4], ciphertext: parts[5] };
 }
 
-function decryptAccountData(envelope) {
+function decryptAccountData(envelope, identity) {
     const parsed = parseEnvelope(envelope);
     if (!parsed) {
         const err = new Error('Saved service account ciphertext is malformed.');
@@ -145,6 +200,9 @@ function decryptAccountData(envelope) {
     const key = resolveKey(parsed.keyVersion);
     try {
         const decipher = crypto.createDecipheriv(ALGO, key, Buffer.from(parsed.iv, 'base64'));
+        if (parsed.envelopeVersion === ENVELOPE_VERSION) {
+            decipher.setAAD(aadFor(identity));
+        }
         decipher.setAuthTag(Buffer.from(parsed.tag, 'base64'));
         const plaintext = Buffer.concat([
             decipher.update(Buffer.from(parsed.ciphertext, 'base64')),

@@ -159,7 +159,7 @@ function createService({ prisma }) {
                 throw httpError(409, 'SAVED_ACCOUNT_EXISTS', 'That account is already saved.');
             }
 
-            const accountDataCiphertext = encryptAccountData(fields);
+            const accountDataCiphertext = encryptAccountData(fields, { userId, serviceCode: service.serviceCode });
 
             try {
                 const record = await prisma.savedServiceAccount.create({
@@ -260,7 +260,7 @@ function createService({ prisma }) {
         async revealAccountFields({ userId, id }) {
             const row = await prisma.savedServiceAccount.findFirst({ where: { id, userId } });
             if (!row) throw httpError(404, 'SAVED_ACCOUNT_NOT_FOUND', 'Saved account not found.');
-            return decryptAccountData(row.accountDataCiphertext);
+            return decryptAccountData(row.accountDataCiphertext, { userId: row.userId, serviceCode: row.serviceCode });
         },
     };
 }

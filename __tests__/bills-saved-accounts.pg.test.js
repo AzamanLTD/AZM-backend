@@ -205,7 +205,7 @@ const FP_KEY = 'b'.repeat(64);
         const [row] = await prisma.$queryRawUnsafe(
             `SELECT "accountDataCiphertext", "accountFingerprint", "accountMask" FROM "SavedServiceAccount" WHERE "userId" = $1`, user.id);
         expect(row.accountDataCiphertext).not.toContain('0123456789');
-        expect(row.accountDataCiphertext.startsWith('senc:v1:')).toBe(true);
+        expect(row.accountDataCiphertext.startsWith('senc:v2:')).toBe(true);
         expect(row.accountMask).not.toContain('0123456789');
 
         await prisma.user.delete({ where: { id: user.id } });
@@ -365,4 +365,76 @@ describe('reset-target safety', () => {
         expect(() => assertFn('postgresql://u:p@ep-x-1.neon.tech/azm_test'))
             .toThrow(/not a local disposable database|managed provider/);
     });
+});
+
+// ── production installer parity ─────────────────────────────────────────────
+// Production runs the overlay installer, not `prisma migrate deploy` (Neon has
+// no migration baseline). These tests prove the installer alone builds the same
+// table the migrations build, and that re-running it is a no-op.
+describe('production installer builds the same schema', () => {
+    const fs = require('fs');
+    const path = require('path');
+    const { PrismaClient } = require('@prisma/client');
+    const { apply, ddl } = require('../infra/install-saved-service-accounts-overlay');
+
+    test('the installer creates the table, indexes, foreign key and checks, twice over', async () => {
+        const prisma = new PrismaClient({ datasources: { db: { url: process.env.TEST_DATABASE_URL } } });
+        try {
+            await prisma.$executeRawUnsafe('DROP TABLE IF EXISTS "SavedServiceAccount" CASCADE');
+            await apply(prisma);
+            await apply(prisma); // idempotent
+
+            const columns = await prisma.$queryRawUnsafe(
+                `SELECT column_name FROM information_schema.columns
+                  WHERE table_name = 'SavedServiceAccount' ORDER BY column_name`);
+            const names = columns.map((c) => c.column_name);
+            expect(names).toEqual(expect.arrayContaining([
+                'accountDataCiphertext', 'accountDataKeyVersion', 'accountFingerprint',
+                'accountMask', 'serviceTemplateVersion', 'verificationStatus', 'verifiedAt',
+                'isPrimary', 'userId', 'serviceCode', 'providerCode', 'nickname',
+            ]));
+
+            const indexes = await prisma.$queryRawUnsafe(
+                `SELECT indexname FROM pg_indexes WHERE tablename = 'SavedServiceAccount'`);
+            const indexNames = indexes.map((i) => i.indexname);
+            expect(indexNames).toEqual(expect.arrayContaining([
+                'SavedServiceAccount_userId_serviceCode_accountFingerprint_key',
+                'SavedServiceAccount_userId_serviceCode_createdAt_idx',
+                'SavedServiceAccount_one_primary_per_service',
+            ]));
+
+            const constraints = await prisma.$queryRawUnsafe(
+                `SELECT conname FROM pg_constraint WHERE conrelid = '"SavedServiceAccount"'::regclass`);
+            const constraintNames = constraints.map((c) => c.conname);
+            expect(constraintNames).toEqual(expect.arrayContaining([
+                'SavedServiceAccount_pkey',
+                'SavedServiceAccount_userId_fkey',
+                'SavedServiceAccount_verificationStatus_check',
+                'SavedServiceAccount_verifiedAt_check',
+            ]));
+
+            // The database, not the application, is what refuses a fake VERIFIED
+            // row and a second primary for one service.
+            await expect(prisma.$executeRawUnsafe(
+                `INSERT INTO "SavedServiceAccount" ("id","userId","serviceCode","providerCode","nickname",
+                    "accountDataCiphertext","accountDataKeyVersion","accountFingerprint","accountMask",
+                    "verificationStatus","updatedAt")
+                 VALUES ('t1','999999','GHANA_WATER','GHANA_WATER','n','senc:v2:1:a:b:c','1',repeat('a',64),'x','VERIFIED',now())`,
+            )).rejects.toThrow();
+
+            // The migration files and the installer must not drift apart.
+            const migrations = fs.readdirSync(path.join(__dirname, '..', 'prisma', 'migrations'))
+                .filter((d) => d.includes('saved_service'));
+            expect(migrations.length).toBe(2);
+            const migrationSql = migrations
+                .map((d) => fs.readFileSync(path.join(__dirname, '..', 'prisma', 'migrations', d, 'migration.sql'), 'utf8'))
+                .join('\n');
+            for (const name of indexNames.filter((n) => n !== 'SavedServiceAccount_pkey')) {
+                expect(migrationSql).toContain(name);
+            }
+            expect(ddl.join('\n')).toContain('SavedServiceAccount_verifiedAt_check');
+        } finally {
+            await prisma.$disconnect();
+        }
+    }, 60000);
 });
