@@ -15,9 +15,10 @@ const fs = require('fs');
 const path = require('path');
 
 /**
- * Resolve the reset target. ONLY TEST_DATABASE_URL counts: falling back to
- * DATABASE_URL would let a normal development database be dropped by someone
- * who merely runs the suite.
+ * Resolve the destructive-SQL target. It is SAVED_ACCOUNTS_TEST_DATABASE_URL
+ * when set, otherwise TEST_DATABASE_URL for a solo local run. DATABASE_URL is
+ * never a candidate: that would let a normal development database be dropped by
+ * someone who merely runs the suite.
  */
 function resolveTestDsn() {
     // This suite resets its target, so it reads its own variable first. Sharing
@@ -77,8 +78,8 @@ function assertDistinctFromSuiteDatabase(testUri, suiteUri) {
     };
     if (norm(testUri) === norm(suiteUri)) {
         throw new Error(
-            'Refusing to run: TEST_DATABASE_URL and DATABASE_URL point at the same database. '
-            + 'The migration test resets its target and would destroy the suite database.',
+            'Refusing to run: the saved-account test database and DATABASE_URL point at the '
+            + 'same database. These tests reset their target and would destroy the suite database.',
         );
     }
 }
@@ -378,14 +379,19 @@ describe('reset-target safety', () => {
 // Production runs the overlay installer, not `prisma migrate deploy` (Neon has
 // no migration baseline). These tests prove the installer alone builds the same
 // table the migrations build, and that re-running it is a no-op.
-describe('production installer builds the same schema', () => {
+(hasDb ? describe : describe.skip)('production installer builds the same schema', () => {
     const fs = require('fs');
     const path = require('path');
     const { PrismaClient } = require('@prisma/client');
     const { apply, ddl } = require('../infra/install-saved-service-accounts-overlay');
 
     test('the installer creates the table, indexes, foreign key and checks, twice over', async () => {
-        const prisma = new PrismaClient({ datasources: { db: { url: process.env.TEST_DATABASE_URL } } });
+        // Same destructive target and the same two guards as the migration
+        // suite: this test DROPs a table, so it must never run against the
+        // shared suite database or anything that is not provably disposable.
+        assertDisposable(DSN);
+        assertDistinctFromSuiteDatabase(DSN, process.env.DATABASE_URL);
+        const prisma = new PrismaClient({ datasources: { db: { url: DSN } } });
         try {
             await prisma.$executeRawUnsafe('DROP TABLE IF EXISTS "SavedServiceAccount" CASCADE');
             await apply(prisma);
