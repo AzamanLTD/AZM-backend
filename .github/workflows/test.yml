@@ -46,7 +46,10 @@ jobs:
 
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
-      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
+      # Deliberately a DIFFERENT database: the saved-account migration test runs
+      # `prisma db push --force-reset`, so pointing this at azm_test would wipe
+      # the shared suite database and its overlay structures mid-run.
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_saved_service_accounts_test?schema=public
       JWT_SECRET: test_secret_exactly_32_characters_long
       # Test-only AES key for fieldCipher/shareToken at-rest proofs
       # (64 hex chars = 32 bytes; never a production value).
@@ -187,6 +190,16 @@ jobs:
           docker exec "$CONTAINER" psql -U postgres -d azm_test \
             -c "ALTER SYSTEM SET synchronous_commit = off" \
             -c "SELECT pg_reload_conf();"
+
+      - name: Create the isolated saved-account test database
+        # Kept separate from azm_test on purpose: the migration test resets its
+        # target, and azm_test carries the overlay structures the rest of the
+        # suite depends on.
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c 'CREATE DATABASE azm_saved_service_accounts_test;'
+          PGPASSWORD=postgres psql -h localhost -U postgres -d azm_saved_service_accounts_test \
+            -c 'SELECT current_database();'
 
       - name: Run tests
         # DB-backed suites share one disposable database and truncate between
