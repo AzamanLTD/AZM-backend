@@ -29,6 +29,24 @@ NODE
 PG_CLI_URL="$(normalize_pg_cli_url "$DATABASE_URL")"
 PG_ADMIN_CLI_URL="$(normalize_pg_cli_url "$PG_ADMIN_URL")"
 
+# Client/server major-version parity.
+# A pg_dump from a newer major writes SET statements the service container
+# rejects (PG17 emits `SET transaction_timeout = 0;` and PG16 has no such GUC),
+# so the drill runs the client binaries INSIDE the PostgreSQL container when one
+# is reachable. Local runs without docker keep using the host binaries.
+PG_CLIENT_CONTAINER="${PG_CLIENT_CONTAINER:-}"
+if [[ -z "$PG_CLIENT_CONTAINER" ]] && command -v docker >/dev/null 2>&1; then
+  PG_CLIENT_CONTAINER="$(docker ps --filter "ancestor=${PG_SERVICE_IMAGE:-postgres:16}" --format "{{ .ID }}" 2>/dev/null | head -1)"
+fi
+
+if [[ -n "$PG_CLIENT_CONTAINER" ]]; then
+  echo "[recovery-drill] client binaries inside container ${PG_CLIENT_CONTAINER} (major parity)"
+  ARCHIVE_REF="/tmp/azm-drill-$$.dump"
+else
+  echo "[recovery-drill] host client binaries: $(pg_dump --version 2>/dev/null || echo unknown)"
+  ARCHIVE_REF="$BACKUP_FILE"
+fi
+
 cleanup() {
   set +e
   psql "$PG_CLI_URL" -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS backup_drill CASCADE;' >/dev/null 2>&1
@@ -62,15 +80,25 @@ INSERT INTO backup_drill.sentinel (id, marker) VALUES (1, 'azaman-backup-restore
 SQL
 
 printf '[recovery-drill] creating custom-format logical backup\n'
-pg_dump \
-  --format=custom \
-  --no-owner \
-  --no-acl \
-  --file="$BACKUP_FILE" \
-  "$PG_CLI_URL"
+if [[ -n "$PG_CLIENT_CONTAINER" ]]; then
+  docker exec "$PG_CLIENT_CONTAINER" pg_dump \
+    --format=custom --no-owner --no-acl "$PG_CLI_URL" > "$BACKUP_FILE"
+  docker cp "$BACKUP_FILE" "$PG_CLIENT_CONTAINER:$ARCHIVE_REF" >/dev/null
+else
+  pg_dump \
+    --format=custom \
+    --no-owner \
+    --no-acl \
+    --file="$BACKUP_FILE" \
+    "$PG_CLI_URL"
+fi
 
 printf '[recovery-drill] validating archive\n'
-pg_restore --list "$BACKUP_FILE" >/dev/null
+if [[ -n "$PG_CLIENT_CONTAINER" ]]; then
+  docker exec "$PG_CLIENT_CONTAINER" pg_restore --list "$ARCHIVE_REF" >/dev/null
+else
+  pg_restore --list "$BACKUP_FILE" >/dev/null
+fi
 
 printf '[recovery-drill] creating disposable restore database %s\n' "$DRILL_DB"
 psql "$PG_ADMIN_CLI_URL" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$DRILL_DB\";"
@@ -84,12 +112,19 @@ NODE
 )"
 
 printf '[recovery-drill] restoring archive\n'
-pg_restore \
-  --exit-on-error \
-  --no-owner \
-  --no-acl \
-  --dbname="$RESTORE_URL" \
-  "$BACKUP_FILE"
+if [[ -n "$PG_CLIENT_CONTAINER" ]]; then
+  docker exec "$PG_CLIENT_CONTAINER" pg_restore \
+    --exit-on-error --no-owner --no-acl \
+    --dbname="$RESTORE_URL" "$ARCHIVE_REF"
+  docker exec "$PG_CLIENT_CONTAINER" rm -f "$ARCHIVE_REF" >/dev/null 2>&1 || true
+else
+  pg_restore \
+    --exit-on-error \
+    --no-owner \
+    --no-acl \
+    --dbname="$RESTORE_URL" \
+    "$BACKUP_FILE"
+fi
 
 printf '[recovery-drill] verifying restored sentinel and schema inventory\n'
 psql "$RESTORE_URL" -v ON_ERROR_STOP=1 <<'SQL'
