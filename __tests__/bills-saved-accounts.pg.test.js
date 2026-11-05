@@ -20,7 +20,10 @@ const path = require('path');
  * who merely runs the suite.
  */
 function resolveTestDsn() {
-    const uri = process.env.TEST_DATABASE_URL;
+    // This suite resets its target, so it reads its own variable first. Sharing
+    // TEST_DATABASE_URL with the other PostgreSQL suites meant this reset wiped
+    // their schema mid-run; the fallback only exists for a solo local run.
+    const uri = process.env.SAVED_ACCOUNTS_TEST_DATABASE_URL || process.env.TEST_DATABASE_URL;
     if (!uri || !/^postgres(ql)?:\/\//.test(uri)) return null;
     return uri;
 }
@@ -313,14 +316,18 @@ describe('reset-target safety', () => {
 
     test('an ordinary DATABASE_URL is never used as the reset target', () => {
         const previousTest = process.env.TEST_DATABASE_URL;
+        const previousSaved = process.env.SAVED_ACCOUNTS_TEST_DATABASE_URL;
         const previousProd = process.env.DATABASE_URL;
         delete process.env.TEST_DATABASE_URL;
+        delete process.env.SAVED_ACCOUNTS_TEST_DATABASE_URL;
         process.env.DATABASE_URL = 'postgresql://postgres@localhost:5432/azam_dev';
         try {
             expect(resolveFn()).toBeNull();
         } finally {
             if (previousTest === undefined) delete process.env.TEST_DATABASE_URL;
             else process.env.TEST_DATABASE_URL = previousTest;
+            if (previousSaved === undefined) delete process.env.SAVED_ACCOUNTS_TEST_DATABASE_URL;
+            else process.env.SAVED_ACCOUNTS_TEST_DATABASE_URL = previousSaved;
             if (previousProd === undefined) delete process.env.DATABASE_URL;
             else process.env.DATABASE_URL = previousProd;
         }

@@ -57,10 +57,13 @@ jobs:
 
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
-      # Deliberately a DIFFERENT database: the saved-account migration test runs
-      # `prisma db push --force-reset`, so pointing this at azm_test would wipe
-      # the shared suite database and its overlay structures mid-run.
-      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_saved_service_accounts_test?schema=public
+      # The suite database every PostgreSQL suite shares, overlay structures
+      # included. It must NOT be the target of a force-reset.
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
+      # Only the saved-account migration suite may reset a database, and only
+      # this one. Keeping it in TEST_DATABASE_URL meant the reset destroyed the
+      # schema the other PostgreSQL suites were still using.
+      SAVED_ACCOUNTS_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_saved_service_accounts_test?schema=public
       JWT_SECRET: test_secret_exactly_32_characters_long
       # Test-only AES key for fieldCipher/shareToken at-rest proofs
       # (64 hex chars = 32 bytes; never a production value).
