@@ -207,6 +207,43 @@ describe('securitySchemas — singleMessage envelope + exact messages', () => {
 });
 
 // ── Regression guard: legacy default formatter unchanged ─────────────────────
+describe('setPinRotationSchema — lengths match AppUnlockService', () => {
+  // The service requires exactly four digits for a new PIN. The schema used to
+  // accept 4-8, which let a six-digit PIN through validation only for the
+  // service to reject it one step later with a different message.
+  const run = (body) => sec.setPinRotationSchema.safeParse(body);
+
+  test('accepts a four-digit PIN', () => {
+    expect(run({ pin: '1234' }).success).toBe(true);
+  });
+
+  test('accepts a four-digit PIN with a four-digit current PIN', () => {
+    expect(run({ pin: '5678', currentPin: '1234' }).success).toBe(true);
+  });
+
+  test('rejects three digits', () => {
+    const out = run({ pin: '123' });
+    expect(out.success).toBe(false);
+    expect(out.error.issues[0].message).toBe('PIN must be exactly 4 digits.');
+  });
+
+  test.each(['12345', '123456', '12345678'])('rejects the %s-digit PIN the service would refuse', (pin) => {
+    const out = run({ pin });
+    expect(out.success).toBe(false);
+    expect(out.error.issues[0].path).toEqual(['pin']);
+  });
+
+  test('rejects a current PIN that is not four digits', () => {
+    const out = run({ pin: '5678', currentPin: '12345' });
+    expect(out.success).toBe(false);
+    expect(out.error.issues[0].message).toBe('Current PIN must be exactly 4 digits.');
+  });
+
+  test('rejects non-numeric digits', () => {
+    expect(run({ pin: '12a4' }).success).toBe(false);
+  });
+});
+
 describe('validate() backward compatibility', () => {
   const { z } = require('zod');
   const schema = z.object({ amount: z.coerce.number().positive('Amount must be positive') });
