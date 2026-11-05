@@ -115,6 +115,7 @@ function mountRoutes(app, {
     app.use('/api/smart-routes', financialLimiter, require('../../routes/smartRouteRoutes'));
     app.use('/api/azm-auction', generalLimiter, require('../../routes/azmAuctionRoutes'));
     app.use('/api/saved-momo', financialLimiter, require('../../routes/savedMomoRoutes'));
+    app.use('/api/bills', generalLimiter, require('../../routes/billsRoutes'));
     app.use('/api/transit', generalLimiter, require('../../routes/transitRoutes'));
 
     app.use('/api/quotes', financialLimiter, require('../../routes/transactionQuoteRoutes'));
