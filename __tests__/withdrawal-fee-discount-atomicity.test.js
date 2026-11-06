@@ -61,10 +61,19 @@ describeOrSkip('AZM fee-discount withdrawal atomicity (real PostgreSQL)', () => 
     afterAll(async () => { if (prisma) await prisma.$disconnect(); });
 
     beforeEach(async () => {
+        // The fixture must declare the fee path it asserts. With
+        // `fiatLiquidityAuthorityEnabled` true, processFiatWithdrawal claims GHS
+        // liquidity and then mirror-writes it into SystemFiatPool through
+        // syncPoolProjection (src/services/fiatLiquidityService.js:566), which
+        // assigns `balance = FiatLiquidityState.availableGhs` — a GHS figure read
+        // back as USDC. A suite leaving the flag true (p5d and the other P5
+        // authority suites set it) therefore changes what THIS suite reads:
+        // measured 99350, which is 50 USDC x 13.0 GHS, not a fee defect.
+        // Pinning it false makes this suite independent of whoever ran before it.
         await prisma.globalSettings.upsert({
             where: { id: 1 },
-            update: { liveRetailRate: 13.0, liveRateSource: 'KOTANI_PAY' },
-            create: { id: 1, liveRetailRate: 13.0, liveRateSource: 'KOTANI_PAY' }
+            update: { liveRetailRate: 13.0, liveRateSource: 'KOTANI_PAY', fiatLiquidityAuthorityEnabled: false },
+            create: { id: 1, liveRetailRate: 13.0, liveRateSource: 'KOTANI_PAY', fiatLiquidityAuthorityEnabled: false }
         });
         await prisma.systemFiatPool.upsert({
             where: { id: 1 },
@@ -123,6 +132,13 @@ describeOrSkip('AZM fee-discount withdrawal atomicity (real PostgreSQL)', () => 
     // ── A. atomic creation ──────────────────────────────────────────────────
     test('A. AZM debit commits atomically with the fiat reservation', async () => {
         const user = await seedWithdrawalUser();
+        // The persisted posture is asserted, not inherited: this is the state the
+        // withdrawal below actually reads, so the absolute pool expectation can
+        // only hold on the fee path this suite intends to exercise.
+        const posture = await prisma.globalSettings.findUnique({ where: { id: 1 } });
+        expect(posture.fiatLiquidityAuthorityEnabled).toBe(false);
+        expect(Number(posture.liveRetailRate)).toBeCloseTo(13.0, 6);
+
         const { data, reference, tier } = await createWithdrawalWithDiscount(user);
 
         expect(data.azmFeeDiscount).toMatchObject({
