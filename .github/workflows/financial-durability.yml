@@ -225,6 +225,9 @@ jobs:
             # claim/state-machine proofs and the wired multi-currency
             # conversion exactly-once identity.
             "__tests__/r42-shared-idempotency-authority.pg.test.js"
+            # claim-release robustness: transient DB errors on the release must
+            # never leave a phantom IN_PROGRESS identity behind a delivered 4xx
+            "__tests__/idempotency-claim-release-retry.test.js"
             # §r42 follow-up review — trade initiation idempotency: the
             # false releaseOn4xx declaration is removed and the post-commit
             # failure RETAIN, concurrent duplicate, and pre-economics release
