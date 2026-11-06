@@ -1018,6 +1018,7 @@ exports.getProfitBreakdown = async (req, res) => {
                 pools: {
                     profitFees: profitFees?.balance || 0,
                     fiatPool: fiatPool?.balance || 0,
+                    fiatPoolUnit: fiatPoolMode.authorityUnit,
                     hotWallet: hotWallet?.balance || 0,
                     masterCrypto: masterCrypto?.balance || 0
                 },
@@ -2168,6 +2169,7 @@ exports.getSystemHealth = async (req, res) => {
     const prisma = getReadPrisma(req.app);
 
     try {
+        const fiatPoolMode = await require('../src/services/fiatLiquidityActivationService').readMode(prisma);
         const [masterCrypto, hotWallet, fiatPool, profitFees, settings, recentTrades, recentDeposits] = await Promise.all([
             prisma.systemMasterCrypto.findUnique({ where: { id: 1 } }).catch(() => null),
             prisma.systemHotWallet.findUnique({ where: { id: 1 } }).catch(() => null),
@@ -2196,13 +2198,26 @@ exports.getSystemHealth = async (req, res) => {
         return res.status(200).json({
             success: true,
             data: {
-                pools: {
-                    masterCrypto: masterCrypto?.balance || 0,
-                    hotWallet: hotWallet?.balance || 0,
-                    fiatPool: fiatPool?.balance || 0,
-                    profitFees: profitFees?.balance || 0,
-                    totalSystemValue: (masterCrypto?.balance || 0) + (hotWallet?.balance || 0) + (fiatPool?.balance || 0) + (profitFees?.balance || 0)
-                },
+                pools: (() => {
+                    // §P.5-D UNIT DISCIPLINE: once the GHS authority is latched,
+                    // SystemFiatPool is a GHS projection. Adding it to a USDC total
+                    // would silently mix units, so it is reported separately and
+                    // excluded from the USDC total.
+                    const mode = fiatPoolMode;
+                    const fiatPoolInUsdc = mode.active ? 0 : (Number(fiatPool?.balance) || 0);
+                    return {
+                        masterCrypto: masterCrypto?.balance || 0,
+                        hotWallet: hotWallet?.balance || 0,
+                        fiatPool: fiatPool?.balance || 0,
+                        fiatPoolUnit: mode.authorityUnit,
+                        fiatPoolRegime: mode.active ? 'GHS_AUTHORITY' : 'LEGACY_USDC_POOL',
+                        profitFees: profitFees?.balance || 0,
+                        totalSystemValue: (Number(masterCrypto?.balance) || 0) + (Number(hotWallet?.balance) || 0)
+                            + fiatPoolInUsdc + (Number(profitFees?.balance) || 0),
+                        totalSystemValueUnit: 'USDC',
+                        fiatPoolExcludedFromUsdcTotal: mode.active,
+                    };
+                })(),
 
                 oracle: {
                     liveUsdToGhs: settings?.liveUsdToGhs || 0,
@@ -2287,6 +2302,8 @@ exports.getPayoutSettings = async (req, res) => {
         }
 
         const fiatPool = await prisma.systemFiatPool.findUnique({ where: { id: 1 } });
+        const fiatPoolMode = await require('../src/services/fiatLiquidityActivationService').readMode(prisma);
+        const fiatPoolUnit = fiatPoolMode.authorityUnit;
 
         return res.status(200).json({
             success: true,
@@ -2298,6 +2315,9 @@ exports.getPayoutSettings = async (req, res) => {
             },
             pool: {
                 balance: fiatPool ? fiatPool.balance : 0,
+                // §P.5-D: this column is a GHS projection once the authority is
+                // latched; the unit is stated rather than assumed.
+                currency: fiatPoolUnit,
                 alertThreshold: 5000 // FIAT_POOL_ALERT_THRESH from finance.service
             }
         });

@@ -29,6 +29,7 @@
 // `LEGACY_ROW_UNDER_AUTHORITY_REGIME`).
 // =============================================================================
 
+const { Prisma } = require('@prisma/client');
 const ACTIVATION_LOCK_KEY = 'azm.p5d.authority.activation';
 
 // Dispatch-eligible: the auto-payout worker's own candidate set.
@@ -60,6 +61,16 @@ class AuthorityDeactivationRefused extends Error {
     }
 }
 
+class AuthorityModeUnknownError extends Error {
+    constructor(cause) {
+        super('[P5-D] the liquidity regime could not be read, so the unit of SystemFiatPool is unknown. '
+            + 'Refusing rather than assuming legacy USDC.');
+        this.name = 'AuthorityModeUnknownError';
+        this.code = 'AUTHORITY_MODE_UNKNOWN';
+        this.cause = cause || null;
+    }
+}
+
 function _dec(v) {
     if (v === null || v === undefined) return null;
     return typeof v.toString === 'function' ? Number(v.toString()) : Number(v);
@@ -70,11 +81,21 @@ function _dec(v) {
  * @returns {Promise<{active:boolean, flagged:boolean, latched:boolean,
  *                    activatedAt:Date|null, authorityUnit:'GHS'|'USDC'}>}
  */
-async function readMode(prisma) {
-    const [settings, state] = await Promise.all([
-        prisma.globalSettings.findUnique({ where: { id: 1 }, select: { fiatLiquidityAuthorityEnabled: true } }).catch(() => null),
-        prisma.fiatLiquidityState.findUnique({ where: { id: 1 }, select: { authorityActivatedAt: true } }).catch(() => null),
-    ]);
+async function readMode(db) {
+    // FAIL CLOSED. A failed read is an UNKNOWN regime, never "legacy USDC".
+    // Swallowing the error here would silently reinterpret the GHS projection
+    // as USDC — the exact defect this service exists to prevent. A MISSING row
+    // is different from an UNREADABLE one: no singleton means default-off.
+    let settings;
+    let state;
+    try {
+        [settings, state] = await Promise.all([
+            db.globalSettings.findUnique({ where: { id: 1 }, select: { fiatLiquidityAuthorityEnabled: true } }),
+            db.fiatLiquidityState.findUnique({ where: { id: 1 }, select: { authorityActivatedAt: true } }),
+        ]);
+    } catch (err) {
+        throw new AuthorityModeUnknownError(err);
+    }
     const flagged = settings?.fiatLiquidityAuthorityEnabled === true;
     const activatedAt = state?.authorityActivatedAt || null;
     const latched = activatedAt != null;
@@ -94,6 +115,15 @@ async function isAuthorityModeActive(prisma) {
 }
 
 /**
+ * Take the regime lock for the rest of this transaction. Money paths and the
+ * activation sequence share it so a withdrawal can never commit under the old
+ * mode while activation's preflight has already decided the old mode is safe.
+ */
+async function lockRegime(tx) {
+    await tx.$executeRawUnsafe('SELECT pg_advisory_xact_lock(hashtext($1))', ACTIVATION_LOCK_KEY);
+}
+
+/**
  * Audit of the rows whose regime would change meaning at activation.
  * Never mutates. Safe to call from an operator script or a test.
  */
@@ -103,7 +133,7 @@ async function activationPreflight(prisma) {
                 w."transactionHistoryId"
            FROM "Withdrawal" w
           WHERE w."status" = ANY($1::text[])
-            AND (w."settlementCurrency" IS NULL OR w."settlementCurrency" = 'USDC')
+            AND (w."settlementCurrency" IS NULL OR w."settlementCurrency" <> 'GHS')
             AND (w."payoutMethod" ILIKE '%MOMO%'
                  OR w."payoutMethod" IN ('FIAT', 'MOBILE_MONEY', 'MTN_MOMO'))
             AND NOT EXISTS (
@@ -134,7 +164,7 @@ async function activationPreflight(prisma) {
         `SELECT t."id", t."txHash", t."status"
            FROM "TransactionHistory" t
           WHERE t."type" = 'WITHDRAWAL_FIAT'
-            AND t."status" = 'PENDING'
+            AND t."status" NOT IN ('COMPLETED', 'FAILED')
             AND NOT EXISTS (SELECT 1 FROM "FiatLiquidityReservation" r WHERE r."reference" = t."txHash")
             AND NOT EXISTS (SELECT 1 FROM "Withdrawal" w WHERE w."transactionHistoryId" = t."id")
           ORDER BY t."id"`
@@ -186,7 +216,7 @@ async function activateAuthority(prisma, { actor = 'operator', reason = null } =
     return prisma.$transaction(async (tx) => {
         // Serialize concurrent activations: two operators must not race the
         // preflight-then-write sequence.
-        await tx.$executeRawUnsafe('SELECT pg_advisory_xact_lock(hashtext($1))', ACTIVATION_LOCK_KEY);
+        await lockRegime(tx);
 
         const preflight = await activationPreflight(tx);
         if (!preflight.ok) throw new AuthorityActivationRefused(preflight);
@@ -205,8 +235,53 @@ async function activateAuthority(prisma, { actor = 'operator', reason = null } =
             create: { id: 1, fiatLiquidityAuthorityEnabled: true },
         });
 
+        // SYNCHRONIZE THE PROJECTION IN THE SAME TRANSACTION. Before activation
+        // SystemFiatPool holds a legacy USDC figure; after it, readers treat the
+        // value as GHS. Leaving the stale USDC number in place would publish a
+        // USDC balance under a GHS label until the next liquidity operation
+        // happened to rewrite it.
+        const syncedState = await tx.fiatLiquidityState.findUnique({ where: { id: 1 } });
+        const previousPool = await tx.systemFiatPool.findUnique({ where: { id: 1 } });
+        await tx.systemFiatPool.upsert({
+            where: { id: 1 },
+            update: { balance: new Prisma.Decimal(syncedState.availableGhs ?? 0) },
+            create: { id: 1, balance: new Prisma.Decimal(syncedState.availableGhs ?? 0) },
+        });
+
+        // DURABLE ACTIVATION AUDIT EVIDENCE: who activated, why, and the
+        // projection rewrite it caused.
+        await tx.adminSettingsAuditLog.create({
+            data: {
+                adminId: Number.isInteger(actor) ? actor : 0,
+                adminName: Number.isInteger(actor) ? null : String(actor || 'operator'),
+                action: 'P5D_AUTHORITY_ACTIVATED',
+                targetType: 'FIAT_LIQUIDITY_AUTHORITY',
+                targetId: '1',
+                changes: {
+                    reason: reason == null ? null : String(reason),
+                    latch: { old: existing.authorityActivatedAt || null, new: syncedState.authorityActivatedAt || null },
+                    projection: {
+                        unit: 'GHS',
+                        previousBalance: previousPool ? String(previousPool.balance) : null,
+                        projectedBalance: String(syncedState.availableGhs ?? 0),
+                    },
+                    preflight: { blockers: preflight.blockers.length, advisories: preflight.advisories.length },
+                },
+            },
+        });
+
         const mode = await readMode(tx);
-        return { ...mode, actor, reason, preflight };
+        return {
+            ...mode,
+            actor,
+            reason,
+            preflight,
+            projection: {
+                unit: 'GHS',
+                balance: String(syncedState.availableGhs ?? 0),
+                previousBalance: previousPool ? String(previousPool.balance) : null,
+            },
+        };
     });
 }
 
@@ -229,8 +304,10 @@ module.exports = {
     BLOCKING_STATUSES,
     AuthorityActivationRefused,
     AuthorityDeactivationRefused,
+    AuthorityModeUnknownError,
     readMode,
     isAuthorityModeActive,
+    lockRegime,
     activationPreflight,
     activateAuthority,
     assertDeactivationAllowed,

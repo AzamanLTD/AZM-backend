@@ -334,6 +334,10 @@ jobs:
             # priced against the GHS projection. Needs the reconciliation + fiat
             # liquidity overlays this lane already installs.
             "__tests__/p5d-legacy-under-authority-regime.test.js"
+            # §P.5-D latched regime contract: Boolean cleared after activation,
+            # reversal under the latch, activation/creation mutual exclusion,
+            # projection sync and unit-explicit readers.
+            "__tests__/p5d-latched-regime-contract.test.js"
           )
           # Fail before jest if the identity expectation is missing: the suites
           # themselves refuse under GitHub Actions, but the lane must not depend

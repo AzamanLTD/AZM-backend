@@ -123,9 +123,13 @@ function toExactGhsDecimal(value, { field = 'amountGhs' } = {}) {
 
 // ─── flag ───────────────────────────────────────────────────────────────────
 
-const isAuthorityEnabled = async (prisma) => {
-    const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
-    return settings?.fiatLiquidityAuthorityEnabled === true;
+// §P.5-D EFFECTIVE MODE — THE SINGLE SOURCE OF TRUTH.
+// Authority mode is TRUE when the Boolean is on OR the one-way latch is set;
+// clearing the Boolean after activation must never restore USDC meaning. The
+// read fails closed (a read error throws rather than reporting legacy mode).
+const isAuthorityEnabled = async (db) => {
+    const activation = require('./fiatLiquidityActivationService');
+    return activation.isAuthorityModeActive(db);
 };
 
 // ─── provider-observation identity (docs §3.3) ───────────────────────────────

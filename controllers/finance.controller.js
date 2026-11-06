@@ -611,6 +611,11 @@ exports.getFiatPoolStatus = async (req, res) => {
                 regime:            mode.active ? 'GHS_AUTHORITY' : 'LEGACY_USDC_POOL',
                 authorityMode:     mode.active,
                 authorityActivatedAt: mode.activatedAt,
+                // While the authority has NEVER been activated, SystemFiatPool
+                // really is the legacy USDC pool, so this is an authoritative
+                // USDC figure. After activation no authoritative USDC pool
+                // exists: null rather than a relabelled GHS number.
+                legacyUsdcPoolBalance: mode.active ? null : parseFloat(Number(balance.toString()).toFixed(6)),
             }
         });
     } catch (error) {
