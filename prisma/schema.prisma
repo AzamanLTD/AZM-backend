@@ -829,6 +829,7 @@ model User {
   // Misc
   savedWallets       SavedWallet[]
   savedMomoAccounts  SavedMomoAccount[]
+  savedServiceAccounts SavedServiceAccount[]
   notifications      Notification[]
   earnedBadges       Badge[]             @relation("UserBadges")
   leaderboardRecords LeaderboardRecord[]
@@ -7395,4 +7396,34 @@ model CustodyEvidence {
   @@index([custodyAccountId, createdAt(sort: Desc)])
   @@index([status])
   @@index([scope, status])
+}
+
+/// Saved bill/top-up service accounts (meter, smartcard, customer reference…).
+/// The identifier payload is AES-256-GCM ciphertext; only the keyed fingerprint
+/// and a short display mask are queryable. This model cannot pay anything.
+model SavedServiceAccount {
+  id                    String    @id @default(uuid())
+  userId                Int
+  serviceCode           String    @db.VarChar(64)
+  providerCode          String    @db.VarChar(64)
+  nickname              String    @db.VarChar(64)
+
+  accountDataCiphertext String    @db.Text
+  accountDataKeyVersion String    @db.VarChar(16)
+  serviceTemplateVersion String @db.VarChar(16) @default("1") // registry schemaVersion that validated the fields
+  accountFingerprint    String    @db.Char(64)
+  accountMask           String    @db.VarChar(32)
+
+  verificationStatus    String    @default("UNVERIFIED")
+  verifiedAt            DateTime?
+  isPrimary             Boolean   @default(false)
+  lastUsedAt            DateTime?
+
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, serviceCode, accountFingerprint])
+  @@index([userId, serviceCode, createdAt(sort: Desc)])
 }
