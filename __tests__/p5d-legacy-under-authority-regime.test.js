@@ -69,6 +69,25 @@ describeOrSkip('§P.5-D mixed-regime over-dispatch (real PostgreSQL)', () => {
             await prisma.$executeRawUnsafe('DELETE FROM "SystemMasterCrypto"');
             await prisma.$executeRawUnsafe('DELETE FROM "SystemFiatPool"');
             await prisma.$executeRawUnsafe('DELETE FROM "SystemProfitFees"');
+            // §CROSS-SUITE HYGIENE: activation and the latch are GLOBAL state.
+            // Leaving authority mode on for whatever suite runs next changes its
+            // money paths (a real lane failure: a BANK refund then took the
+            // authority branch and the wallet reconciliation disagreed). Every
+            // global this suite touches is restored to the default-off shape.
+            await prisma.$executeRawUnsafe('DELETE FROM "Withdrawal"');
+            await prisma.$executeRawUnsafe('DELETE FROM "TransactionHistory"');
+            await prisma.$executeRawUnsafe('DELETE FROM "FiatLiquidityReservation"');
+            await prisma.$executeRawUnsafe('DELETE FROM "FiatProviderEvent"');
+            await prisma.$executeRawUnsafe('DELETE FROM "ReconciliationException"');
+            await prisma.fiatLiquidityState.upsert({
+                where: { id: 1 },
+                update: { availableGhs: 0, reservedGhs: 0, inTransitGhs: 0, paidOutGhs: 0, reconciliationHeldGhs: 0, authorityActivatedAt: null },
+                create: { id: 1 },
+            });
+            await prisma.globalSettings.update({
+                where: { id: 1 },
+                data: { fiatLiquidityAuthorityEnabled: false, autoPayoutEnabled: false },
+            }).catch(() => null);
             await prisma.$disconnect();
         }
     });
