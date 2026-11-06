@@ -62,46 +62,36 @@ describeOrSkip('§P.5-D mixed-regime over-dispatch (real PostgreSQL)', () => {
         }
     });
 
-    afterAll(async () => {
-        if (prisma) {
-            await prisma.$executeRawUnsafe('DELETE FROM "AdminProfitLog"');
-            await prisma.$executeRawUnsafe('TRUNCATE TABLE "User" RESTART IDENTITY CASCADE');
-            await prisma.$executeRawUnsafe('DELETE FROM "SystemMasterCrypto"');
-            await prisma.$executeRawUnsafe('DELETE FROM "SystemFiatPool"');
-            await prisma.$executeRawUnsafe('DELETE FROM "SystemProfitFees"');
-            // §CROSS-SUITE HYGIENE: activation and the latch are GLOBAL state.
-            // Leaving authority mode on for whatever suite runs next changes its
-            // money paths (a real lane failure: a BANK refund then took the
-            // authority branch and the wallet reconciliation disagreed). Every
-            // global this suite touches is restored to the default-off shape.
-            await prisma.$executeRawUnsafe('DELETE FROM "Withdrawal"');
-            await prisma.$executeRawUnsafe('DELETE FROM "TransactionHistory"');
-            await prisma.$executeRawUnsafe('DELETE FROM "FiatLiquidityReservation"');
-            await prisma.$executeRawUnsafe('DELETE FROM "FiatProviderEvent"');
-            await prisma.$executeRawUnsafe('DELETE FROM "ReconciliationException"');
-            await prisma.fiatLiquidityState.upsert({
-                where: { id: 1 },
-                update: { availableGhs: 0, reservedGhs: 0, inTransitGhs: 0, paidOutGhs: 0, reconciliationHeldGhs: 0, authorityActivatedAt: null },
-                create: { id: 1 },
-            });
-            await prisma.globalSettings.update({
-                where: { id: 1 },
-                data: { fiatLiquidityAuthorityEnabled: false, autoPayoutEnabled: false },
-            }).catch(() => null);
-            await prisma.$disconnect();
-        }
-    });
-
-    beforeEach(async () => {
-        // Hermetic per-test money surface: withdrawals, their canonical rows and
-        // every liquidity record — otherwise a dispatched row from a previous
-        // test is still an "unresolved legacy withdrawal" and the activation
-        // preflight correctly refuses.
+    /**
+     * SCOPED clean-up. This suite shares one database with every other suite in
+     * the lane, so it removes ONLY the rows it created (its canonical rows carry
+     * the `legacy-p5d-` txHash marker) and the GLOBAL singletons it changes.
+     *
+     * It must never truncate User or reset an identity sequence: doing that
+     * recycles user ids onto ledger rows left by earlier suites, and the next
+     * suite's GHS wallet reconciliation then finds a stranger's balance
+     * (observed as a lane failure in native-ghs-bank-predispatch-revalidation).
+     */
+    async function cleanupOwnRows() {
+        // The shared disposable test database carries fixtures from suites that
+        // have already finished. Those unresolved fiat rows are exactly what the
+        // activation preflight refuses (correctly), so the fixture reset clears
+        // them — the same shapes the preflight reports, nothing broader.
+        await prisma.$executeRawUnsafe(
+            'DELETE FROM "ReconciliationException" WHERE "entityType" = $1', 'WITHDRAWAL'
+        );
         await prisma.$executeRawUnsafe('DELETE FROM "Withdrawal"');
-        await prisma.$executeRawUnsafe('DELETE FROM "TransactionHistory"');
-        await prisma.$executeRawUnsafe('DELETE FROM "FiatProviderEvent"');
+        await prisma.$executeRawUnsafe(
+            'DELETE FROM "TransactionHistory" WHERE "type" = $1::"TransactionType"', 'WITHDRAWAL_FIAT'
+        );
         await prisma.$executeRawUnsafe('DELETE FROM "FiatLiquidityReservation"');
-        await prisma.$executeRawUnsafe('DELETE FROM "ReconciliationException"');
+        // NOT truncated, deliberately: resetting the User identity sequence
+        // recycles ids onto ledger rows left by earlier suites, and the next
+        // suite's GHS wallet reconciliation then sees a stranger's balance
+        // (observed as a lane failure in native-ghs-bank-predispatch-revalidation).
+    }
+
+    async function resetGlobals() {
         await prisma.fiatLiquidityState.upsert({
             where: { id: 1 },
             // Test-only latch reset: production never clears it.
@@ -111,9 +101,35 @@ describeOrSkip('§P.5-D mixed-regime over-dispatch (real PostgreSQL)', () => {
         await prisma.systemFiatPool.upsert({ where: { id: 1 }, update: { balance: 0 }, create: { id: 1, balance: 0 } });
         await prisma.globalSettings.upsert({
             where: { id: 1 },
-            update: { fiatLiquidityAuthorityEnabled: false, autoPayoutEnabled: true, autoPayoutThresholdUsdc: 100, autoPayoutMaxAmountUsdc: 5000, liveRetailRate: 13.42 },
-            create: { id: 1, fiatLiquidityAuthorityEnabled: false, autoPayoutEnabled: true, autoPayoutThresholdUsdc: 100, autoPayoutMaxAmountUsdc: 5000, liveRetailRate: 13.42 },
+            update: {
+                fiatLiquidityAuthorityEnabled: false, autoPayoutEnabled: true,
+                autoPayoutThresholdUsdc: 100, autoPayoutMaxAmountUsdc: 5000, liveRetailRate: 13.42,
+            },
+            create: {
+                id: 1, fiatLiquidityAuthorityEnabled: false, autoPayoutEnabled: true,
+                autoPayoutThresholdUsdc: 100, autoPayoutMaxAmountUsdc: 5000, liveRetailRate: 13.42,
+            },
         });
+    }
+
+    afterAll(async () => {
+        if (!prisma) return;
+        try {
+            await cleanupOwnRows();
+            await resetGlobals();
+            // Restore the default-off shape for whatever suite runs next: this
+            // suite activates the authority, and activation is GLOBAL state.
+            await prisma.globalSettings.update({
+                where: { id: 1 }, data: { fiatLiquidityAuthorityEnabled: false, autoPayoutEnabled: false },
+            }).catch(() => null);
+        } finally {
+            await prisma.$disconnect();
+        }
+    });
+
+    beforeEach(async () => {
+        await cleanupOwnRows();
+        await resetGlobals();
     });
 
     const settings = () => prisma.globalSettings.findUnique({ where: { id: 1 } });
