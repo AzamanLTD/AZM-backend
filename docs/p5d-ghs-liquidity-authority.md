@@ -351,6 +351,58 @@ reservations.
   when the deposit webhooks settle — evidence recording is always safe (no balance
   effects), availability only ever arises from evidence.
 
+### 4.1 One-way activation latch — turning the flag OFF is NOT a rollback
+
+The Boolean is a **decision to activate**, not a live mode switch. Once
+activation has run, `SystemFiatPool.balance` holds GHS pesewas. Clearing the
+Boolean afterwards would reinterpret that number as USDC — a ~13x error on the
+payout gate — so the regime is latched:
+
+- `FiatLiquidityState.authorityActivatedAt` is written **once** by
+  `fiatLiquidityActivationService.activateAuthority()` and is never cleared by
+  application code (only a test resets it).
+- `readMode()` / `isAuthorityModeActive()` report `active = flag || latched`.
+  A latched database therefore stays in authority mode whatever the Boolean says.
+- `assertDeactivationAllowed()` throws `P5D_DEACTIVATION_REFUSED` on a latched
+  database. **There is no supported deactivation procedure.** Rolling back to
+  legacy USDC settlement requires a new database, not a flag change.
+
+**Operator activation procedure** (the only sanctioned order):
+
+1. Drain: resolve every dispatch-eligible legacy fiat withdrawal. `PENDING`,
+   `APPROVED`, `PROCESSING`, `IN_TRANSIT`, `UNKNOWN`, `AWAITING_PROVIDER` and
+   `PENDING_PROVIDER` rows without a `FiatLiquidityReservation` are all blockers —
+   not only `PENDING`. Rows already `NEEDS_MANUAL_REVIEW` are reported as
+   advisories: the worker will not dispatch them under authority mode, so they do
+   not block activation.
+2. Preview: `activationPreflight(prisma)` returns `{ ok, blockers, advisories }`
+   and changes nothing.
+3. Activate: `activateAuthority(prisma, { actor, reason })` re-runs the preflight
+   inside a transaction holding an advisory lock, writes the latch and the Boolean,
+   and returns the resulting mode. It throws `P5D_ACTIVATION_BLOCKED` with the
+   blocker list rather than activating partially.
+
+**Never** set `fiatLiquidityAuthorityEnabled` by hand in a database that has any
+unresolved legacy fiat withdrawal: that is exactly the mixed-regime state that
+produced a 650 GHS dispatch against a 600 GHS pool (a 50 USDC row compared with a
+100 USDC threshold against the GHS projection).
+
+### 4.2 An unreserved legacy row under authority mode is parked, never priced
+
+The auto-payout worker resolves the regime per row (`FiatLiquidityReservation`
+for the canonical reference = authority row; otherwise legacy) and now also
+consults the latch. Under authority mode an unreserved legacy row is parked
+through the reconciliation infrastructure with the stable reason
+**`LEGACY_ROW_UNDER_AUTHORITY_REGIME`** (`Withdrawal` →
+`NEEDS_MANUAL_REVIEW`, `ReconciliationException` OPEN). No provider is called and
+the GHS projection is not consulted as if it were USDC. Such a row needs a human
+settlement decision: it predates the authority and has no reserved GHS.
+
+`GET /api/finance/fiat-pool-status` reports `currency`, `thresholdCurrency` and
+`regime` alongside `balance`/`threshold`, and classifies against the floor in the
+matching unit (USDC floor while legacy, the exact GHS equivalent of the same floor
+once activated).
+
 ## 5. Invariants (each has a real-PG proof)
 
 1. Only VERIFIED evidence creates AVAILABLE liquidity. The service itself verifies

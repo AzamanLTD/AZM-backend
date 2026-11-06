@@ -46,6 +46,7 @@
 const { Prisma } = require('@prisma/client');
 const logger = require('../src/config/logger');
 const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
+const fiatLiquidityActivation = require('../src/services/fiatLiquidityActivationService'); // §P.5-D latch
 const { canonicalProviderName, persistPayoutOwnership } = require('../services/payoutProviderOwnership');
 const { recordReconciliationException } = require('../services/reconciliationExceptionService');
 const restrictedObligations = require('../services/restrictedObligationService'); // r17 P0 durable identity
@@ -272,6 +273,16 @@ class PayoutBatchWorker {
         // the batch actually needs it. Authority-reserved processing never
         // reads SystemFiatPool at all.
         let runningPoolBalance = null; // legacy regime gauge (USDC projection); null = no legacy row read it yet
+        // §P.5-D ONE-WAY LATCH: resolved at most once per batch. Once the
+        // authority has been activated, SystemFiatPool is a GHS projection and
+        // an unreserved legacy row can never be priced against it.
+        let authorityModeActive = null;
+        const ensureAuthorityMode = async () => {
+            if (authorityModeActive === null) {
+                authorityModeActive = await fiatLiquidityActivation.isAuthorityModeActive(this.prisma);
+            }
+            return authorityModeActive;
+        };
         const ensureLegacyPool = async () => {
             if (runningPoolBalance === null) {
                 const fiatPool = await this.prisma.systemFiatPool.findUnique({ where: { id: 1 } });
@@ -450,10 +461,28 @@ class PayoutBatchWorker {
                     continue;
                 }
             } else {
-                // Legacy regime (recorded row predates §P.5-D — no
-                // reservation row): preserve the historical SystemFiatPool
-                // pool/threshold policy. SystemFiatPool is a compatibility /
-                // legacy projection ONLY and is never an authority input.
+                // §P.5-D LATCHED REGIME: once the authority has been activated,
+                // SystemFiatPool.balance is the GHS projection of availableGhs,
+                // NOT the legacy USDC pool. An unreserved row here (a recorded
+                // row that predates §P.5-D) may therefore never be priced
+                // against it: comparing a 50 USDC row with the 100 USDC
+                // threshold against a 600 GHS projection dispatched 650 GHS
+                // while the authority held 600. The row is parked durably and
+                // no provider is contacted.
+                if (await ensureAuthorityMode()) {
+                    const parked = await this._parkForManualReview(withdrawal, 'LEGACY_ROW_UNDER_AUTHORITY_REGIME', {
+                        amount,
+                        amountUsdc: amount,
+                        message: 'This payout predates the GHS liquidity authority and has no GHS reservation. '
+                            + 'It cannot be priced against the GHS pool projection, so it needs manual settlement.',
+                    });
+                    if (parked) results.flaggedManualReview.push({ id: withdrawal.id, reason: 'LEGACY_ROW_UNDER_AUTHORITY_REGIME', amount });
+                    continue;
+                }
+                // Legacy regime (authority never activated): preserve the
+                // historical SystemFiatPool pool/threshold policy. SystemFiatPool
+                // is a compatibility / legacy projection ONLY and is never an
+                // authority input.
                 const poolBalanceNow = await ensureLegacyPool();
                 if (poolBalanceNow < threshold || poolBalanceNow < amount) {
                     const parked = await this._parkForManualReview(withdrawal, 'INSUFFICIENT_POOL_LIQUIDITY', {
@@ -657,7 +686,9 @@ class PayoutBatchWorker {
                 // touching availableGhs. Legacy rows keep the historical
                 // USDC pool projection gauge.
                 if (!authorityRecorded) {
-                    runningPoolBalance -= amount;
+                    // The gauge is USDC only because the branch above refused
+                    // every legacy row once the projection became GHS.
+                    if (!(await ensureAuthorityMode())) runningPoolBalance -= amount;
                 }
 
                 results.processed.push({
@@ -709,7 +740,11 @@ class PayoutBatchWorker {
                 // over-dispatch the remaining pool headroom. Authority-
                 // recorded rows have no batch gauge to decrement.
                 if (!authorityRecorded) {
-                    runningPoolBalance -= amount;
+                    // The gauge is USDC only because the branch above refused
+                    // every legacy row once the projection became GHS.
+                    // Same invariant as the site above: never subtract a USDC amount
+            // from a gauge that holds GHS.
+            if (!(await ensureAuthorityMode())) runningPoolBalance -= amount;
                 }
                 results.unknownOutcome.push({
                     id: withdrawal.id,

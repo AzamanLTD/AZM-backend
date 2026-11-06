@@ -329,6 +329,11 @@ jobs:
             "__tests__/native-ghs-risk-gating.test.js"
             "__tests__/native-ghs-risk-hardening.test.js"
             "__tests__/native-ghs-trusted-age-risk.test.js"
+            # §P.5-D mixed-regime over-dispatch: a legacy row under the latched
+            # GHS authority is parked (LEGACY_ROW_UNDER_AUTHORITY_REGIME) and never
+            # priced against the GHS projection. Needs the reconciliation + fiat
+            # liquidity overlays this lane already installs.
+            "__tests__/p5d-legacy-under-authority-regime.test.js"
           )
           # Fail before jest if the identity expectation is missing: the suites
           # themselves refuse under GitHub Actions, but the lane must not depend

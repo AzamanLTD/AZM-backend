@@ -1894,6 +1894,11 @@ model FiatLiquidityReservation {
 /// row; sums over receipts/reservations are the reconciliation target.
 model FiatLiquidityState {
   id                    Int     @id @default(1)
+  // §P.5-D ONE-WAY ACTIVATION LATCH (docs §4.1). Written ONCE by
+  // fiatLiquidityActivationService.activateAuthority() and never cleared: once
+  // SystemFiatPool has been written as a GHS projection, clearing the
+  // GlobalSettings Boolean must NOT reinterpret those pesewas as USDC.
+  authorityActivatedAt  DateTime?
   availableGhs          Decimal @default(0) @db.Decimal(20, 2)
   reservedGhs           Decimal @default(0) @db.Decimal(20, 2)
   inTransitGhs          Decimal @default(0) @db.Decimal(20, 2)
