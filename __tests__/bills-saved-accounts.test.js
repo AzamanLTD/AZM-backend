@@ -622,3 +622,156 @@ describe('key configuration refuses before anything is written', () => {
             .toThrow(expect.objectContaining({ code: 'SAVED_SERVICE_IDENTITY_REQUIRED' }));
     });
 });
+
+// ── legacy v1 envelopes ─────────────────────────────────────────────────────
+// The engine moved to senc:v2 (owner + service AAD). Rows written before the
+// move must still open, so this fixture is the REAL v1 output: it was produced
+// by running the pre-v2 implementation itself
+// (`git show 18830d9:services/bills/savedServiceCrypto.js`) with the fixed key
+// below and a fixed IV of twelve 0x0b bytes. It is not v2 encryption labelled
+// v1: the envelope carries the v1 segment, no AAD, and a 6-field layout.
+// Test-only key material, derived from a label, never a production value.
+describe('legacy v1 envelopes still open', () => {
+    const LEGACY_KEY = '4bd8c0a382afac4fa4ab56ce37aeb55afda91a5e0d8be98d491684ff9008a138';
+    const LEGACY_ENVELOPE = 'senc:v1:1:s6Thn7Kg3iYHhasM:0UReRkHo77haClPJC6XW4Q==:BHavpvmWp6XO/Svgn0K4TlKxM0ox3M/MUdOoDQ==';
+    const LEGACY_PLAINTEXT = { meterNumber: '1234567890' };
+    const CURRENT_KEY = crypto.createHash('sha256').update('azaman.saved-service.v2.current.fixture').digest('hex');
+
+    test('the fixture is a genuine v1 envelope, not v2 in disguise', () => {
+        const parts = LEGACY_ENVELOPE.split(':');
+        expect(parts).toHaveLength(6);
+        expect(parts[0]).toBe('senc');
+        expect(parts[1]).toBe('v1');
+        expect(parts[2]).toBe('1');
+        expect(LEGACY_ENVELOPE).not.toContain('1234567890');
+        expect(LEGACY_ENVELOPE).not.toContain(LEGACY_KEY);
+    });
+
+    test('the production decryption path opens it and recovers the exact plaintext', () => {
+        const c = freshCrypto({ encKey: LEGACY_KEY, version: '1' });
+        expect(c.parseEnvelope(LEGACY_ENVELOPE).envelopeVersion).toBe('v1');
+        // v1 carried no AAD, so it opens without an identity, exactly as written.
+        expect(c.decryptAccountData(LEGACY_ENVELOPE)).toEqual(LEGACY_PLAINTEXT);
+    });
+
+    test('it still opens after the current key version has advanced to v2', () => {
+        const rotated = freshCrypto({
+            encKey: CURRENT_KEY,
+            version: '2',
+            ring: JSON.stringify({ 1: LEGACY_KEY }),
+        });
+        expect(rotated.decryptAccountData(LEGACY_ENVELOPE)).toEqual(LEGACY_PLAINTEXT);
+
+        // A v2 envelope written under the new version is unaffected by the ring.
+        const fresh = rotated.encryptAccountData(LEGACY_PLAINTEXT, OWNER);
+        expect(rotated.decryptAccountData(fresh, OWNER)).toEqual(LEGACY_PLAINTEXT);
+    });
+
+    test('an incorrect legacy key fails closed', () => {
+        const wrongKey = crypto.createHash('sha256').update('azaman.not-the-legacy-key').digest('hex');
+        const wrong = freshCrypto({
+            encKey: CURRENT_KEY,
+            version: '2',
+            ring: JSON.stringify({ 1: wrongKey }),
+        });
+        let err;
+        try { wrong.decryptAccountData(LEGACY_ENVELOPE); } catch (e) { err = e; }
+        expect(err).toBeTruthy();
+        expect(err.code).toBe('SAVED_SERVICE_CIPHERTEXT_INVALID');
+        expect(err.message).not.toContain('1234567890');
+        expect(JSON.stringify(err.message)).not.toContain(LEGACY_KEY);
+    });
+
+    test('a version the ring does not know is refused, never guessed', () => {
+        const c = freshCrypto({ encKey: CURRENT_KEY, version: '2' });
+        const unknownVersion = LEGACY_ENVELOPE.replace('senc:v1:1:', 'senc:v1:7:');
+        expect(() => c.decryptAccountData(unknownVersion))
+            .toThrow(expect.objectContaining({ code: 'SAVED_SERVICE_KEY_VERSION_UNKNOWN' }));
+    });
+});
+
+// ── owner and service isolation ─────────────────────────────────────────────
+// v2 binds userId + serviceCode as AES-GCM AAD. Row-level scoping already
+// refuses another member's query; these tests prove the ciphertext itself is
+// bound, so a row that ends up attached to the wrong owner (bad migration,
+// replication mix-up, operator edit) fails authentication instead of
+// decrypting into the wrong tenant's UI.
+describe('ciphertext is bound to one owner and one service', () => {
+    const { createService } = require('../services/bills/savedServiceAccountService');
+    const build = () => {
+        jest.resetModules();
+        process.env.SAVED_SERVICE_ENCRYPTION_KEY = KEY;
+        process.env.SAVED_SERVICE_FINGERPRINT_KEY = FP_KEY;
+        process.env.SAVED_SERVICE_ENCRYPTION_KEY_VERSION = '1';
+        process.env.SAVED_SERVICE_ENCRYPTION_KEYS_JSON = '';
+        const prisma = fakePrisma([]);
+        return { prisma, svc: createService({ prisma }) };
+    };
+
+    test('the owner with the right service decrypts, and only then', async () => {
+        const { svc } = build();
+        const mine = await svc.createAccount({ userId: 7, ...ECG });
+        await expect(svc.revealAccountFields({ userId: 7, id: mine.id }))
+            .resolves.toEqual({ meterNumber: '1234567890' });
+
+        // User B cannot even reach the row: owner-scoped query.
+        await expect(svc.revealAccountFields({ userId: 8, id: mine.id }))
+            .rejects.toMatchObject({ status: 404, code: 'SAVED_ACCOUNT_NOT_FOUND' });
+    });
+
+    test('a row re-pointed at another member fails authentication, not the query', async () => {
+        const { prisma, svc } = build();
+        const mine = await svc.createAccount({ userId: 7, ...ECG });
+        // The dangerous case: the row now CLAIMS to belong to user 8, so the
+        // owner-scoped lookup finds it. Only the AAD can refuse.
+        prisma._rows[0].userId = 8;
+
+        let err;
+        try { await svc.revealAccountFields({ userId: 8, id: mine.id }); } catch (e) { err = e; }
+        expect(err).toBeTruthy();
+        expect(err.code).toBe('SAVED_SERVICE_CIPHERTEXT_INVALID');
+        expect(err.message).toMatch(/failed authentication/);
+        expect(err.message).not.toContain('1234567890');
+        expect(JSON.stringify(err)).not.toContain('1234567890');
+    });
+
+    test('a row re-pointed at another service fails authentication too', async () => {
+        const { prisma, svc } = build();
+        const mine = await svc.createAccount({ userId: 7, ...ECG });
+        prisma._rows[0].serviceCode = 'ECG_POSTPAID';
+
+        let err;
+        try { await svc.revealAccountFields({ userId: 7, id: mine.id }); } catch (e) { err = e; }
+        expect(err).toBeTruthy();
+        expect(err.code).toBe('SAVED_SERVICE_CIPHERTEXT_INVALID');
+        expect(err.message).not.toContain('1234567890');
+    });
+
+    test('the low-level helper refuses other owners, other services, and a missing identity', () => {
+        const c = freshCrypto({ version: '1' });
+        const sealed = c.encryptAccountData({ meterNumber: '1234567890' }, { userId: 7, serviceCode: 'ECG_PREPAID' });
+
+        expect(c.decryptAccountData(sealed, { userId: 7, serviceCode: 'ECG_PREPAID' }))
+            .toEqual({ meterNumber: '1234567890' });
+
+        const otherOwner = () => c.decryptAccountData(sealed, { userId: 8, serviceCode: 'ECG_PREPAID' });
+        const otherService = () => c.decryptAccountData(sealed, { userId: 7, serviceCode: 'ECG_POSTPAID' });
+        for (const attempt of [otherOwner, otherService]) {
+            expect(attempt).toThrow(expect.objectContaining({ code: 'SAVED_SERVICE_CIPHERTEXT_INVALID' }));
+            expect(attempt).toThrow(/failed authentication/);
+        }
+        // No identity at all cannot open a v2 envelope. Decryption reports the
+        // same generic authentication failure rather than revealing that the
+        // caller simply forgot the identity.
+        expect(() => c.decryptAccountData(sealed))
+            .toThrow(expect.objectContaining({ code: 'SAVED_SERVICE_CIPHERTEXT_INVALID' }));
+        // Encryption, by contrast, states the programming error plainly.
+        expect(() => c.encryptAccountData({ meterNumber: '1' }))
+            .toThrow(expect.objectContaining({ code: 'SAVED_SERVICE_IDENTITY_REQUIRED' }));
+        // And the refusal never leaks the payload or key material.
+        try { otherOwner(); } catch (e) {
+            expect(e.message).not.toContain('1234567890');
+            expect(JSON.stringify(e.message)).not.toContain(KEY);
+        }
+    });
+});
