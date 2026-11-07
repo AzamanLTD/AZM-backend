@@ -53,7 +53,6 @@ describe('processFiatWithdrawal fiat-pool concurrency guard', () => {
         findFirst: jest.fn(),
       },
       globalSettings: {
-      fiatLiquidityState: { findUnique: jest.fn().mockResolvedValue(null) },
         findUnique: jest.fn().mockResolvedValue({
           liveRetailRate: 13,
           liveRateSource: 'KOTANI_PAY',

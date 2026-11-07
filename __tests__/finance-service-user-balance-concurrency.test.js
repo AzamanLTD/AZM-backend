@@ -55,7 +55,6 @@ describe('processFiatWithdrawal customer balance concurrency guard', () => {
         findFirst: jest.fn().mockResolvedValue(referrer),
       },
       globalSettings: {
-      fiatLiquidityState: { findUnique: jest.fn().mockResolvedValue(null) },
         findUnique: jest.fn().mockResolvedValue({
           liveRetailRate: 13.25,
           liveUsdToGhs: 13.10,

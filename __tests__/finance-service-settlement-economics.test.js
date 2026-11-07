@@ -157,7 +157,6 @@ describe('fiat withdrawal settlement economics', () => {
         findUnique: jest.fn().mockResolvedValue({ balance: 5 }),
       },
       systemFiatPool: {
-      fiatLiquidityState: { findUnique: jest.fn().mockResolvedValue(null) },
         upsert: jest.fn().mockResolvedValue({}),
         update: jest.fn().mockResolvedValue({}),
         findUnique: jest.fn().mockResolvedValue({ balance: 30 }),

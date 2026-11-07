@@ -36,7 +36,6 @@ describe('liquidateProfits concurrency guard', () => {
         findUnique: jest.fn(async () => ({ balance: profitBalance })),
       },
       systemFiatPool: {
-      fiatLiquidityState: { findUnique: jest.fn().mockResolvedValue(null) },
         upsert: jest.fn().mockResolvedValue({}),
         update: jest.fn(async ({ data }) => {
           fiatPoolBalance += Number(data.balance.increment);
@@ -86,7 +85,6 @@ describe('liquidateProfits concurrency guard', () => {
         updateMany: jest.fn().mockResolvedValue({ count: 0 }),
       },
       systemFiatPool: {
-      fiatLiquidityState: { findUnique: jest.fn().mockResolvedValue(null) },
         upsert: jest.fn().mockResolvedValue({}),
         update: jest.fn(),
       },

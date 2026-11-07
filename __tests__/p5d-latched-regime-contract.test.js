@@ -215,12 +215,16 @@ const hasDb = !!process.env.TEST_DATABASE_URL;
 
         test('a reversal reports the pool unit of the regime that released it', async () => {
             await setRegime({ flagged: false, latched: false, availableGhs: 0, pool: 0 });
-            // The reversal unwinds the USDC capture from SystemMasterCrypto; a fresh
-            // CI database holds 0 there, and the balance CHECK would reject the
-            // decrement. Seed the capture the withdrawal actually made.
+            // The two reversals below unwind 20 + 10 USDC from SystemMasterCrypto,
+            // and the balance CHECK rejects a negative row. Seed EXACTLY the capture
+            // they unwind, and put the singleton back exactly as found (including
+            // removing it when it did not exist) so no arbitrary balance is left
+            // behind for a later suite.
+            const priorMaster = await prisma.systemMasterCrypto.findUnique({ where: { id: 1 } });
             await prisma.systemMasterCrypto.upsert({
-                where: { id: 1 }, update: { balance: D(500) }, create: { id: 1, balance: D(500) },
+                where: { id: 1 }, update: { balance: D(30) }, create: { id: 1, balance: D(30) },
             });
+            try {
             const user = await newUser(100);
             const reference = `p5d-rev-${Date.now()}`;
             const tx = await prisma.transactionHistory.create({
@@ -259,6 +263,14 @@ const hasDb = !!process.env.TEST_DATABASE_URL;
             expect(latchedReversal.systemFiatPoolRegime).toBe('GHS_AUTHORITY');
             // and the GHS projection was NOT incremented by the USDC amount
             expect((await poolBalance()).toFixed(2)).toBe('600.00');
+            } finally {
+                // Guaranteed restore, including when an assertion above failed.
+                if (priorMaster) {
+                    await prisma.systemMasterCrypto.update({ where: { id: 1 }, data: { balance: priorMaster.balance } });
+                } else {
+                    await prisma.systemMasterCrypto.deleteMany({ where: { id: 1 } });
+                }
+            }
         });
     });
     describe('12. operator verification proves the latch, the projection and the audit', () => {

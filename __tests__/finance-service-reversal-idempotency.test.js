@@ -58,7 +58,6 @@ describe('finance reversal and crypto deposit idempotency', () => {
         findUnique: jest.fn().mockResolvedValue({ balance: 5 }),
       },
       systemFiatPool: {
-      fiatLiquidityState: { findUnique: jest.fn().mockResolvedValue(null) },
         upsert: jest.fn().mockResolvedValue({}),
         update: jest.fn().mockResolvedValue({}),
         findUnique: jest.fn().mockResolvedValue({ balance: 20 }),
