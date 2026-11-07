@@ -572,9 +572,11 @@ exports.getFiatPoolStatus = async (req, res) => {
         // while it is actually 8x short. Existing response keys are preserved
         // for current consumers; `currency`/`regime` state which unit
         // `balance`/`threshold` are expressed in.
-        const mode = await fiatLiquidityActivation.readMode(prisma);
-        const pool = await prisma.systemFiatPool.findUnique({ where: { id: 1 } });
-        const balance = pool?.balance ?? 0;
+        // ONE statement = ONE snapshot: the mode and the balance cannot straddle
+        // an activation, and the authoritative GHS figure is used while active.
+        const mode = await fiatLiquidityActivation.readModeAndPool(prisma);
+        const pool = await prisma.systemFiatPool.findUnique({ where: { id: 1 }, select: { updatedAt: true } });
+        const balance = mode.balance;
 
         let threshold = FIAT_POOL_ALERT_THRESH;
         if (mode.active) {

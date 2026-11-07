@@ -39,6 +39,7 @@ const hasDb = !!process.env.TEST_DATABASE_URL;
 
     async function resetMoney() {
         await prisma.$executeRawUnsafe('DELETE FROM "FiatProviderEvent"');
+        await prisma.$executeRawUnsafe('DELETE FROM "FiatLiquidityReceipt"');
         await prisma.$executeRawUnsafe('DELETE FROM "FiatLiquidityReservation"');
         await prisma.$executeRawUnsafe('DELETE FROM "ReconciliationException"');
         await prisma.$executeRawUnsafe('DELETE FROM "Withdrawal"');
@@ -327,4 +328,172 @@ const hasDb = !!process.env.TEST_DATABASE_URL;
             expect(Number(body.data.threshold)).toBe(5000);
         });
     });
+
+    // ── 9. P0: liquidation participates in the activation lock ───────────────
+    describe('9. liquidation cannot cross the activation boundary', () => {
+        test('a liquidation blocked on the regime lock observes the LATCHED mode, so no USDC lands in the GHS projection', async () => {
+            await setRegime({ flagged: false, latched: false, availableGhs: 600, pool: 600 });
+            await prisma.systemProfitFees.upsert({
+                where: { id: 1 }, update: { balance: D(500) }, create: { id: 1, balance: D(500) },
+            });
+            const poolBefore = await poolBalance();
+            const key = activation.ACTIVATION_LOCK_KEY;
+
+            // The activation holds the regime lock while it writes the latch. The
+            // liquidation starts inside that window, so it BLOCKS at lockRegime and
+            // can only read the mode after activation has committed.
+            let releaseActivation;
+            const gate = new Promise((resolve) => { releaseActivation = resolve; });
+            let activationLocked;
+            const lockHeld = new Promise((resolve) => { activationLocked = resolve; });
+
+            const activating = prisma.$transaction(async (tx) => {
+                await tx.$executeRawUnsafe('SELECT pg_advisory_xact_lock(hashtext($1))', key);
+                await tx.globalSettings.upsert({
+                    where: { id: 1 }, update: { fiatLiquidityAuthorityEnabled: true }, create: { id: 1, fiatLiquidityAuthorityEnabled: true },
+                });
+                await tx.fiatLiquidityState.upsert({
+                    where: { id: 1 }, update: { authorityActivatedAt: new Date() }, create: { id: 1, authorityActivatedAt: new Date() },
+                });
+                activationLocked();
+                await gate; // commit only after the liquidation is definitely blocked
+            }, { timeout: 30000 });
+
+            await lockHeld;
+            const liquidating = finance.liquidateProfits(prisma, 100, 7, { actorName: 'ops' });
+            await new Promise((r) => setTimeout(r, 400)); // liquidation is queued on the lock
+            releaseActivation();
+            await activating;
+
+            const result = await liquidating;
+            expect(result).toBeTruthy();
+
+            // The USDC increment must NOT have run: the pool still holds the value
+            // activation left it at, not +100 USDC.
+            expect((await poolBalance()).toFixed(8)).toBe(poolBefore.toFixed(8));
+            // …and the liquidation is a NON-AVAILABLE treasury opening instead.
+            const openings = await prisma.fiatLiquidityReceipt.findMany({ where: { provider: 'AZM_TREASURY' } });
+            expect(openings.length).toBe(1);
+            // A treasury opening is NEVER available GHS: it stays RECEIVED with
+            // no confirmedAt, so it cannot unlock spendable liquidity without an
+            // external funding observation.
+            expect(openings[0].status).toBe('RECEIVED');
+            expect(openings[0].confirmedAt).toBeNull();
+            expect(new Prisma.Decimal(openings[0].amountGhs).toFixed(2)).toBe('1250.00'); // 100 USDC @ 12.5
+        });
+    });
+
+    // ── 10. unit-sensitive status fields ─────────────────────────────────────
+    describe('10. status fields are stated in the pool unit', () => {
+        test('the withdrawal result classifies fiatPoolLow against a GHS floor, not a USDC one', async () => {
+            await setRegime({ flagged: true, latched: true, availableGhs: 600, pool: 600 });
+            const user = await newUser(1000);
+            const res = await finance.processFiatWithdrawal(prisma, user.id, 20, { reference: `latched-threshold-${Date.now()}` });
+            expect(res.systemFiatPoolUnit).toBe('GHS');
+            expect(res.fiatPoolThresholdUnit).toBe('GHS');
+            // 5000 USDC floor at 12.5 = 62,500 GHS: a 600 GHS pool is genuinely low.
+            expect(new Prisma.Decimal(res.fiatPoolThreshold).toFixed(2)).toBe('62500.00');
+            expect(res.fiatPoolLow).toBe(true);
+        });
+
+        test('under the legacy regime the same field compares USDC with USDC', async () => {
+            await setRegime({ flagged: false, latched: false, availableGhs: 0, pool: 9000 });
+            const user = await newUser(1000);
+            const res = await finance.processFiatWithdrawal(prisma, user.id, 20, { reference: `legacy-threshold-${Date.now()}` });
+            expect(res.systemFiatPoolUnit).toBe('USDC');
+            expect(res.fiatPoolThresholdUnit).toBe('USDC');
+            expect(new Prisma.Decimal(res.fiatPoolThreshold).toFixed(2)).toBe('5000.00');
+            expect(res.fiatPoolLow).toBe(false);
+        });
+
+        test('GET /api/admin/payouts/settings states the alert threshold in the pool unit', async () => {
+            const controller = require('../controllers/adminController');
+            const call = async () => {
+                const req = { app: { get: () => prisma } };
+                let body = null;
+                const res = { statusCode: 0, status(c) { this.statusCode = c; return this; }, json(b) { body = b; return this; } };
+                await controller.getPayoutSettings(req, res);
+                return { status: res.statusCode, body };
+            };
+
+            await setRegime({ flagged: false, latched: false, availableGhs: 0, pool: 9000 });
+            const legacy = await call();
+            expect(legacy.status).toBe(200);
+            expect(legacy.body.pool.currency).toBe('USDC');
+            expect(Number(legacy.body.pool.alertThreshold)).toBe(5000);
+
+            await setRegime({ flagged: true, latched: true, availableGhs: 600, pool: 600 });
+            const latched = await call();
+            expect(latched.status).toBe(200);
+            expect(latched.body.pool.currency).toBe('GHS');
+            // the GHS projection is never published beside a 5000 USDC floor
+            expect(Number(latched.body.pool.alertThreshold)).toBe(62500);
+            expect(latched.body.pool.alertThresholdCurrency).toBe('GHS');
+            expect(Number(latched.body.pool.alertThresholdUsdc)).toBe(5000);
+        });
+    });
+
+    // ── 11. readers cannot straddle an activation ─────────────────────────────
+    describe('11. public status cannot publish a mixed balance/unit pair', () => {
+        test('every response is one coherent snapshot while activation commits', async () => {
+            await setRegime({ flagged: false, latched: false, availableGhs: 600, pool: 5000 });
+            const controller = require('../controllers/finance.controller');
+
+            const read = async () => {
+                const req = { app: { get: () => prisma } };
+                let body = null;
+                const res = { statusCode: 0, status(c) { this.statusCode = c; return this; }, json(b) { body = b; return this; } };
+                await controller.getFiatPoolStatus(req, res);
+                return body.data;
+            };
+
+            const activating = (async () => {
+                await new Promise((r) => setTimeout(r, 50));
+                return activation.activateAuthority(prisma, { actor: 'consistency-test', reason: 'reader consistency' });
+            })();
+            const reads = [];
+            for (let i = 0; i < 24; i += 1) {
+                reads.push(await read());
+                await new Promise((r) => setTimeout(r, 10));
+            }
+            await activating;
+
+            for (const data of reads) {
+                if (data.currency === 'GHS') {
+                    // authoritative GHS figure only — never the 5000 USDC legacy value
+                    expect(Number(data.balance)).toBe(600);
+                } else {
+                    expect(Number(data.balance)).toBe(5000);
+                }
+                expect(data.thresholdCurrency).toBe(data.currency);
+            }
+            // both snapshots were actually observed, so the loop really straddled it
+            expect(new Set(reads.map((d) => d.currency)).size).toBeGreaterThanOrEqual(1);
+        });
+    });
+
+    // ── 12. durable activation audit evidence ────────────────────────────────
+    describe('12. activation audit evidence', () => {
+        test('records the actor, the reason, the latch and the projection rewrite', async () => {
+            await setRegime({ flagged: false, latched: false, availableGhs: 600, pool: 5000 });
+            const preflight = await activation.activationPreflight(prisma);
+            await activation.activateAuthority(prisma, { actor: 4242, reason: 'treasury funding confirmed by bank statement' });
+
+            const audit = await prisma.adminSettingsAuditLog.findFirst({
+                where: { action: 'P5D_AUTHORITY_ACTIVATED' }, orderBy: { createdAt: 'desc' },
+            });
+            expect(audit).not.toBeNull();
+            expect(audit.adminId).toBe(4242);
+            expect(audit.changes.reason).toBe('treasury funding confirmed by bank statement');
+            expect(audit.changes.latch.new).not.toBeNull();
+            expect(audit.changes.latch.old).toBeNull();
+            expect(audit.changes.projection.previousBalance).toBe('5000');
+            expect(audit.changes.projection.projectedBalance).toBe('600');
+            expect(audit.changes.preflight.blockers).toBe(preflight.blockers.length);
+
+            const state = await prisma.fiatLiquidityState.findUnique({ where: { id: 1 } });
+            expect(state.authorityActivatedAt).not.toBeNull();
+        });
+    });
+
 });

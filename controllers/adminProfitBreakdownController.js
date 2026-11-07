@@ -45,7 +45,7 @@ exports.getProfitBreakdown = async (req, res) => {
         const periodDays = getPeriodDays(requestedPeriod);
         const from = new Date(now.getTime() - periodDays * 24 * 60 * 60 * 1000);
 
-        const fiatPoolMode = await require('../src/services/fiatLiquidityActivationService').readMode(prisma);
+        const fiatPoolMode = await require('../src/services/fiatLiquidityActivationService').readModeAndPool(prisma);
         const [profitFees, fiatPool, hotWallet, masterCrypto, profitLogs, dailySnapshots] = await Promise.all([
             prisma.systemProfitFees.findUnique({ where: { id: 1 } }).catch(() => ({ balance: 0 })),
             prisma.systemFiatPool.findUnique({ where: { id: 1 } }).catch(() => ({ balance: 0 })),
@@ -121,7 +121,7 @@ exports.getProfitBreakdown = async (req, res) => {
                     const mode = fiatPoolMode;
                     return {
                     profitFees: asNumber(profitFees?.balance),
-                    fiatPool: asNumber(fiatPool?.balance),
+                    fiatPool: asNumber(fiatPoolMode.balance),
                     fiatPoolUnit: mode.authorityUnit,
                     fiatPoolRegime: mode.active ? 'GHS_AUTHORITY' : 'LEGACY_USDC_POOL',
                     hotWallet: asNumber(hotWallet?.balance),

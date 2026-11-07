@@ -403,6 +403,40 @@ settlement decision: it predates the authority and has no reserved GHS.
 matching unit (USDC floor while legacy, the exact GHS equivalent of the same floor
 once activated).
 
+## 4.3 Operator procedure — the only sanctioned way to change the regime
+
+The Boolean `GlobalSettings.fiatLiquidityAuthorityEnabled` is not a switch to flip by
+hand. It is one half of the regime (`flag OR latch`); the latch can never be cleared,
+and clearing the Boolean after the GHS projection has been written does not restore
+USDC semantics. There is deliberately no command that writes the Boolean directly.
+
+```bash
+# 1. READ-ONLY preflight. Prints every blocker and advisory row. Exit 1 if unsafe.
+node scripts/p5d-authority-activate.js preflight
+
+# 2. Resolve every blocker, then activate. Actor and reason are REQUIRED and are
+#    written to AdminSettingsAuditLog with the latch timestamp and both projection
+#    values.
+node scripts/p5d-authority-activate.js activate \
+  --actor 42 --reason "treasury GHS confirmed against bank statement 2026-11-06"
+
+# 3. Post-activation verification: latch, GHS projection, audit entry. Exit 0 only
+#    when all three are present.
+node scripts/p5d-authority-activate.js verify
+```
+
+`activate` re-runs the full preflight and refuses while any blocker remains. It writes
+the latch, the Boolean, the `SystemFiatPool` projection and the audit row in ONE
+transaction holding the regime advisory lock — the same lock `processFiatWithdrawal`
+and `liquidateProfits` take, so a liquidation or withdrawal creation that began under
+the old mode cannot commit across the boundary. Deactivation is refused while the
+latch is set.
+
+Readers never read the mode and the balance separately:
+`fiatLiquidityActivation.readModeAndPool()` returns both from ONE statement, so no
+endpoint can publish a balance labelled with the other regime's unit.
+
+
 ## 5. Invariants (each has a real-PG proof)
 
 1. Only VERIFIED evidence creates AVAILABLE liquidity. The service itself verifies

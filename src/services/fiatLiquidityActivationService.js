@@ -109,6 +109,50 @@ async function readMode(db) {
     };
 }
 
+
+/**
+ * Mode AND pool balance from ONE statement, i.e. ONE MVCC snapshot.
+ *
+ * Every reader that publishes a balance must publish the unit it is counted in.
+ * Reading the mode and the pool in two round trips lets an activation land in
+ * between, which publishes a GHS projection labelled USDC (or the reverse).
+ * While the authority is active the authoritative number is
+ * FiatLiquidityState.availableGhs, not the SystemFiatPool projection.
+ *
+ * A failed read throws (fail closed) - it never degrades to "legacy USDC".
+ *
+ * @returns {Promise<{active:boolean, flagged:boolean, latched:boolean,
+ *                    activatedAt:Date|null, currency:'GHS'|'USDC',
+ *                    balance:Prisma.Decimal, source:string}>}
+ */
+async function readModeAndPool(db) {
+    const rows = await db.$queryRawUnsafe(`
+        SELECT
+            COALESCE(g."fiatLiquidityAuthorityEnabled", false) AS flagged,
+            s."authorityActivatedAt" AS "activatedAt",
+            s."availableGhs"::text AS "availableGhs",
+            p."balance"::text AS "projectionBalance"
+          FROM (SELECT 1 AS "id") AS anchor
+          LEFT JOIN "GlobalSettings" g ON g."id" = 1
+          LEFT JOIN "FiatLiquidityState" s ON s."id" = 1
+          LEFT JOIN "SystemFiatPool" p ON p."id" = 1`);
+    const row = rows[0] || {};
+    const flagged = row.flagged === true;
+    const activatedAt = row.activatedAt || null;
+    const latched = activatedAt != null;
+    const active = flagged || latched;
+    const balance = active
+        ? new Prisma.Decimal(row.availableGhs ?? 0)
+        : new Prisma.Decimal(row.projectionBalance ?? 0);
+    return {
+        active, flagged, latched, activatedAt,
+        currency: active ? 'GHS' : 'USDC',
+        authorityUnit: active ? 'GHS' : 'USDC',
+        balance,
+        source: active ? 'FiatLiquidityState.availableGhs' : 'SystemFiatPool.balance',
+    };
+}
+
 /** Convenience predicate used by the money paths. */
 async function isAuthorityModeActive(prisma) {
     return (await readMode(prisma)).active;
@@ -306,6 +350,7 @@ module.exports = {
     AuthorityDeactivationRefused,
     AuthorityModeUnknownError,
     readMode,
+    readModeAndPool,
     isAuthorityModeActive,
     lockRegime,
     activationPreflight,

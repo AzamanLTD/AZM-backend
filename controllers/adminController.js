@@ -951,6 +951,12 @@ exports.getProfitBreakdown = async (req, res) => {
         const now = new Date();
         const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
 
+        // §P.5-D: this handler published fiatPoolUnit from an undeclared
+        // variable (a ReferenceError on every call, latent until the unit was
+        // added). The snapshot read makes the unit and the balance consistent
+        // and the endpoint working.
+        const fiatPoolMode = await require('../src/services/fiatLiquidityActivationService').readModeAndPool(prisma);
+
         const [profitFees, fiatPool, hotWallet, masterCrypto, profitLogs, dailySnapshots] = await Promise.all([
             prisma.systemProfitFees.findUnique({ where: { id: 1 } }).catch(() => ({ balance: 0 })),
             prisma.systemFiatPool.findUnique({ where: { id: 1 } }).catch(() => ({ balance: 0 })),
@@ -1017,8 +1023,8 @@ exports.getProfitBreakdown = async (req, res) => {
                 // Current system pool balances
                 pools: {
                     profitFees: profitFees?.balance || 0,
-                    fiatPool: fiatPool?.balance || 0,
-                    fiatPoolUnit: fiatPoolMode.authorityUnit,
+                    fiatPool: fiatPoolMode.balance,
+                    fiatPoolUnit: fiatPoolMode.currency,
                     hotWallet: hotWallet?.balance || 0,
                     masterCrypto: masterCrypto?.balance || 0
                 },
@@ -2169,7 +2175,7 @@ exports.getSystemHealth = async (req, res) => {
     const prisma = getReadPrisma(req.app);
 
     try {
-        const fiatPoolMode = await require('../src/services/fiatLiquidityActivationService').readMode(prisma);
+        const fiatPoolMode = await require('../src/services/fiatLiquidityActivationService').readModeAndPool(prisma);
         const [masterCrypto, hotWallet, fiatPool, profitFees, settings, recentTrades, recentDeposits] = await Promise.all([
             prisma.systemMasterCrypto.findUnique({ where: { id: 1 } }).catch(() => null),
             prisma.systemHotWallet.findUnique({ where: { id: 1 } }).catch(() => null),
@@ -2208,8 +2214,8 @@ exports.getSystemHealth = async (req, res) => {
                     return {
                         masterCrypto: masterCrypto?.balance || 0,
                         hotWallet: hotWallet?.balance || 0,
-                        fiatPool: fiatPool?.balance || 0,
-                        fiatPoolUnit: mode.authorityUnit,
+                        fiatPool: mode.balance,
+                        fiatPoolUnit: mode.currency,
                         fiatPoolRegime: mode.active ? 'GHS_AUTHORITY' : 'LEGACY_USDC_POOL',
                         profitFees: profitFees?.balance || 0,
                         totalSystemValue: (Number(masterCrypto?.balance) || 0) + (Number(hotWallet?.balance) || 0)
@@ -2301,9 +2307,17 @@ exports.getPayoutSettings = async (req, res) => {
             return res.status(404).json({ success: false, message: 'GlobalSettings not found.' });
         }
 
-        const fiatPool = await prisma.systemFiatPool.findUnique({ where: { id: 1 } });
-        const fiatPoolMode = await require('../src/services/fiatLiquidityActivationService').readMode(prisma);
-        const fiatPoolUnit = fiatPoolMode.authorityUnit;
+        // ONE snapshot: a concurrent activation must never make the admin UI
+        // show a GHS projection under a USDC label (or the reverse).
+        const fiatPoolView = await require('../src/services/fiatLiquidityActivationService').readModeAndPool(prisma);
+        const fiatPool = { balance: fiatPoolView.balance };
+        const fiatPoolMode = fiatPoolView;
+        const fiatPoolUnit = fiatPoolView.currency;
+        const fiatPoolAlertThreshold = fiatPoolUnit === 'GHS'
+            ? new Prisma.Decimal(require('../services/finance.service').FIAT_POOL_ALERT_THRESH)
+                .times(new Prisma.Decimal(String(settings?.liveRetailRate || 0)))
+                .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP)
+            : new Prisma.Decimal(require('../services/finance.service').FIAT_POOL_ALERT_THRESH);
 
         return res.status(200).json({
             success: true,
@@ -2318,7 +2332,11 @@ exports.getPayoutSettings = async (req, res) => {
                 // §P.5-D: this column is a GHS projection once the authority is
                 // latched; the unit is stated rather than assumed.
                 currency: fiatPoolUnit,
-                alertThreshold: 5000 // FIAT_POOL_ALERT_THRESH from finance.service
+                // The floor is stated IN THE POOL'S UNIT: a GHS projection is
+                // never compared with (or published beside) a 5000 USDC floor.
+                alertThreshold: fiatPoolAlertThreshold,
+                alertThresholdUsdc: 5000,
+                alertThresholdCurrency: fiatPoolUnit,
             }
         });
     } catch (error) {
