@@ -104,7 +104,9 @@ const processFiatWithdrawal = async (prisma, userId, amountIn, opts = {}) => {
     // Outer read for early, user-facing validation only. The AUTHORITATIVE
     // regime is re-read inside the transaction under the activation lock (see
     // below): this value can be stale by the time we commit.
-    const outerAuthorityOn = await fiatLiquidity.isAuthorityEnabled(prisma);
+    // §P.5-D: NO pre-transaction regime read. The effective mode is resolved
+    // inside the transaction under the activation lock, so a stale USDC answer
+    // can never decide a GHS-era branch (see the legacy capacity preflight).
     const referrer = await _resolveReferrer(prisma, userId);
 
     const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
@@ -163,18 +165,6 @@ const processFiatWithdrawal = async (prisma, userId, amountIn, opts = {}) => {
     // which fails closed (FIAT_POOL_INSUFFICIENT, identical user-facing
     // message) and rolls back the user debit when the exact payoutGhs
     // cannot be claimed from FiatLiquidityState.availableGhs.
-    if (!outerAuthorityOn) {
-        const fiatPool = await prisma.systemFiatPool.findUnique({ where: { id: 1 } });
-        if (!fiatPool || new Prisma.Decimal(fiatPool.balance).lessThan(amount)) {
-            const err = new Error(
-                'MoMo payouts are temporarily at capacity. Your USDC has not been deducted. ' +
-                'Please try again in a few minutes or contact support.'
-            );
-            err.code = 'FIAT_POOL_INSUFFICIENT';
-            throw err;
-        }
-    }
-
     const result = await prisma.$transaction(async (tx) => {
         // §P.5-D MUTUAL EXCLUSION WITH ACTIVATION. Activation takes this same
         // advisory lock for its preflight-then-latch sequence, so the two paths
@@ -182,6 +172,23 @@ const processFiatWithdrawal = async (prisma, userId, amountIn, opts = {}) => {
         // this withdrawal observes the activated regime and reserves GHS.
         await fiatLiquidityActivation.lockRegime(tx);
         const liquidityAuthorityOn = (await fiatLiquidityActivation.readMode(tx)).active;
+
+        // §P.5-D: the LEGACY capacity preflight lives here, not before the
+        // transaction. Read outside the lock it could compare a GHS projection
+        // against a USDC amount if activation committed in between. Under the
+        // authority the pool is not a USDC scalar at all, so the check is
+        // skipped and the atomic reserveForPayout claim is the authority.
+        if (!liquidityAuthorityOn) {
+            const fiatPool = await tx.systemFiatPool.findUnique({ where: { id: 1 } });
+            if (!fiatPool || new Prisma.Decimal(fiatPool.balance).lessThan(amount)) {
+                const err = new Error(
+                    'MoMo payouts are temporarily at capacity. Your USDC has not been deducted. ' +
+                    'Please try again in a few minutes or contact support.'
+                );
+                err.code = 'FIAT_POOL_INSUFFICIENT';
+                throw err;
+            }
+        }
 
         const liveUser = await tx.user.findUnique({ where: { id: userId } });
         if (!liveUser) throw new Error('User not found.');
@@ -838,7 +845,12 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
             tx.systemMasterCrypto.findUnique({ where: { id: 1 } }),
             tx.user.findUnique({ where: { id: userId }, select: { availableBalance: true } })
         ]);
-        return { alreadyReversed: false, profitFees, fiatPool: updatedFiatPool, masterCrypto, user, azmFeeDiscount };
+        const reversalMode = await fiatLiquidityActivation.readMode(tx);
+        return {
+            alreadyReversed: false, profitFees, fiatPool: updatedFiatPool, masterCrypto, user, azmFeeDiscount,
+            fiatPoolUnit: reversalMode.active ? 'GHS' : 'USDC',
+            fiatPoolRegime: reversalMode.active ? 'GHS_AUTHORITY' : 'LEGACY_USDC_POOL',
+        };
     };
 
     // r16 P0-C: run inside the caller's transaction when coordinated claims
@@ -854,6 +866,8 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
         newUserBalance: result.user.availableBalance,
         systemProfitFees: result.profitFees.balance,
         systemFiatPool: result.fiatPool.balance,
+        systemFiatPoolUnit: result.fiatPoolUnit,
+        systemFiatPoolRegime: result.fiatPoolRegime,
         systemMasterCrypto: result.masterCrypto.balance,
         unwoundCapture: amountUsdc,
         azmFeeDiscount: result.azmFeeDiscount,
@@ -971,13 +985,28 @@ const liquidateProfits = async (prisma, amountIn, adminId, auditContext = {}) =>
             amountLiquidated: amount,
             newProfitFees: result.updatedProfitFees.balance,
             newFiatPool: result.updatedFiatPool.balance,
+            // The pool is the GHS projection here: it did NOT grow by the
+            // liquidated USDC amount, and no spendable GHS was created.
+            newFiatPoolUnit: 'GHS',
+            newFiatPoolRegime: 'GHS_AUTHORITY',
+            fiatPoolCredited: false,
             profitLog: result.profitLog,
             treasuryOpeningRecorded: true,
             ghsAvailableCreated: '0.00',
             ghsAvailabilityNote: 'Internal USDC liquidation records a non-available treasury opening only; confirming it requires an external GHS funding event (confirmTreasuryOpening).'
         };
     }
-    return { amountLiquidated: amount, newProfitFees: result.updatedProfitFees.balance, newFiatPool: result.updatedFiatPool.balance, profitLog: result.profitLog };
+    return {
+        amountLiquidated: amount,
+        newProfitFees: result.updatedProfitFees.balance,
+        newFiatPool: result.updatedFiatPool.balance,
+        newFiatPoolUnit: 'USDC',
+        newFiatPoolRegime: 'LEGACY_USDC_POOL',
+        fiatPoolCredited: true,
+        profitLog: result.profitLog,
+        treasuryOpeningRecorded: false,
+        ghsAvailableCreated: '0.00'
+    };
 };
 
 const processCryptoDeposit = async (prisma, { userId, amountUsdc, txHash, address }) => {

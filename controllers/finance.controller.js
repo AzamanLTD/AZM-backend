@@ -97,6 +97,12 @@ exports.liquidateProfits = async (req, res) => {
                 amountLiquidated: data.amountLiquidated,
                 newProfitFees:    data.newProfitFees,
                 newFiatPool:      data.newFiatPool,
+                // A pool figure is meaningless without its unit: under the
+                // authority this is the GHS projection, not a USDC pool.
+                newFiatPoolUnit:   data.newFiatPoolUnit,
+                newFiatPoolRegime: data.newFiatPoolRegime,
+                fiatPoolCredited:  data.fiatPoolCredited,
+                treasuryOpeningRecorded: data.treasuryOpeningRecorded,
                 timestamp:        new Date().toISOString()
             });
         } catch (socketErr) {
@@ -105,7 +111,9 @@ exports.liquidateProfits = async (req, res) => {
 
         return res.status(200).json({
             success: true,
-            message: `Liquidated ${data.amountLiquidated} USDC from SystemProfitFees to SystemFiatPool.`,
+            message: data.treasuryOpeningRecorded
+                ? `Liquidated ${data.amountLiquidated} USDC from SystemProfitFees and recorded a NON-AVAILABLE AZM treasury opening. No spendable GHS entered the fiat pool.`
+                : `Liquidated ${data.amountLiquidated} USDC from SystemProfitFees to SystemFiatPool.`,
             data
         });
     } catch (error) {

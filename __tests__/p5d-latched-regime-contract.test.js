@@ -93,6 +93,236 @@ const hasDb = !!process.env.TEST_DATABASE_URL;
     beforeEach(async () => { await resetMoney(); });
 
     // ── 1. the regime read is fail-closed ────────────────────────────────────
+    describe('10. admin system health is one snapshot', () => {
+        const admin = require('../controllers/adminController');
+
+        function fakeRes() {
+            return { code: 200, body: null, status(c) { this.code = c; return this; }, json(b) { this.body = b; return this; } };
+        }
+        const fakeReq = () => ({ app: { get: (k) => (k === 'prisma' ? prisma : null) } });
+
+        test('a stale GHS projection never contributes a USDC amount to totalSystemValue', async () => {
+            await setRegime({ flagged: false, latched: true, availableGhs: 600, pool: 5000 });
+            await prisma.systemMasterCrypto.upsert({ where: { id: 1 }, update: { balance: D(10) }, create: { id: 1, balance: D(10) } });
+            await prisma.systemHotWallet.upsert({ where: { id: 1 }, update: { balance: D(20) }, create: { id: 1, balance: D(20) } });
+            await prisma.systemProfitFees.upsert({ where: { id: 1 }, update: { balance: D(0) }, create: { id: 1, balance: D(0) } });
+
+            const res = fakeRes();
+            await admin.getSystemHealth(fakeReq(), res);
+
+            const pools = res.body.data.pools;
+            expect(pools.fiatPoolUnit).toBe('GHS');
+            expect(new Prisma.Decimal(pools.fiatPool).toFixed(2)).toBe('600.00');
+            expect(pools.fiatPoolExcludedFromUsdcTotal).toBe(true);
+            expect(pools.totalSystemValueUnit).toBe('USDC');
+            expect(new Prisma.Decimal(pools.totalSystemValue).toFixed(8)).toBe('30.00000000');
+        });
+
+        test('a legacy pool still contributes its own USDC value to the total', async () => {
+            await setRegime({ flagged: false, latched: false, availableGhs: 0, pool: 500 });
+            await prisma.systemMasterCrypto.upsert({ where: { id: 1 }, update: { balance: D(10) }, create: { id: 1, balance: D(10) } });
+            await prisma.systemHotWallet.upsert({ where: { id: 1 }, update: { balance: D(20) }, create: { id: 1, balance: D(20) } });
+            await prisma.systemProfitFees.upsert({ where: { id: 1 }, update: { balance: D(0) }, create: { id: 1, balance: D(0) } });
+
+            const res = fakeRes();
+            await admin.getSystemHealth(fakeReq(), res);
+            const pools = res.body.data.pools;
+            expect(pools.fiatPoolUnit).toBe('USDC');
+            expect(new Prisma.Decimal(pools.totalSystemValue).toFixed(8)).toBe('530.00000000');
+        });
+    });
+    describe('11. liquidation and reversal responses carry honest units', () => {
+        const admin = require('../controllers/adminController');
+        const financeController = require('../controllers/finance.controller');
+
+        function fakeRes() {
+            return { code: 200, body: null, status(c) { this.code = c; return this; }, json(b) { this.body = b; return this; } };
+        }
+        function fakeReq(body = {}) {
+            const emit = jest.fn();
+            return {
+                emit,
+                req: {
+                    app: { get: (k) => (k === 'prisma' ? prisma : (k === 'socketio' ? { emit } : null)) },
+                    body,
+                    user: { id: 7, username: 'ops' },
+                    ip: '127.0.0.1',
+                },
+                res: fakeRes(),
+            };
+        }
+        async function seedProfit(amount = 500) {
+            await prisma.systemProfitFees.upsert({
+                where: { id: 1 }, update: { balance: D(amount) }, create: { id: 1, balance: D(amount) },
+            });
+        }
+
+        test('authority-mode liquidation says it recorded a treasury opening, never a pool transfer', async () => {
+            await setRegime({ flagged: true, latched: true, availableGhs: 600, pool: 600 });
+            await seedProfit();
+            const { req, res } = fakeReq({ amountUsdc: 50 });
+
+            await admin.liquidateProfits(req, res);
+
+            expect(res.code).toBe(200);
+            expect(res.body.data.treasuryOpeningRecorded).toBe(true);
+            expect(res.body.data.ghsAvailableCreated).toBe('0.00');
+            expect(res.body.data.fiatPoolCredited).toBe(false);
+            expect(res.body.data.newFiatPoolUnit).toBe('GHS');
+            expect(res.body.data.newFiatPoolRegime).toBe('GHS_AUTHORITY');
+            expect(res.body.message).toMatch(/NON-AVAILABLE/);
+            expect(res.body.message).not.toMatch(/to SystemFiatPool/);
+            expect(res.body.message).not.toMatch(/to fiat pool/);
+            // the pool did not grow by the liquidated USDC amount
+            expect((await poolBalance()).toFixed(2)).toBe('600.00');
+        });
+
+        test('legacy liquidation still reports the USDC pool transfer it really performs', async () => {
+            await setRegime({ flagged: false, latched: false, availableGhs: 0, pool: 100 });
+            await seedProfit();
+            const { req, res } = fakeReq({ amountUsdc: 50 });
+
+            await admin.liquidateProfits(req, res);
+
+            expect(res.code).toBe(200);
+            expect(res.body.data.treasuryOpeningRecorded).toBe(false);
+            expect(res.body.data.fiatPoolCredited).toBe(true);
+            expect(res.body.data.newFiatPoolUnit).toBe('USDC');
+            expect(res.body.message).toMatch(/to fiat pool/);
+            expect((await poolBalance()).toFixed(2)).toBe('150.00');
+        });
+
+        test('the finance controller reports the same distinction', async () => {
+            await setRegime({ flagged: true, latched: true, availableGhs: 600, pool: 600 });
+            await seedProfit();
+            const { req, res } = fakeReq({ amountUsdc: 50 });
+            await financeController.liquidateProfits(req, res);
+            expect(res.body.data.treasuryOpeningRecorded).toBe(true);
+            expect(res.body.message).toMatch(/NON-AVAILABLE/);
+            expect(res.body.message).not.toMatch(/to SystemFiatPool/);
+        });
+
+        test('the admin_alert socket payload never emits a pool figure without its unit', async () => {
+            await setRegime({ flagged: true, latched: true, availableGhs: 600, pool: 600 });
+            await seedProfit();
+            const bundle = fakeReq({ amountUsdc: 50 });
+            await admin.liquidateProfits(bundle.req, bundle.res);
+            const payload = bundle.emit.mock.calls.find((c) => c[0] === 'admin_alert')[1];
+            expect(payload.newFiatPoolUnit).toBe('GHS');
+            expect(payload.newFiatPoolRegime).toBe('GHS_AUTHORITY');
+            expect(payload.treasuryOpeningRecorded).toBe(true);
+        });
+
+        test('a reversal reports the pool unit of the regime that released it', async () => {
+            await setRegime({ flagged: false, latched: false, availableGhs: 0, pool: 0 });
+            const user = await newUser(100);
+            const reference = `p5d-rev-${Date.now()}`;
+            const tx = await prisma.transactionHistory.create({
+                data: {
+                    userId: user.id, type: 'WITHDRAWAL_FIAT', amountUsdc: D(20),
+                    status: 'PENDING', txHash: reference, createdAt: new Date(Date.now() - 60_000),
+                },
+            });
+            await prisma.withdrawal.create({
+                data: {
+                    userId: user.id, amount: D(20), status: 'PENDING', payoutMethod: 'MTN_MOMO',
+                    transactionHistoryId: tx.id,
+                },
+            });
+
+            const legacyReversal = await finance.reverseFiatWithdrawal(prisma, reference, { reason: 'test reversal' });
+            expect(legacyReversal.systemFiatPoolUnit).toBe('USDC');
+            expect(legacyReversal.systemFiatPoolRegime).toBe('LEGACY_USDC_POOL');
+
+            await setRegime({ flagged: false, latched: true, availableGhs: 600, pool: 600 });
+            const latchedReference = `${reference}-b`;
+            const tx2 = await prisma.transactionHistory.create({
+                data: {
+                    userId: user.id, type: 'WITHDRAWAL_FIAT', amountUsdc: D(10),
+                    status: 'PENDING', txHash: latchedReference, createdAt: new Date(Date.now() - 60_000),
+                },
+            });
+            await prisma.withdrawal.create({
+                data: {
+                    userId: user.id, amount: D(10), status: 'PENDING', payoutMethod: 'MTN_MOMO',
+                    transactionHistoryId: tx2.id,
+                },
+            });
+            const latchedReversal = await finance.reverseFiatWithdrawal(prisma, latchedReference, { reason: 'test reversal' });
+            expect(latchedReversal.systemFiatPoolUnit).toBe('GHS');
+            expect(latchedReversal.systemFiatPoolRegime).toBe('GHS_AUTHORITY');
+            // and the GHS projection was NOT incremented by the USDC amount
+            expect((await poolBalance()).toFixed(2)).toBe('600.00');
+        });
+    });
+    describe('12. operator verification proves the latch, the projection and the audit', () => {
+        const { verifyEvidence } = require('../scripts/p5d-authority-activate');
+        const path = require('path');
+        const { execFile } = require('child_process');
+
+        test('flag true but latch absent is REFUSED', async () => {
+            await setRegime({ flagged: true, latched: false, availableGhs: 600, pool: 600 });
+            const verdict = await verifyEvidence(prisma, activation, Prisma);
+            expect(verdict.ok).toBe(false);
+            expect(verdict.failures.join(' ')).toMatch(/LATCH_ABSENT/);
+        });
+
+        test('latch present but projection mismatched is REFUSED', async () => {
+            await activation.activateAuthority(prisma, { actor: 7, reason: 'operator test activation' });
+            await prisma.systemFiatPool.update({ where: { id: 1 }, data: { balance: D(999) } });
+            const verdict = await verifyEvidence(prisma, activation, Prisma);
+            expect(verdict.ok).toBe(false);
+            expect(verdict.failures.join(' ')).toMatch(/PROJECTION_MISMATCH/);
+        });
+
+        test('missing audit is REFUSED', async () => {
+            await activation.activateAuthority(prisma, { actor: 7, reason: 'operator test activation' });
+            await prisma.$executeRawUnsafe('DELETE FROM "AdminSettingsAuditLog"');
+            const verdict = await verifyEvidence(prisma, activation, Prisma);
+            expect(verdict.ok).toBe(false);
+            expect(verdict.failures.join(' ')).toMatch(/AUDIT_MISSING/);
+        });
+
+        test('latch, projection and audit agreeing is ACCEPTED', async () => {
+            await setRegime({ flagged: false, latched: false, availableGhs: 600, pool: 5000 });
+            const result = await activation.activateAuthority(prisma, { actor: 7, reason: 'operator test activation' });
+            expect(new Prisma.Decimal(result.projection.balance).toFixed(2)).toBe('600.00');
+            const verdict = await verifyEvidence(prisma, activation, Prisma);
+            expect(verdict.failures).toEqual([]);
+            expect(verdict.ok).toBe(true);
+            expect(verdict.evidence.latched).toBe(true);
+            expect(verdict.evidence.systemFiatPoolProjection).toBe('600.00');
+        });
+
+        test('the CLI exits nonzero and still disconnects on a refused verification', async () => {
+            await setRegime({ flagged: false, latched: false, availableGhs: 0, pool: 0 });
+            const code = await new Promise((resolve) => {
+                const child = execFile(
+                    process.execPath,
+                    [path.join(__dirname, '..', 'scripts', 'p5d-authority-activate.js'), 'verify'],
+                    { env: { ...process.env, DATABASE_URL: process.env.TEST_DATABASE_URL }, timeout: 45000 },
+                    (err) => resolve(err ? err.code : 0)
+                );
+                child.on('exit', () => { /* exit proves the client disconnected */ });
+            });
+            expect(code).toBe(1);
+        });
+
+        test('the CLI exits zero on a verified regime', async () => {
+            await setRegime({ flagged: false, latched: false, availableGhs: 600, pool: 600 });
+            await activation.activateAuthority(prisma, { actor: 7, reason: 'operator test activation' });
+            const code = await new Promise((resolve) => {
+                execFile(
+                    process.execPath,
+                    [path.join(__dirname, '..', 'scripts', 'p5d-authority-activate.js'), 'verify'],
+                    { env: { ...process.env, DATABASE_URL: process.env.TEST_DATABASE_URL }, timeout: 45000 },
+                    (err) => resolve(err ? err.code : 0)
+                );
+            });
+            expect(code).toBe(0);
+        });
+    });
+
     describe('1. regime read failures fail closed', () => {
         const throwing = (which) => ({
             globalSettings: { findUnique: async () => { if (which === 'settings') throw new Error('settings read failed'); return { fiatLiquidityAuthorityEnabled: false }; } },
@@ -361,7 +591,27 @@ const hasDb = !!process.env.TEST_DATABASE_URL;
 
             await lockHeld;
             const liquidating = finance.liquidateProfits(prisma, 100, 7, { actorName: 'ops' });
-            await new Promise((r) => setTimeout(r, 400)); // liquidation is queued on the lock
+
+            // PROVE the liquidation is actually waiting on the regime lock before
+            // activation is allowed to commit. A sleep is not evidence: this polls
+            // pg_locks for an UNGRANTED advisory lock owned by a live session and
+            // fails if the wait never materialises.
+            const waitingOnRegimeLock = async () => {
+                const rows = await prisma.$queryRawUnsafe(
+                    `SELECT count(*)::int AS waiting
+                       FROM pg_locks l
+                       JOIN pg_stat_activity a ON a.pid = l.pid
+                      WHERE l.locktype = 'advisory' AND l.granted = false`
+                );
+                return (rows[0] && rows[0].waiting) || 0;
+            };
+            let waited = 0;
+            for (let i = 0; i < 100; i += 1) { // up to ~5s
+                waited = await waitingOnRegimeLock();
+                if (waited > 0) break;
+                await new Promise((r) => setTimeout(r, 50));
+            }
+            expect(waited).toBeGreaterThan(0); // the liquidation reached the lock
             releaseActivation();
             await activating;
 

@@ -768,6 +768,10 @@ exports.liquidateProfits = async (req, res) => {
                 amountLiquidated: data.amountLiquidated,
                 newProfitFees:    data.newProfitFees,
                 newFiatPool:      data.newFiatPool,
+                newFiatPoolUnit:   data.newFiatPoolUnit,
+                newFiatPoolRegime: data.newFiatPoolRegime,
+                fiatPoolCredited:  data.fiatPoolCredited,
+                treasuryOpeningRecorded: data.treasuryOpeningRecorded,
                 timestamp:        new Date().toISOString()
             });
         } catch (socketErr) {
@@ -776,7 +780,9 @@ exports.liquidateProfits = async (req, res) => {
 
         return res.status(200).json({
             success: true,
-            message: `Liquidated ${data.amountLiquidated} USDC from profit fees to fiat pool.`,
+            message: data.treasuryOpeningRecorded
+                ? `Liquidated ${data.amountLiquidated} USDC from profit fees and recorded a NON-AVAILABLE AZM treasury opening. No spendable GHS entered the fiat pool.`
+                : `Liquidated ${data.amountLiquidated} USDC from profit fees to fiat pool.`,
             data
         });
     } catch (error) {
@@ -2210,7 +2216,11 @@ exports.getSystemHealth = async (req, res) => {
                     // would silently mix units, so it is reported separately and
                     // excluded from the USDC total.
                     const mode = fiatPoolMode;
-                    const fiatPoolInUsdc = mode.active ? 0 : (Number(fiatPool?.balance) || 0);
+                    // The USDC contribution comes from the SAME snapshot as the
+                    // displayed value. A separately fetched SystemFiatPool could
+                    // already hold GHS if activation committed in between, and
+                    // adding that to a USDC total is a mixed-unit lie.
+                    const fiatPoolInUsdc = mode.active ? 0 : (Number(mode.balance) || 0);
                     return {
                         masterCrypto: masterCrypto?.balance || 0,
                         hotWallet: hotWallet?.balance || 0,
