@@ -71,6 +71,25 @@ describeOrSkip('AZM fee-discount withdrawal atomicity (real PostgreSQL)', () => 
             update: { balance: 100_000.0 },
             create: { id: 1, balance: 100_000.0 }
         });
+        // §P.5-D FIXTURE ISOLATION. Every assertion below is USDC arithmetic on
+        // SystemFiatPool. Under the latched regime that row is a GHS projection
+        // and the same withdrawal reserves GHS instead, which turned
+        // `100_000 - 50` into a number from a different unit when an earlier
+        // suite had activated. Pin both components (Boolean AND latch) and prove
+        // it through the production reader before the suite runs.
+        await prisma.globalSettings.upsert({
+            where: { id: 1 },
+            update: { fiatLiquidityAuthorityEnabled: false },
+            create: { id: 1, liveRetailRate: 13.0, liveRateSource: 'KOTANI_PAY', fiatLiquidityAuthorityEnabled: false }
+        });
+        await prisma.fiatLiquidityState.upsert({
+            where: { id: 1 },
+            update: { authorityActivatedAt: null },
+            create: { id: 1, availableGhs: 0, reservedGhs: 0, inTransitGhs: 0, paidOutGhs: 0, updatedAt: new Date() }
+        });
+        const mode = await require('../src/services/fiatLiquidityActivationService').readMode(prisma);
+        expect(mode.active).toBe(false);
+        expect(mode.authorityUnit).toBe('USDC');
         // Fresh-install posture: processFiatWithdrawal DEFERS the principal
         // into SystemMasterCrypto, and test A asserts the master balance
         // against the seeded withdrawal. A prior suite's residue (e.g. the

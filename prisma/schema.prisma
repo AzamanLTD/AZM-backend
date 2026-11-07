@@ -1000,6 +1000,7 @@ model User {
   onchainSweeps  OnchainSweep[]
 
   @@index([phoneHash])
+  savedBankBeneficiaries SavedBankBeneficiary[]
 }
 
 // =============================================================================
@@ -1376,6 +1377,8 @@ model Withdrawal {
   // infra overlay) — a Withdrawal row can never exist without its
   // canonical row.
   transactionHistoryId String?  @db.VarChar(36)
+  amountGhs Decimal? @db.Decimal(20, 2)
+  settlementCurrency String?
   totalGasFee          Decimal  @default(0.0) @db.Decimal(20, 8)
   vendorGasShare       Decimal  @default(0.0) @db.Decimal(20, 8)
   adminGasShare        Decimal  @default(0.0) @db.Decimal(20, 8)
@@ -1520,6 +1523,8 @@ model GlobalSettings {
   // ON credits the customer's native-GHS wallet in exact pesewas instead —
   // GHS stays GHS. Mutually exclusive with Model B (fail-closed).
   nativeGhsSettlementEnabled Boolean @default(false)
+
+  nativeGhsWithdrawalEnabled Boolean @default(false)
 
   // Phase Q15: App Version Gate
   minAppVersion  String @default("1.0.0") // Minimum supported app version (semver)
@@ -1889,6 +1894,11 @@ model FiatLiquidityReservation {
 /// row; sums over receipts/reservations are the reconciliation target.
 model FiatLiquidityState {
   id                    Int     @id @default(1)
+  // §P.5-D ONE-WAY ACTIVATION LATCH (docs §4.1). Written ONCE by
+  // fiatLiquidityActivationService.activateAuthority() and never cleared: once
+  // SystemFiatPool has been written as a GHS projection, clearing the
+  // GlobalSettings Boolean must NOT reinterpret those pesewas as USDC.
+  authorityActivatedAt  DateTime?
   availableGhs          Decimal @default(0) @db.Decimal(20, 2)
   reservedGhs           Decimal @default(0) @db.Decimal(20, 2)
   inTransitGhs          Decimal @default(0) @db.Decimal(20, 2)
@@ -1969,6 +1979,8 @@ model TransactionHistory {
   payerMsisdn       String? // MSISDN that paid — stored raw, masked before display
   initiatedByUserId Int? // User who triggered this deposit (null = USSD walk-up)
   metadata          Json? // { provider, network, amountGhs, rateAtInitiation, ... }
+  amountGhs Decimal? @db.Decimal(20, 2)
+  settlementCurrency String?
   status            TransactionStatus @default(PENDING)
   createdAt         DateTime          @default(now())
 
@@ -6817,6 +6829,13 @@ model FraudAssessment {
   id              String  @id @default(uuid())
   userId          Int
   transactionType String  @db.VarChar(50)
+  /// Asset the assessed amount is denominated in. Historical rows were always
+  /// USDC; new rows name their asset so a GHS amount is never read as dollars.
+  asset           String  @default("USDC") @db.VarChar(10)
+  /// The assessed amount in `asset`, exactly as the decision saw it.
+  amountExact     Decimal @default(0) @db.Decimal(30, 8)
+  /// LEGACY, USDC-ONLY. Kept so existing consumers and historical rows keep
+  /// their meaning. A non-USDC assessment writes 0 here and its amount above.
   amountUsdc      Decimal @default(0) @db.Decimal(20, 8)
   riskScore       Int     @default(0)
   triggeredRules  String  @db.VarChar(500)
@@ -7452,4 +7471,36 @@ model CustodyEvidence {
   @@index([custodyAccountId, createdAt(sort: Desc)])
   @@index([status])
   @@index([scope, status])
+}
+
+/// Saved BANK payout beneficiary (issue #389). The account number exists only
+/// as a versioned AES-256-GCM envelope plus an HMAC-SHA256 fingerprint under a
+/// DISTINCT key; plaintext is never persisted, logged or returned after save.
+/// accountName is a provider-validated fact, never a client claim.
+model SavedBankBeneficiary {
+  id                  String    @id @default(uuid())
+  userId              Int
+  bankCode            String    @db.VarChar(16)
+  bankName            String    @db.VarChar(80)
+  accountName         String?   @db.VarChar(120)
+  accountNumberEnc    String
+  accountNumberMasked String    @db.VarChar(32)
+  accountNumberHmac   String    @db.VarChar(64)
+  nickname            String?   @db.VarChar(40)
+  status              String    @default("ACTIVE")
+  /// §P1-3 At most ONE ACTIVE primary per user. Enforced by the partial unique
+  /// index SavedBankBeneficiary_one_primary_per_user (raw SQL in the
+  /// 20261103190000 migration — Prisma cannot express a partial index). The
+  /// service demotes-then-writes inside a transaction and retries once on a
+  /// primary collision; the index is the backstop for every other writer.
+  isPrimary           Boolean   @default(false)
+  validatedAt         DateTime?
+  keyId               String?   @db.VarChar(32)
+  envelopeVersion     Int       @default(2)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, accountNumberHmac])
+  @@index([userId, status])
 }

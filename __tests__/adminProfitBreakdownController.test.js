@@ -1,6 +1,11 @@
 jest.mock('../src/config/readReplica', () => ({
     getReadPrisma: jest.fn(),
 }));
+jest.mock('../src/services/fiatLiquidityActivationService', () => ({
+    readMode: jest.fn().mockResolvedValue({ active: false, flagged: false, latched: false, activatedAt: null, currency: 'USDC' }),
+    readModeAndPool: jest.fn().mockResolvedValue({ active: false, flagged: false, latched: false, activatedAt: null, currency: 'USDC', balance: 0 }),
+    lockRegime: jest.fn().mockResolvedValue(undefined),
+}));
 
 const { getReadPrisma } = require('../src/config/readReplica');
 const { getProfitBreakdown } = require('../controllers/adminProfitBreakdownController');

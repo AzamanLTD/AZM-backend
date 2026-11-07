@@ -11,6 +11,7 @@
 
 const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client'); // r39 exact decimals in refund derivation
+const nativeGhsWithdrawalService = require('../src/services/nativeGhsWithdrawalService');
 const financeService = require('../services/finance.service');
 const { recordProviderSettlementAttempt } = require('../services/providerSettlementAttemptService');
 const { resolvePayoutOwner } = require('../services/payoutProviderOwnership');
@@ -28,20 +29,30 @@ const SMS_LARGE_WITHDRAWAL_THRESHOLD = parseFloat(
     process.env.SMS_LARGE_WITHDRAWAL_THRESHOLD || '100'
 );
 
+// §P0-2: the bank rail's durable provider identity. One registry
+// (services/payoutProviderOwnership) owns these names; this constant is only the
+// worker's expectation for a BANK payout, used to detect a wrong-rail owner.
+const BANK_PROVIDER_CANONICAL = 'MOOLRE_DISBURSEMENT';
+
 class WithdrawalReconciliationWorker {
-    constructor(prisma, io, mtnDisbursementService, emailService, smsService) {
+    constructor(prisma, io, mtnDisbursementService, emailService, smsService, bankPayoutPort = null) {
         this.prisma = prisma;
         this.io = io;
         this.mtn = mtnDisbursementService;
         this.email = emailService || null;
         this.sms = smsService || null;
+        // §P0-2: the BANK payout adapter (Agent B owns the provider contract;
+        // this worker owns reconciliation). Optional: the bank rail stays
+        // dependency-injected and default-off, so an unbound port simply
+        // parks BANK rows instead of polling them on the wrong rail.
+        this.bankPayoutPort = bankPayoutPort || null;
         this._timer = null;
         this._running = false;
     }
 
     start() {
         if (this._timer) return;
-        if (!this.mtn) {
+        if (!this.mtn && !this.bankPayoutPort) {
             logger.warn('[WithdrawalReconciliation] disbursement service not bound — worker disabled.');
             return;
         }
@@ -341,14 +352,61 @@ class WithdrawalReconciliationWorker {
             // search below remains correct.
         }
 
+        // §P0-2 RAIL IDENTITY. A bank payout is reconciled on the BANK rail and
+        // NOTHING else: the MoMo status service cannot know what a bank
+        // disbursement did, and a "not found" answer from it would be a lie
+        // about a provider that was never asked. The mirror's payoutMethod and
+        // the canonical metadata rail both carry the truth; either one naming
+        // BANK makes this a bank payout.
+        const canonicalRail = String(txRow.metadata?.rail || '').toUpperCase();
+        const mirrorRail = String(withdrawal.payoutMethod || '').toUpperCase();
+        const isBankPayout = mirrorRail === 'BANK' || canonicalRail === 'BANK';
+        const evidenceRail = isBankPayout ? 'BANK' : 'MOMO';
+
+        // A durable owner on the WRONG rail for this payout is a contradiction,
+        // not new information: never poll it, never settle or reverse on it.
+        if (isBankPayout && payoutOwner && payoutOwner.canonicalName
+            && String(payoutOwner.canonicalName).toUpperCase() !== BANK_PROVIDER_CANONICAL) {
+            logger.error({ reference, owner: payoutOwner.canonicalName, rail: 'BANK' },
+                '[WithdrawalReconciliation] BANK payout is owned by a non-bank provider — parking for operator review');
+            await this._recordException(
+                withdrawal,
+                'OWNER_RAIL_CONTRADICTION',
+                { reference, owner: payoutOwner, expectedRail: 'BANK', ownerCanonicalName: payoutOwner.canonicalName },
+                reference
+            );
+            return;
+        }
+
         let statusResp;
         try {
-            statusResp = await this.mtn.getTransferStatus(reference, payoutOwner?.tag);
+            if (isBankPayout) {
+                // Bank status is evidence-only: the adapter never initiates,
+                // retries or invents a reference. Poll the ORIGINAL reference.
+                if (!this.bankPayoutPort || typeof this.bankPayoutPort.getBankTransferStatus !== 'function') {
+                    await this._recordException(
+                        withdrawal,
+                        'BANK_STATUS_PORT_UNAVAILABLE',
+                        {
+                            reference,
+                            settlementCurrency: txRow.settlementCurrency || null,
+                            ownerCanonicalName: payoutOwner?.canonicalName || null,
+                            note: 'BANK payout cannot be reconciled without the bank payout port; never polled on the MoMo rail',
+                        },
+                        reference
+                    );
+                    logger.warn(`[WithdrawalReconciliation] ref=${reference} BANK payout has no bank status port — parked, never polled on the wrong rail.`);
+                    return;
+                }
+                statusResp = await this.bankPayoutPort.getBankTransferStatus({ referenceId: reference });
+            } else {
+                statusResp = await this.mtn.getTransferStatus(reference, payoutOwner?.tag);
+            }
         } catch (err) {
             await this._recordException(
                 withdrawal,
                 'PROVIDER_STATUS_UNAVAILABLE',
-                { provider: payoutOwner?.canonicalName || 'DISBURSEMENT', error: err.message },
+                { provider: payoutOwner?.canonicalName || 'DISBURSEMENT', rail: evidenceRail, error: err.message },
                 reference
             );
             logger.warn(`[WithdrawalReconciliation] provider status query failed for ${reference}: ${err.message}`);
@@ -357,6 +415,14 @@ class WithdrawalReconciliationWorker {
 
         const remoteStatus = String((statusResp && statusResp.status) || 'PENDING').toUpperCase();
         const providerRef = statusResp?.providerRef || statusResp?.referenceId || statusResp?.transactionId || statusResp?.txId || null;
+        // §P0-2 AMOUNT ADAPTATION. The bank adapter reports the exact payout
+        // amount as `amountGhsExact`; the MoMo adapters use `amountGhs`. Adapt
+        // explicitly and NEVER substitute the originally requested amount: a
+        // missing provider amount is missing evidence, not "what we asked".
+        const observedAmountGhs = isBankPayout
+            ? (statusResp?.amountGhsExact ?? null)
+            : (statusResp?.amountGhs ?? null);
+        const observedExternalId = statusResp?.externalId ?? null;
 
         // r15 hardening: a KNOWN owner is authoritative — the status
         // answer's own self-identification may never override it. If the
@@ -394,7 +460,7 @@ class WithdrawalReconciliationWorker {
         try {
             await fiatLiquidity.recordProviderEvent(this.prisma, {
                 provider: evidenceProvider,
-                rail: 'MOMO',
+                rail: evidenceRail,
                 direction: 'OUTBOUND',
                 status: remoteStatus,
                 providerRef,
@@ -402,13 +468,17 @@ class WithdrawalReconciliationWorker {
                 // echoed business reference are durable evidence too. The
                 // semantics layer fails closed on a materially-different
                 // payload replaying under the same observation identity.
-                amountGhs: statusResp?.amountGhs ?? null,
+                // The bank rail's exact amount arrives as `amountGhsExact`.
+                amountGhs: observedAmountGhs,
                 dedupKey: `event:payout-outbound:${evidenceProvider}:${reference}:${remoteStatus}`,
                 relatedReference: reference,
                 raw: {
                     source: 'provider_status_poll',
+                    rail: evidenceRail,
                     reason: statusResp?.reason || null,
-                    externalId: statusResp?.externalId ?? null,
+                    externalId: observedExternalId,
+                    providerCode: statusResp?.providerCode ?? null,
+                    providerStatusRaw: statusResp?.providerStatusRaw ?? null,
                 },
             });
         } catch (evidenceErr) {
@@ -437,9 +507,12 @@ class WithdrawalReconciliationWorker {
                 'PROVIDER_REFERENCE_NOT_FOUND',
                 {
                     provider: evidenceProvider,
+                    rail: evidenceRail,
                     owner: payoutOwner?.tag || null,
                     ownerCanonicalName: payoutOwner?.canonicalName || null,
                     observedStatus: remoteStatus,
+                    observedAmountGhs,
+                    providerRef,
                     response: statusResp,
                 },
                 reference
@@ -461,8 +534,11 @@ class WithdrawalReconciliationWorker {
             const binding = await bindOutboundSettlementEvidence(this.prisma, {
                 reference,
                 provider: evidenceProvider,
-                externalId: statusResp?.externalId ?? null,
-                amountGhs: statusResp?.amountGhs ?? null,
+                externalId: observedExternalId,
+                // Explicit adaptation: the bank adapter's `amountGhsExact` is
+                // what the binder compares against the committed economics. A
+                // null provider amount is never backfilled from the request.
+                amountGhs: observedAmountGhs,
                 status: remoteStatus,
                 source: 'provider_status_poll',
                 payoutOwner,
@@ -506,15 +582,18 @@ class WithdrawalReconciliationWorker {
         // owner's rail, or every rail ambiguous with unknown ownership). The
         // payout stays parked with durable evidence — it is never a state to
         // settle or reverse on.
-        if (remoteStatus === 'UNKNOWN') {
+        if (remoteStatus === 'UNKNOWN' || remoteStatus === 'UNRESOLVED') {
             await this._recordException(
                 withdrawal,
                 'PROVIDER_STATUS_UNRESOLVED',
                 {
                     provider: evidenceProvider,
+                    rail: evidenceRail,
                     owner: payoutOwner?.tag || null,
                     ownerCanonicalName: payoutOwner?.canonicalName || null,
-                    unresolvedReason: statusResp?.unresolvedReason || null,
+                    unresolvedReason: statusResp?.unresolvedReason || statusResp?.reason || null,
+                    providerRef,
+                    observedAmountGhs,
                     response: statusResp,
                 },
                 reference
@@ -594,9 +673,36 @@ class WithdrawalReconciliationWorker {
                         data: { providerRef: String(providerRef) }
                     });
                 }
-                const result = await financeService.reverseFiatWithdrawal(this.prisma, reference, {
-                    reason: `provider_async_failure: ${statusResp.reason || 'unspecified'}`
-                });
+                // §4.4 (issue #389): a native-GHS payout is NOT a USDC
+                // withdrawal. Its mirror row carries amount = 0 and its real
+                // money in `amountGhs`, so the legacy USDC reversal would
+                // "refund" zero and never restore the customer's GHS. Use the
+                // native-GHS reversal authority, which is atomic across the
+                // GHS liability, any USDC shortfall funding, the conversion
+                // posting and the P5-D reservation.
+                const isNativeGhs = txRow.settlementCurrency === 'GHS_NATIVE';
+                const result = isNativeGhs
+                    ? await nativeGhsWithdrawalService.reverseNativeGhsWithdrawal(this.prisma, {
+                        reference,
+                        reason: `provider_async_failure: ${statusResp.reason || 'unspecified'}`,
+                        // §P1-1: this authority owns the row in PROCESSING (that
+                        // is the state it scans), so it must be able to claim it.
+                        // Terminal paid states stay non-reversible regardless.
+                        allowedMirrorStatuses: [withdrawal.status],
+                    })
+                    : await financeService.reverseFiatWithdrawal(this.prisma, reference, {
+                        reason: `provider_async_failure: ${statusResp.reason || 'unspecified'}`
+                    });
+                if (isNativeGhs && result.reversed !== true) {
+                    await this._recordException(
+                        withdrawal,
+                        'NATIVE_GHS_REVERSAL_NOT_APPLIED',
+                        { reason: result.reason || null, providerStatus: remoteStatus },
+                        reference
+                    );
+                    logger.error(`[WithdrawalReconciliation] ref=${reference} native-GHS reversal not applied (${result.reason}).`);
+                    return;
+                }
                 if (result.notReversible || result.status === 'COMPLETED') {
                     await this._recordException(
                         withdrawal,
@@ -630,16 +736,21 @@ class WithdrawalReconciliationWorker {
                 // so terminal failure payloads never carry an undefined refund.
                 // r39/P1 — exact refund derivation (Decimal-native), with
                 // a Number() display mirror ONLY for notification payloads.
-                const refundedExact = result.refundedAmount != null
-                    ? new Prisma.Decimal(result.refundedAmount)
-                    : new Prisma.Decimal(txRow.amountUsdc).plus(txRow.feeUsdc);
-                const refundedAmount = Number(refundedExact.toFixed(8));
+                const refundedExact = isNativeGhs
+                    ? new Prisma.Decimal(result.amountGhs || txRow.amountGhs || 0)
+                    : (result.refundedAmount != null
+                        ? new Prisma.Decimal(result.refundedAmount)
+                        : new Prisma.Decimal(txRow.amountUsdc).plus(txRow.feeUsdc));
+                const refundedAmount = isNativeGhs
+                    ? Number(refundedExact.toFixed(2))
+                    : Number(refundedExact.toFixed(8));
+                const refundCurrency = isNativeGhs ? 'GHS' : 'USDC';
 
-                logger.warn(`[WithdrawalReconciliation] ref=${reference} REVERSED. user refund: ${refundedAmount} USDC.`);
+                logger.warn(`[WithdrawalReconciliation] ref=${reference} REVERSED. user refund: ${refundedAmount} ${refundCurrency}.`);
                 if (this.io) {
-                    this.io.to(`user_${withdrawal.userId}`).emit('withdrawal_settled', {
-                        reference, status: 'FAILED', amount: withdrawal.amount, refunded: refundedAmount
-                    });
+                    this.io.to(`user_${withdrawal.userId}`).emit('withdrawal_settled', isNativeGhs
+                        ? { reference, status: 'FAILED', currency: 'GHS', amountGhs: refundedAmount, refundedGhs: refundedAmount, destinationType: withdrawal.payoutMethod || 'MOMO' }
+                        : { reference, status: 'FAILED', amount: withdrawal.amount, refunded: refundedAmount });
                     this.io.emit('admin_alert', {
                         type: 'WITHDRAWAL_AUTO_REVERSED', reference, userId: withdrawal.userId,
                         amountUsdc: withdrawal.amount,
@@ -652,10 +763,10 @@ class WithdrawalReconciliationWorker {
                     const amount = withdrawal.amount;
                     const refunded = refundedAmount;
                     const reasonStr = statusResp.reason || 'The MoMo gateway rejected the disbursement.';
-                    setImmediate(() => this.email.sendWithdrawalReceipt(recipient, {
-                        kind: 'fiat_failure', amount, currency: 'USDC', reference,
-                        refundedAmount: refunded, reason: reasonStr
-                    }).catch(() => {}));
+                    setImmediate(() => this.email.sendWithdrawalReceipt(recipient, isNativeGhs
+                        ? { kind: 'fiat_failure', amount: refundedAmount, currency: 'GHS', reference, refundedAmount: refunded, reason: reasonStr }
+                        : { kind: 'fiat_failure', amount, currency: 'USDC', reference, refundedAmount: refunded, reason: reasonStr }
+                    ).catch(() => {}));
                 }
                 if (this.sms && withdrawal.user?.phoneNumber && withdrawal.user.phoneVerified
                     && withdrawal.amount >= SMS_LARGE_WITHDRAWAL_THRESHOLD) {

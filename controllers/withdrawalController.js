@@ -16,6 +16,7 @@
 
 const logger = require('../src/config/logger');
 const fraudService = require('../services/fraudDetectionService');
+const payoutRiskGate = require('../src/services/payoutRiskGate');
 const ledger = require('../services/ledgerService'); // §P.4 authoritative ledger (shadow journalIntegration no longer used on this path)
 const restrictedObligations = require('../services/restrictedObligationService');
 const financeService          = require('../services/finance.service');
@@ -28,6 +29,7 @@ const { randomUUID }          = require('crypto');
 const { audit }               = require('../utils/audit');
 const { FEE_DISCOUNT_TIERS } = require('../services/azmSpendService');
 const { Prisma } = require('@prisma/client');
+const savedBankBeneficiaryService = require('../src/services/savedBankBeneficiaryService');
 
 const POLYGON_GAS_FEE_MATIC   = 0.05;  // V2 Blueprint: 100% of network gas is borne by user
 const FIAT_POOL_ALERT_THRESH  = financeService.FIAT_POOL_ALERT_THRESH;
@@ -1788,5 +1790,684 @@ exports.getWithdrawalStatus = async (req, res) => {
     } catch (error) {
         logger.error({ err: error }, '[getWithdrawalStatus] error');
         return res.status(500).json({ success: false, code: 'SERVER_ERROR', message: error.message });
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// NATIVE-GHS PAYOUT SURFACE (issue #389, Agent A)
+//
+// GHS is denominated, debited, reserved and dispatched in GHS. No rate is
+// consulted anywhere in a GHS-only payout; the ONLY rate in this flow belongs
+// to an explicit, quoted, consented USDC→GHS shortfall conversion.
+//
+// Reuses the canonical state machine end to end: the reservation transaction
+// commits the FinancialOperation claim (COMMITTED, 202 body) inside the same
+// economics as the GHS debit, the P5-D liquidity claim and the Withdrawal
+// mirror; dispatch happens AFTER the response and claims PENDING→DISPATCHING
+// exactly once (single winner vs worker/admin/webhook).
+// ═══════════════════════════════════════════════════════════════════════════
+
+const nativeGhsWithdrawalService = require('../src/services/nativeGhsWithdrawalService');
+const ghsFundingPlanner = require('../src/services/ghsFundingPlanner');
+
+const _ghsErrorStatus = (code) => {
+    switch (code) {
+        case 'GHS_AMOUNT_INVALID':
+        case 'GHS_AMOUNT_REQUIRED':
+        case 'GHS_AMOUNT_PRECISION':
+            return 400;
+        case 'GHS_INSUFFICIENT_BALANCE':
+        case 'USDC_INSUFFICIENT_BALANCE':
+        case 'NATIVE_GHS_QUOTE_INTENT_MISMATCH':
+        case 'NATIVE_GHS_QUOTE_INVALID':
+            return 409;
+        case 'BANK_FEE_POLICY_UNEVIDENCED':
+        case 'NATIVE_GHS_LIQUIDITY_AUTHORITY_REQUIRED':
+        case 'RATE_UNAVAILABLE':
+        case 'QUOTE_RATE_UNAVAILABLE':
+            return 503;
+        case 'FIAT_POOL_INSUFFICIENT':
+            return 503;
+        case 'QUOTE_ALREADY_CONSUMED':
+        case 'QUOTE_EXPIRED':
+        case 'QUOTE_WRONG_OWNER':
+            return 409;
+        default:
+            return 400;
+    }
+};
+
+const _resolveGhsDestination = async (prisma, userId, { destination, savedAccountId }) => {
+    if (savedAccountId) {
+        const saved = await prisma.savedMomoAccount.findUnique({ where: { id: savedAccountId } });
+        if (!saved || saved.userId !== userId) {
+            return { ok: false, status: 404, body: { success: false, code: 'SAVED_ACCOUNT_NOT_FOUND', message: 'Saved account not found.' } };
+        }
+        return { ok: true, destination: saved.phoneNumber || saved.accountNumber, network: saved.network || null };
+    }
+    const dest = String(destination || '').trim();
+    if (!dest || dest.length < 9) {
+        return { ok: false, status: 400, body: { success: false, code: 'DESTINATION_REQUIRED', message: 'A payout destination phone number is required.' } };
+    }
+    return { ok: true, destination: dest, network: null };
+};
+
+/// §P0-2 BANK PREVIEW + QUOTE (no money mutation). The BANK rail needed this:
+/// a bank payout that native GHS cannot cover answers
+/// GHS_SHORTFALL_QUOTE_REQUIRED, and there was no way to obtain the quote it
+/// demands. Everything the digest binds is resolved SERVER-SIDE here from the
+/// owner's persisted beneficiary — never a client-supplied fingerprint, bank
+/// code or snapshot.
+exports.bankFundingPlan = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const enabled = await nativeGhsWithdrawalService.isNativeGhsWithdrawalEnabled(prisma);
+        if (!enabled) {
+            return res.status(503).json({ success: false, code: 'NATIVE_GHS_WITHDRAWAL_DISABLED', message: 'Native-GHS withdrawals are not enabled.' });
+        }
+        // §P0 A QUOTE IS A PROMISE TO PAY. Never mint an executable customer
+        // consent for a rail whose payout capability is disabled: the customer
+        // would consent to a payout that cannot happen.
+        if (!bankPayoutIsAvailable(req.app.get('moolreBankPayoutPort'))) {
+            return res.status(503).json({
+                success: false,
+                code: 'BANK_PAYOUT_CAPABILITY_UNAVAILABLE',
+                message: 'Bank payouts are not available right now, so no quote was issued. Nothing was debited.',
+            });
+        }
+        // 1. the beneficiary is the OWNER's, and must be ACTIVE.
+        let bank;
+        try {
+            bank = await savedBankBeneficiaryService.revealForPayout(prisma, req.user.id, req.body.beneficiaryId);
+        } catch (beneficiaryError) {
+            const notFound = beneficiaryError.code === 'BENEFICIARY_NOT_FOUND';
+            return res.status(notFound ? 404 : 422).json({
+                success: false,
+                code: beneficiaryError.code || 'BENEFICIARY_UNAVAILABLE',
+                message: beneficiaryError.message,
+            });
+        }
+        // 2. and it must be PROVIDER-verified: a quote is a consent to pay THIS
+        // payee, and an unverified payee cannot be paid at all.
+        try {
+            savedBankBeneficiaryService.assertPayableVerification(bank);
+        } catch (verificationError) {
+            return res.status(422).json({
+                success: false,
+                code: verificationError.code || 'BENEFICIARY_NOT_VERIFIED',
+                message: verificationError.message,
+            });
+        }
+        // 3. the SAME fee policy the payout will charge. A quote that cannot
+        // state the exact debit must not be minted.
+        const feePolicy = nativeGhsWithdrawalService.bankPayoutFeePolicy();
+        if (!feePolicy) {
+            const configured = String(process.env.BANK_PAYOUT_FEE_GHS ?? '').trim();
+            const nonZero = configured !== '' && !/^0*(\.0+)?$/.test(configured);
+            return res.status(503).json({
+                success: false,
+                code: nonZero ? 'BANK_FEE_POLICY_UNAPPROVED' : 'BANK_FEE_POLICY_UNEVIDENCED',
+                message: 'Bank payouts are not enabled, so no quote can be issued. Nothing was debited.',
+            });
+        }
+        const user = await prisma.user.findUnique({ where: { id: req.user.id }, select: { nativeGhsBalance: true, availableBalance: true } });
+        const plan = ghsFundingPlanner.planGhsPayoutFunding({
+            amountGhs: req.body.amountGhs,
+            feeGhs: feePolicy.feeGhs,
+            availableNativeGhs: user?.nativeGhsBalance ?? 0,
+        });
+        // 4. identity from the PERSISTED record: the acceptance-time HMAC
+        // fingerprint of the account number plus the bank code. Digits are only
+        // unique within a bank, so the code is part of the payee.
+        const beneficiaryIdentity = ghsFundingPlanner.destinationIdentityOf({
+            destinationType: 'BANK',
+            destinationSnapshot: {
+                fingerprint: savedBankBeneficiaryService.fingerprint(bank.accountNumber),
+                bankCode: bank.bankCode,
+            },
+            beneficiaryId: bank.id,
+        });
+        if (!plan.requiresQuote) {
+            return res.status(200).json({
+                success: true,
+                plan,
+                quote: null,
+                usdcBalanceExact: new Prisma.Decimal(user?.availableBalance ?? 0).toFixed(8),
+                beneficiary: {
+                    id: bank.id, bankCode: bank.bankCode, bankName: bank.bankName,
+                    accountNumberMasked: bank.accountNumberMasked, accountNameVerified: bank.accountNameVerified === true,
+                },
+            });
+        }
+        const quote = await ghsFundingPlanner.quoteGhsShortfall({
+            prisma,
+            marketOracle: req.app.get('marketOracle'),
+            userId: req.user.id,
+            shortfallGhs: plan.shortfallGhs,
+            intent: {
+                rail: 'BANK',
+                recipientGhs: plan.recipientGhs,
+                feeGhs: plan.feeGhs,
+                destinationIdentity: beneficiaryIdentity,
+            },
+        });
+        return res.status(200).json({
+            success: true,
+            plan,
+            quote,
+            usdcBalanceExact: new Prisma.Decimal(user?.availableBalance ?? 0).toFixed(8),
+            beneficiary: {
+                id: bank.id, bankCode: bank.bankCode, bankName: bank.bankName,
+                accountNumberMasked: bank.accountNumberMasked, accountNameVerified: bank.accountNameVerified === true,
+            },
+        });
+    } catch (error) {
+        logger.error({ err: error, userId: req.user?.id }, '[bankFundingPlan] error');
+        return res.status(_ghsErrorStatus(error.code)).json({ success: false, code: error.code || 'SERVER_ERROR', message: error.message });
+    }
+};
+
+/// PREVIEW + QUOTE (no mutation of money): what would this payout need?
+exports.ghsFundingPlan = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const enabled = await nativeGhsWithdrawalService.isNativeGhsWithdrawalEnabled(prisma);
+        if (!enabled) {
+            return res.status(503).json({ success: false, code: 'NATIVE_GHS_WITHDRAWAL_DISABLED', message: 'Native-GHS withdrawals are not enabled.' });
+        }
+        const user = await prisma.user.findUnique({ where: { id: req.user.id }, select: { nativeGhsBalance: true, availableBalance: true } });
+        const plan = ghsFundingPlanner.planGhsPayoutFunding({
+            amountGhs: req.body.amountGhs,
+            feeGhs: 0,
+            availableNativeGhs: user?.nativeGhsBalance ?? 0,
+        });
+        if (!plan.requiresQuote) {
+            return res.status(200).json({ success: true, plan, quote: null, usdcBalanceExact: new Prisma.Decimal(user?.availableBalance ?? 0).toFixed(8) });
+        }
+        // Executable quote through the ONE canonical authority. Fail closed if
+        // no fresh canonical rate exists — never a display/fallback rate.
+        // §P1-2 the quote is minted for THIS payout, not for "a payout needing
+        // this shortfall". Declaring the destination in the preview body binds
+        // the consent to a payee; omitting it keeps the quote amount-only, and
+        // it then cannot be spent on a payout that names one.
+        const declaredRail = String(req.body.destinationType || 'MOMO').toUpperCase();
+        // Resolve the payee exactly as the payout route will, so a quote taken
+        // against a SAVED account is bound to the number that will be paid
+        // (not to the saved-account id, which never reaches the payout).
+        let declaredDestination = req.body.destination ?? null;
+        if (req.body.savedAccountId) {
+            const resolved = await _resolveGhsDestination(prisma, req.user.id, {
+                destination: req.body.destination,
+                savedAccountId: req.body.savedAccountId,
+            });
+            if (!resolved.ok) {
+                return res.status(resolved.status).json(resolved.body);
+            }
+            declaredDestination = resolved.destination;
+        }
+        const quote = await ghsFundingPlanner.quoteGhsShortfall({
+            prisma,
+            marketOracle: req.app.get('marketOracle'),
+            userId: req.user.id,
+            shortfallGhs: plan.shortfallGhs,
+            intent: {
+                rail: declaredRail,
+                recipientGhs: plan.recipientGhs,
+                feeGhs: plan.feeGhs,
+                // §P1-4 EVIDENCE IS SERVER-OWNED. A client-supplied
+                // destinationSnapshot or beneficiaryId is not read here: a
+                // caller could then bind a quote to a payee fingerprint it
+                // asserted rather than one the server resolved.
+                destinationIdentity: ghsFundingPlanner.destinationIdentityOf({
+                    destinationType: declaredRail,
+                    destination: declaredDestination,
+                }),
+            },
+        });
+        return res.status(200).json({ success: true, plan, quote, usdcBalanceExact: new Prisma.Decimal(user?.availableBalance ?? 0).toFixed(8) });
+    } catch (error) {
+        logger.error({ err: error, userId: req.user?.id }, '[ghsFundingPlan] error');
+        return res.status(_ghsErrorStatus(error.code)).json({ success: false, code: error.code || 'SERVER_ERROR', message: error.message });
+    }
+};
+
+exports.ghsWithdrawal = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
+    const payoutDispatcher = req.app.get('paymentFailoverService') || req.app.get('mtnDisbursementService');
+    try {
+        const enabled = await nativeGhsWithdrawalService.isNativeGhsWithdrawalEnabled(prisma);
+        if (!enabled) {
+            res.locals.financialClaimRelease = true;
+            return res.status(503).json({ success: false, code: 'NATIVE_GHS_WITHDRAWAL_DISABLED', message: 'Native-GHS withdrawals are not enabled.' });
+        }
+        const userId = req.user.id;
+        const target = await _resolveGhsDestination(prisma, userId, req.body);
+        if (!target.ok) {
+            res.locals.financialClaimRelease = true;
+            return res.status(target.status).json(target.body);
+        }
+        const network = req.body.network || target.network;
+
+        // §P0-1 RISK GATE. This used to call evaluate() with `action:
+        // 'WITHDRAWAL_GHS'` and read `.blocked`: the engine keys on `type` and
+        // answers `allowed`, so no rule ran and no answer was read, and a failed
+        // evaluation was logged and ignored. It is now the shared asset-aware
+        // seam, and it refuses BEFORE any debit, quote consumption, reservation
+        // or dispatch.
+        // The amount is put into EXACT pesewas BEFORE any risk decision. The
+        // input contract accepts a string or a number, so `Number(...)` here
+        // could carry float noise into a threshold comparison; a value that is
+        // not exact pesewas is refused instead of silently rounded.
+        let riskAmountExact;
+        try {
+            riskAmountExact = nativeGhsWithdrawalService.toExactPesewa(req.body.amountGhs).toFixed(2);
+        } catch (amountError) {
+            res.locals.financialClaimRelease = true;
+            return res.status(422).json({
+                success: false,
+                code: amountError.code || 'NATIVE_GHS_AMOUNT_INVALID',
+                message: amountError.message || 'That amount is not a valid GHS pesewa figure.',
+            });
+        }
+        const risk = await payoutRiskGate.evaluatePayoutRisk({
+            userId,
+            amount: riskAmountExact,
+            asset: 'GHS',
+            destination: target.destination,
+            rail: 'MOMO',
+            // No account age is passed: the gate reads User.createdAt from the
+            // database, so a JWT without createdAt cannot skip the rule.
+            channel: 'NATIVE_GHS_MOMO',
+            db: prisma,
+        });
+        if (!risk.ok) {
+            res.locals.financialClaimRelease = true;
+            return res.status(risk.status).json({
+                success: false,
+                code: risk.code,
+                message: risk.message,
+                // Operator-visible refusal evidence: which rules fired, or which
+                // parts of the GHS risk policy are missing.
+                data: risk.rules
+                    ? { rules: risk.rules }
+                    : (risk.policyGaps ? { policyGaps: risk.policyGaps, policyMissing: risk.policyMissing } : undefined),
+            });
+        }
+
+        // Funding plan first: a genuine shortfall REQUIRES an explicit,
+        // consented quote. Equal amounts mean the quote covers it EXACTLY.
+        const user = await prisma.user.findUnique({ where: { id: userId }, select: { nativeGhsBalance: true } });
+        // §P0-2 the plan must use the fee the QUOTE was minted with, or the
+        // shortfall the customer consented to and the shortfall we recompute
+        // would differ by the fee.
+        // §6 MoMo IS NOT THE BANK RAIL. This plan funds a MoMo payout and the
+        // service will charge the MoMo fee policy; reading the BANK policy here
+        // made a BANK_PAYOUT_FEE_GHS value — or its absence — change a MoMo
+        // quote and its consent-bound shortfall. Cross-rail pricing is not a
+        // configuration detail, it is a different contract.
+        const momoFeePolicy = nativeGhsWithdrawalService.momoPayoutFeePolicy();
+        const plan = ghsFundingPlanner.planGhsPayoutFunding({
+            amountGhs: req.body.amountGhs,
+            feeGhs: momoFeePolicy.feeGhs,
+            availableNativeGhs: user?.nativeGhsBalance ?? 0,
+        });
+        if (plan.requiresQuote && !req.body.quoteId) {
+            res.locals.financialClaimRelease = true;
+            return res.status(409).json({
+                success: false,
+                code: 'GHS_SHORTFALL_QUOTE_REQUIRED',
+                message: 'Native GHS does not cover this withdrawal. Request a shortfall quote and consent to it before retrying.',
+                plan,
+            });
+        }
+
+        const reference = randomUUID();
+        let acceptedResponse = null;
+        const facts = await nativeGhsWithdrawalService.processNativeGhsWithdrawal(
+            prisma,
+            userId,
+            {
+                amountGhs: req.body.amountGhs,
+                destination: target.destination,
+                network,
+                reference,
+                quoteId: req.body.quoteId || null,
+                // §P1-4 the accepted destination is recorded as evidence, built
+                // here from server-side facts. req.body.destinationSnapshot is
+                // deliberately NOT read: a payout must never be described by a
+                // snapshot the payer wrote.
+                destinationType: 'MOMO',
+                destinationSnapshot: nativeGhsWithdrawalService.buildMomoDestinationSnapshot({
+                    destination: target.destination,
+                    network,
+                }),
+            },
+            {
+                commitOperationClaimInTransaction: async (tx, f) => {
+                    acceptedResponse = {
+                        success: true,
+                        status: 'PENDING',
+                        message: 'Native-GHS withdrawal accepted. The payout is being processed — track it with this reference.',
+                        reference,
+                        data: {
+                            reference,
+                            status: 'PENDING',
+                            asset: 'GHS',
+                            settlementCurrency: nativeGhsWithdrawalService.SETTLEMENT_CURRENCY,
+                            withdrawalId: f.withdrawalRecord?.id ?? null,
+                            transactionId: f.txRecord.id,
+                            amountGhs: f.recipientGhsExact,
+                            feeGhs: f.feeGhsExact,
+                            totalDebitGhs: f.totalDebitGhsExact,
+                            feePolicy: nativeGhsWithdrawalService.GHS_NATIVE_FEE_POLICY,
+                            funding: f.funding ?? { mode: 'GHS_ONLY' },
+                            nativeGhsBalance: f.nativeGhsBalanceExact,
+                            network: network || null,
+                            destination: target.destination,
+                            destinationEvidence: {
+                                masked: nativeGhsWithdrawalService.buildMomoDestinationSnapshot({
+                                    destination: target.destination, network,
+                                }).destinationMasked,
+                                accountNameVerified: false,
+                                note: 'Mobile money payouts are not name-checked at acceptance; the masked number above is what was accepted.',
+                            },
+                        },
+                    };
+                    const operation = res.locals?.financialOperation || null;
+                    if (!operation) return;
+                    const committed = await tx.financialOperation.updateMany({
+                        where: { id: operation.id, status: 'IN_PROGRESS' },
+                        data: { status: 'COMMITTED', statusCode: 202, responseBody: JSON.stringify(acceptedResponse) },
+                    });
+                    if (committed.count !== 1) {
+                        const err = new Error('Idempotency operation state conflict.');
+                        err.code = 'IDEMPOTENCY_STATE_CONFLICT';
+                        throw err;
+                    }
+                },
+            }
+        );
+
+        // Response emitted AT/BEFORE the commit boundary; dispatch follows.
+        res.status(202).json(acceptedResponse);
+        if (typeof emitBalanceUpdate === 'function') {
+            try { emitBalanceUpdate(userId); } catch (_) { /* socket best-effort */ }
+        }
+
+        const dispatch = await nativeGhsWithdrawalService.dispatchNativeGhsWithdrawal(prisma, {
+            reference,
+            amountGhsExact: facts.recipientGhsExact,
+            destination: target.destination,
+            network,
+            dispatcher: payoutDispatcher,
+        });
+        if (dispatch.reason === 'DISPATCH_CLAIM_LOST' || dispatch.reason === 'DISPATCHER_UNAVAILABLE') {
+            logger.warn({ reference, dispatch }, '[ghsWithdrawal] dispatch deferred (single-winner claim / dispatcher binding)');
+        }
+        if (dispatch.reason === 'PROVIDER_REJECTED') {
+            logger.warn({ reference, dispatch }, '[ghsWithdrawal] provider rejected pre-dispatch — reversed once');
+        }
+        return undefined;
+    } catch (error) {
+        logger.error({ err: error, userId: req.user?.id }, '[ghsWithdrawal] error');
+        if (!res.headersSent) {
+            return res.status(_ghsErrorStatus(error.code)).json({ success: false, code: error.code || 'SERVER_ERROR', message: error.message });
+        }
+        return undefined;
+    }
+};
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BANK PAYOUT SURFACE (issue #389 section 4, Agent A)
+//
+// Explicitly typed BANK destination — never inferred. The provider call is
+// §P0 BANK CAPABILITY BEFORE ECONOMICS. "The method exists" is not "the rail can
+// pay out": an adapter can expose initiateBankTransfer while its payout
+// capability is disabled by configuration (no credentials, no source account, an
+// unapproved host, provider mode 'disabled'). Every bank entry point therefore
+// asks the adapter what it can actually do, and a capability that cannot be
+// PROVEN is unavailable. Refusing here costs the customer a retry; refusing
+// later costs them their money.
+function bankPayoutIsAvailable(port) {
+    // BOTH capabilities, at BOTH entry points. The rail cannot pay a destination
+    // it is unable to re-validate immediately before the transfer, so a port
+    // that can initiate but cannot validate is NOT available: accepting its
+    // quote would reserve customer funds for a payout the dispatcher must then
+    // refuse.
+    if (!port
+        || typeof port.capabilities !== 'function'
+        || typeof port.initiateBankTransfer !== 'function'
+        || typeof port.validateBankAccount !== 'function') {
+        return false;
+    }
+    try {
+        const caps = port.capabilities();
+        return caps?.canInitiateBankPayout === true && caps?.canValidateBankAccount === true;
+    } catch (_) {
+        return false;
+    }
+}
+
+// delegated to the INJECTED `moolreBankPayoutPort` (Agent B's adapter, not
+// edited here); when that capability is not bound the route refuses 503 with
+// ZERO mutation instead of guessing a rail. Economics, operation identity,
+// reservation, state machine, reversal and reconciliation are the SAME
+// authorities the MoMo GHS leg uses.
+// ═══════════════════════════════════════════════════════════════════════════
+exports.bankWithdrawal = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
+    const bankPort = req.app.get('moolreBankPayoutPort');
+    try {
+        const enabled = await nativeGhsWithdrawalService.isNativeGhsWithdrawalEnabled(prisma);
+        if (!enabled) {
+            res.locals.financialClaimRelease = true;
+            return res.status(503).json({ success: false, code: 'NATIVE_GHS_WITHDRAWAL_DISABLED', message: 'Native-GHS withdrawals are not enabled.' });
+        }
+        // Capability-first: a missing OR DISABLED rail is a configuration fact,
+        // not a customer error — refuse BEFORE any money moves.
+        if (!bankPayoutIsAvailable(bankPort)) {
+            res.locals.financialClaimRelease = true;
+            return res.status(503).json({
+                success: false,
+                code: 'BANK_PAYOUT_CAPABILITY_UNAVAILABLE',
+                message: 'Bank payouts are not available right now. Nothing was debited.',
+            });
+        }
+        const userId = req.user.id;
+        const bank = await savedBankBeneficiaryService.revealForPayout(prisma, userId, req.body.beneficiaryId);
+        // §P0-1 the BANK rail had NO risk gate at all. Same authority, same
+        // asset awareness, same pre-economics position: before the verification
+        // gate flips any state, before the balance debit, before the quote is
+        // consumed and before the reservation. The payee identity is passed as
+        // masked context only — never a full account number.
+        // Exact pesewas, from the SAME validator the MoMo rail uses. Passing
+        // Number(amountGhs) here let a GHS threshold be decided by float
+        // rounding, and the two rails must not disagree about the amount.
+        let bankRiskAmountExact;
+        try {
+            bankRiskAmountExact = nativeGhsWithdrawalService.toExactPesewa(req.body.amountGhs).toFixed(2);
+        } catch (exactError) {
+            res.locals.financialClaimRelease = true;
+            return res.status(422).json({
+                success: false,
+                code: exactError.code || 'GHS_AMOUNT_NOT_EXACT_PESEWAS',
+                message: exactError.message || 'The amount must be an exact two-decimal GHS amount.',
+            });
+        }
+        const risk = await payoutRiskGate.evaluatePayoutRisk({
+            userId,
+            amount: bankRiskAmountExact,
+            asset: 'GHS',
+            destination: bank.accountNumberMasked,
+            rail: 'BANK',
+            // No account age is passed: the gate reads User.createdAt from the
+            // database. A token claim or client value would be a bypass.
+            channel: 'NATIVE_GHS_BANK',
+            db: prisma,
+        });
+        if (!risk.ok) {
+            res.locals.financialClaimRelease = true;
+            return res.status(risk.status).json({
+                success: false,
+                code: risk.code,
+                message: risk.message,
+                // Operator-visible refusal evidence: which rules fired, or which
+                // parts of the GHS risk policy are missing.
+                data: risk.rules
+                    ? { rules: risk.rules }
+                    : (risk.policyGaps ? { policyGaps: risk.policyGaps, policyMissing: risk.policyMissing } : undefined),
+            });
+        }
+        // §P0-3: only a PROVIDER-VERIFIED destination may be paid. The
+        // beneficiary endpoint establishes this from the provider's own answer,
+        // so an unverified payee means validation has not happened (or was
+        // invalidated by a bank/account change). Refuse before any money moves.
+        try {
+            savedBankBeneficiaryService.assertPayableVerification(bank);
+        } catch (verificationError) {
+            res.locals.financialClaimRelease = true;
+            return res.status(422).json({
+                success: false,
+                code: verificationError.code || 'BENEFICIARY_NOT_VERIFIED',
+                message: verificationError.message,
+            });
+        }
+        // §P1C VALIDATION FRESHNESS. A stored validatedAt proves the provider
+        // once confirmed this account; it does not prove the account is payable
+        // NOW, and no approved validity interval exists to say how old is too
+        // old. So the payout boundary re-asks the provider, bound to the STORED
+        // number and bank code, and records the provider's own validation
+        // timestamp in the immutable snapshot. A refusal costs a retry; a stale
+        // pass costs the money.
+        let freshness;
+        try {
+            freshness = await savedBankBeneficiaryService.revalidateBeneficiary(prisma, userId, bank.id, { port: bankPort });
+        } catch (freshnessError) {
+            res.locals.financialClaimRelease = true;
+            const code = freshnessError.code || 'BENEFICIARY_REVALIDATION_REQUIRED';
+            const unavailable = code === 'VALIDATION_UNAVAILABLE' || code === 'VALIDATION_UNDETERMINED'
+                || code === 'DIRECTORY_UNAVAILABLE' || code === 'BENEFICIARY_KEY_UNAVAILABLE';
+            return res.status(unavailable ? 503 : (code === 'BENEFICIARY_NOT_FOUND' ? 404 : 422)).json({
+                success: false,
+                code,
+                message: unavailable
+                    ? 'Bank account verification is unavailable right now, so this withdrawal was not started. Nothing was debited.'
+                    : 'This destination could not be re-verified with the bank just now, so this withdrawal was not started. Nothing was debited.',
+            });
+        }
+        bank.accountName = freshness.beneficiary.accountName;
+        bank.accountNameVerified = true;
+        bank.validatedAt = freshness.beneficiary.validatedAt || null;
+
+        // §6 immutable acceptance snapshot: what the customer confirmed, not
+        // what the payee record happens to say later.
+        const beneficiarySnapshot = {
+            beneficiaryId: bank.id,
+            bankCode: bank.bankCode,
+            bankName: bank.bankName,
+            accountName: bank.accountName || null,
+            // Evidence, not decoration: this says whether the bank ever
+            // confirmed the name, so a payout can never be described as going
+            // to a verified account when the name was only typed by the payer.
+            accountNameVerified: bank.accountNameVerified === true,
+            accountNumberMasked: bank.accountNumberMasked,
+            fingerprint: savedBankBeneficiaryService.fingerprint(bank.accountNumber),
+            // WHEN the provider confirmed this exact destination, not merely
+            // "true": a boolean cannot be aged or questioned later.
+            providerValidatedAt: (freshness.verification && freshness.verification.validatedAt) || null,
+            verificationSource: 'MOOLRE_ACCOUNT_ENQUIRY',
+            capturedAt: new Date().toISOString(),
+        };
+
+        const user = await prisma.user.findUnique({ where: { id: userId }, select: { nativeGhsBalance: true } });
+        const plan = ghsFundingPlanner.planGhsPayoutFunding({
+            amountGhs: req.body.amountGhs,
+            feeGhs: 0,
+            availableNativeGhs: user?.nativeGhsBalance ?? 0,
+        });
+        if (plan.requiresQuote && !req.body.quoteId) {
+            res.locals.financialClaimRelease = true;
+            return res.status(409).json({
+                success: false,
+                code: 'GHS_SHORTFALL_QUOTE_REQUIRED',
+                message: 'Native GHS does not cover this withdrawal. Request a shortfall quote and consent to it before retrying.',
+                data: { plan },
+            });
+        }
+
+        const reference = randomUUID();
+        let acceptedResponse = null;
+        const facts = await nativeGhsWithdrawalService.processNativeGhsWithdrawal(
+            prisma,
+            userId,
+            {
+                amountGhs: req.body.amountGhs,
+                destination: bank.accountNumberMasked,
+                reference,
+                quoteId: req.body.quoteId || null,
+                destinationType: 'BANK',
+                beneficiaryId: bank.id,
+                destinationSnapshot: beneficiarySnapshot,
+            },
+            {
+                commitOperationClaimInTransaction: async (tx, claimFacts) => {
+                    acceptedResponse = {
+                        success: true,
+                        status: 'PENDING',
+                        message: 'Bank payout accepted. The transfer is being processed — track it with this reference.',
+                        reference,
+                        data: {
+                            reference,
+                            status: 'PENDING',
+                            destinationType: 'BANK',
+                            settlementCurrency: 'GHS_NATIVE',
+                            withdrawalId: claimFacts.withdrawalRecord?.id ?? null,
+                            transactionId: claimFacts.txRecord?.id ?? null,
+                            amountGhs: claimFacts.recipientGhsExact,
+                            feeGhs: claimFacts.feeGhsExact,
+                            totalDebitGhs: claimFacts.totalDebitGhsExact,
+                            bankName: bank.bankName,
+                            accountName: bank.accountName || null,
+                            accountNameVerified: bank.accountNameVerified === true,
+                            accountNumberMasked: bank.accountNumberMasked,
+                            funding: claimFacts.funding ?? { mode: 'GHS_ONLY' },
+                        },
+                    };
+                    const operation = res.locals?.financialOperation || null;
+                    if (!operation) return;
+                    const committed = await tx.financialOperation.updateMany({
+                        where: { id: operation.id, status: 'IN_PROGRESS' },
+                        data: { status: 'COMMITTED', statusCode: 202, responseBody: JSON.stringify(acceptedResponse) },
+                    });
+                    if (committed.count !== 1) {
+                        const err = new Error('Idempotency operation state conflict.');
+                        err.code = 'IDEMPOTENCY_STATE_CONFLICT';
+                        throw err;
+                    }
+                },
+            }
+        );
+
+        res.status(202).json(acceptedResponse);
+        if (typeof emitBalanceUpdate === 'function') {
+            try {
+                emitBalanceUpdate(userId, { nativeGhsBalance: facts.nativeGhsBalanceExact, availableBalance: facts.usdcBalanceExact });
+            } catch (_) { /* socket fan-out is best effort */ }
+        }
+        await nativeGhsWithdrawalService.dispatchNaturalGhsBankWithdrawal(prisma, {
+            reference,
+            amountGhsExact: facts.recipientGhsExact,
+            bank,
+            port: bankPort,
+        });
+        return undefined;
+    } catch (error) {
+        logger.error({ err: error, userId: req.user?.id }, '[bankWithdrawal] error');
+        if (!res.headersSent) {
+            return res.status(_ghsErrorStatus(error.code)).json({ success: false, code: error.code || 'SERVER_ERROR', message: error.message });
+        }
+        return undefined;
     }
 };

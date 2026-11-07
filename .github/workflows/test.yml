@@ -29,6 +29,12 @@ jobs:
     # finishes in ~10 min regardless.
     timeout-minutes: 90
 
+    # The database guard authenticates the runner with an OIDC token. This is a
+    # job-level block: it ADDS id-token: write to whatever the workflow grants.
+    permissions:
+      contents: read
+      id-token: write
+
     services:
       postgres:
         image: postgres:16
@@ -75,6 +81,82 @@ jobs:
         # that does not validate must stop CI at its own gate with a clear
         # name in the summary.
         run: npx prisma validate
+
+      - name: 'Guard: authenticate the runner (GitHub OIDC)'
+        # GITHUB_ACTIONS=true, a container label and a run id are all settable by
+        # anyone; none of them authenticates a runner. The database guard enables
+        # its CI branch only for a GitHub Actions OIDC token whose RS256 signature
+        # verifies against GitHub's published JWKS and whose issuer, audience,
+        # expiry, repository and workflow claims match. The token is written to a
+        # private file and never printed.
+        run: |
+          set -euo pipefail
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::This job cannot request an OIDC token (needs permissions: id-token: write). The database guard would refuse, so the lane stops here rather than degrading."
+            exit 1
+          fi
+          TOKEN_FILE="${RUNNER_TEMP:-/tmp}/azm-ci-oidc.jwt"
+          curl -sS -f -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=azm-test-db-guard" \
+            | node -e 'let body = ""; process.stdin.on("data", (chunk) => { body += chunk; }).on("end", () => { const token = JSON.parse(body).value; if (!token) process.exit(1); require("fs").writeFileSync(process.argv[1], token, { mode: 0o600 }); });' "$TOKEN_FILE"
+          test -s "$TOKEN_FILE"
+          echo "AZM_CI_OIDC_TOKEN_PATH=${TOKEN_FILE}" >> "$GITHUB_ENV"
+          echo "Runner OIDC token acquired (value never printed)."
+
+      - name: 'Guard: identify the PostgreSQL service container (exact identity)'
+        # §392 — __tests__/helpers/testDatabaseGuard.js refuses to run its
+        # table-wide maintenance statement unless the server's OWN reported
+        # address matches an independent expectation. That expectation is this
+        # container's address, read from docker itself. Without this step a
+        # GitHub Actions run has no expectation and the guard fails closed, so
+        # the identity is established here for this lane too, exactly as the
+        # financial-durability lane does.
+        #
+        # Ambiguity is fatal: zero or several candidates, or several network
+        # addresses, means the target cannot be proven.
+        run: |
+          set -euo pipefail
+          mapfile -t CANDIDATES < <(docker ps -q --filter "ancestor=postgres:16")
+          if [ "${#CANDIDATES[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one postgres:16 service container, found ${#CANDIDATES[@]}. The database identity cannot be established."
+            exit 1
+          fi
+          CONTAINER="${CANDIDATES[0]}"
+          mapfile -t ADDRESSES < <(docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "$CONTAINER" | sed '/^[[:space:]]*$/d')
+          if [ "${#ADDRESSES[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one network address for container ${CONTAINER}, found ${#ADDRESSES[@]}. Refusing to guess."
+            exit 1
+          fi
+          ADDRESS="${ADDRESSES[0]}"
+          if ! printf '%s' "$ADDRESS" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+            echo "::error::Container address '${ADDRESS}' is not a dotted IPv4 address."
+            exit 1
+          fi
+          echo "PostgreSQL service container: ${CONTAINER}"
+          echo "Exact expected database address: ${ADDRESS}"
+          echo "AZM_TEST_PG_CONTAINER=${CONTAINER}" >> "$GITHUB_ENV"
+          echo "AZM_EXPECTED_TEST_DB_ADDRESS=${ADDRESS}" >> "$GITHUB_ENV"
+          # The service-container id from the job.services context: where the
+          # workflow can supply it, the docker-selected container must be that one.
+          SERVICE_CONTAINER='${{ job.services.postgres.id }}'
+          # MANDATORY. The guard will not fall back to a docker ps selection: the
+          # container it verifies must be the service container this job declared.
+          if [ -z "$SERVICE_CONTAINER" ]; then
+            echo "::error::job.services.postgres.id is empty. This job declares services.postgres, so the service container id must be available; refusing rather than falling back to a docker ps selection."
+            exit 1
+          fi
+          case "$SERVICE_CONTAINER" in
+            *[!0-9a-fA-F]*)
+              echo "::error::job.services.postgres.id (${SERVICE_CONTAINER}) is not a hexadecimal container id."
+              exit 1
+              ;;
+          esac
+          if [ "${#SERVICE_CONTAINER}" -ne 64 ]; then
+            echo "::error::job.services.postgres.id (${SERVICE_CONTAINER}) is ${#SERVICE_CONTAINER} characters, not a full 64-character container id."
+            exit 1
+          fi
+          echo "AZM_CI_SERVICE_CONTAINER_ID=${SERVICE_CONTAINER}" >> "$GITHUB_ENV"
+          echo "Service container declared by the job: ${SERVICE_CONTAINER}"
 
       - name: Apply database schema
         # CI uses a disposable PostgreSQL instance. Production remains managed
@@ -124,6 +206,8 @@ jobs:
 
       - name: Install native-GHS settlement overlay
         run: node infra/install-native-ghs-settlement-overlay.js
+      - name: Install native-GHS withdrawal overlay
+        run: node infra/install-native-ghs-withdrawal-overlay.js
 
       # PR #292 follow-up: the release chain (npm run release) executes the
       # business-os overlay in production (it is the schema authority for
@@ -192,7 +276,9 @@ jobs:
         # ALTER SYSTEM cannot run inside one (run 35367906505), so run
         # psql inside the service container directly.
         run: |
-          CONTAINER=$(docker ps --filter "ancestor=postgres:16" --format "{{ .ID }}" | head -1)
+          # Reuse the container the identity step selected: one way to decide
+          # which PostgreSQL this lane is talking to.
+          CONTAINER="${AZM_TEST_PG_CONTAINER:?the identity step must export AZM_TEST_PG_CONTAINER}"
           docker exec "$CONTAINER" psql -U postgres -d azm_test \
             -c "ALTER SYSTEM SET synchronous_commit = off" \
             -c "SELECT pg_reload_conf();" \
@@ -212,18 +298,64 @@ jobs:
         # DB-backed suites share one disposable database and truncate between
         # tests, so Jest must remain serial. The application bootstrap also
         # leaves Prisma/pg handles open, hence forceExit.
+        #
+        # THE GUARD'S PROOF IS RENEWED, NOT WEAKENED. The database guard
+        # authenticates the runner with a GitHub OIDC token, and that token is
+        # short-lived while this suite now runs longer than one token lives —
+        # every test after expiry was refused ("the OIDC token expired"). The
+        # token file is therefore refreshed from the runner's own OIDC endpoint
+        # every few minutes, atomically (write + rename), so the guard always
+        # reads a complete, currently-valid token and still performs every one
+        # of its checks. Nothing about the checks, the audience, the workflow
+        # allowlist or the run identity changes.
+        #
         # Retry once only to absorb a transient CI database/runner timeout;
         # genuine test failures must reproduce and still fail the job.
         run: |
           set +e
+          if [ -z "${AZM_EXPECTED_TEST_DB_ADDRESS:-}" ]; then
+            echo "::error::AZM_EXPECTED_TEST_DB_ADDRESS is not set; the database identity guard would refuse. Fix the identity step."
+            exit 1
+          fi
+          TOKEN_FILE="${AZM_CI_OIDC_TOKEN_PATH:-}"
+          if [ -z "$TOKEN_FILE" ]; then
+            echo "::error::AZM_CI_OIDC_TOKEN_PATH is not set; the database identity guard would refuse. Fix the OIDC step."
+            exit 1
+          fi
+
+          refresh_oidc() {
+            local tmp="${TOKEN_FILE}.next"
+            curl -sS -f -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=azm-test-db-guard" \
+              | node -e 'let body = ""; process.stdin.on("data", (chunk) => { body += chunk; }).on("end", () => { const token = JSON.parse(body).value; if (!token) process.exit(1); require("fs").writeFileSync(process.argv[1], token, { mode: 0o600 }); });' "$tmp"
+            if [ ! -s "$tmp" ]; then
+              echo "::error::could not refresh the runner OIDC token; the guard will refuse once the current token expires."
+              return 1
+            fi
+            mv -f "$tmp" "$TOKEN_FILE"   # atomic: the guard never reads a partial token
+          }
+
+          # Background renewer: keeps the guard's proof valid for the whole run.
+          (
+            while true; do
+              sleep 240
+              refresh_oidc || exit 1
+              echo "Runner OIDC token refreshed."
+            done
+          ) &
+          RENEW_PID=$!
+          trap 'kill "$RENEW_PID" 2>/dev/null' EXIT
+
           npm test -- --runInBand --forceExit
           code=$?
           if [ $code -ne 0 ]; then
             echo "::warning::Test suite failed on first attempt — retrying once for transient CI-environment failures."
+            refresh_oidc
             npm test -- --runInBand --forceExit
             code=$?
           fi
           exit $code
+
 
       - name: Checkout authoritative frontend (AZM-businessPortal)
         # route-check is a FRONTEND/BACKEND compatibility gate: it must scan

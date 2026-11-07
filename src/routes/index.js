@@ -50,6 +50,7 @@ function mountRoutes(app, {
     app.use('/api/withdraw', financialLimiter, require('../../routes/withdrawalRoutes'));
     app.use('/api/trade-accounts', generalLimiter, require('../../routes/tradeAccountRoutes'));
     app.use('/api/payout-destinations', generalLimiter, require('../../routes/payoutDestinationRoutes'));
+    app.use('/api/bank-beneficiaries', financialLimiter, require('../../routes/bankBeneficiaryRoutes'));
     app.use('/api/admin/chat', generalLimiter, require('../../routes/adminChatRoutes'));
     app.use('/api/security', generalLimiter, require('../../routes/securityRoutes'));
     app.use('/api/users', generalLimiter, require('../../routes/userRoutes'));

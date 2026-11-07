@@ -10,6 +10,11 @@ jest.mock('../src/services/fiatLiquidityService', () => ({
     settleIfRecorded: jest.fn().mockResolvedValue({ skipped: true }),
     inTransitIfRecorded: jest.fn().mockResolvedValue({ skipped: true }),
 }));
+jest.mock('../src/services/fiatLiquidityActivationService', () => ({
+    readMode: jest.fn().mockResolvedValue({ active: false, flagged: false, latched: false, activatedAt: null, currency: 'USDC' }),
+    readModeAndPool: jest.fn().mockResolvedValue({ active: false, flagged: false, latched: false, activatedAt: null, currency: 'USDC', balance: 0 }),
+    lockRegime: jest.fn().mockResolvedValue(undefined),
+}));
 
 describe('liquidateProfits concurrency guard', () => {
   test('only one concurrent liquidation can claim the same profit funds', async () => {

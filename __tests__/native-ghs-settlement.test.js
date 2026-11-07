@@ -38,6 +38,8 @@ if (!hasDb) console.warn('[native-ghs-settlement.test] TEST_DATABASE_URL not set
 
 describeOrSkip('Native-GHS collection settlement (real PostgreSQL)', () => {
     let prisma;
+    // Decimal-native assertions (exact money arithmetic, never floats).
+    const { Prisma } = require('@prisma/client');
     const { seedUser } = require('./helpers/factories');
     const ledger = require('../services/ledgerService');
     const nativeGhsSettlement = require('../src/services/nativeGhsSettlementService');
@@ -165,6 +167,8 @@ describeOrSkip('Native-GHS collection settlement (real PostgreSQL)', () => {
         await setFlag(true);
         const user = await seedUser(prisma, { availableBalance: 25, nativeGhsBalance: 7 });
         const pending = await initiateDeposit(user, 100);
+        // Baseline captured immediately before the settlement under test.
+        const floatBefore = new Prisma.Decimal((await ledger.accountBalance(prisma, 'fiat:momo:ghs')).balance);
 
         const res = await moolreWebhook(pending.txHash, 100);
         expect(res.statusCode).toBe(200);
@@ -186,8 +190,14 @@ describeOrSkip('Native-GHS collection settlement (real PostgreSQL)', () => {
         // GHS asset + user GHS liability carry the exact credited amount;
         // the legacy USDC conversion bridge (clearing:conversion) is NOT
         // used on this path.
+        // NOTE: asserted as the EXACT delta this settlement posted, not as an
+        // absolute floor. The float is a running provider asset that other
+        // payout suites in the same run also debit, so an absolute floor made
+        // this test depend on file execution order (it failed whenever a
+        // withdrawal suite ran first). A delta is both order-independent and
+        // stricter: the collection must move the float by exactly this much.
         const asset = await ledger.accountBalance(prisma, 'fiat:momo:ghs');
-        expect(Number(asset.balance)).toBeGreaterThanOrEqual(100);
+        expect(new Prisma.Decimal(asset.balance).minus(floatBefore).toFixed(2)).toBe('100.00');
         const ghsLiability = await ledger.accountBalance(prisma, `ghs:user:${user.id}:liability`);
         expect(Number(ghsLiability.balance)).toBe(100); // exactly the credit
     });
