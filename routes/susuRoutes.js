@@ -7,9 +7,10 @@ const overlay = require('../controllers/susu/susuOverlayController');
 const { protect } = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
 const { idempotency } = require('../middleware/idempotency');
+const { requireKyc } = require('../middleware/requireKyc');
 
 // ── Legacy GroupChat-bound flow (kept as-is) ──────────────────────────────
-router.post('/groups',                    protectActive, idempotency(), ctrl.createSusu);
+router.post('/groups',                    protectActive, requireKyc('susu'), idempotency(), ctrl.createSusu);
 router.get('/groups/:id',                 protect,       ctrl.getDetail);
 router.get('/groups/:id/transparency',    protect,       ctrl.getTransparencyReport);
 router.post('/groups/:id/contract',       protectActive, idempotency(), ctrl.acceptContract);
