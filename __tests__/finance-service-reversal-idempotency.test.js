@@ -1,4 +1,11 @@
 jest.mock('../utils/securityCheck', () => ({ runDoubleCheck: jest.fn().mockResolvedValue(undefined) }));
+jest.mock('../src/services/fiatLiquidityActivationService', () => ({
+    // These suites model the LEGACY USDC pool: the P5-D stays inert so the
+    // pre-existing expectations about SystemFiatPool arithmetic still hold.
+    readMode: jest.fn().mockResolvedValue({ active: false, flagged: false, latched: false, activatedAt: null, currency: 'USDC' }),
+    readModeAndPool: jest.fn().mockResolvedValue({ active: false, flagged: false, latched: false, activatedAt: null, currency: 'USDC', balance: 0 }),
+    lockRegime: jest.fn().mockResolvedValue(undefined),
+}));
 
 // §P.5-D: the GHS liquidity authority is not under test here — the regime
 // wrappers report "no reservation row" (legacy regime), so the legacy
@@ -51,6 +58,7 @@ describe('finance reversal and crypto deposit idempotency', () => {
         findUnique: jest.fn().mockResolvedValue({ balance: 5 }),
       },
       systemFiatPool: {
+      fiatLiquidityState: { findUnique: jest.fn().mockResolvedValue(null) },
         upsert: jest.fn().mockResolvedValue({}),
         update: jest.fn().mockResolvedValue({}),
         findUnique: jest.fn().mockResolvedValue({ balance: 20 }),

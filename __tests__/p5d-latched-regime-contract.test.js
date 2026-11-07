@@ -215,6 +215,12 @@ const hasDb = !!process.env.TEST_DATABASE_URL;
 
         test('a reversal reports the pool unit of the regime that released it', async () => {
             await setRegime({ flagged: false, latched: false, availableGhs: 0, pool: 0 });
+            // The reversal unwinds the USDC capture from SystemMasterCrypto; a fresh
+            // CI database holds 0 there, and the balance CHECK would reject the
+            // decrement. Seed the capture the withdrawal actually made.
+            await prisma.systemMasterCrypto.upsert({
+                where: { id: 1 }, update: { balance: D(500) }, create: { id: 1, balance: D(500) },
+            });
             const user = await newUser(100);
             const reference = `p5d-rev-${Date.now()}`;
             const tx = await prisma.transactionHistory.create({
