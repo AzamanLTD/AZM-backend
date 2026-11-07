@@ -298,6 +298,17 @@ jobs:
         # DB-backed suites share one disposable database and truncate between
         # tests, so Jest must remain serial. The application bootstrap also
         # leaves Prisma/pg handles open, hence forceExit.
+        #
+        # THE GUARD'S PROOF IS RENEWED, NOT WEAKENED. The database guard
+        # authenticates the runner with a GitHub OIDC token, and that token is
+        # short-lived while this suite now runs longer than one token lives —
+        # every test after expiry was refused ("the OIDC token expired"). The
+        # token file is therefore refreshed from the runner's own OIDC endpoint
+        # every few minutes, atomically (write + rename), so the guard always
+        # reads a complete, currently-valid token and still performs every one
+        # of its checks. Nothing about the checks, the audience, the workflow
+        # allowlist or the run identity changes.
+        #
         # Retry once only to absorb a transient CI database/runner timeout;
         # genuine test failures must reproduce and still fail the job.
         run: |
@@ -306,14 +317,45 @@ jobs:
             echo "::error::AZM_EXPECTED_TEST_DB_ADDRESS is not set; the database identity guard would refuse. Fix the identity step."
             exit 1
           fi
+          TOKEN_FILE="${AZM_CI_OIDC_TOKEN_PATH:-}"
+          if [ -z "$TOKEN_FILE" ]; then
+            echo "::error::AZM_CI_OIDC_TOKEN_PATH is not set; the database identity guard would refuse. Fix the OIDC step."
+            exit 1
+          fi
+
+          refresh_oidc() {
+            local tmp="${TOKEN_FILE}.next"
+            curl -sS -f -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+              "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=azm-test-db-guard" \
+              | node -e 'let body = ""; process.stdin.on("data", (chunk) => { body += chunk; }).on("end", () => { const token = JSON.parse(body).value; if (!token) process.exit(1); require("fs").writeFileSync(process.argv[1], token, { mode: 0o600 }); });' "$tmp"
+            if [ ! -s "$tmp" ]; then
+              echo "::error::could not refresh the runner OIDC token; the guard will refuse once the current token expires."
+              return 1
+            fi
+            mv -f "$tmp" "$TOKEN_FILE"   # atomic: the guard never reads a partial token
+          }
+
+          # Background renewer: keeps the guard's proof valid for the whole run.
+          (
+            while true; do
+              sleep 240
+              refresh_oidc || exit 1
+              echo "Runner OIDC token refreshed."
+            done
+          ) &
+          RENEW_PID=$!
+          trap 'kill "$RENEW_PID" 2>/dev/null' EXIT
+
           npm test -- --runInBand --forceExit
           code=$?
           if [ $code -ne 0 ]; then
             echo "::warning::Test suite failed on first attempt — retrying once for transient CI-environment failures."
+            refresh_oidc
             npm test -- --runInBand --forceExit
             code=$?
           fi
           exit $code
+
 
       - name: Checkout authoritative frontend (AZM-businessPortal)
         # route-check is a FRONTEND/BACKEND compatibility gate: it must scan
