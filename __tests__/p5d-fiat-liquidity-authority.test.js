@@ -1484,9 +1484,10 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             // 4. the provider received EXACTLY the reserved 268.40 — not the
             //    recalculated 315.00
             expect(worker.mtn.initiateTransfer).toHaveBeenCalledWith(expect.objectContaining({
-                referenceId: reference, amountGhs: 268.40,
+                referenceId: reference, amountGhs: '268.40',
             }));
-            expect(results.details.processed[0].amountGhs).toBe(268.40);
+            // §r42.2: the boundary carries an exact 2-dp STRING, not a double.
+            expect(results.details.processed[0].amountGhs).toBe('268.40');
 
             // 5. the reservation row itself still carries exactly 268.40
             const rzAfter = await prisma.fiatLiquidityReservation.findUnique({ where: { reference } });
@@ -1534,7 +1535,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             const results = await worker._processBatch(settings, { isManualTrigger: true });
             expect(results.processed).toBe(1);
             expect(results.details.flaggedManualReview).toHaveLength(0);
-            expect(worker.mtn.initiateTransfer).toHaveBeenCalledWith(expect.objectContaining({ referenceId: reference, amountGhs: 268.40 }));
+            expect(worker.mtn.initiateTransfer).toHaveBeenCalledWith(expect.objectContaining({ referenceId: reference, amountGhs: '268.40' }));
             // reserved → IN_TRANSIT for exactly the reserved amount; the
             // authority figures never touched the legacy pool
             const st = await state();

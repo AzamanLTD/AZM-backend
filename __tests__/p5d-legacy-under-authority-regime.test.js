@@ -52,7 +52,7 @@ describeOrSkip('§P.5-D mixed-regime over-dispatch (real PostgreSQL)', () => {
         process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
         process.env.NODE_ENV = 'test';
         process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_secret_at_least_32_chars_long_xxxxx';
-        const { PrismaClient } = require('@prisma/client');
+        const { PrismaClient, Prisma } = require('@prisma/client');
         prisma = new PrismaClient();
         const table = await prisma.$queryRawUnsafe(
             `SELECT to_regclass('public."ReconciliationException"')::text AS name`
@@ -202,8 +202,10 @@ describeOrSkip('§P.5-D mixed-regime over-dispatch (real PostgreSQL)', () => {
         expect(results.processed).toBe(1);
         expect(results.details.flaggedManualReview).toHaveLength(0);
         expect(transfer).toHaveBeenCalledTimes(1);
-        // exact USDC -> GHS conversion at the live rate
-        expect(transfer).toHaveBeenCalledWith(expect.objectContaining({ amountGhs: parseFloat((20 * 13.42).toFixed(2)) }));
+        // exact USDC -> GHS conversion at the live rate. The provider boundary
+        // now receives an exact 2-dp STRING rather than a JS double (§r42.2):
+        // 20 × 13.42 is exactly 268.4 → "268.40".
+        expect(transfer).toHaveBeenCalledWith(expect.objectContaining({ amountGhs: '268.40' }));
         expect(results.poolBalance).toBe(2000 - 20);
         expect(await prisma.fiatLiquidityReservation.count()).toBe(0);
     });
@@ -258,7 +260,9 @@ describeOrSkip('§P.5-D mixed-regime over-dispatch (real PostgreSQL)', () => {
         const results = await worker._processBatch(await settings(), { isManualTrigger: true });
         expect(results.processed).toBe(1);
         expect(transfer).toHaveBeenCalledTimes(1);
-        expect(transfer).toHaveBeenCalledWith(expect.objectContaining({ amountGhs: 650 }));
+        // §r42.2: the reserved figure is dispatched verbatim, as an exact 2-dp
+        // string (it used to be round-tripped through a JS double).
+        expect(transfer).toHaveBeenCalledWith(expect.objectContaining({ amountGhs: '650.00' }));
         const rz = await prisma.fiatLiquidityReservation.findUnique({ where: { reference: canonical.txHash } });
         expect(rz.status).toBe('IN_TRANSIT');
         const st = await state();
