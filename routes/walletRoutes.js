@@ -203,7 +203,15 @@ router.get('/pool-withdrawal-preview', protect, async (req, res) => {
 });
 
 // POST /api/wallet/internal-transfer
-// Body: { direction: 'TO_POOL' | 'FROM_POOL', amount: number }
+// Body: { direction: 'TO_POOL' | 'FROM_POOL', amount: string | number }
+//
+// `amount` is a DECIMAL STRING and the string is authoritative (see
+// docs/MONEY_CONTRACT.md §5). Legacy numeric compatibility is conditional: a
+// JSON number is accepted only as a whole number, or as a fraction below
+// 2^25 USDC where a double still carries every 8-dp step. A fractional number
+// at or above that magnitude is refused with USDC_AMOUNT_STRING_REQUIRED
+// rather than silently rounded, because JSON.parse may already have destroyed
+// the last digit. Over-precision (>8dp) is USDC_AMOUNT_PRECISION.
 router.post('/internal-transfer', protectActive, require2FA(),
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), async (req, res) => {
     const prisma = req.app.get('prisma');

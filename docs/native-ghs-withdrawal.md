@@ -11,7 +11,7 @@ Nothing here activates until the owner rules; no merge/deploy/production action 
 | Denomination | GHS, exact 2dp (pesewa) | USDC, exact 8dp |
 | Ledger liability | `ghs:user:{id}:liability` (GHS) | `user:{id}:liability` (USDC) |
 | Settlement asset | `fiat:momo:ghs` (provider GHS float) | custody / provider USDC |
-| Headline | native GHS only | shown as its own balance |
+| Headline | the GHS leg of the combined estimate | the other leg, valued at the same canonical rate |
 
 Neither balance is ever reinterpreted as the other. A GHS payout debits GHS; it never reads
 `availableBalance`. A USDC quote is only used when the customer explicitly funds a GHS
@@ -87,18 +87,30 @@ owner's own row.
 
 ## Headline contract (resolved, not deferred)
 
-The valuation question raised during inventory — #369's consolidated headline versus Planning #78's
-native-GHS-only headline — is **decided and already implemented upstream** in this branch's base:
-`src/services/balanceValuationService.js` (commit `9909fe2`, "ghs headline is the native balance only")
-and `controllers/profileController.js` build the headline from `nativeGhsAvailable` only.
+The valuation question raised during inventory (a combined headline versus a native-GHS-only headline)
+is **decided**: [`MONEY_CONTRACT.md`](./MONEY_CONTRACT.md) §3 selects **`COMBINED_ESTIMATE`**, and
+`NATIVE_ONLY` remains a **supported alternative**, not the selected customer experience.
 
-`usdcEquivalent` is the *estimate of that GHS headline in USDC* — display only. It is never added to the
-headline, never a second balance, and a missing or stale rate leaves the headline valid while the estimate
-goes `null` (`FX_UNAVAILABLE`). Regression: `__tests__/balance-valuation.test.js` (11/11 on this head),
-which asserts that a rate change moves only the estimate and never the headline.
+Under the selected mode the front-face headline is one GHS figure,
 
-This branch adds no competing headline logic; the payout leg simply spends the same native-GHS balance the
-headline already reflects.
+    headlineGhs = nativeGhsAvailable + availableUsdc × displayRate
+
+with the secondary line `usdcEquivalent = headlineGhs / displayRate` computed at the **same** canonical
+rate, and `headlineIsEstimate` true whenever `availableUsdc > 0`. Locked buckets stay off the front face
+and are reported in their own units on the back of the card.
+
+This does not merge the two liabilities. `nativeGhsBalance` and `availableBalance` remain separate
+stored balances in their own units; the combined figure is a valuation, and a rate change moves only the
+valuation. A missing rate degrades the headline to `nativeGhsAvailable` alone with
+`PARTIAL_FX_UNAVAILABLE`, and `spendableGhsNow` never includes the indicative GHS value of USDC: spending
+USDC needs its own priced, confirmed quote.
+
+`usdcEquivalent` keeps its established response name. Regression:
+`__tests__/balance-valuation.test.js` asserts that a rate change moves only the estimate and never a
+stored balance.
+
+The payout leg in this branch spends the native-GHS balance the headline's GHS leg already reflects; it
+does not read the combined figure and cannot spend the USDC valuation.
 
 ## Compatibility
 

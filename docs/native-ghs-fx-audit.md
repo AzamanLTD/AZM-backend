@@ -2,7 +2,22 @@
 
 Status: implement-and-document (evidence in this branch, not a paper trail)
 Scope: `AZM-backend` — schema, ledger, services, routes, middleware, CI/release chain, tests.
-Related contract: `docs/CURRENCY_AND_SETTLEMENT_CONTRACT.md` (USDC remains the authoritative settlement unit; this workstream adds a REAL native-GHS balance and honest FX display fallbacks without changing that invariant).
+**Normative money contract:** [`MONEY_CONTRACT.md`](./MONEY_CONTRACT.md) governs what a customer is
+owed, what a screen may claim and where an estimate stops being money. This audit documents the
+implementation detail behind that contract; where the two differ in wording, `MONEY_CONTRACT.md`
+governs. `docs/CURRENCY_AND_SETTLEMENT_CONTRACT.md` is superseded by it.
+
+**Two customer liabilities, two rails.** GHS and USDC are separate customer liabilities, each held in
+its own unit and settled on its own rail (`MONEY_CONTRACT.md` §1, §10). There is no single universal
+settlement asset behind the ledger. This workstream adds a REAL native-GHS balance (`User.nativeGhsBalance`,
+projected from a genuine GHS ledger liability account) and honest FX display fallbacks, and it changes
+neither liability: no USDC balance is reclassified as GHS, and no GHS balance is treated as a view of
+USDC.
+
+**Existing legacy provider settlement is a different thing.** The established Moolre deposit/withdrawal
+flows predate the native-GHS wallet: they convert GHS⇄USDC at the rail and settle into the **USDC**
+wallet. That is legacy provider settlement, not the GHS liability. It is untouched by this workstream
+(§1 "Explicitly NOT changed") and is documented by its actual provider rail in `MONEY_CONTRACT.md` §10.
 
 ---
 
@@ -69,12 +84,12 @@ supported alternative, not the selected customer experience.
 
     COMBINED_ESTIMATE (selected)
         headlineGhs  = nativeGhsAvailable + availableUsdc × displayRateGhsPerUsdc
-        headlineUsdc = headlineGhs / displayRateGhsPerUsdc          (same rate)
+        usdcEquivalent = headlineGhs / displayRateGhsPerUsdc        (same rate)
         headlineIsEstimate = availableUsdc > 0
 
     NATIVE_ONLY (supported alternative)
         headlineGhs  = nativeGhsAvailable
-        headlineUsdc = nativeGhsAvailable / displayRateGhsPerUsdc
+        usdcEquivalent = nativeGhsAvailable / displayRateGhsPerUsdc
         headlineIsEstimate = false
 
 Both modes keep the two liabilities separate underneath: `nativeGhsAvailable`
@@ -94,8 +109,8 @@ primitives (`nativeGhsAvailable`, `availableUsdc`, `displayRate`,
 case as `FX_UNAVAILABLE`. Under `COMBINED_ESTIMATE` the combined headline is
 exactly `nativeGhsAvailable + availableUsdc × displayRate` over those same
 primitives, so the selected front face is composable without a new money path.
-Aligning the emitted field names (`headlineGhs`, `headlineUsdc`,
-`headlineIsEstimate`, `PARTIAL_FX_UNAVAILABLE`) with this contract is a
+Aligning the emitted field names (`headlineGhs`, `headlineIsEstimate`,
+`PARTIAL_FX_UNAVAILABLE`) with this contract is a
 follow-up change with its own tests; it is not silently redefined here.
 
 Response fields (every Decimal financial quantity serialized as BOTH exact string `*Exact` and a JS number projection for presentation):
@@ -188,8 +203,11 @@ Any future route whose authorization adds a GHS conversion, GHS-valued limit, or
 
 The gate decides WHETHER a conversion may execute; the settlement-scale
 policy decides WHAT the conversion produces. `services/settlementScale.js`
-is the single settlement authority (full contract in
-`docs/CURRENCY_AND_SETTLEMENT_CONTRACT.md` §Settlement scale and rounding):
+is the single settlement authority. The customer-facing requirement (GHS at 2
+dp ROUND_HALF_UP from an exact decimal product, USDC at 8 dp) is normative in
+[`MONEY_CONTRACT.md`](./MONEY_CONTRACT.md) §6; the implementation detail is
+carried over from `docs/CURRENCY_AND_SETTLEMENT_CONTRACT.md` §Settlement scale
+and rounding:
 
 - USDC settles at 8 dp; fiat wallet currencies at 2 dp — per currency, never
   assumed uniform. Rounding is ROUND_HALF_UP, and nothing else may round on
@@ -275,7 +293,7 @@ Legacy fields (`availableBalance`, `totalBalance`, `currency:'USDC'`, ...) untou
 ## 10. Why it is safe to merge
 
 1. **Additive only**: no existing field, route, response, or money movement changes meaning. Legacy balance/oracle clients are byte-compatible.
-2. **USDC settlement invariant preserved**: USDC remains the authoritative settlement unit; GHS adds a real distinct balance, it does not reclassify anything.
+2. **Both liabilities preserved**: GHS and USDC remain separate customer liabilities in their own units on their own rails; GHS adds a real distinct balance and reclassifies nothing (`MONEY_CONTRACT.md` §1, §10).
 3. **Fail-closed everywhere**: no fresh canonical rate → FX-dependent routes 503 BEFORE any claim/money/provider; display falls back honestly (saved → demo → honest unavailability) and never fabricates.
 4. **Demo artifacts can never leak into production**: DB CHECKs + install gating + read gating + explicit labelling (§7).
 5. **Exact-decimal discipline**: Prisma Decimals end-to-end; JS numbers only at the presentation boundary (dual-serialized `*Exact`).

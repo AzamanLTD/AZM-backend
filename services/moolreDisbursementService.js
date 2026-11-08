@@ -201,7 +201,10 @@ class MoolreDisbursementService {
      *
      * @param {{
      *   referenceId: string,                 // idempotency key (reused as txHash)
-     *   amountGhs:   number,
+     *   amountGhs:   string | number,        // decimal string authoritative; a
+     *                                        // number is accepted for legacy
+     *                                        // callers and read as an exact
+     *                                        // GHS figure, then settled to 2dp
      *   recipientPhone: string,              // E.164 or local (MSISDN)
      *   externalId?: string,                 // your own audit reference
      *   payerMessage?: string,
@@ -214,11 +217,18 @@ class MoolreDisbursementService {
      *   referenceId: string,
      *   externalId: string,
      *   status: 'PENDING'|'SUCCESSFUL'|'FAILED',
-     *   amountGhs: number,
+     *   amountGhs: string,        // AUTHORITATIVE: exact GHS at 2dp, e.g. '268.40'
+     *   amountGhsValue: number,   // presentation projection of amountGhs
      *   recipientPhone: string,
      *   message: string,
      *   source: 'LIVE'|'MOCK'
      * }>}
+     *
+     * `amountGhs` is a STRING, never a number: it is the exact 2-dp figure that
+     * is sent to Moolre, recorded in the mock ledger and compared against a
+     * provider echo. `amountGhsValue` is the explicitly named numeric
+     * projection for display only; it is not authoritative and must never be
+     * used as the amount of record (docs/MONEY_CONTRACT.md §6, §10).
      */
     async initiateTransfer(payload) {
         const {
