@@ -108,6 +108,17 @@ describeOrSkip('payout provider unknown-outcome (real PostgreSQL)', () => {
                 fiatLiquidityAuthorityEnabled: false,
             }
         });
+        // THE WORKER SCANS A GLOBAL BATCH (status PENDING/APPROVED, MOMO-ish,
+        // createdAt ASC, MAX_BATCH_SIZE). This suite asserts on `processed`, so
+        // it must own that batch: rows left behind by earlier suites are older
+        // and would fill the batch, making this row invisible and the assertions
+        // fail for a reason that has nothing to do with unknown-outcome handling.
+        await prisma.withdrawal.deleteMany({
+            where: {
+                status: { in: ['PENDING', 'APPROVED'] },
+                settlementCurrency: { not: 'GHS_NATIVE' },
+            },
+        });
         await prisma.fiatLiquidityState.upsert({
             where: { id: 1 },
             update: { authorityActivatedAt: null },

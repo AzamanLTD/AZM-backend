@@ -373,10 +373,14 @@ run('Business offered-categories contract (real PostgreSQL)', () => {
             expect(row.category).toBe('FOOD_BEVERAGE');
             expect(row.offeredCategories).toEqual([]);
         } else {
+            // REQUEST B WON. resB is the FULFILLED result, so it has no
+            // `.reason`; asserting one made this test pass only while A always
+            // won the race and throw as soon as B did. The loser's contract is
+            // checked by the `resA.status === 'rejected'` block below.
+            expect(resB.status).toBe('fulfilled');
             expect(raced).toBe(true);
             expect(row.category).toBe('HOSPITALITY');
             expect(row.offeredCategories).toEqual(['FOOD_BEVERAGE']);
-            expect(resB.reason.message).toMatch(/must not repeat the primary category/i);
         }
         if (resA.status === 'rejected') {
             expect(resA.reason.message).toMatch(/must not repeat the primary category/i);

@@ -169,6 +169,15 @@ describeOrSkip('Native-GHS collection settlement (real PostgreSQL)', () => {
         const pending = await initiateDeposit(user, 100);
         // Baseline captured immediately before the settlement under test.
         const floatBefore = new Prisma.Decimal((await ledger.accountBalance(prisma, 'fiat:momo:ghs')).balance);
+        // The customer GHS liability is asserted as a DELTA for the same reason
+        // the float is: the account code embeds the user id, some suites in this
+        // battery TRUNCATE "User" ... RESTART IDENTITY, and journal entries are
+        // append-only and never truncated. A recycled id therefore starts with a
+        // non-zero history, so an absolute balance is not a property of THIS
+        // settlement while its delta is exactly 100.00.
+        const liabilityBefore = new Prisma.Decimal(
+            (await ledger.accountBalance(prisma, `ghs:user:${user.id}:liability`)).balance,
+        );
 
         const res = await moolreWebhook(pending.txHash, 100);
         expect(res.statusCode).toBe(200);
@@ -199,7 +208,7 @@ describeOrSkip('Native-GHS collection settlement (real PostgreSQL)', () => {
         const asset = await ledger.accountBalance(prisma, 'fiat:momo:ghs');
         expect(new Prisma.Decimal(asset.balance).minus(floatBefore).toFixed(2)).toBe('100.00');
         const ghsLiability = await ledger.accountBalance(prisma, `ghs:user:${user.id}:liability`);
-        expect(Number(ghsLiability.balance)).toBe(100); // exactly the credit
+        expect(new Prisma.Decimal(ghsLiability.balance).minus(liabilityBefore).toFixed(2)).toBe('100.00'); // exactly the credit
     });
 
     // ── C. idempotency: replay credits nothing ──────────────────────────
