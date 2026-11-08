@@ -23,17 +23,17 @@
 //   • HTTP 503 with success=false, a stable code (RATE_STALE /
 //     RATE_UNAVAILABLE), retryable=true and the honest display hint — no
 //     client-side retry storm can turn a stale oracle green.
-//   • SIDE-EFFECT SAFE BY ORDERING: mount this middleware BEFORE idempotency
+//   • SIDE-EFFECT SAFE BY ORDERING: mount this middleware BEFORE the replay guard
 //     (and before any controller) so a refused request never claims an
-//     idempotency key, never debits/credits/reserves anything and never
+//     replay key, never debits/credits/reserves anything and never
 //     dispatches to a provider. The controllers' own gates re-validate
 //     inside the financial transaction for defense in depth.
 //
 // Ordering contract (enforced by the mounted route stacks and pinned by
 // tests): authentication / ban guard / required 2FA run BEFORE this gate;
-// this gate runs BEFORE idempotency and before any controller. An
+// this gate runs BEFORE the replay guard and before any controller. An
 // unauthenticated request must never learn the gate's state, and a refused
-// request never claims an idempotency key.
+// request never claims a replay key.
 //
 // SCOPE SELECTION — a CLOSED enum, not a lambda. A mount site picks one of
 // the reviewed classifications below; there is no way for a call site to
@@ -58,22 +58,30 @@
 
 const { getFreshServerRateGhsPerUsdc } = require('../src/services/transactionQuoteService');
 
-// Destination predicate for the MoMo-destination classification. The
+// Destination resolution for the MoMo-destination classification. The
 // wallet-withdraw destination space is exactly: Binance Pay IDs, TRC20
 // addresses (T..., 34 chars), EVM addresses (0x..., 42 chars), and MoMo
-// phone numbers (numeric, >= 9 digits) — the same classifier the
-// controller's payout-method dispatch uses. A MoMo destination authorizes
-// a GHS payout (FX-dependent); every other destination is same-asset USDC.
-function _isMomoPayoutDestination(req) {
-    // THE single authoritative classification
-    // (services/payoutDestinationClassification.js) — shared with the payout
-    // dispatcher, so the gate decision and the provider dispatch can never
-    // disagree (financial-core blocker A). The earlier local 9-15 digit
-    // regex BOTH mis-flagged 9-12 digit Binance Pay IDs (dispatched as
-    // same-asset USDC) AND failed open on 16+ digit MoMo destinations the
-    // dispatcher actually pays as GHS.
-    const { isMomoPayoutDestination } = require('../services/payoutDestinationClassification');
-    return isMomoPayoutDestination(req.body?.destination);
+// phone numbers — resolved through the SAME authoritative contract
+// (services/payoutDestinationClassification.js) the controller's
+// payout-method dispatch uses. A resolved MOMO destination authorizes a
+// GHS payout (FX-dependent); every other RESOLVED destination is
+// same-asset USDC. An UNRESOLVABLE destination (numeric without an
+// explicit destinationType, format mismatch, unknown format) is refused
+// HERE with the SAME code and message the controller would produce —
+// the gate and the dispatch can never disagree, and an ambiguous request
+// can never slip past the gate into the controller (owner-approved
+// destinationType contract, 2026-10-27).
+function _resolvePayoutDestination(req) {
+    const {
+        resolvePayoutDestination,
+        payoutDestinationRefusal,
+    } = require('../services/payoutDestinationClassification');
+    const result = resolvePayoutDestination(
+        req.body?.destination,
+        req.body?.destinationType,
+        req.body?.networkPref
+    );
+    return { result, refusal: result.status === 'RESOLVED' ? null : payoutDestinationRefusal(result) };
 }
 
 const SCOPE_ENUM = Object.freeze({
@@ -94,9 +102,18 @@ function requireFreshFxRate({ when } = {}) {
         // Destination-conditional classification: non-MoMo destinations are
         // same-asset USDC dispatches — never FX-gated (route-specific
         // contract, AZM-Planning #75). This branch does NOT touch the
-        // freshness authority at all.
-        if (scope === SCOPE_ENUM.MOMO_PAYOUT_DESTINATION && !_isMomoPayoutDestination(req)) {
-            return next();
+        // freshness authority at all. An UNRESOLVABLE destination is
+        // refused with the shared refusal contract BEFORE the replay guard —
+        // same code and message the dispatcher produces (blocker A).
+        if (scope === SCOPE_ENUM.MOMO_PAYOUT_DESTINATION) {
+            const { result, refusal } = _resolvePayoutDestination(req);
+            if (refusal) {
+                return res.status(400).json({ success: false, code: refusal.code, message: refusal.message });
+            }
+            if (result.payoutMethod !== 'MOMO') {
+                return next();
+            }
+            return _assertFresh(req, res, next);
         }
         return _assertFresh(req, res, next);
     }

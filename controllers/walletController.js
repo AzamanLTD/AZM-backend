@@ -20,13 +20,11 @@ exports.requestWithdrawal = async (req, res) => {
     const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
     
     try {
-        // We now look for 'destination' (which handles IDs, Wallets, and Phone Numbers)
-        const { amount, destination, networkPref } = req.body;
-        // Destination classification is the SINGLE shared contract
-        // (services/payoutDestinationClassification.js): the FX
-        // authorization gate and this dispatch read the SAME classification
-        // so they can never disagree (financial-core blocker A).
-        const { classifyPayoutDestination } = require('../services/payoutDestinationClassification');
+        // We now look for 'destination' plus the explicit 'destinationType'
+        // (owner-approved contract, 2026-10-27): numeric destinations are
+        // ambiguous between MoMo numbers and Binance Pay IDs and are never
+        // digit-length-guessed.
+        const { amount, destination, destinationType, networkPref } = req.body;
         const userId = req.user.id;
         const withdrawAmount = parseFloat(amount);
 
@@ -42,6 +40,24 @@ exports.requestWithdrawal = async (req, res) => {
             return res.status(400).json({ success: false, message: "Destination address or number is required." });
         }
 
+        // Destination resolution is the SINGLE shared contract
+        // (services/payoutDestinationClassification.js): the FX
+        // authorization gate and this dispatch read the SAME resolution
+        // so they can never disagree (financial-core blocker A). An
+        // unresolvable destination (numeric without a type, format
+        // mismatch, unknown format) is refused BEFORE any economics —
+        // the same code and message the gate produces.
+        const {
+            resolvePayoutDestination,
+            payoutDestinationRefusal,
+        } = require('../services/payoutDestinationClassification');
+        const resolution = resolvePayoutDestination(destination, destinationType, networkPref);
+        if (resolution.status !== 'RESOLVED') {
+            const refusal = payoutDestinationRefusal(resolution);
+            res.locals.financialClaimRelease = true;
+            return res.status(400).json({ success: false, code: refusal.code, message: refusal.message });
+        }
+
         // 2. Fetch Global Settings for Live Gas Prices
         const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
         if (!settings) throw new Error("Global settings offline.");
@@ -51,13 +67,11 @@ exports.requestWithdrawal = async (req, res) => {
         const platformFeeUsdc = parseFloat((withdrawAmount * cryptoPlatformFeePct).toFixed(6));
         const netAfterPlatformFee = withdrawAmount - platformFeeUsdc;
 
-        // --- THE BACKEND DETECTIVE ---
-        let payoutMethod = "UNKNOWN";
-        let detectedNetwork = networkPref || "UNKNOWN";
+        // --- PAYOUT CLASSIFICATION (resolved above; no silent guessing) ---
         let totalGasFee = 0.0;
 
         const cleanDest = destination.trim();
-        ({ payoutMethod, detectedNetwork } = classifyPayoutDestination(destination, networkPref));
+        const { payoutMethod, detectedNetwork } = resolution;
         // Gas-fee resolution per classification (unchanged semantics):
         if (payoutMethod === "BINANCE_ID") {
             totalGasFee = 0.0; // ZERO FEES!

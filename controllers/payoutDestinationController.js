@@ -1,5 +1,19 @@
 const logger = require('../src/config/logger');
 const authMiddleware = require('../middleware/authMiddleware');
+const {
+    resolvePayoutDestination,
+    payoutDestinationRefusal,
+    DESTINATION_TYPES,
+} = require('../services/payoutDestinationClassification');
+
+// Saved payout destinations adopt the SAME owner-approved contract
+// (2026-10-27) as payout dispatch: an explicit, validated destinationType
+// consistent with the stored address. Legacy rows (written before the
+// contract, with free-text types like "BINANCE_PAY" or "BANK") are never
+// mutated — the read path reports them with typeStatus NEEDS_CONFIRMATION
+// plus, for unambiguous formats, a suggestedDestinationType the client may
+// offer as a one-tap migration. Numeric legacy rows are never auto-typed:
+// a suggestion would be the digit-length guess the contract abolishes.
 
 exports.addPayoutDestination = async (req, res) => {
     const prisma = req.app.get('prisma');
@@ -15,6 +29,15 @@ exports.addPayoutDestination = async (req, res) => {
             });
         }
 
+        // Single shared resolution — the saved destination must be valid
+        // under the SAME contract payout dispatch uses, so a saved
+        // destination can never encode a dispatch that would refuse.
+        const resolution = resolvePayoutDestination(destinationAddress, destinationType, req.body?.networkPref);
+        if (resolution.status !== 'RESOLVED') {
+            const refusal = payoutDestinationRefusal(resolution);
+            return res.status(400).json({ success: false, code: refusal.code, message: refusal.message });
+        }
+
         // If this is the first destination, make it the default
         const existingCount = await prisma.payoutDestination.count({
             where: { userId }
@@ -24,7 +47,7 @@ exports.addPayoutDestination = async (req, res) => {
             data: {
                 userId,
                 nickname,
-                destinationType,
+                destinationType: resolution.destinationType,
                 destinationAddress,
                 isExternalCrypto: isExternalCrypto || false,
                 isDefault: existingCount === 0,
@@ -42,6 +65,23 @@ exports.addPayoutDestination = async (req, res) => {
     }
 };
 
+// Honest read-path classification for legacy rows: VALID for rows already
+// carrying a contract-valid type that matches their address format;
+// NEEDS_CONFIRMATION otherwise, with a format-derived suggestion ONLY for
+// unambiguous formats (never a numeric guess).
+function _classifySavedDestination(row) {
+    const resolution = resolvePayoutDestination(row.destinationAddress, row.destinationType, null);
+    if (resolution.status === 'RESOLVED') {
+        return { typeStatus: 'VALID', suggestedDestinationType: null };
+    }
+    // Unambiguous formats get a migration suggestion; numeric rows never do.
+    const untyped = resolvePayoutDestination(row.destinationAddress, null, null);
+    if (untyped.status === 'RESOLVED') {
+        return { typeStatus: 'NEEDS_CONFIRMATION', suggestedDestinationType: untyped.destinationType };
+    }
+    return { typeStatus: 'NEEDS_CONFIRMATION', suggestedDestinationType: null };
+}
+
 exports.getPayoutDestinations = async (req, res) => {
     const prisma = req.app.get('prisma');
 
@@ -55,7 +95,10 @@ exports.getPayoutDestinations = async (req, res) => {
 
         res.status(200).json({
             success: true,
-            destinations
+            destinations: destinations.map(d => ({
+                ...d,
+                ..._classifySavedDestination(d),
+            }))
         });
     } catch (error) {
         logger.error("Get Payout Destinations Error:", error);
@@ -80,13 +123,13 @@ exports.deletePayoutDestination = async (req, res) => {
 
         // If we deleted the default, make the most recent remaining one the default
         if (wasDefault) {
-            const nextDest = await prisma.payoutDestination.findFirst({
+            const next = await prisma.payoutDestination.findFirst({
                 where: { userId },
-                orderBy: { createdAt: 'desc' }
+                orderBy: { createdAt: "desc" }
             });
-            if (nextDest) {
+            if (next) {
                 await prisma.payoutDestination.update({
-                    where: { id: nextDest.id },
+                    where: { id: next.id },
                     data: { isDefault: true }
                 });
             }
@@ -127,3 +170,5 @@ exports.setDefaultPayoutDestination = async (req, res) => {
         res.status(500).json({ success: false, message: error.message });
     }
 };
+
+exports.DESTINATION_TYPES = DESTINATION_TYPES;
