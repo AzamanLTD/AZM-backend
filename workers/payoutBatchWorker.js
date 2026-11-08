@@ -256,7 +256,16 @@ class PayoutBatchWorker {
         const threshold = Number(settings.autoPayoutThresholdUsdc) || 500;
 
         const globalSettings = await this.prisma.globalSettings.findUnique({ where: { id: 1 } });
-        const liveRate = globalSettings ? Number(globalSettings.liveRetailRate) : 12.5;
+        // §r42.2 EXACT RATE. The rate is money on this path: it converts the
+        // requested USDC into the GHS the provider is asked to pay. It is kept
+        // as a Decimal from the column itself; the old `Number(...)` copy plus
+        // `amount * liveRate` + toFixed(2) rounded the BINARY product, which
+        // can land a pesewa below the exact decimal product (0.05 USDC at
+        // 12.3 GHS is exactly 0.615 GHS → 0.62, but 0.6149999999999999 →
+        // 0.61). A missing rate still falls back to the historical 12.5.
+        const liveRateExact = new Prisma.Decimal(
+            globalSettings && globalSettings.liveRetailRate != null ? globalSettings.liveRetailRate : 12.5
+        );
 
         // §P.5-D PER-ROW REGIME: the liquidity regime follows the RECORDED
         // row, never the current global flag. A FiatLiquidityReservation for
@@ -448,7 +457,7 @@ class PayoutBatchWorker {
                 // comparison — it never mutates the economic amount of an
                 // existing reservation.
                 const thresholdGhs = fiatLiquidity.toExactGhsDecimal(
-                    new Prisma.Decimal(threshold).times(liveRate).toFixed(2)
+                    new Prisma.Decimal(threshold).times(liveRateExact).toFixed(2)
                 );
                 if (remainingLiquidityGhs.lt(thresholdGhs)) {
                     const parked = await this._parkForManualReview(withdrawal, 'AUTHORITY_HEADROOM_BELOW_THRESHOLD', {
@@ -520,9 +529,18 @@ class PayoutBatchWorker {
                 // the current live rate must NEVER mutate the GHS amount of
                 // an existing reservation. Only genuine legacy rows convert
                 // USDC → GHS at the current live rate, as they always did.
-                const amountGhs = authorityRecorded
-                    ? parseFloat(new Prisma.Decimal(reservation.amountGhs).toFixed(2))
-                    : parseFloat((amount * liveRate).toFixed(2));
+                // §r42.2 EXACT PROVIDER AMOUNT. Both branches produce an exact
+                // 2-dp GHS DECIMAL and hand the provider a 2-dp STRING — the
+                // amount is never turned back into a JS double on its way out.
+                // Rounding is ROUND_HALF_UP on the decimal value, which is the
+                // intent the old binary toFixed(2) was approximating.
+                const amountGhsExact = authorityRecorded
+                    ? new Prisma.Decimal(reservation.amountGhs)
+                        .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP)
+                    : new Prisma.Decimal(String(withdrawal.amount))
+                        .times(liveRateExact)
+                        .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
+                const amountGhs = amountGhsExact.toFixed(2);
 
                 const dispatchResult = await this.mtn.initiateTransfer({
                     referenceId,

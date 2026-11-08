@@ -86,8 +86,8 @@ const RELEASE_EVIDENCE = [
             'controllers/peerTransferController.js',
             '§R42.1 — the committed response body is built INSIDE the',
             "const committed = await tx.financialOperation.updateMany({ where: { id: operation.id, status: 'IN_PROGRESS' },",
-            { file: '__tests__/peer-transfer.test.js', name: 'A: sendFunds debits sender and credits receiver' },
-            'No route-level replay test exists for this mount; the atomic claim commit is proven statically here and the cited test proves the economics. A same-key replay test would strengthen it.',
+            { file: '__tests__/release-evidence-route-behaviour.pg.test.js', name: 'A1. same-key replay cannot repeat the economic operation' },
+            'Route-level, real disposable PostgreSQL, real auth + 2FA + shared idempotency over HTTP: A1 same-key replay (byte-identical COMMITTED body, one transfer row, one sender-side history row), A2 concurrent duplicates (exactly one movement), A3 post-commit emit failure (claim still COMMITTED with the wire body; the retry replays it and never re-runs the economics).',
         ),
     },
 
@@ -225,8 +225,8 @@ const RELEASE_EVIDENCE = [
             'controllers/withdrawalController.js',
             'commitOperationClaimInTransaction: async (tx, f) =>',
             "const committed = await tx.financialOperation.updateMany({ where: { id: operation.id, status: 'IN_PROGRESS' },",
-            { file: '__tests__/native-ghs-withdrawal.test.js', name: '2FA is enforced BEFORE any idempotency claim' },
-            'The GHS leg additionally commits the claim in-tx before any provider I/O (nativeGhsWithdrawalService:514); this entry proves the controller half and cites the 2FA-before-claim ordering test.',
+            { file: '__tests__/release-evidence-route-behaviour.pg.test.js', name: 'B1. same-key replay cannot repeat the economic operation' },
+            'Route-level, real disposable PostgreSQL: B1 same-key replay (byte-identical COMMITTED 202 body, one debit, one withdrawal row, one provider instruction), B2 concurrent duplicates (exactly one movement; the duplicate is refused or replays), B3 post-commit provider failure (the acceptance claim stays COMMITTED and the retry replays it instead of paying twice). The GHS leg also commits the claim in-tx before any provider I/O (nativeGhsWithdrawalService).',
         ),
     },
     {

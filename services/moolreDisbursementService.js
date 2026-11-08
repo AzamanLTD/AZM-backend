@@ -56,6 +56,7 @@
 const logger = require('../src/config/logger');
 const axios          = require('axios');
 const { randomUUID } = require('crypto');
+const { Prisma }     = require('@prisma/client');
 
 // ── Confirmed constants ───────────────────────────────────────────────────────
 const PROVIDER_NAME          = 'MOOLRE_DISBURSEMENT';
@@ -266,7 +267,11 @@ class MoolreDisbursementService {
 
         const body = {
             [BODY_KEYS.currency]:      SUPPORTED_CURRENCY,
-            [BODY_KEYS.amount]:        String(Number(amountGhs)),   // Moolre requires amount as string
+            // §r42.2 Moolre requires the amount as a string, and the old
+            // String(Number(...)) round-trip put an IEEE double in front of the
+            // outbound GHS figure. The Decimal string is already exact (2dp
+            // from the caller) and is the same value the old path formatted.
+            [BODY_KEYS.amount]:        String(new Prisma.Decimal(String(amountGhs))),
             [BODY_KEYS.recipient]:     this._sanitizeMsisdn(recipientPhone),
             [BODY_KEYS.reference]:     referenceId,         // strict idempotency key
             [BODY_KEYS.channel]:       channel,

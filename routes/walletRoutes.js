@@ -9,6 +9,51 @@ const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client');
 const ledger = require('../services/ledgerService');
 const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
+
+// ── §r42.2 EXACT USDC INPUT (internal-transfer) ──────────────────────────
+// Every balance column on this path is Decimal(20, 8). The old handler ran
+// `parseFloat` on the request and then handed that double to Prisma for BOTH
+// balance mutations: the number that was validated was not necessarily the
+// number that moved (values above 2^53 lost precision at JSON.parse, and a
+// 9-dp input was silently rounded by NUMERIC(20,8) AFTER the negative-balance
+// guard had already compared the unrounded double). The amount is now parsed
+// into a Decimal ONCE and that same Decimal is what is compared, debited,
+// credited, posted to the ledger and recorded in history.
+const USDC_DP = 8;
+// Decimal(20,8) holds 12 integer digits; the bound makes an out-of-range
+// amount a deterministic 400 instead of a database error mid-transaction.
+const USDC_MAX_EXCLUSIVE = new Prisma.Decimal('1000000000000');
+
+function toExactUsdcAmount(value) {
+    if (value === null || value === undefined || value === '') {
+        return { error: 'amount must be a positive number.', code: 'USDC_AMOUNT_REQUIRED' };
+    }
+    let d;
+    try {
+        // String() first: a JSON number becomes its shortest round-trip
+        // decimal, a string stays exactly what the client sent. Constructing
+        // Decimal from a number directly would reintroduce binary noise.
+        d = new Prisma.Decimal(String(value));
+    } catch (_) {
+        return { error: 'amount must be a positive number.', code: 'USDC_AMOUNT_INVALID' };
+    }
+    if (!d.isFinite() || d.lessThanOrEqualTo(0)) {
+        return { error: 'amount must be a positive number.', code: 'USDC_AMOUNT_INVALID' };
+    }
+    if (!d.equals(d.toDecimalPlaces(USDC_DP))) {
+        return {
+            error: `amount must be an exact ${USDC_DP}-decimal USDC figure; sub-${USDC_DP}dp precision is refused rather than rounded.`,
+            code: 'USDC_AMOUNT_PRECISION',
+        };
+    }
+    if (d.greaterThanOrEqualTo(USDC_MAX_EXCLUSIVE)) {
+        return {
+            error: 'amount is larger than the wallet can represent.',
+            code: 'USDC_AMOUNT_OUT_OF_RANGE',
+        };
+    }
+    return { value: d };
+}
 const express                  = require('express');
 const router                   = express.Router();
 const walletController         = require('../controllers/walletController');
@@ -124,14 +169,15 @@ router.post('/internal-transfer', protectActive, require2FA(),
                 message: 'direction must be "TO_POOL" or "FROM_POOL".'
             });
         }
-        if (!amount || isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) {
+        const parsedAmount = toExactUsdcAmount(amount);
+        if (parsedAmount.error) {
             return res.status(400).json({
                 success: false,
-                message: 'amount must be a positive number.'
+                code: parsedAmount.code,
+                message: parsedAmount.error,
             });
         }
-
-        const amountFloat = parseFloat(amount);
+        const amountExact = parsedAmount.value;
 
         // Verify user is a vendor
         const user = await prisma.user.findUnique({
@@ -159,17 +205,17 @@ router.post('/internal-transfer', protectActive, require2FA(),
             // the balance negative.
             const committedBody = await prisma.$transaction(async (tx) => {
                 const claim = await tx.user.updateMany({
-                    where: { id: userId, availableBalance: { gte: amountFloat } },
+                    where: { id: userId, availableBalance: { gte: amountExact } },
                     data: {
-                        availableBalance: { decrement: amountFloat },
-                        vendorUnallocatedBalance: { increment: amountFloat },
+                        availableBalance: { decrement: amountExact },
+                        vendorUnallocatedBalance: { increment: amountExact },
                     },
                 });
                 if (claim.count !== 1) {
                     throw new Error(`Insufficient available balance. You have ${user.availableBalance} USDC.`);
                 }
                 const history = await tx.transactionHistory.create({
-                    data: { userId, type: 'INTERNAL_TRANSFER', amountUsdc: -amountFloat, feeUsdc: 0, status: 'COMPLETED' }
+                    data: { userId, type: 'INTERNAL_TRANSFER', amountUsdc: amountExact.negated(), feeUsdc: 0, status: 'COMPLETED' }
                 });
                 //   D user:{vendor}:liability    — available liability down
                 //   C user:{vendor}:unallocated  — restricted pool liability up
@@ -180,17 +226,20 @@ router.post('/internal-transfer', protectActive, require2FA(),
                     userId,
                     relatedEntity: 'transactionHistory',
                     relatedEntityId: history.id,
-                    metadata: { direction, amount: _exact(amountFloat) },
+                    metadata: { direction, amount: _exact(amountExact) },
                     lines: [
-                        { account: `user:${userId}:liability`, debit: _exact(amountFloat) },
-                        { account: `user:${userId}:unallocated`, credit: _exact(amountFloat) },
+                        { account: `user:${userId}:liability`, debit: _exact(amountExact) },
+                        { account: `user:${userId}:unallocated`, credit: _exact(amountExact) },
                     ],
                 });
 
+                // The wire keeps a JSON number (the published contract) but it
+                // is derived from the exact Decimal, never from float math.
+                const amountWire = Number(amountExact.toFixed(USDC_DP));
                 const body = {
                     success: true,
-                    message: `${amountFloat} USDC moved to Trading Pool.`,
-                    data: { direction, amount: amountFloat }
+                    message: `${amountExact.toString()} USDC moved to Trading Pool.`,
+                    data: { direction, amount: amountWire }
                 };
                 if (operation) {
                     const committed = await tx.financialOperation.updateMany({
@@ -215,7 +264,7 @@ router.post('/internal-transfer', protectActive, require2FA(),
             return res.status(200).json(committedBody);
         } else {
             // Vendor Unallocated → Available (withdraw from trading pool)
-            if (user.vendorUnallocatedBalance < amountFloat) {
+            if (new Prisma.Decimal(user.vendorUnallocatedBalance).lessThan(amountExact)) {
                 return res.status(400).json({
                     success: false,
                     message: `Insufficient trading pool balance. You have ${user.vendorUnallocatedBalance} USDC.`
@@ -232,17 +281,17 @@ router.post('/internal-transfer', protectActive, require2FA(),
             // the user row lock.
             const committedBody = await prisma.$transaction(async (tx) => {
                 const claim = await tx.user.updateMany({
-                    where: { id: userId, vendorUnallocatedBalance: { gte: amountFloat } },
+                    where: { id: userId, vendorUnallocatedBalance: { gte: amountExact } },
                     data: {
-                        vendorUnallocatedBalance: { decrement: amountFloat },
-                        availableBalance: { increment: amountFloat },
+                        vendorUnallocatedBalance: { decrement: amountExact },
+                        availableBalance: { increment: amountExact },
                     },
                 });
                 if (claim.count !== 1) {
                     throw new Error(`Insufficient trading pool balance. You have ${user.vendorUnallocatedBalance} USDC.`);
                 }
                 const history = await tx.transactionHistory.create({
-                    data: { userId, type: 'INTERNAL_TRANSFER', amountUsdc: amountFloat, feeUsdc: 0, status: 'COMPLETED' }
+                    data: { userId, type: 'INTERNAL_TRANSFER', amountUsdc: amountExact, feeUsdc: 0, status: 'COMPLETED' }
                 });
                 //   D user:{vendor}:unallocated  — restricted pool liability down
                 //   C user:{vendor}:liability    — available liability up
@@ -253,10 +302,10 @@ router.post('/internal-transfer', protectActive, require2FA(),
                     userId,
                     relatedEntity: 'transactionHistory',
                     relatedEntityId: history.id,
-                    metadata: { direction, amount: _exact(amountFloat) },
+                    metadata: { direction, amount: _exact(amountExact) },
                     lines: [
-                        { account: `user:${userId}:unallocated`, debit: _exact(amountFloat) },
-                        { account: `user:${userId}:liability`, credit: _exact(amountFloat) },
+                        { account: `user:${userId}:unallocated`, debit: _exact(amountExact) },
+                        { account: `user:${userId}:liability`, credit: _exact(amountExact) },
                     ],
                 });
 
@@ -267,7 +316,11 @@ router.post('/internal-transfer', protectActive, require2FA(),
                     where: { id: userId },
                     select: { vendorUnallocatedBalance: true },
                 });
-                const newPoolBalance = Number(freshUser.vendorUnallocatedBalance);
+                // The post-transfer pool balance stays a Decimal for the ad
+                // comparison: comparing NUMERIC(20,8) against a double could
+                // deactivate an ad whose limit equals the balance exactly.
+                const newPoolBalanceExact = new Prisma.Decimal(freshUser.vendorUnallocatedBalance);
+                const newPoolBalance = Number(newPoolBalanceExact.toFixed(USDC_DP));
 
                 // Auto-deactivate ads that exceed the new pool balance —
                 // same transaction as the balance move it depends on.
@@ -275,7 +328,7 @@ router.post('/internal-transfer', protectActive, require2FA(),
                     where: {
                         vendorId: userId,
                         status: 'ACTIVE',
-                        maxLimit: { gt: newPoolBalance }
+                        maxLimit: { gt: newPoolBalanceExact }
                     },
                     select: { id: true, maxLimit: true, paymentMethod: true }
                 });
@@ -290,10 +343,10 @@ router.post('/internal-transfer', protectActive, require2FA(),
                 const body = overLimitAds.length > 0
                     ? {
                         success: true,
-                        message: `${amountFloat} USDC moved to Available Wallet. ${overLimitAds.length} ad(s) were deactivated because they exceed your new pool balance.`,
+                        message: `${amountExact.toString()} USDC moved to Available Wallet. ${overLimitAds.length} ad(s) were deactivated because they exceed your new pool balance.`,
                         data: {
                             direction,
-                            amount: amountFloat,
+                            amount: Number(amountExact.toFixed(USDC_DP)),
                             newPoolBalance,
                             deactivatedAds: overLimitAds,
                             deactivatedCount: overLimitAds.length,
@@ -301,8 +354,8 @@ router.post('/internal-transfer', protectActive, require2FA(),
                     }
                     : {
                         success: true,
-                        message: `${amountFloat} USDC moved to Available Wallet.`,
-                        data: { direction, amount: amountFloat }
+                        message: `${amountExact.toString()} USDC moved to Available Wallet.`,
+                        data: { direction, amount: Number(amountExact.toFixed(USDC_DP)) }
                     };
                 if (operation) {
                     const committed = await tx.financialOperation.updateMany({
