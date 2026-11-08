@@ -28,19 +28,31 @@ const USDC_MAX_EXCLUSIVE = new Prisma.Decimal('1000000000000');
 //
 // A DECIMAL STRING is the authoritative input: it is parsed exactly, however
 // many digits it carries. A JSON number is still accepted for existing clients
-// (the Flutter vendor dashboard sends `'amount': <double>`), but only when the
-// value is EXACTLY representable at 8 decimal places. Above
-// 2^53 / 10^8 ≈ 90,071,992.5474 USDC a double cannot express every 8-dp
-// amount, and the digits JSON.parse already destroyed cannot be recovered by
-// converting the surviving number to a string. Such a request is refused
-// (USDC_AMOUNT_STRING_REQUIRED) instead of being silently rounded: fail closed,
-// never guess.
-// Fidelity limit for a FRACTIONAL JSON number. A double whose magnitude is at
-// or above 2^25 has an ulp of 2^-26 ≈ 1.49e-8, i.e. WIDER than one 8-dp step,
-// so a fractional amount there can silently lose its last digit during
-// JSON.parse — 100000000.00000002 arrives as ...00000001. Such amounts must be
-// sent as decimal strings. Whole numbers stay exact as doubles well beyond
-// this point, so an integer input is not subject to the limit.
+// (the Flutter vendor dashboard sends `'amount': <double>`), but only inside a
+// conservative fidelity band. Past that band the digits JSON.parse already
+// destroyed cannot be recovered by converting the surviving number back to a
+// string, so the request is refused (USDC_AMOUNT_STRING_REQUIRED) instead of
+// being silently rounded: fail closed, never guess.
+//
+// Fidelity limit for a FRACTIONAL JSON number. Adjacent doubles are one ulp
+// apart, and that spacing doubles every binade:
+//
+//     [2^24, 2^25)   ulp 2^-28 ≈ 3.73e-9
+//     [2^25, 2^26)   ulp 2^-27 ≈ 7.45e-9
+//     [2^26, 2^27)   ulp 2^-26 ≈ 1.49e-8  <-- WIDER than an 8-dp step (1e-8)
+//
+// From 2^26 upward two distinct 8-dp amounts can collapse onto the same double,
+// so the last digit is genuinely unrecoverable: 100000000.00000002 arrives as
+// ...00000001.
+//
+// The cutoff is set deliberately ONE BINADE LOWER, at 2^25 (33,554,432 USDC).
+// In [2^25, 2^26) the ulp (7.45e-9) is still NARROWER than one 8-dp step, so
+// the last digit is not guaranteed to be lost there; the guard refuses that
+// band anyway. That is a conservative choice, not a claim that corruption
+// begins at 2^25: it keeps the limit on a round binade and leaves a full
+// binade of margin before 8-dp fidelity provably breaks. Whole numbers stay
+// exact as doubles far past this point, so an integer input is not subject to
+// the limit.
 const USDC_NUMBER_FRACTION_MAX_MAGNITUDE = 2 ** 25; // 33,554,432 USDC
 
 function toExactUsdcAmount(value) {
@@ -51,8 +63,8 @@ function toExactUsdcAmount(value) {
         if (!Number.isFinite(value)) {
             return { error: 'amount must be a positive number.', code: 'USDC_AMOUNT_INVALID' };
         }
-        // A fractional value accepted here survives JSON parsing exactly at
-        // 8dp; one that cannot is refused and must be sent as a string.
+        // A fractional value below the cutoff is accepted; at or above it the
+        // input must be sent as a decimal string.
         if (!Number.isInteger(value) && Math.abs(value) >= USDC_NUMBER_FRACTION_MAX_MAGNITUDE) {
             return {
                 error: 'amount must be sent as a decimal string: this JSON number carries more precision than a double can represent at 8 decimal places.',

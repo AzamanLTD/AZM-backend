@@ -128,13 +128,29 @@ The selected mode behaves as follows.
   - a **fractional** value at or above `2^25` is refused with
     `USDC_AMOUNT_STRING_REQUIRED` **before** any `Decimal` is constructed and
     before any financial mutation.
-- **Why `2^25`, stated correctly:** for magnitudes in `[2^25, 2^26)` the
-  distance between adjacent doubles is `2^-26 ≈ 1.49e-8`, which is **wider than
-  one 8-dp step (`1e-8`)**. In that band an 8-dp amount is not necessarily
-  representable at all, so `JSON.parse` may hand the handler a neighbouring
-  value: `100000000.00000002` arrives as `100000000.00000001`. The digit is
-  lost before any handler runs and cannot be recovered by stringifying the
-  surviving number, which is why such input is refused rather than converted.
+- **Why `2^25`, stated correctly.** Adjacent doubles are one ulp apart, and the
+  ulp doubles every binade:
+
+  | Magnitude band | ulp | vs one 8-dp step (`1e-8`) |
+  | --- | --- | --- |
+  | `[2^24, 2^25)` | `2^-28 ≈ 3.73e-9` | narrower |
+  | `[2^25, 2^26)` | `2^-27 ≈ 7.45e-9` | narrower |
+  | `[2^26, 2^27)` | `2^-26 ≈ 1.49e-8` | **wider** |
+
+  From `2^26` upward the ulp exceeds one 8-dp step, so two distinct 8-dp
+  amounts can collapse onto the same double and the last digit is genuinely
+  unrecoverable: `100000000.00000002` arrives as `100000000.00000001`. The
+  digit is lost inside `JSON.parse`, before any handler runs, and cannot be
+  recovered by stringifying the surviving number.
+
+  **`2^25` is therefore a deliberately conservative refusal cutoff, not the
+  point where precision actually breaks.** In `[2^25, 2^26)` the ulp is still
+  narrower than one 8-dp step, and the guard refuses that band anyway. The
+  cutoff sits one binade below the provable failure point so that the limit
+  falls on a round binade and carries a full binade of margin; it refuses only
+  *fractional* input, so ordinary whole-number compatibility is unaffected.
+  A caller that wants to send a fractional amount at or above the cutoff sends
+  the decimal string that is authoritative anyway.
 - **This is not `Number.isSafeInteger(value × 10^8)`.** That test is not the
   implemented guard: a product can look integral in floating point while the
   input was already rounded, so the guard keys off the input's own magnitude
