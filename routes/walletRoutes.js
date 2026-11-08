@@ -17,13 +17,32 @@ const { idempotency } = require('../middleware/idempotency');
 const { require2FA } = require('../middleware/require2FA');
 const { protectActive }        = require('../middleware/banGuardMiddleware');
 
+// Route-specific FX gate (AZM-Planning #75 — PROPOSED, pending owner
+// approval): the wallet withdrawal is FX-dependent exactly when the
+// destination dispatches a GHS MoMo payout. Destination classification is
+// the SINGLE shared contract (services/payoutDestinationClassification.js)
+// used by both this gate and the payout dispatch in walletController — the
+// gate decision and the provider dispatch classification are identical by
+// construction (financial-core blocker A).
+const { requireFreshFxRate } = require('../middleware/fxTransactionGateMiddleware');
+
+
 // Withdrawals — r42 WAVE-2: the claim commits INSIDE the withdrawal
 // reservation transaction (see walletController.requestWithdrawal) with the
 // deterministic created-ticket response. There is NO provider I/O in the
 // request path (payout workers own dispatch), so the response is honest
 // post-commit; 4xx/5xx responses prove the reservation rolled back and
 // release the claim for retry (same disposition contract as /api/withdraw/*).
-router.post('/withdraw',       protectActive, require2FA(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), walletController.requestWithdrawal);
+// Route-specific FX gate (PROPOSED): MoMo/GHS payout destinations demand
+// a FRESH canonical rate and are refused 503 BEFORE the idempotency claim;
+// Binance Pay IDs, TRC20 and EVM wallet addresses are same-asset USDC
+// dispatches and are NOT FX-gated. A saved/demo fallback rate never opens
+// the gate. Classification is shared — see the module comment above.
+router.post('/withdraw',
+    protectActive, require2FA(),
+    requireFreshFxRate({ when: 'MOMO_PAYOUT_DESTINATION' }),
+    idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
+    walletController.requestWithdrawal);
 
 // Read-only history (banned users still need to see their own history)
 router.get('/history',         protect,       walletController.getWithdrawalHistory);
@@ -90,7 +109,8 @@ router.get('/pool-withdrawal-preview', protect, async (req, res) => {
 
 // POST /api/wallet/internal-transfer
 // Body: { direction: 'TO_POOL' | 'FROM_POOL', amount: number }
-router.post('/internal-transfer', protectActive, require2FA(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), async (req, res) => {
+router.post('/internal-transfer', protectActive, require2FA(),
+    idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), async (req, res) => {
     const prisma = req.app.get('prisma');
     const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
 

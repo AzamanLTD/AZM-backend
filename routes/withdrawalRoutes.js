@@ -2,9 +2,12 @@ const logger = require('../src/config/logger');
 const express = require('express');
 const router = express.Router();
 const withdrawalController = require('../controllers/withdrawalController');
+
+// FX-balance workstream — fresh-canonical-rate transaction gate (§Gate scope)
+const { requireFreshFxRate } = require('../middleware/fxTransactionGateMiddleware');
 const authMiddleware = require('../middleware/authMiddleware');
 const { validate } = require('../middleware/validate');
-const { fiatWithdrawalSchema, cryptoWithdrawalSchema } = require('../services/validation/financialSchemas');
+const { fiatWithdrawalSchema, cryptoWithdrawalSchema, ghsWithdrawalSchema, bankWithdrawalSchema, bankWithdrawalQuoteSchema } = require('../services/validation/financialSchemas');
 
 const { idempotency } = require('../middleware/idempotency');
 const { require2FA } = require('../middleware/require2FA');
@@ -27,11 +30,42 @@ const protect = authMiddleware.protect;
 // res-silent (outcomes live in the Withdrawal / CustodyExecution /
 // reconciliation state machines). This is the same disposition contract the
 // r42 review approved for the in-transaction-wired convert route.
+// FX-balance workstream — server-side transaction gate. The fiat payout
+// path is FX-dependent (USDC debit ⇄ GHS payout via Moolre at the canonical
+// rate): with no FRESH canonical rate it is refused 503 here, BEFORE the
+// idempotency claim and before any controller money movement. A saved/demo
+// fallback rate is display-only and never opens this gate.
 router.post('/fiat',
     protect, require2FA(),
+    requireFreshFxRate(),
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
     validate(fiatWithdrawalSchema),
     withdrawalController.fiatWithdrawal);
+// NATIVE-GHS PAYOUT (issue #389). Deliberately NOT behind
+// requireFreshFxRate(): a GHS-only payout is denominated, debited, reserved
+// and dispatched in GHS and depends on NO rate. The only rate in this flow is
+// the explicit, separately-consented USDC->GHS shortfall quote carried as
+// `quoteId`, which is consumed (owner-scoped, fresh, one-time) inside the
+// reservation transaction.
+// Preview + executable shortfall quote. Read-only economics: no debit, no
+// reservation, no conversion. The quote is minted by the ONE canonical quote
+// authority (fresh-rate gated, owner-scoped, expiring, one-time).
+router.post('/ghs/quote',
+    protect,
+    idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
+    validate(ghsWithdrawalSchema),
+    withdrawalController.ghsFundingPlan);
+
+router.post('/ghs',
+    protect, require2FA(),
+    idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
+    validate(ghsWithdrawalSchema),
+    withdrawalController.ghsWithdrawal);
+
+// /crypto is universally gated like every other USDC-enabled transaction
+// authorization (universal scope — see docs/native-ghs-fx-audit.md §4.1):
+// the balance being spent against cannot be honestly valued on a stale
+// oracle, even when the payout destination itself is on-chain USDC.
 router.post('/crypto',
     protect, require2FA(),
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
@@ -40,6 +74,25 @@ router.post('/crypto',
 
 // Real-time withdrawal progress popup — polling fallback for the Socket.IO
 // `withdrawal_progress` event. Owner-only; returns a {stage,label,pct} triple.
+// BANK shortfall preview + quote. Read-only economics (no debit, no
+// reservation, no conversion). Without it a BANK payout that native GHS cannot
+// cover could only ever answer GHS_SHORTFALL_QUOTE_REQUIRED: there was no way
+// to obtain the quote the payout demands.
+router.post('/bank/quote',
+    protect,
+    idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
+    validate(bankWithdrawalQuoteSchema),
+    withdrawalController.bankFundingPlan);
+
+// BANK payout: explicit typed destination, GHS-denominated, NO F+X gate (a
+// GHS-only payout is not an FX transaction). The provider is the injected
+// bank port; when unbound the handler refuses 503 before any mutation.
+router.post('/bank',
+    protect, require2FA(),
+    idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
+    validate(bankWithdrawalSchema),
+    withdrawalController.bankWithdrawal);
+
 router.get('/status/:reference', protect, withdrawalController.getWithdrawalStatus);
 
 module.exports = router;

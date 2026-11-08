@@ -54,6 +54,11 @@ const logger = require('../src/config/logger');
 //   user:{id}:dispute        ↔ User.disputeEscrowBalance  (per-user dispute-locked)
 //   user:{id}:unallocated    ↔ User.vendorUnallocatedBalance (per-vendor pool)
 const USER_LIABILITY_RE = /^user:(\d+):liability$/;
+// FX-balance workstream — NATIVE-GHS customer liability (GHS owed to the
+// customer, a SEPARATE liability from the USDC wallet). Same dynamic-account
+// pattern as USER_LIABILITY_RE, but the asset identity is GHS so GHS wallet
+// movements can never blend into the USDC balance authority.
+const GHS_USER_LIABILITY_RE = /^ghs:user:(\d+):liability$/;
 const USER_DISPUTE_RE = /^user:(\d+):dispute$/;
 const USER_UNALLOCATED_RE = /^user:(\d+):unallocated$/;
 const ESCROW_LOCKED_RE = /^escrow:([A-Za-z0-9][A-Za-z0-9_.-]*):locked$/;
@@ -222,6 +227,10 @@ function classifyAccountCode(code) {
   if (userMatch) {
     return { kind: 'USER_LIABILITY', userId: Number(userMatch[1]), spec: { accountClass: 'LIABILITY', normalSide: 'CREDIT', asset: 'USDC', network: null } };
   }
+  const ghsUserMatch = GHS_USER_LIABILITY_RE.exec(code);
+  if (ghsUserMatch) {
+    return { kind: 'GHS_USER_LIABILITY', userId: Number(ghsUserMatch[1]), spec: { accountClass: 'LIABILITY', normalSide: 'CREDIT', asset: 'GHS', network: null } };
+  }
   const escrowMatch = ESCROW_LOCKED_RE.exec(code);
   if (escrowMatch) {
     return { kind: 'ESCROW_LOCKED', key: escrowMatch[1], spec: { accountClass: 'LIABILITY', normalSide: 'CREDIT', asset: 'USDC', network: null } };
@@ -262,7 +271,7 @@ function susuEscrowCode(cycleId, memberId) {
 async function ensureAccount(tx, code, opts = {}) {
   const cls = classifyAccountCode(code);
   const spec = cls.spec;
-  const userId = (cls.kind === 'USER_LIABILITY' || cls.kind === 'USER_DISPUTE' || cls.kind === 'USER_UNALLOCATED') ? cls.userId : (opts.userId ?? null);
+  const userId = (cls.kind === 'USER_LIABILITY' || cls.kind === 'GHS_USER_LIABILITY' || cls.kind === 'USER_DISPUTE' || cls.kind === 'USER_UNALLOCATED') ? cls.userId : (opts.userId ?? null);
   // Classification is authoritative — never rewritten. Prisma's upsert is not
   // atomic: concurrent FIRST USE collides on the code unique index; translated into a retryable error.
   let row;

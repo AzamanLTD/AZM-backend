@@ -652,6 +652,14 @@ model User {
   vendorUnallocatedBalance Decimal @default(0.0) @db.Decimal(20, 8) // USDT returned to vendor post auto-cancel
   escrowLockedBalance      Decimal @default(0.0) @db.Decimal(20, 8) // USDT locked in escrow for active trades
   disputeEscrowBalance     Decimal @default(0.0) @db.Decimal(20, 8) // USDT frozen during an open dispute
+  // Native-GHS customer wallet (FX-balance workstream). This is REAL GHS
+  // owed to the customer — a separate liability from the USDC wallet, never
+  // a display conversion of availableBalance. Additive column: existing
+  // USDC balances and every existing flow are untouched. The DB-level
+  // CHECK (nativeGhsBalance >= 0) lives in
+  // infra/install-ghs-wallet-overlay.js (Prisma cannot express CHECKs).
+  // Mirrored by the dynamic ledger account ghs:user:{id}:liability.
+  nativeGhsBalance         Decimal @default(0.0) @db.Decimal(20, 8)
 
   // --- AZM LOYALTY POINTS (independent reward ledger) ---
   // AZM is an internal platform loyalty-point currency (like BNB or airline
@@ -993,6 +1001,7 @@ model User {
   onchainSweeps  OnchainSweep[]
 
   @@index([phoneHash])
+  savedBankBeneficiaries SavedBankBeneficiary[]
 }
 
 // =============================================================================
@@ -1369,6 +1378,8 @@ model Withdrawal {
   // infra overlay) — a Withdrawal row can never exist without its
   // canonical row.
   transactionHistoryId String?  @db.VarChar(36)
+  amountGhs Decimal? @db.Decimal(20, 2)
+  settlementCurrency String?
   totalGasFee          Decimal  @default(0.0) @db.Decimal(20, 8)
   vendorGasShare       Decimal  @default(0.0) @db.Decimal(20, 8)
   adminGasShare        Decimal  @default(0.0) @db.Decimal(20, 8)
@@ -1508,6 +1519,14 @@ model GlobalSettings {
   // durable realized economics (cost basis + customer spread).
   modelBSettlementEnabled Boolean @default(false)
 
+  // Native-GHS settlement rollout flag (owner intent, #369): OFF (default)
+  // keeps the legacy USDC conversion credit for settled Moolre collections;
+  // ON credits the customer's native-GHS wallet in exact pesewas instead —
+  // GHS stays GHS. Mutually exclusive with Model B (fail-closed).
+  nativeGhsSettlementEnabled Boolean @default(false)
+
+  nativeGhsWithdrawalEnabled Boolean @default(false)
+
   // Phase Q15: App Version Gate
   minAppVersion  String @default("1.0.0") // Minimum supported app version (semver)
   forceUpdateUrl String @default("https://play.google.com/store/apps/details?id=com.azaman.app")
@@ -1543,6 +1562,49 @@ model GlobalSettings {
 
   updatedAt DateTime @updatedAt
 }
+
+// =============================================================================
+// FX SAVED-RATE SNAPSHOT (FX-balance workstream)
+//
+// The LAST SUCCESSFULLY VALIDATED external USDC/GHS observation, kept
+// SEPARATE from GlobalSettings.liveRetailRate (the canonical CURRENT rate
+// whose freshness the 271C gate judges). This row is a DISPLAY-ONLY
+// fallback: it may never make a transaction gate pass and is never
+// presented as a fresh/live rate.
+//
+// Write path: fxRateSnapshotService.saveValidatedRateSnapshot — called only
+// from the oracle's success-only external write. A failed, stale,
+// malformed, noncanonical or partial observation never overwrites a valid
+// saved snapshot. A DEMO seed (isDemoSeed = true, source 'DEMO_SEED') is
+// written only by the explicit demo/test seeder and never overwrites a
+// genuine observation.
+// =============================================================================
+model FxSavedRate {
+  id         String   @id @default(uuid())
+  // Exact pair and direction: 'USDC/GHS' — GHS per 1 USDC.
+  pair       String   @unique @db.VarChar(16)
+  rate       Decimal  @db.Decimal(20, 8)
+  // Provenance: KOTANI_PAY | FALLBACK_FX | DEMO_SEED | ... (never 'Binance'
+  // unless a real observation from that provider passed validation).
+  source     String   @db.VarChar(32)
+  // External observation timestamp (UTC) — when the market was observed.
+  observedAt DateTime
+  // Successful receipt/save timestamp (UTC) — when WE persisted it.
+  savedAt    DateTime @default(now())
+  // True only for the explicit demo/test seed (1 USDC = GHS 12.03). Demo
+  // rows are display-eligible only in demo/test environments and NEVER
+  // authorize transactions.
+  isDemoSeed Boolean  @default(false)
+  // Freshness/canonicality metadata at save time (validation verdict, max
+  // age policy version, oracle mode) — enough to revalidate the snapshot.
+  validation Json?
+
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([pair, savedAt(sort: Desc)])
+}
+
 
 // QR Forge scan tracking (Phase 3)
 model QrScan {
@@ -1833,6 +1895,11 @@ model FiatLiquidityReservation {
 /// row; sums over receipts/reservations are the reconciliation target.
 model FiatLiquidityState {
   id                    Int     @id @default(1)
+  // §P.5-D ONE-WAY ACTIVATION LATCH (docs §4.1). Written ONCE by
+  // fiatLiquidityActivationService.activateAuthority() and never cleared: once
+  // SystemFiatPool has been written as a GHS projection, clearing the
+  // GlobalSettings Boolean must NOT reinterpret those pesewas as USDC.
+  authorityActivatedAt  DateTime?
   availableGhs          Decimal @default(0) @db.Decimal(20, 2)
   reservedGhs           Decimal @default(0) @db.Decimal(20, 2)
   inTransitGhs          Decimal @default(0) @db.Decimal(20, 2)
@@ -1913,6 +1980,8 @@ model TransactionHistory {
   payerMsisdn       String? // MSISDN that paid — stored raw, masked before display
   initiatedByUserId Int? // User who triggered this deposit (null = USSD walk-up)
   metadata          Json? // { provider, network, amountGhs, rateAtInitiation, ... }
+  amountGhs Decimal? @db.Decimal(20, 2)
+  settlementCurrency String?
   status            TransactionStatus @default(PENDING)
   createdAt         DateTime          @default(now())
 
@@ -6761,6 +6830,13 @@ model FraudAssessment {
   id              String  @id @default(uuid())
   userId          Int
   transactionType String  @db.VarChar(50)
+  /// Asset the assessed amount is denominated in. Historical rows were always
+  /// USDC; new rows name their asset so a GHS amount is never read as dollars.
+  asset           String  @default("USDC") @db.VarChar(10)
+  /// The assessed amount in `asset`, exactly as the decision saw it.
+  amountExact     Decimal @default(0) @db.Decimal(30, 8)
+  /// LEGACY, USDC-ONLY. Kept so existing consumers and historical rows keep
+  /// their meaning. A non-USDC assessment writes 0 here and its amount above.
   amountUsdc      Decimal @default(0) @db.Decimal(20, 8)
   riskScore       Int     @default(0)
   triggeredRules  String  @db.VarChar(500)
@@ -7426,4 +7502,37 @@ model SavedServiceAccount {
 
   @@unique([userId, serviceCode, accountFingerprint])
   @@index([userId, serviceCode, createdAt(sort: Desc)])
+}
+
+/// Saved BANK payout beneficiary (issue #389). The account number exists only
+/// as a versioned AES-256-GCM envelope plus an HMAC-SHA256 fingerprint under a
+/// DISTINCT key; plaintext is never persisted, logged or returned after save.
+/// accountName is a provider-validated fact, never a client claim.
+model SavedBankBeneficiary {
+  id                  String    @id @default(uuid())
+  userId              Int
+  bankCode            String    @db.VarChar(16)
+  bankName            String    @db.VarChar(80)
+  accountName         String?   @db.VarChar(120)
+  accountNumberEnc    String
+  accountNumberMasked String    @db.VarChar(32)
+  accountNumberHmac   String    @db.VarChar(64)
+  nickname            String?   @db.VarChar(40)
+  status              String    @default("ACTIVE")
+  /// §P1-3 At most ONE ACTIVE primary per user. Enforced by the partial unique
+  /// index SavedBankBeneficiary_one_primary_per_user (raw SQL in the
+  /// 20261103190000 migration — Prisma cannot express a partial index). The
+  /// service demotes-then-writes inside a transaction and retries once on a
+  /// primary collision; the index is the backstop for every other writer.
+  isPrimary           Boolean   @default(false)
+  validatedAt         DateTime?
+  keyId               String?   @db.VarChar(32)
+  envelopeVersion     Int       @default(2)
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, accountNumberHmac])
+  @@index([userId, status])
+
 }

@@ -56,18 +56,35 @@ describeOrSkip('payout provider unknown-outcome (real PostgreSQL)', () => {
     afterAll(async () => { if (prisma) await prisma.$disconnect(); });
 
     afterEach(async () => {
-        // Every test in this suite settles the SAME module-level REF, and the
-        // §P.5-D observation-identity contract makes a materially different
-        // observation under a committed dedupKey a CONFLICT (fail closed,
-        // settlement deferred) rather than a silent replay. Durable provider
-        // observations, reservations and receipts for REF therefore MUST NOT
-        // leak between tests — wipe the fiat authority tables with the rest.
+        // Scoped cleanup only: the exact evidence THIS suite created, plus the
+        // two singletons it seeds. No TRUNCATE of User/Withdrawal/Transaction and
+        // above all no RESTART IDENTITY — resetting shared sequences made later
+        // suites observe id gaps that have nothing to do with their own fixtures.
+        // Every test in this suite reuses the SAME module-level REF, and the
+        // §P.5-D observation-identity contract treats a materially different
+        // observation under a committed dedupKey as a CONFLICT (fail closed,
+        // settlement deferred). Durable provider observations, reservations and
+        // receipts for REF must therefore not survive into the next test.
+        //
+        // Scope: the EVIDENCE tables this suite creates, and nothing else. No
+        // User/Withdrawal/TransactionHistory/GlobalSettings truncation, and no
+        // RESTART IDENTITY — resetting shared sequences made later suites observe
+        // id gaps unrelated to their own fixtures.
         await prisma.$executeRawUnsafe(
-            'TRUNCATE TABLE "User", "Withdrawal", "TransactionHistory", "GlobalSettings", "SystemFiatPool", "ProviderSettlementAttempt", "ReconciliationException", "FiatProviderEvent", "FiatLiquidityReceipt", "FiatLiquidityReservation", "FiatLiquidityState" RESTART IDENTITY CASCADE'
-        );
+            'TRUNCATE TABLE "ProviderSettlementAttempt", "ReconciliationException", "FiatProviderEvent", "FiatLiquidityReceipt", "FiatLiquidityReservation" CASCADE'
+        ).catch((e) => { throw new Error(`evidence cleanup failed: ${e.message}`); });
+
+        await prisma.transactionHistory.deleteMany({ where: { id: { in: seededTxIds } } });
+        await prisma.withdrawal.deleteMany({ where: { userId: { in: seededUserIds } } });
+        await prisma.user.deleteMany({ where: { id: { in: seededUserIds } } });
+        seededTxIds.length = 0;
+        seededUserIds.length = 0;
     }, 15000);
 
     // ── seeds ────────────────────────────────────────────────────────────────
+    const seededUserIds = [];
+    const seededTxIds = [];
+
     const seedScenario = async () => {
         await prisma.globalSettings.upsert({
             where: { id: 1 },
@@ -77,11 +94,37 @@ describeOrSkip('payout provider unknown-outcome (real PostgreSQL)', () => {
             },
             create: { id: 1, liveRetailRate: 13.0, autoPayoutEnabled: true, autoPayoutMaxAmountUsdc: 200, autoPayoutThresholdUsdc: 500 }
         });
+        // §P.5-D FIXTURE ISOLATION. The worker refuses an UNRESERVED legacy row
+        // under the latched regime (it parks it as LEGACY_ROW_UNDER_AUTHORITY_REGIME
+        // instead of dispatching it against the GHS projection), and the regime is
+        // (Boolean OR latch). This suite is about the LEGACY dispatch path, so both
+        // components are pinned here rather than inherited from an earlier suite.
+        await prisma.globalSettings.upsert({
+            where: { id: 1 },
+            update: { fiatLiquidityAuthorityEnabled: false },
+            create: {
+                id: 1, liveRetailRate: 13.0, autoPayoutEnabled: true,
+                autoPayoutMaxAmountUsdc: 200, autoPayoutThresholdUsdc: 500,
+                fiatLiquidityAuthorityEnabled: false,
+            }
+        });
+        await prisma.fiatLiquidityState.upsert({
+            where: { id: 1 },
+            update: { authorityActivatedAt: null },
+            create: { id: 1, availableGhs: 0, reservedGhs: 0, inTransitGhs: 0, paidOutGhs: 0, updatedAt: new Date() },
+        });
         await prisma.systemFiatPool.upsert({
             where: { id: 1 },
             update: { balance: 100_000.0 },
             create: { id: 1, balance: 100_000.0 }
         });
+
+        // Prove the regime through the production reader: this suite exercises the
+        // legacy USDC path only.
+        const mode = await require('../src/services/fiatLiquidityActivationService').readMode(prisma);
+        if (mode.active !== false || mode.authorityUnit !== 'USDC') {
+            throw new Error(`payout-unknown-outcome requires LEGACY USDC mode, got ${JSON.stringify({ active: mode.active, flagged: mode.flagged, latched: mode.latched, unit: mode.authorityUnit })}`);
+        }
         const suffix = `${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
         const user = await prisma.user.create({
             data: {
@@ -116,6 +159,8 @@ describeOrSkip('payout provider unknown-outcome (real PostgreSQL)', () => {
                 createdAt
             }
         });
+        seededUserIds.push(user.id);
+        seededTxIds.push(tx.id);
         return { user, tx, withdrawal };
     };
 

@@ -47,4 +47,10 @@ module.exports = {
     //
     // Conditional on purpose: database-free runs keep full parallelism.
     ...(process.env.TEST_DATABASE_URL ? { maxWorkers: 1 } : {}),
+
+    // Runs once before any suite (CI and local): converges the GlobalSettings
+    // singleton so the battery is order-independent on a freshly-pushed DB.
+    // See test-support/global-setup.js for the full contract.
+    globalSetup: './test-support/global-setup.js',
+
 };

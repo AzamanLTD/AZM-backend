@@ -22,6 +22,11 @@ exports.requestWithdrawal = async (req, res) => {
     try {
         // We now look for 'destination' (which handles IDs, Wallets, and Phone Numbers)
         const { amount, destination, networkPref } = req.body;
+        // Destination classification is the SINGLE shared contract
+        // (services/payoutDestinationClassification.js): the FX
+        // authorization gate and this dispatch read the SAME classification
+        // so they can never disagree (financial-core blocker A).
+        const { classifyPayoutDestination } = require('../services/payoutDestinationClassification');
         const userId = req.user.id;
         const withdrawAmount = parseFloat(amount);
 
@@ -52,31 +57,17 @@ exports.requestWithdrawal = async (req, res) => {
         let totalGasFee = 0.0;
 
         const cleanDest = destination.trim();
-        const isNumeric = /^\d+$/.test(cleanDest);
-
-        if (isNumeric && cleanDest.length >= 8 && cleanDest.length <= 12) {
-            // 8 to 12 digits is the standard length of a Binance Pay ID
-            payoutMethod = "BINANCE_ID";
-            detectedNetwork = "BINANCE_PAY";
+        ({ payoutMethod, detectedNetwork } = classifyPayoutDestination(destination, networkPref));
+        // Gas-fee resolution per classification (unchanged semantics):
+        if (payoutMethod === "BINANCE_ID") {
             totalGasFee = 0.0; // ZERO FEES!
-        } 
-        else if (cleanDest.startsWith('T') && cleanDest.length === 34) {
-            // Tron (TRC20) addresses always start with 'T' and are 34 chars long
-            payoutMethod = "EXTERNAL_WALLET";
-            detectedNetwork = "TRC20";
+        } else if (payoutMethod === "EXTERNAL_WALLET" && detectedNetwork === "TRC20") {
             totalGasFee = settings.gasFeeTrc20;
-        } 
-        else if (cleanDest.startsWith('0x') && cleanDest.length === 42) {
-            // Ethereum (ERC20) or Binance Smart Chain (BEP20)
-            payoutMethod = "EXTERNAL_WALLET";
-            detectedNetwork = networkPref || "BEP20"; // Default to cheaper BEP20 if not specified
+        } else if (payoutMethod === "EXTERNAL_WALLET") {
+            // ERC20 or BEP20 — detectedNetwork already defaulted by the classifier
             totalGasFee = detectedNetwork === "ERC20" ? settings.gasFeeErc20 : settings.gasFeeBep20;
-        } 
-        else if (isNumeric && cleanDest.length >= 9) {
-            // Looks like an MTN/Telecel phone number
-            payoutMethod = "MOMO";
-            detectedNetwork = networkPref || "MTN";
-            totalGasFee = 0.0; 
+        } else if (payoutMethod === "MOMO") {
+            totalGasFee = 0.0;
         }
 
         // Calculate the 50/50 Split!
