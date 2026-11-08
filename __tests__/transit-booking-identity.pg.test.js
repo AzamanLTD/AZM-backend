@@ -181,6 +181,16 @@ run('transit booking identity (PostgreSQL)', () => {
         where: { userId, key },
     });
 
+    // Claims are keyed by (userId, key) and User ids are RECYCLED whenever any
+    // suite in this run resets the identity sequence (many do: TRUNCATE ...
+    // RESTART IDENTITY). A claim row left by a previous attempt of this same
+    // suite then answers for a brand-new customer of the same id, which reads
+    // as "the rollback did not release the claim". Clear only this suite's own
+    // key namespace, in the disposable test database, before the run.
+    beforeAll(async () => {
+        await prisma.financialOperation.deleteMany({ where: { key: { startsWith: 'key-T' } } });
+    });
+
     // ── T1: first keyed booking succeeds and records its durable identity ──
 
     test('T1. first booking succeeds; FinancialOperation row is COMMITTED with '

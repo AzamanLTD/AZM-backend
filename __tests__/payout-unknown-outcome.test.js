@@ -113,10 +113,17 @@ describeOrSkip('payout provider unknown-outcome (real PostgreSQL)', () => {
         // it must own that batch: rows left behind by earlier suites are older
         // and would fill the batch, making this row invisible and the assertions
         // fail for a reason that has nothing to do with unknown-outcome handling.
+        // Prisma's `not` compiles to `<>`, which is UNKNOWN for NULL, so
+        // `settlementCurrency: { not: 'GHS_NATIVE' }` alone silently SPARES
+        // exactly the legacy rows this suite competes with. Legacy rows carry
+        // NULL here, so both cases have to be named.
         await prisma.withdrawal.deleteMany({
             where: {
                 status: { in: ['PENDING', 'APPROVED'] },
-                settlementCurrency: { not: 'GHS_NATIVE' },
+                OR: [
+                    { settlementCurrency: null },
+                    { settlementCurrency: { not: 'GHS_NATIVE' } },
+                ],
             },
         });
         await prisma.fiatLiquidityState.upsert({
@@ -146,6 +153,18 @@ describeOrSkip('payout provider unknown-outcome (real PostgreSQL)', () => {
                 availableBalance: 0
             }
         });
+        // RECYCLED-IDENTITY HYGIENE. Several suites in this run reset the identity
+        // sequence (TRUNCATE ... RESTART IDENTITY), so this brand-new user can
+        // carry the id of a previous suite's user. The worker resolves a
+        // withdrawal's canonical reference by matching TransactionHistory rows in
+        // a createdAt window for that user, so a leftover row under the same id
+        // makes the match ambiguous and the row parks as
+        // MISSING_TRANSACTION_REFERENCE for a reason that has nothing to do with
+        // this suite. Clear only this user's own id space.
+        await prisma.withdrawal.deleteMany({ where: { userId: user.id } });
+        await prisma.financialOperation.deleteMany({ where: { userId: user.id } });
+        await prisma.transactionHistory.deleteMany({ where: { userId: user.id } });
+
         // Backdated so the reconciliation worker's 30s staleness gate includes it.
         const createdAt = new Date(Date.now() - 60_000);
         const tx = await prisma.transactionHistory.create({
@@ -169,6 +188,14 @@ describeOrSkip('payout provider unknown-outcome (real PostgreSQL)', () => {
                 status: 'PENDING',
                 createdAt
             }
+        });
+        // …and the id can equally have been recycled on the OBLIGATION side. The
+        // worker refuses to dispatch a withdrawal that "owns" an active
+        // restricted obligation (r17 identity guard), so a stale ACTIVE row for
+        // sourceEntity 'withdrawal' + the recycled id makes this row park as
+        // MISSING_TRANSACTION_REFERENCE. This row is the id's only owner now.
+        await prisma.restrictedObligation.deleteMany({
+            where: { sourceEntity: 'withdrawal', sourceEntityId: String(withdrawal.id) },
         });
         seededUserIds.push(user.id);
         seededTxIds.push(tx.id);
