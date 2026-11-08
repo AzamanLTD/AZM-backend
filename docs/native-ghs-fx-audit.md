@@ -61,20 +61,50 @@ Wired into: `package.json` (`install:ghs-wallet` + the `npm run release` chain),
 
 Read model consumed by `/api/users/balance` (additive `valuation` block; legacy fields untouched and still authoritative). READ-ONLY by construction: no service function mutates balances; an FX revaluation changes only the DISPLAY estimate.
 
-**GHS-first contract (owner correction, 2026-10-27 — supersedes the earlier combined-valuation formula):**
+**Headline modes (owner decision D1, 2026-11-08 — supersedes the 2026-10-27 GHS-first-only rule):**
 
-    headline (nativeGhsAvailable) = the authoritative native-GHS wallet balance ONLY
-    usdcEquivalent                 = nativeGhsAvailable / displayRateGhsPerUsdc
+Two modes are supported. **`COMBINED_ESTIMATE` is the selected mode** (see
+[`MONEY_CONTRACT.md`](./MONEY_CONTRACT.md) §3); `NATIVE_ONLY` remains a
+supported alternative, not the selected customer experience.
 
-The former aggregate `availableGhsValue = nativeGhs + availableUsdc × rate` is REMOVED from the contract: it is not acceptable for the GHS headline. `availableUsdc` (the real USDC held) stays a SEPARATE reported field — never summed into the headline, never reinterpreted into GHS by the valuation read.
+    COMBINED_ESTIMATE (selected)
+        headlineGhs  = nativeGhsAvailable + availableUsdc × displayRateGhsPerUsdc
+        headlineUsdc = headlineGhs / displayRateGhsPerUsdc          (same rate)
+        headlineIsEstimate = availableUsdc > 0
+
+    NATIVE_ONLY (supported alternative)
+        headlineGhs  = nativeGhsAvailable
+        headlineUsdc = nativeGhsAvailable / displayRateGhsPerUsdc
+        headlineIsEstimate = false
+
+Both modes keep the two liabilities separate underneath: `nativeGhsAvailable`
+and `availableUsdc` remain distinct stored balances in their own units, locked
+buckets stay in their native units on the back of the card, and neither mode
+changes a ledger, transaction, balance or notification. A display-rate change
+moves the valuation only. When no usable display rate exists the headline falls
+back to `nativeGhsAvailable` alone and the response reports
+`PARTIAL_FX_UNAVAILABLE` — the USDC contribution is never invented. The
+indicative GHS valuation of USDC is never spendable: `spendableGhsNow` excludes
+it, and spending USDC requires a separately priced, confirmed quote.
+
+**Implementation status (read this before trusting a field name):** the
+`/api/users/balance` read model as merged still emits the NATIVE_ONLY-shaped
+primitives (`nativeGhsAvailable`, `availableUsdc`, `displayRate`,
+`usdcEquivalent` = the USDC worth of the GHS balance) and reports the missing-rate
+case as `FX_UNAVAILABLE`. Under `COMBINED_ESTIMATE` the combined headline is
+exactly `nativeGhsAvailable + availableUsdc × displayRate` over those same
+primitives, so the selected front face is composable without a new money path.
+Aligning the emitted field names (`headlineGhs`, `headlineUsdc`,
+`headlineIsEstimate`, `PARTIAL_FX_UNAVAILABLE`) with this contract is a
+follow-up change with its own tests; it is not silently redefined here.
 
 Response fields (every Decimal financial quantity serialized as BOTH exact string `*Exact` and a JS number projection for presentation):
 
 | Field | Meaning |
 |---|---|
-| `nativeGhsAvailable` | THE GHS HEADLINE. REAL GHS owed to the customer, from the authoritative native-GHS wallet balance ONLY. Invariant to the FX rate and to the USDC actually held. |
-| `availableUsdc` | REAL liquid USDC held — reported separately, never part of the headline. |
-| `usdcEquivalent` | The ESTIMATED USDC equivalent OF THE GHS HEADLINE (`nativeGhsAvailable / displayRate`). NOT the quantity of USDC held, NOT a combined valuation. `null` when no rate is available (never fabricated). |
+| `nativeGhsAvailable` | REAL GHS owed to the customer, from the authoritative native-GHS wallet balance. The whole headline under `NATIVE_ONLY`; the GHS leg of the headline under `COMBINED_ESTIMATE`. Invariant to the FX rate. |
+| `availableUsdc` | REAL liquid USDC held, in USDC. Under `COMBINED_ESTIMATE` its indicative GHS value joins the front-face headline (and sets `headlineIsEstimate`); it is never spendable GHS and never merged into a stored balance. |
+| `usdcEquivalent` | The ESTIMATED USDC equivalent of the GHS headline at the same canonical display rate. NOT the quantity of USDC held. `null` when no rate is available (never fabricated). |
 | `rateStatus` | `CURRENT` (fresh canonical) / `SAVED_FALLBACK` (last validated observation, display-only) / `DEMO_FALLBACK` (demo seed, display-only) / `UNAVAILABLE`. |
 | `valuationStatus` | `CURRENT` / `SAVED_FALLBACK` / `DEMO_FALLBACK` / `FX_UNAVAILABLE`. |
 | `currentRate`, `savedRate` | The two concepts stay SEPARATE — a saved rate is never labelled current/fresh. |
@@ -84,8 +114,8 @@ Response fields (every Decimal financial quantity serialized as BOTH exact strin
 
 Honesty rules (proven by tests):
 
-- A missing FX rate NEVER makes a valid GHS balance unavailable: `nativeGhsAvailable` is always reported in full; a missing rate only nulls the `usdcEquivalent` estimate (`FX_UNAVAILABLE`). The headline never depends on FX.
-- The headline is INVARIANT to actual USDC held (owner regression: nativeGhs = 100, USDC held = 500, rate = 10 → headline 100, estimate 10 — never a combined 5010 GHS / 501 USDC valuation; the headline stays 100 across every variation of USDC held).
+- A missing FX rate NEVER makes a valid GHS balance unavailable: `nativeGhsAvailable` is always reported in full; a missing rate only nulls the estimated USDC leg and degrades the headline to `nativeGhsAvailable` alone (`PARTIAL_FX_UNAVAILABLE`). The native GHS headline never depends on FX.
+- Under `NATIVE_ONLY` the headline is invariant to USDC held (nativeGhs = 100, USDC held = 500, rate = 10 → headline 100, estimate 10). Under the selected `COMBINED_ESTIMATE` the headline deliberately moves with USDC held (same inputs → headline 5100 GHS, secondary 510 USDC) and is marked as an estimate; that is the intended behaviour, not a regression, and it changes no stored balance.
 
 ---
 

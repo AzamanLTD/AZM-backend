@@ -105,3 +105,28 @@ headline already reflects.
 Legacy USDC-denominated fiat/crypto/MoMo withdrawals are untouched: with the flag OFF these
 routes are byte-identical, and no old `TransactionHistory`/`Withdrawal` row is rewritten. A
 separate cutover contract is still required before any USDC-denominated caller is migrated.
+
+## GHS settlement precision and the rounding correction
+
+GHS payouts settle at **2 decimal places, ROUND_HALF_UP**, computed from an
+exact decimal product of the USDC amount and the canonical rate. The provider
+receives that figure as a 2-dp decimal **string**; nothing on the outbound path
+round-trips it through a JavaScript number.
+
+This is an internal rounding correction, not a provider contract change. The
+provider API, its amount field and its units are untouched; only the arithmetic
+that produces the figure changed. Before the correction the product was rounded
+as a binary double, which under-paid a pesewa on verified pairs:
+
+| USDC | Rate (GHS/USDC) | Exact | Previously paid |
+| --- | --- | --- | --- |
+| 0.35 | 12.3 | 4.31 | 4.30 |
+| 0.15 | 12.3 | 1.85 | 1.84 |
+| 0.02 | 12.25 | 0.25 | 0.24 |
+| 0.30 | 12.35 | 3.71 | 3.70 |
+| 0.42 | 12.25 | 5.15 | 5.14 |
+
+Every money comparison that decides whether a payout is dispatched or held
+(withdrawal amount, auto-approve maximum, operational pool threshold, legacy
+pool balance and remaining pool after a dispatch) is made in `Prisma.Decimal`,
+so a configured limit is never crossed by binary rounding.

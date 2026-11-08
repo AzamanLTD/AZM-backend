@@ -252,17 +252,30 @@ class PayoutBatchWorker {
     }
 
     async _processBatch(settings, { isManualTrigger = false } = {}) {
-        const maxAmount = Number(settings.autoPayoutMaxAmountUsdc) || 200;
-        const threshold = Number(settings.autoPayoutThresholdUsdc) || 500;
+        // §r42.4 — EVERY money comparison on this path is Decimal. These two
+        // values decide whether a payout is dispatched or held, so the
+        // configured figures are read as Decimals and only their numeric
+        // projections (`maxAmount`, `threshold`) are used for messages.
+        const maxAmountExact = new Prisma.Decimal(
+            settings.autoPayoutMaxAmountUsdc != null ? settings.autoPayoutMaxAmountUsdc : 200
+        );
+        const thresholdExact = new Prisma.Decimal(
+            settings.autoPayoutThresholdUsdc != null ? settings.autoPayoutThresholdUsdc : 500
+        );
+        const maxAmount = maxAmountExact.toNumber();   // presentation only
+        const threshold = thresholdExact.toNumber();   // presentation only
 
         const globalSettings = await this.prisma.globalSettings.findUnique({ where: { id: 1 } });
         // §r42.2 EXACT RATE. The rate is money on this path: it converts the
         // requested USDC into the GHS the provider is asked to pay. It is kept
         // as a Decimal from the column itself; the old `Number(...)` copy plus
         // `amount * liveRate` + toFixed(2) rounded the BINARY product, which
-        // can land a pesewa below the exact decimal product (0.05 USDC at
-        // 12.3 GHS is exactly 0.615 GHS → 0.62, but 0.6149999999999999 →
-        // 0.61). A missing rate still falls back to the historical 12.5.
+        // lands a pesewa below the exact decimal product on verified pairs:
+        // 0.35 USDC at 12.3 pays 4.30 instead of 4.31, 0.15 at 12.3 → 1.84
+        // instead of 1.85, 0.02 at 12.25 → 0.24 instead of 0.25, 0.30 at
+        // 12.35 → 3.70 instead of 3.71, 0.42 at 12.25 → 5.14 instead of 5.15.
+        // (0.05 at 12.3 happens to round correctly both ways — it is not an
+        // example of the defect.) A missing rate still falls back to 12.5.
         const liveRateExact = new Prisma.Decimal(
             globalSettings && globalSettings.liveRetailRate != null ? globalSettings.liveRetailRate : 12.5
         );
@@ -281,7 +294,7 @@ class PayoutBatchWorker {
         // The legacy pool is read LAZILY — only when the first legacy row of
         // the batch actually needs it. Authority-reserved processing never
         // reads SystemFiatPool at all.
-        let runningPoolBalance = null; // legacy regime gauge (USDC projection); null = no legacy row read it yet
+        let runningPoolBalance = null; // legacy regime gauge (USDC projection, DECIMAL); null = no legacy row read it yet
         // §P.5-D ONE-WAY LATCH: resolved at most once per batch. Once the
         // authority has been activated, SystemFiatPool is a GHS projection and
         // an unreserved legacy row can never be priced against it.
@@ -295,7 +308,7 @@ class PayoutBatchWorker {
         const ensureLegacyPool = async () => {
             if (runningPoolBalance === null) {
                 const fiatPool = await this.prisma.systemFiatPool.findUnique({ where: { id: 1 } });
-                runningPoolBalance = fiatPool ? Number(fiatPool.balance) : 0;
+                runningPoolBalance = fiatPool ? new Prisma.Decimal(fiatPool.balance) : new Prisma.Decimal(0);
             }
             return runningPoolBalance;
         };
@@ -358,7 +371,15 @@ class PayoutBatchWorker {
         };
 
         for (const withdrawal of pendingWithdrawals) {
-            const amount = Number(withdrawal.amount);
+            // §r42.4 — the row amount is Decimal from the column; the numeric
+            // copy exists for messages and evidence payloads only.
+            let amountExact = null;
+            try {
+                amountExact = new Prisma.Decimal(String(withdrawal.amount));
+            } catch (_) {
+                amountExact = null;
+            }
+            const amount = amountExact && amountExact.isFinite() ? amountExact.toNumber() : null;
 
             // Defence in depth for the query above: if a native-GHS row ever
             // reaches this loop, park it — never measure it with the USDC
@@ -377,16 +398,16 @@ class PayoutBatchWorker {
             // A zero (or unreadable) USDC amount is not a zero-value payout. It
             // is a row this policy cannot measure, so it cannot be
             // auto-approved by it.
-            if (!Number.isFinite(amount) || amount <= 0) {
+            if (!amountExact || !amountExact.isFinite() || amountExact.lessThanOrEqualTo(0)) {
                 const parked = await this._parkForManualReview(withdrawal, 'ZERO_AMOUNT_NOT_AUTO_APPROVABLE', {
-                    amount: Number.isFinite(amount) ? amount : null,
+                    amount: amount != null && Number.isFinite(amount) ? amount : null,
                     message: 'Withdrawal amount is zero or unreadable; the auto-approve limit cannot measure this payout.',
                 });
                 if (parked) results.flaggedManualReview.push({ id: withdrawal.id, reason: 'ZERO_AMOUNT_NOT_AUTO_APPROVABLE', amount: null });
                 continue;
             }
 
-            if (amount > maxAmount) {
+            if (amountExact.greaterThan(maxAmountExact)) {
                 const parked = await this._parkForManualReview(withdrawal, 'AMOUNT_EXCEEDS_THRESHOLD', {
                     amount,
                     maxAmount,
@@ -457,7 +478,7 @@ class PayoutBatchWorker {
                 // comparison — it never mutates the economic amount of an
                 // existing reservation.
                 const thresholdGhs = fiatLiquidity.toExactGhsDecimal(
-                    new Prisma.Decimal(threshold).times(liveRateExact).toFixed(2)
+                    thresholdExact.times(liveRateExact).toFixed(2)
                 );
                 if (remainingLiquidityGhs.lt(thresholdGhs)) {
                     const parked = await this._parkForManualReview(withdrawal, 'AUTHORITY_HEADROOM_BELOW_THRESHOLD', {
@@ -493,14 +514,15 @@ class PayoutBatchWorker {
                 // is a compatibility / legacy projection ONLY and is never an
                 // authority input.
                 const poolBalanceNow = await ensureLegacyPool();
-                if (poolBalanceNow < threshold || poolBalanceNow < amount) {
+                if (poolBalanceNow.lessThan(thresholdExact) || poolBalanceNow.lessThan(amountExact)) {
                     const parked = await this._parkForManualReview(withdrawal, 'INSUFFICIENT_POOL_LIQUIDITY', {
                         amount,
-                        poolBalance: poolBalanceNow,
+                        poolBalance: poolBalanceNow.toFixed(2),
+                        poolBalanceExact: poolBalanceNow.toFixed(8),
                         threshold,
                         message: `Fiat pool ($${poolBalanceNow.toFixed(2)}) below threshold ($${threshold}) or insufficient for $${amount}`
                     });
-                    if (parked) results.flaggedManualReview.push({ id: withdrawal.id, reason: 'INSUFFICIENT_POOL_LIQUIDITY', amount, poolBalance: poolBalanceNow });
+                    if (parked) results.flaggedManualReview.push({ id: withdrawal.id, reason: 'INSUFFICIENT_POOL_LIQUIDITY', amount, poolBalance: poolBalanceNow.toNumber(), poolBalanceExact: poolBalanceNow.toFixed(8) });
                     continue;
                 }
             }
@@ -706,7 +728,7 @@ class PayoutBatchWorker {
                 if (!authorityRecorded) {
                     // The gauge is USDC only because the branch above refused
                     // every legacy row once the projection became GHS.
-                    if (!(await ensureAuthorityMode())) runningPoolBalance -= amount;
+                    if (!(await ensureAuthorityMode())) runningPoolBalance = runningPoolBalance.minus(amountExact);
                 }
 
                 results.processed.push({
@@ -762,7 +784,7 @@ class PayoutBatchWorker {
                     // every legacy row once the projection became GHS.
                     // Same invariant as the site above: never subtract a USDC amount
             // from a gauge that holds GHS.
-            if (!(await ensureAuthorityMode())) runningPoolBalance -= amount;
+            if (!(await ensureAuthorityMode())) runningPoolBalance = runningPoolBalance.minus(amountExact);
                 }
                 results.unknownOutcome.push({
                     id: withdrawal.id,
@@ -785,7 +807,7 @@ class PayoutBatchWorker {
             // authoritative GHS liquidity — under §P.5-D the authority
             // figure lives in FiatLiquidityState and is never projected
             // here.
-            poolBalance: runningPoolBalance,
+            poolBalance: runningPoolBalance == null ? null : runningPoolBalance.toNumber(),
             details: isManualTrigger ? results : undefined
         };
 

@@ -205,6 +205,72 @@ if (!hasDb) console.warn('[wallet-exact-arithmetic] TEST_DATABASE_URL not set �
         expect(await balances(a.id)).toEqual(await balances(b.id));
     });
 
+    // ── §r42.3: string-authoritative input, JSON-number collision ──────────
+    test('P1. a decimal string above the double boundary is honoured exactly', async () => {
+        const user = await seedUser(prisma, {
+            availableBalance: new Prisma.Decimal('100000001'), vendorUnallocatedBalance: 0, role: 'VENDOR',
+        });
+        const res = await transfer(user, randomUUID(), { direction: 'TO_POOL', amount: '100000000.00000002' });
+        expect(res.status).toBe(200);
+        const after = await balances(user.id);
+        expect(after.pool).toBe('100000000.00000002');
+        expect(after.available).toBe('0.99999998');
+    });
+
+    test('P2. the same amount as a JSON number is REFUSED, never rounded', async () => {
+        // Proven collision: JSON.parse already moved the last digit before the
+        // handler could see it, which is exactly why a number cannot be
+        // "converted back" to the value the client sent.
+        expect(String(JSON.parse('100000000.00000002'))).toBe('100000000.00000001');
+
+        const user = await seedUser(prisma, {
+            availableBalance: new Prisma.Decimal('100000001'), vendorUnallocatedBalance: 0, role: 'VENDOR',
+        });
+        const before = await balances(user.id);
+        const res = await transfer(user, randomUUID(), { direction: 'TO_POOL', amount: 100000000.00000002 });
+        expect(res.status).toBe(400);
+        expect(res.body.code).toBe('USDC_AMOUNT_STRING_REQUIRED');
+        expect(await balances(user.id)).toEqual(before);
+        expect(await prisma.transactionHistory.count({
+            where: { userId: user.id, type: 'INTERNAL_TRANSFER' },
+        })).toBe(0);
+    });
+
+    test('P3. a legacy JSON number still works for the Flutter client (back-compat)', async () => {
+        const user = await seedUser(prisma, { availableBalance: 10, vendorUnallocatedBalance: 0, role: 'VENDOR' });
+        const res = await transfer(user, randomUUID(), { direction: 'TO_POOL', amount: 0.1 });
+        expect(res.status).toBe(200);
+        expect((await balances(user.id)).pool).toBe('0.10000000');
+    });
+
+    test('P4. a fractional JSON number inside the double-fidelity band is exact', async () => {
+        const user = await seedUser(prisma, {
+            availableBalance: new Prisma.Decimal('30000001'), vendorUnallocatedBalance: 0, role: 'VENDOR',
+        });
+        const res = await transfer(user, randomUUID(), { direction: 'TO_POOL', amount: 30000000.12345678 });
+        expect(res.status).toBe(200);
+        const after = await balances(user.id);
+        expect(after.pool).toBe('30000000.12345678');
+        expect(after.available).toBe('0.87654322');
+    });
+
+    test('P5. a fractional number exactly at 2^25 is refused; a whole number above it is not', async () => {
+        const user = await seedUser(prisma, {
+            availableBalance: new Prisma.Decimal('100000000'), vendorUnallocatedBalance: 0, role: 'VENDOR',
+        });
+        const before = await balances(user.id);
+        // 2^25 USDC: ulp is now wider than one 8-dp step → must be a string.
+        const refused = await transfer(user, randomUUID(), { direction: 'TO_POOL', amount: 33554432.5 });
+        expect(refused.status).toBe(400);
+        expect(refused.body.code).toBe('USDC_AMOUNT_STRING_REQUIRED');
+        expect(await balances(user.id)).toEqual(before);
+
+        // A whole number carries no fractional digits to lose, so it stays valid.
+        const accepted = await transfer(user, randomUUID(), { direction: 'TO_POOL', amount: 90000000 });
+        expect(accepted.status).toBe(200);
+        expect((await balances(user.id)).pool).toBe('90000000.00000000');
+    });
+
     // ── atomicity of the two movements ─────────────────────────────────────
     test('X5. a mid-transaction failure leaves BOTH balances untouched (no half-move)', async () => {
         const user = await seedUser(prisma, { availableBalance: 50, vendorUnallocatedBalance: 0, role: 'VENDOR' });

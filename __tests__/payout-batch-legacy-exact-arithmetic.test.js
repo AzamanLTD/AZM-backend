@@ -114,6 +114,93 @@ describe('payoutBatchWorker legacy fiat dispatch — exact 2-dp GHS', () => {
         expect(dispatched.amountGhs).toBe('0.62');
     });
 
+    // ── §r42.4 threshold boundaries: Decimal decides dispatch vs hold ───────
+    describe('eligibility boundaries are decided in Decimal', () => {
+        const run = async ({ usdcAmount, pool, settingsOverride = {} }) => {
+            const settings = {
+                autoPayoutEnabled: true,
+                autoPayoutMaxAmountUsdc: 200,
+                autoPayoutThresholdUsdc: 500,
+                autoPayoutIntervalMs: 120000,
+                liveRetailRate: '12.5',
+                ...settingsOverride,
+            };
+            const initiateTransfer = jest.fn().mockResolvedValue({
+                _provider: 'mtn', provider: 'MTN_MOMO_DISBURSEMENT', status: 'ACCEPTED',
+            });
+            const prisma = {
+                globalSettings: { findUnique: jest.fn().mockResolvedValue(settings) },
+                fiatLiquidityState: { findUnique: jest.fn().mockResolvedValue(null) },
+                systemFiatPool: { findUnique: jest.fn().mockResolvedValue({ balance: pool }) },
+                fiatLiquidityReservation: { findUnique: jest.fn().mockResolvedValue(null) },
+                withdrawal: {
+                    findMany: jest.fn().mockResolvedValue([{
+                        id: 77, userId: 7, amount: usdcAmount, destination: '0240000000', network: 'MTN',
+                        payoutMethod: 'MTN_MOMO', createdAt: new Date('2026-08-30T10:00:00.000Z'),
+                    }]),
+                    update: jest.fn().mockResolvedValue({}),
+                    updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+                },
+                transactionHistory: {
+                    findMany: jest.fn().mockResolvedValue([{
+                        id: 'tx-9', txHash: 'ref-9', status: 'PENDING', userId: 7, amountUsdc: usdcAmount,
+                    }]),
+                    findUnique: jest.fn(),
+                    create: jest.fn(),
+                },
+                $queryRawUnsafe: jest.fn().mockResolvedValue([]),
+                $executeRawUnsafe: jest.fn().mockResolvedValue(1),
+            };
+            const worker = new PayoutBatchWorker(prisma, null, { initiateTransfer }, null);
+            const result = await worker._processBatch(settings, { isManualTrigger: true });
+            return { result, initiateTransfer };
+        };
+
+        test('an amount exactly equal to the auto-approve maximum is DISPATCHED', async () => {
+            const { result, initiateTransfer } = await run({ usdcAmount: new Prisma.Decimal('200'), pool: '5000' });
+            expect(result.processed).toBe(1);
+            expect(initiateTransfer).toHaveBeenCalledTimes(1);
+        });
+
+        test('one 8-dp step above the maximum is HELD', async () => {
+            const { result, initiateTransfer } = await run({ usdcAmount: new Prisma.Decimal('200.00000001'), pool: '5000' });
+            expect(result.processed).toBe(0);
+            expect(initiateTransfer).not.toHaveBeenCalled();
+            expect(result.details.flaggedManualReview[0].reason).toBe('AMOUNT_EXCEEDS_THRESHOLD');
+        });
+
+        test('a legacy pool exactly equal to the payout is ENOUGH (not short by a rounding step)', async () => {
+            const { result, initiateTransfer } = await run({
+                usdcAmount: new Prisma.Decimal('0.3'),
+                pool: '0.3',
+                settingsOverride: { autoPayoutThresholdUsdc: '0.3' },
+            });
+            expect(result.processed).toBe(1);
+            expect(initiateTransfer).toHaveBeenCalledTimes(1);
+        });
+
+        test('a pool one 8-dp step short of the payout is HELD', async () => {
+            const { result, initiateTransfer } = await run({
+                usdcAmount: new Prisma.Decimal('0.3'),
+                pool: '0.29999999',
+                settingsOverride: { autoPayoutThresholdUsdc: '0.29999999' },
+            });
+            expect(result.processed).toBe(0);
+            expect(initiateTransfer).not.toHaveBeenCalled();
+            expect(result.details.flaggedManualReview[0].reason).toBe('INSUFFICIENT_POOL_LIQUIDITY');
+        });
+
+        test('a pool exactly at the configured threshold is ENOUGH', async () => {
+            const { result, initiateTransfer } = await run({
+                usdcAmount: new Prisma.Decimal('5'),
+                pool: '25',
+                settingsOverride: { autoPayoutThresholdUsdc: '25' },
+            });
+            expect(result.processed).toBe(1);
+            expect(initiateTransfer).toHaveBeenCalledTimes(1);
+        });
+    });
+
     test('the provider amount is a 2-dp string and its value equals the exact decimal product', async () => {
         const dispatched = await dispatch({ usdcAmount: new Prisma.Decimal('12.34'), liveRetailRate: '12.55' });
         // 12.34 × 12.55 = 154.867 exactly → 154.87

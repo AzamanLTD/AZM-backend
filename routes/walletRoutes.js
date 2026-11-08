@@ -24,15 +24,48 @@ const USDC_DP = 8;
 // amount a deterministic 400 instead of a database error mid-transaction.
 const USDC_MAX_EXCLUSIVE = new Prisma.Decimal('1000000000000');
 
+// §r42.3 — money representation at the boundary.
+//
+// A DECIMAL STRING is the authoritative input: it is parsed exactly, however
+// many digits it carries. A JSON number is still accepted for existing clients
+// (the Flutter vendor dashboard sends `'amount': <double>`), but only when the
+// value is EXACTLY representable at 8 decimal places. Above
+// 2^53 / 10^8 ≈ 90,071,992.5474 USDC a double cannot express every 8-dp
+// amount, and the digits JSON.parse already destroyed cannot be recovered by
+// converting the surviving number to a string. Such a request is refused
+// (USDC_AMOUNT_STRING_REQUIRED) instead of being silently rounded: fail closed,
+// never guess.
+// Fidelity limit for a FRACTIONAL JSON number. A double whose magnitude is at
+// or above 2^25 has an ulp of 2^-26 ≈ 1.49e-8, i.e. WIDER than one 8-dp step,
+// so a fractional amount there can silently lose its last digit during
+// JSON.parse — 100000000.00000002 arrives as ...00000001. Such amounts must be
+// sent as decimal strings. Whole numbers stay exact as doubles well beyond
+// this point, so an integer input is not subject to the limit.
+const USDC_NUMBER_FRACTION_MAX_MAGNITUDE = 2 ** 25; // 33,554,432 USDC
+
 function toExactUsdcAmount(value) {
     if (value === null || value === undefined || value === '') {
         return { error: 'amount must be a positive number.', code: 'USDC_AMOUNT_REQUIRED' };
     }
+    if (typeof value === 'number') {
+        if (!Number.isFinite(value)) {
+            return { error: 'amount must be a positive number.', code: 'USDC_AMOUNT_INVALID' };
+        }
+        // A fractional value accepted here survives JSON parsing exactly at
+        // 8dp; one that cannot is refused and must be sent as a string.
+        if (!Number.isInteger(value) && Math.abs(value) >= USDC_NUMBER_FRACTION_MAX_MAGNITUDE) {
+            return {
+                error: 'amount must be sent as a decimal string: this JSON number carries more precision than a double can represent at 8 decimal places.',
+                code: 'USDC_AMOUNT_STRING_REQUIRED',
+            };
+        }
+    }
     let d;
     try {
-        // String() first: a JSON number becomes its shortest round-trip
-        // decimal, a string stays exactly what the client sent. Constructing
-        // Decimal from a number directly would reintroduce binary noise.
+        // String() first: a string stays exactly what the client sent; an
+        // accepted JSON number becomes its shortest round-trip decimal. This
+        // does NOT restore digits the JSON parser already dropped — that is
+        // why an over-precise number is refused above rather than converted.
         d = new Prisma.Decimal(String(value));
     } catch (_) {
         return { error: 'amount must be a positive number.', code: 'USDC_AMOUNT_INVALID' };
@@ -116,7 +149,21 @@ router.get('/pool-withdrawal-preview', protect, async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const userId = req.user.id;
-        const amount = parseFloat(req.query.amount || '0');
+        // §r42.3 — this preview decides WHICH ADS GET DEACTIVATED, so the
+        // comparison is made in Decimal, never in binary floating point.
+        let amountExact = new Prisma.Decimal(0);
+        const rawAmount = req.query.amount;
+        if (rawAmount !== undefined && rawAmount !== '') {
+            const parsedPreview = toExactUsdcAmount(rawAmount);
+            if (parsedPreview.error) {
+                return res.status(400).json({
+                    success: false,
+                    code: parsedPreview.code,
+                    message: parsedPreview.error,
+                });
+            }
+            amountExact = parsedPreview.value;
+        }
 
         const user = await prisma.user.findUnique({
             where: { id: userId },
@@ -124,7 +171,8 @@ router.get('/pool-withdrawal-preview', protect, async (req, res) => {
         });
         if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
 
-        const newPoolBalance = Number(user.vendorUnallocatedBalance) - amount;
+        const poolExact = new Prisma.Decimal(user.vendorUnallocatedBalance);
+        const newPoolBalance = poolExact.minus(amountExact);
 
         const activeAds = await prisma.ad.findMany({
             where: { vendorId: userId, status: 'ACTIVE' },
@@ -132,15 +180,17 @@ router.get('/pool-withdrawal-preview', protect, async (req, res) => {
             orderBy: { createdAt: 'desc' }
         });
 
-        const adsAtRisk = activeAds.filter(a => Number(a.maxLimit) > newPoolBalance);
-        const adsSafe = activeAds.filter(a => Number(a.maxLimit) <= newPoolBalance);
+        const adsAtRisk = activeAds.filter(a => new Prisma.Decimal(a.maxLimit).greaterThan(newPoolBalance));
+        const adsSafe = activeAds.filter(a => !new Prisma.Decimal(a.maxLimit).greaterThan(newPoolBalance));
 
         return res.status(200).json({
             success: true,
             data: {
-                currentPoolBalance: Number(user.vendorUnallocatedBalance),
-                withdrawAmount: amount,
-                newPoolBalance: Math.max(0, newPoolBalance),
+                currentPoolBalance: Number(poolExact),
+                withdrawAmount: Number(amountExact),
+                amountExact: amountExact.toFixed(USDC_DP),
+                newPoolBalance: (!newPoolBalance.isNegative() ? newPoolBalance : new Prisma.Decimal(0)).toNumber(),
+                newPoolBalanceExact: (!newPoolBalance.isNegative() ? newPoolBalance : new Prisma.Decimal(0)).toFixed(USDC_DP),
                 totalActiveAds: activeAds.length,
                 adsAtRisk,
                 adsSafe,

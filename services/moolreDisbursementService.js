@@ -235,7 +235,18 @@ class MoolreDisbursementService {
         if (!referenceId || typeof referenceId !== 'string') {
             throw this._outcomeError('referenceId is required for idempotency.', PROVIDER_OUTCOMES.NOT_DISPATCHED, { stage: 'VALIDATE' });
         }
-        if (!amountGhs || Number(amountGhs) <= 0) {
+        // §r42.5 — the amount is validated and carried as an EXACT decimal.
+        // A JS number never becomes the authoritative figure on this path: the
+        // provider body, the mock ledger and every return value carry the
+        // 2-dp decimal STRING, with an explicitly-named numeric projection
+        // (`amountGhsValue`) for display consumers only.
+        let amountGhsExact;
+        try {
+            amountGhsExact = new Prisma.Decimal(String(amountGhs));
+        } catch (_) {
+            throw this._outcomeError('amountGhs must be a positive decimal.', PROVIDER_OUTCOMES.NOT_DISPATCHED, { stage: 'VALIDATE' });
+        }
+        if (!amountGhsExact.isFinite() || amountGhsExact.lessThanOrEqualTo(0)) {
             throw this._outcomeError('amountGhs must be positive.', PROVIDER_OUTCOMES.NOT_DISPATCHED, { stage: 'VALIDATE' });
         }
         if (!recipientPhone) {
@@ -243,13 +254,14 @@ class MoolreDisbursementService {
         }
 
         const finalExternalId   = externalId   || `AZAMAN_${referenceId}`;
+        const amountGhsValue    = amountGhsExact.toFixed(2);
         const finalNote         = (payeeNote || payerMessage || 'Azaman MoMo payout').slice(0, 160);
         const channel           = NETWORK_TO_CHANNEL[(network || 'MTN').toUpperCase()] || NETWORK_TO_CHANNEL.MTN;
 
         if (this.providerMode === 'MOCK') {
             return this._mockInitiateTransfer({
                 referenceId,
-                amountGhs:      Number(amountGhs),
+                amountGhs:      amountGhsValue,
                 recipientPhone,
                 externalId:     finalExternalId,
                 note:           finalNote,
@@ -271,7 +283,10 @@ class MoolreDisbursementService {
             // String(Number(...)) round-trip put an IEEE double in front of the
             // outbound GHS figure. The Decimal string is already exact (2dp
             // from the caller) and is the same value the old path formatted.
-            [BODY_KEYS.amount]:        String(new Prisma.Decimal(String(amountGhs))),
+            // §r42.5 — the SAME 2-dp string that is returned and recorded, so
+            // the amount we send, the amount we store and the amount we report
+            // can never diverge by a scale digit.
+            [BODY_KEYS.amount]:        amountGhsValue,
             [BODY_KEYS.recipient]:     this._sanitizeMsisdn(recipientPhone),
             [BODY_KEYS.reference]:     referenceId,         // strict idempotency key
             [BODY_KEYS.channel]:       channel,
@@ -324,7 +339,8 @@ class MoolreDisbursementService {
                 referenceId,
                 externalId:     finalExternalId,
                 status:         normalized,
-                amountGhs:      Number(amountGhs),
+                amountGhs:      amountGhsValue,
+                amountGhsValue: Number(amountGhsValue),
                 recipientPhone: this._sanitizeMsisdn(recipientPhone),
                 message:        message || 'Moolre accepted disbursement.',
                 providerTxId:   (data && (data.transactionid || data.txid || data.id)) || null,
@@ -434,7 +450,9 @@ class MoolreDisbursementService {
                 referenceId,
                 externalId:  (data && data.externalref) || null,
                 status:      this._normalizeStatus(rawStatus),
-                amountGhs:   data && data.amount ? Number(data.amount) : null,
+                amountGhs:   data && data.amount != null
+                    ? new Prisma.Decimal(String(data.amount)).toFixed(2)
+                    : null,
                 reason:      (data && data.reason) || message || null,
                 source:      'LIVE'
             };

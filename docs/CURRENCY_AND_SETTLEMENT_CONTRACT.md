@@ -1,5 +1,12 @@
 # Azaman Currency & Settlement Contract
 
+> **Superseded by [`MONEY_CONTRACT.md`](./MONEY_CONTRACT.md).**
+> The balance-headline, valuation and money-representation rules in this
+> document are superseded by the Money Contract (owner decision D1,
+> 2026-11-08). Historical context below is retained; where the two disagree,
+> `MONEY_CONTRACT.md` governs.
+
+
 This document records the current production invariant for the Ghana launch.
 
 ## Currency roles
