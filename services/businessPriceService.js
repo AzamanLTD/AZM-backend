@@ -484,6 +484,25 @@ async function resolveEffectiveGhsPrices(client, businessProductIds) {
     return resolved;
 }
 
+/**
+ * Checkout containment (WP-1.10).
+ *
+ * Return the subset of `businessProductIds` that currently carry an APPLICABLE
+ * authoritative GHS price — i.e. exactly the ids `resolveEffectiveGhsPrices`
+ * resolves a row for. Checkout must refuse these items: no GHS settlement path
+ * exists yet, so any USDC charge for such an item would charge an amount the
+ * customer was never shown.
+ *
+ * This is deliberately a thin wrapper over the resolver and the eligibility
+ * predicate above, NOT a second interpretation: the storefront catalogue and
+ * this guard must never disagree about which items are GHS-priced.
+ */
+async function findGhsPricedProductIds(client, businessProductIds) {
+    if (!Array.isArray(businessProductIds) || businessProductIds.length === 0) return [];
+    const resolved = await resolveEffectiveGhsPrices(client, businessProductIds);
+    return businessProductIds.filter((id) => resolved.has(id));
+}
+
 module.exports = {
     BusinessPriceError,
     parseGhsDecimal,
@@ -495,6 +514,7 @@ module.exports = {
     confirmPrice,
     resolveEffectiveGhsPrice,
     resolveEffectiveGhsPrices,
+    findGhsPricedProductIds,
     eligibleCurrentGhsPriceWhere,
     // closed domains exported for tests and future admin surfaces
     SCOPE_VALUES,
