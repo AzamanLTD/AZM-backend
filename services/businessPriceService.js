@@ -485,22 +485,117 @@ async function resolveEffectiveGhsPrices(client, businessProductIds) {
 }
 
 /**
- * Checkout containment (WP-1.10).
+ * Checkout containment (WP-1.10 / WP-1.10A).
  *
- * Return the subset of `businessProductIds` that currently carry an APPLICABLE
- * authoritative GHS price — i.e. exactly the ids `resolveEffectiveGhsPrices`
- * resolves a row for. Checkout must refuse these items: no GHS settlement path
- * exists yet, so any USDC charge for such an item would charge an amount the
- * customer was never shown.
+ * Decide whether checkout may proceed for a set of products, using the STRICT
+ * resolver semantics — not the feed's lenient ones.
  *
- * This is deliberately a thin wrapper over the resolver and the eligibility
- * predicate above, NOT a second interpretation: the storefront catalogue and
- * this guard must never disagree about which items are GHS-priced.
+ * The two resolvers differ deliberately (see the batch resolver's header):
+ * `resolveEffectiveGhsPrices` EXCLUDES a future-dated or ambiguous current
+ * identity from the feed and logs it, because one corrupt product must not
+ * break a page. Checkout cannot inherit that: for a purchase, "the resolver
+ * returned no row" must never be read as "there is no GHS price" when the row
+ * set is in fact corrupt. So this evaluator mirrors `resolveEffectiveGhsPrice`
+ * row for row — same candidate query (ACTIVE, GHS, DEFAULT, locationId null,
+ * effectiveTo null), same shared `selectEligiblePriceRows` split, same
+ * fail-closed verdicts — but batches the query and reports instead of throwing.
+ *
+ * Verdicts:
+ *   eligible === 1                      → APPLICABLE  (a GHS price is shown)
+ *   eligible >  1                       → UNRESOLVED  (ambiguous, fail closed)
+ *   eligible === 0 and futureDated > 0  → UNRESOLVED  (future-dated, fail closed)
+ *   nothing current and confirmed       → allow
+ *
+ * Archived / expired (`effectiveTo`) / unconfirmed / MIGRATION / BRANCH rows
+ * never reach the candidate query or never survive the shared selector, so v1
+ * eligibility is applied exactly as documented and not widened here.
  */
-async function findGhsPricedProductIds(client, businessProductIds) {
-    if (!Array.isArray(businessProductIds) || businessProductIds.length === 0) return [];
-    const resolved = await resolveEffectiveGhsPrices(client, businessProductIds);
-    return businessProductIds.filter((id) => resolved.has(id));
+const GHS_CHECKOUT_CODES = Object.freeze({
+    APPLICABLE: 'GHS_CHECKOUT_UNAVAILABLE',
+    UNRESOLVED: 'GHS_PRICE_STATE_UNRESOLVED',
+});
+
+async function resolveGhsCheckoutDecision(client, businessProductIds) {
+    const ids = Array.isArray(businessProductIds) ? businessProductIds.filter(Boolean) : [];
+    if (ids.length === 0) return { block: false, code: null, productIds: [] };
+
+    // No pricing surface at all: absence of a GHS price cannot be proven, so
+    // a purchase must not proceed on the assumption that there is none.
+    if (!client?.businessPrice?.findMany) {
+        return { block: true, code: GHS_CHECKOUT_CODES.UNRESOLVED, productIds: ids };
+    }
+
+    // Identical candidate query to resolveEffectiveGhsPrice, batched.
+    const rows = await client.businessPrice.findMany({
+        where: {
+            businessProductId: { in: ids },
+            currency: 'GHS',
+            scope: 'DEFAULT',
+            locationId: null,
+            status: 'ACTIVE',
+            effectiveTo: null,
+        },
+        orderBy: { effectiveFrom: 'desc' },
+    });
+
+    const byProduct = new Map();
+    for (const row of rows) {
+        const list = byProduct.get(row.businessProductId) || [];
+        list.push(row);
+        byProduct.set(row.businessProductId, list);
+    }
+
+    const applicable = [];
+    const unresolved = [];
+    for (const id of ids) {
+        const productRows = byProduct.get(id);
+        if (!productRows) continue; // no current identity at all
+        const { eligible, futureDated } = selectEligiblePriceRows(productRows);
+        if (eligible.length > 1) { unresolved.push(id); continue; }
+        if (eligible.length === 1) { applicable.push(id); continue; }
+        if (futureDated.length > 0) { unresolved.push(id); }
+    }
+
+    if (unresolved.length > 0) {
+        return { block: true, code: GHS_CHECKOUT_CODES.UNRESOLVED, productIds: unresolved };
+    }
+    if (applicable.length > 0) {
+        return { block: true, code: GHS_CHECKOUT_CODES.APPLICABLE, productIds: applicable };
+    }
+    return { block: false, code: null, productIds: [] };
+}
+
+/**
+ * The single refusal body for both checkout call sites (storefront routes and
+ * the product-linked business ESCROW ticket path). Stable, machine-readable,
+ * and deliberately free of any internal identifier or suggested alternative
+ * amount: the client must not be able to infer a USDC price to fall back to.
+ */
+function ghsCheckoutRefusal(code) {
+    if (code === GHS_CHECKOUT_CODES.UNRESOLVED) {
+        return {
+            statusCode: 409,
+            body: {
+                success: false,
+                code: GHS_CHECKOUT_CODES.UNRESOLVED,
+                message:
+                    'This item\'s Ghana Cedi (GHS) price could not be resolved, so it cannot be '
+                    + 'purchased right now. No order was created and nothing was charged. '
+                    + 'Please try again later or contact the business.',
+            },
+        };
+    }
+    return {
+        statusCode: 409,
+        body: {
+            success: false,
+            code: GHS_CHECKOUT_CODES.APPLICABLE,
+            message:
+                'This item is listed with a Ghana Cedi (GHS) price, and GHS checkout is not '
+                + 'available yet. No order was created and nothing was charged. '
+                + 'Please contact the business to complete this purchase.',
+        },
+    };
 }
 
 module.exports = {
@@ -514,7 +609,9 @@ module.exports = {
     confirmPrice,
     resolveEffectiveGhsPrice,
     resolveEffectiveGhsPrices,
-    findGhsPricedProductIds,
+    resolveGhsCheckoutDecision,
+    ghsCheckoutRefusal,
+    GHS_CHECKOUT_CODES,
     eligibleCurrentGhsPriceWhere,
     // closed domains exported for tests and future admin surfaces
     SCOPE_VALUES,

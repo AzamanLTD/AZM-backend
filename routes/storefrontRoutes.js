@@ -53,7 +53,7 @@ function storefrontReplayOrConflict(res, existing, requestHash) {
   });
 }
 
-// WP-1.10 — retail GHS-price containment.
+// WP-1.10 / WP-1.10A — retail GHS-price containment.
 //
 // The catalogue can present an authoritative GHS BusinessPrice for an item
 // while checkout charges product.priceUsdc. Those amounts are unrelated: no
@@ -63,22 +63,17 @@ function storefrontReplayOrConflict(res, existing, requestHash) {
 // refused here — before any order, escrow, payment request, inventory, wallet,
 // ledger or provider side effect.
 //
-// The guard uses the same authority as the catalogue response
-// (businessPriceService.resolveEffectiveGhsPrices, exposed as
-// findGhsPricedProductIds) resolved from SERVER data. A client-supplied
-// priceGhs / priceUsdc / currency / rate / amount can never satisfy or defeat
-// it.
-const GHS_CHECKOUT_UNAVAILABLE = Object.freeze({
-    success: false,
-    code: 'GHS_CHECKOUT_UNAVAILABLE',
-    message:
-        'This item is listed with a Ghana Cedi (GHS) price, and GHS checkout is not available yet. '
-        + 'No order was created and nothing was charged. Please contact the business to complete this purchase.',
-});
-
-const refuseGhsPricedItems = async (prisma, productIds) => {
-    const blocked = await priceService.findGhsPricedProductIds(prisma, productIds);
-    return blocked.length > 0 ? blocked : null;
+// The decision (businessPriceService.resolveGhsCheckoutDecision) applies the
+// STRICT resolver semantics: a future-dated or ambiguous current pricing
+// identity fails closed rather than being mistaken for "no GHS price". It is
+// resolved from SERVER data, so a client-supplied priceGhs / priceUsdc /
+// currency / rate / amount can never satisfy or defeat it.
+const refuseGhsPricedItems = async (res, prisma, productIds) => {
+    const decision = await priceService.resolveGhsCheckoutDecision(prisma, productIds);
+    if (!decision.block) return false;
+    const refusal = priceService.ghsCheckoutRefusal(decision.code);
+    res.status(refusal.statusCode).json(refusal.body);
+    return true;
 };
 
 function wrap(handler) {
@@ -604,8 +599,7 @@ router.post('/:businessProfileId/checkout', protect, protectActive, wrap(async (
   }
 
   // WP-1.10 — refuse before the order/escrow transaction opens.
-  const blockedGhs = await refuseGhsPricedItems(prisma, products.map(p => p.id));
-  if (blockedGhs) return res.status(409).json(GHS_CHECKOUT_UNAVAILABLE);
+  if (await refuseGhsPricedItems(res, prisma, products.map(p => p.id))) return;
 
   // Calculate totals and build order items
   let totalAmount = 0;
@@ -840,8 +834,7 @@ router.post('/:businessProfileId/order', protect, protectActive, wrap(async (req
   }
 
   // WP-1.10 — refuse before the order row is created.
-  const blockedGhs = await refuseGhsPricedItems(prisma, [product.id]);
-  if (blockedGhs) return res.status(409).json(GHS_CHECKOUT_UNAVAILABLE);
+  if (await refuseGhsPricedItems(res, prisma, [product.id])) return;
 
   const qty = Math.max(1, parseInt(quantity, 10) || 1);
   const amount = parseFloat(product.priceUsdc) * qty;

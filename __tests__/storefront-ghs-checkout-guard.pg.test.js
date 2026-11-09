@@ -82,6 +82,9 @@ run('WP-1.10 — storefront GHS checkout guard (PostgreSQL)', () => {
 
     async function seedShop({ ghs = true, ghsOverrides = {}, secondProduct = false, escrow = false } = {}) {
         const { biz, owner, product } = await seedBusiness(prisma);
+        // The checkout transaction enforces a stock trigger; fixtures buy stock
+        // so the only variable under test is the pricing guard.
+        await prisma.businessProduct.update({ where: { id: product.id }, data: { stockQty: 50 } });
         if (escrow) {
             // Escrow protection is opt-in per business; without it the ESCROW
             // checkout mode is refused 403 before any pricing is considered.
@@ -109,6 +112,7 @@ run('WP-1.10 — storefront GHS checkout guard (PostgreSQL)', () => {
                 data: {
                     businessProfileId: biz.id, name: 'USDC-only item',
                     priceUsdc: 9.99, slug: `usdc-only-${uniq()}`, isActive: true, isAvailable: true,
+                    stockQty: 50,
                 },
             });
         }
@@ -198,8 +202,8 @@ run('WP-1.10 — storefront GHS checkout guard (PostgreSQL)', () => {
         // v1 eligibility is DEFAULT-scope only (businessPriceService header +
         // eligibleCurrentGhsPriceWhere): neither a matching nor a non-matching
         // branch confers a displayed GHS price, so the guard must not fire.
-        const resolved = await priceService.findGhsPricedProductIds(prisma, [product.id]);
-        expect(resolved).toEqual([]);
+        const branchDecision = await priceService.resolveGhsCheckoutDecision(prisma, [product.id]);
+        expect(branchDecision.block).toBe(false);
 
         const res = await placeOrder(biz.id, customer.id, { productId: product.id, quantity: 1 });
         expect(res.status).not.toBe(409);
@@ -238,7 +242,7 @@ run('WP-1.10 — storefront GHS checkout guard (PostgreSQL)', () => {
                 confirmedByType: 'MIGRATION', confirmedById: String(owner.id),
             });
         });
-        expect(await priceService.findGhsPricedProductIds(prisma, [product.id])).toEqual([]);
+        expect((await priceService.resolveGhsCheckoutDecision(prisma, [product.id])).block).toBe(false);
         expect((await placeOrder(biz.id, customer.id, { productId: product.id })).status).toBe(201);
     });
 
@@ -254,8 +258,16 @@ run('WP-1.10 — storefront GHS checkout guard (PostgreSQL)', () => {
             where: { businessProductId: product.id },
             data: { effectiveFrom: new Date(Date.now() + 24 * 3600_000) },
         });
-        expect(await priceService.findGhsPricedProductIds(prisma, [product.id])).toEqual([]);
-        expect((await placeOrder(biz.id, customer.id, { productId: product.id })).status).toBe(201);
+        // WP-1.10A: a future-dated current identity is NOT "no GHS price" — the
+        // strict semantics fail closed instead of allowing a USDC charge for an
+        // item whose GHS price the platform is deliberately not yet showing.
+        const decision = await priceService.resolveGhsCheckoutDecision(prisma, [product.id]);
+        expect(decision.block).toBe(true);
+        expect(decision.code).toBe('GHS_PRICE_STATE_UNRESOLVED');
+        const res = await placeOrder(biz.id, customer.id, { productId: product.id });
+        expect(res.status).toBe(409);
+        expect(res.body).toMatchObject({ success: false, code: 'GHS_PRICE_STATE_UNRESOLVED' });
+        expect(await prisma.businessOrder.count({ where: { businessProfileId: biz.id } })).toBe(0);
     });
 
     test('6c. an expired (effectiveTo set) row is not eligible', async () => {
@@ -276,7 +288,7 @@ run('WP-1.10 — storefront GHS checkout guard (PostgreSQL)', () => {
             where: { businessProductId: product.id },
             data: { effectiveTo: new Date(Date.now() - 3600_000) },
         });
-        expect(await priceService.findGhsPricedProductIds(prisma, [product.id])).toEqual([]);
+        expect((await priceService.resolveGhsCheckoutDecision(prisma, [product.id])).block).toBe(false);
         expect((await placeOrder(biz.id, customer.id, { productId: product.id })).status).toBe(201);
     });
 
@@ -330,8 +342,9 @@ run('WP-1.10 — storefront GHS checkout guard (PostgreSQL)', () => {
     // ── parity: catalogue and guard share one resolver ─────────────────────
     test('parity. the catalogue priceGhs and the guard agree for every fixture', async () => {
         const { biz, owner, customer, product, other } = await seedShop({ ghs: true, secondProduct: true });
-        const blocked = await priceService.findGhsPricedProductIds(prisma, [product.id, other.id]);
-        expect(blocked).toEqual([product.id]);
+        const decision = await priceService.resolveGhsCheckoutDecision(prisma, [product.id, other.id]);
+        expect(decision).toMatchObject({ block: true, code: 'GHS_CHECKOUT_UNAVAILABLE' });
+        expect(decision.productIds).toEqual([product.id]);
 
         const listed = await priceService.resolveEffectiveGhsPrices(prisma, [product.id, other.id]);
         expect(listed.has(product.id)).toBe(true);
@@ -340,5 +353,187 @@ run('WP-1.10 — storefront GHS checkout guard (PostgreSQL)', () => {
         expect(priceService.pesewasToGhsString(priceService.toPesewas(listed.get(product.id).amountExact)))
             .toBe('120.50');
         void owner; void customer; void biz;
+    });
+
+    // ── WP-1.10A: product-linked business ESCROW ticket path ───────────────
+    // POST /api/tickets with businessProfileId + productId + type ESCROW is an
+    // ALTERNATE purchase path for the same BusinessProduct: it defaults
+    // escrowAmount from product.priceUsdc and creates Ticket + SmartEscrow +
+    // BusinessOrder. It must refuse exactly like checkout.
+    const ticketController = require('../controllers/ticketController');
+
+    const postTicket = (userId, body) => new Promise((resolve, reject) => {
+        const req = {
+            app, params: {}, query: {}, body, headers: {},
+            user: { id: userId }, get: (k) => app.get(k),
+        };
+        const res = mkRes();
+        const originalJson = res.json.bind(res);
+        res.json = (b) => { originalJson(b); resolve({ status: res.statusCode, body: res.body }); return res; };
+        Promise.resolve(ticketController.createTicket(req, res)).catch(reject);
+    });
+
+    const ticketCounts = async (bizId) => ({
+        tickets: await prisma.ticket.count({ where: { businessProfileId: bizId } }),
+        escrows: await prisma.smartEscrow.count({
+            where: { ticket: { businessProfileId: bizId } },
+        }),
+        orders: await prisma.businessOrder.count({ where: { businessProfileId: bizId } }),
+        messages: await prisma.directMessage.count({
+            where: { ticket: { businessProfileId: bizId } },
+        }).catch(() => 0),
+    });
+
+    test('ticket-1. product-linked ESCROW ticket for a GHS-priced item → 409, no Ticket/escrow/order', async () => {
+        const { biz, customer, product } = await seedShop({ ghs: true });
+        const before = await ticketCounts(biz.id);
+
+        const res = await postTicket(customer.id, {
+            businessProfileId: biz.id, productId: product.id, type: 'ESCROW',
+            name: 'Buy item', targetAmount: 50, targetCurrency: 'USDC',
+        });
+
+        expect(res.status).toBe(409);
+        expect(res.body).toMatchObject({ success: false, code: 'GHS_CHECKOUT_UNAVAILABLE' });
+        expect(await ticketCounts(biz.id)).toEqual(before);
+        expect(before).toEqual({ tickets: 0, escrows: 0, orders: 0, messages: 0 });
+    });
+
+    test('ticket-2. an explicit escrowAmount cannot route around the product price', async () => {
+        const { biz, customer, product } = await seedShop({ ghs: true });
+        const res = await postTicket(customer.id, {
+            businessProfileId: biz.id, productId: product.id, type: 'ESCROW',
+            name: 'Buy item', targetAmount: 50, targetCurrency: 'USDC', escrowAmount: 3,
+        });
+        expect(res.status).toBe(409);
+        expect(await prisma.ticket.count({ where: { businessProfileId: biz.id } })).toBe(0);
+    });
+
+    test('ticket-3. a non-ESCROW business ticket about the same product is NOT blocked', async () => {
+        const { biz, customer, product } = await seedShop({ ghs: true });
+        const res = await postTicket(customer.id, {
+            businessProfileId: biz.id, productId: product.id, type: 'BUY',
+            name: 'Question about item', targetAmount: 1, targetCurrency: 'USDC',
+        });
+        // No financial record is created for a non-ESCROW ticket, so GHS
+        // containment does not apply and unrelated ticket behaviour is intact.
+        expect(res.status).not.toBe(409);
+        expect(await prisma.ticket.count({ where: { businessProfileId: biz.id } })).toBe(1);
+        expect(await prisma.smartEscrow.count({ where: { ticket: { businessProfileId: biz.id } } })).toBe(0);
+    });
+
+    test('ticket-4. product-linked ESCROW ticket for a USDC-only item still works', async () => {
+        const { biz, customer, product } = await seedShop({ ghs: false });
+        const res = await postTicket(customer.id, {
+            businessProfileId: biz.id, productId: product.id, type: 'ESCROW',
+            name: 'Buy item', targetAmount: 50, targetCurrency: 'USDC',
+        });
+        expect(res.status).not.toBe(409);
+        expect(await prisma.ticket.count({ where: { businessProfileId: biz.id } })).toBe(1);
+    });
+
+    // ── WP-1.10A: idempotent replay must survive a later price change ──────
+    test('replay-1. /order: a pre-price order replays on the same key, a new key refuses', async () => {
+        const { biz, customer, product } = await seedShop({ ghs: false });
+        const payload = { productId: product.id, quantity: 1, idempotencyKey: 'replay-key-1' };
+
+        const first = await placeOrder(biz.id, customer.id, payload);
+        expect(first.status).toBe(201);
+        const originalId = first.body.data?.order?.id || first.body.data?.id || first.body.order?.id;
+        expect(originalId).toBeTruthy();
+
+        // The price becomes GHS-denominated AFTER the order exists.
+        await prisma.$transaction(async (tx) => {
+            await priceService.setPrice(tx, {
+                businessProductId: product.id, amountGhs: '120.50',
+                confirmedByType: 'BUSINESS', confirmedById: '1',
+            });
+        });
+
+        const replay = await placeOrder(biz.id, customer.id, payload);
+        expect(replay.status).toBe(200);
+        expect(replay.body.data?.idempotent).toBe(true);
+
+        const fresh = await placeOrder(biz.id, customer.id, {
+            productId: product.id, quantity: 1, idempotencyKey: 'replay-key-2',
+        });
+        expect(fresh.status).toBe(409);
+        expect(fresh.body.code).toBe('GHS_CHECKOUT_UNAVAILABLE');
+
+        expect(await prisma.businessOrder.count({ where: { businessProfileId: biz.id } })).toBe(1);
+        expect(await prisma.smartEscrow.count({ where: { payerId: customer.id } })).toBe(0);
+    });
+
+    test('replay-2. /checkout: a pre-price order replays on the same key, a new key refuses', async () => {
+        const { biz, customer, product } = await seedShop({ ghs: false, escrow: true });
+        const payload = {
+            items: [{ productId: product.id, quantity: 1 }],
+            paymentMode: 'ESCROW', idempotencyKey: 'replay-checkout-1',
+        };
+
+        const first = await placeCheckout(biz.id, customer.id, payload);
+        expect(first.status).toBe(201);
+        const escrowsAfterFirst = await prisma.smartEscrow.count({ where: { payerId: customer.id } });
+        expect(escrowsAfterFirst).toBe(1);
+
+        await prisma.$transaction(async (tx) => {
+            await priceService.setPrice(tx, {
+                businessProductId: product.id, amountGhs: '120.50',
+                confirmedByType: 'BUSINESS', confirmedById: '1',
+            });
+        });
+
+        const replay = await placeCheckout(biz.id, customer.id, payload);
+        expect(replay.status).toBe(200);
+        expect(replay.body.data?.idempotent).toBe(true);
+
+        const fresh = await placeCheckout(biz.id, customer.id, {
+            items: [{ productId: product.id, quantity: 1 }],
+            paymentMode: 'ESCROW', idempotencyKey: 'replay-checkout-2',
+        });
+        expect(fresh.status).toBe(409);
+
+        expect(await prisma.businessOrder.count({ where: { businessProfileId: biz.id } })).toBe(1);
+        expect(await prisma.smartEscrow.count({ where: { payerId: customer.id } })).toBe(1);
+    });
+
+    // ── WP-1.10A: ambiguous current identity fails closed ─────────────────
+    test('ambiguity-1. the database itself refuses two current DEFAULT rows', async () => {
+        const { biz, product } = await seedShop({ ghs: true });
+        void biz;
+        await expect(prisma.businessPrice.create({
+            data: {
+                businessProductId: product.id, currency: 'GHS', amountExact: '10.00',
+                scope: 'DEFAULT', locationId: null, status: 'ACTIVE',
+                confirmedByType: 'BUSINESS', confirmedById: '1', confirmedAt: new Date(),
+                effectiveFrom: new Date(),
+            },
+        })).rejects.toThrow(/unique|constraint/i);
+    });
+
+    test('ambiguity-2. classification fails closed when a corrupt row set is presented', async () => {
+        // The partial unique index makes this state unreachable through the
+        // database (proved above), so the classifier is exercised directly with
+        // a two-row client double. This is a unit-level proof of the VERDICT,
+        // not a claim about persistence.
+        const { product } = await seedShop({ ghs: false });
+        const now = new Date();
+        const corruptClient = {
+            businessPrice: {
+                findMany: async () => ([
+                    { businessProductId: product.id, effectiveFrom: now, confirmedAt: now, confirmedByType: 'BUSINESS' },
+                    { businessProductId: product.id, effectiveFrom: now, confirmedAt: now, confirmedByType: 'ADMIN' },
+                ]),
+            },
+        };
+        const decision = await priceService.resolveGhsCheckoutDecision(corruptClient, [product.id]);
+        expect(decision.block).toBe(true);
+        expect(decision.code).toBe('GHS_PRICE_STATE_UNRESOLVED');
+    });
+
+    test('ambiguity-3. a missing pricing surface fails closed rather than assuming no price', async () => {
+        const decision = await priceService.resolveGhsCheckoutDecision({}, [123]);
+        expect(decision.block).toBe(true);
+        expect(decision.code).toBe('GHS_PRICE_STATE_UNRESOLVED');
     });
 });

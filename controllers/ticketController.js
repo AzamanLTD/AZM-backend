@@ -33,6 +33,7 @@ const logger = require('../src/config/logger');
 const escrowService = require('../services/escrowService');
 const businessOrderService = require('../services/businessOrderService');
 const bizNotificationService = require('../services/bizNotificationService');
+const priceService = require('../services/businessPriceService');
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -172,6 +173,24 @@ exports.createTicket = async (req, res) => {
             if (!product.isActive) {
                 return res.status(409).json({ success: false, message: 'This product is no longer available.' });
             }
+
+            // WP-1.10A — this is an ALTERNATE customer purchase path for the
+            // same BusinessProduct the storefront lists, and it is just as
+            // capable of charging USDC for an item presented with a GHS price:
+            // when type === 'ESCROW' it creates a Ticket, a SmartEscrow and a
+            // BusinessOrder, and defaults escrowAmount from product.priceUsdc.
+            // The same containment therefore applies, before prisma.ticket.create
+            // and before any escrow/order/notification side effect. Non-ESCROW
+            // business tickets (an enquiry about a product) create no financial
+            // record and are deliberately NOT blocked.
+            if (type === 'ESCROW') {
+                const ghsDecision = await priceService.resolveGhsCheckoutDecision(prisma, [product.id]);
+                if (ghsDecision.block) {
+                    const refusal = priceService.ghsCheckoutRefusal(ghsDecision.code);
+                    return res.status(refusal.statusCode).json(refusal.body);
+                }
+            }
+
             if (!escrowAmount) {
                 escrowAmount = Number(product.priceUsdc);
             }
