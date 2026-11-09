@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * NATIVE-GHS WITHDRAWAL LEG (issue #389, Agent A).
+ * NATIVE-GHS WITHDRAWAL LEG (issue #389, withdrawal workstream).
  * =============================================================================
  * The customer's GHS never round-trips through USDC. A GHS-only payout debits
  * `user.nativeGhsBalance` (exact pesewas) against the SAME provider float the
@@ -688,7 +688,7 @@ async function parkUncertainDispatch(prisma, { reference, outcome, error, rail =
 
 // ── BANK dispatch observation decision (issue #389 P0-1) ────────────────────
 // A resolved promise from initiateBankTransfer is NOT a provider acceptance.
-// Agent B returns status:'UNRESOLVED' for timeouts, duplicate references and
+// The adapter workstream returns status:'UNRESOLVED' for timeouts, duplicate references and
 // every malformed/inconclusive answer; it returns PENDING/SUCCESSFUL/FAILED
 // only when the provider answered something it could parse. The decision below
 // is therefore about the OBSERVATION, not about whether the HTTP call returned.
@@ -956,7 +956,7 @@ async function recordBankDispatchPark(prisma, {
 }
 
 /**
- * BANK payout dispatch through the INJECTED provider port (Agent B owns the
+ * BANK payout dispatch through the INJECTED provider port (the adapter workstream owns the
  * adapter; this module owns the state machine). Same single-winner claim,
  * same reversal authority, same evidence — only the provider call differs.
  */
@@ -1440,7 +1440,7 @@ async function dispatchNaturalGhsBankWithdrawal(prisma, {
 
   let outbound;
   try {
-    // EXACT provider contract (Agent B, services/moolreBankPayoutService.js).
+    // EXACT provider contract (adapter workstream, services/moolreBankPayoutService.js).
     // The GHS amount is passed as the exact 2dp pesewa string — never a JS
     // float — and the external reference is the ORIGINAL Azaman reference so
     // the provider's idempotency key matches the one we can reconcile against.

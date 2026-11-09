@@ -4,7 +4,7 @@
 // Real PostgreSQL.
 //
 // PROVES:
-//   A. status:'UNRESOLVED' (Agent B's answer for timeouts, duplicate refs and
+//   A. status:'UNRESOLVED' (the adapter workstream's answer for timeouts, duplicate refs and
 //      malformed responses) is NOT an accepted dispatch: no acceptedAt stamp,
 //      no P5-D IN_TRANSIT movement, funds stay reserved, durable operator
 //      evidence on the ORIGINAL reference.

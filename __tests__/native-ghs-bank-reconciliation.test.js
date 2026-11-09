@@ -4,7 +4,7 @@
 // Real PostgreSQL.
 //
 // PROVES the existing WithdrawalReconciliationWorker routes a BANK payout to
-// Agent B's getBankTransferStatus() and never to the MoMo status service, that
+// the adapter workstream's getBankTransferStatus() and never to the MoMo status service, that
 // the adapter's `amountGhsExact` is adapted into the evidence binder's amount
 // field, and that UNRESOLVED / NOT_FOUND / contradictory answers are HELD:
 //   A. SUCCESSFUL + exact amount   -> settled once (canonical COMPLETED).

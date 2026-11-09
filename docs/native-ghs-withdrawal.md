@@ -1,4 +1,4 @@
-# Native-GHS withdrawal leg and BANK payouts (issue #389, Agent A)
+# Native-GHS withdrawal leg and BANK payouts (issue #389, withdrawal workstream)
 
 Status: implemented behind `GlobalSettings.nativeGhsWithdrawalEnabled` (default **OFF**).
 Nothing here activates until the owner rules; no merge/deploy/production action is taken by this branch.
@@ -73,7 +73,7 @@ or price a conversion.
 
 `POST /api/withdraw/bank` takes an explicit typed **BANK** destination (`beneficiaryId`) — the
 rail is never inferred. The provider call is delegated to the injected `moolreBankPayoutPort`
-(Agent B's adapter, owned elsewhere and not edited here). When that port is not bound the route
+(the adapter workstream's adapter, owned elsewhere and not edited here). When that port is not bound the route
 refuses `503 BANK_PAYOUT_CAPABILITY_UNAVAILABLE` with **zero mutation**. Everything else —
 operation identity, 2FA, funding/quote, reservation, state machine, reversal, reconciliation —
 is the same authority as the MoMo leg; it is not a second withdrawal engine.

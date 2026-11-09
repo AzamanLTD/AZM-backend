@@ -198,7 +198,7 @@ maybe('saved bank beneficiaries + BANK payout (real PostgreSQL)', () => {
             await new Promise((r) => setTimeout(r, 25));
         }
         expect(port.initiateBankTransfer).toHaveBeenCalledTimes(1);
-        // EXACT Agent B contract (services/moolreBankPayoutService.js):
+        // EXACT adapter contract (services/moolreBankPayoutService.js):
         // { referenceId, amountGhsExact, recipientAccountNumber, bankCode,
         //   payerMessage, payeeNote } — the fake must not invent a different one.
         const call = port.initiateBankTransfer.mock.calls[0][0];

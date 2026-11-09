@@ -104,7 +104,7 @@ narrower than the obvious 0/1/2 table. Only `1` → `SUCCESSFUL` is published
 and mapped; every other value, including `0` and `2`, is `UNRESOLVED`. A missing
 status is never reported as pending.
 
-The outer envelope `status` is **not** proof of settlement. Agent A's
+The outer envelope `status` is **not** proof of settlement. the withdrawal workstream's
 reconciliation authority decides terminality.
 
 ### 3.1 Why `0` and `2` are NOT mapped to PENDING and FAILED
@@ -142,7 +142,7 @@ only as decimal **strings** matching `^(0|[1-9][0-9]*)(\.[0-9]{1,2})?$`, with
 surrounding transport whitespace trimmed. A JSON number is rejected: it has
 already passed through binary floating point before the adapter sees it, so
 accepting one would launder a possibly-corrupted value into `amountGhsExact`,
-which Agent A uses as independent settlement evidence. Rejected evidence becomes
+which the withdrawal workstream uses as independent settlement evidence. Rejected evidence becomes
 `null`, never the caller's requested amount, and the three fees are reported
 separately and never summed.
 

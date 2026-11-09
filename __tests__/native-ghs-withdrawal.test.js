@@ -1,6 +1,6 @@
 // __tests__/native-ghs-withdrawal.test.js
 // =============================================================================
-// Native-GHS withdrawal leg — issue #389 (Agent A). Real-PostgreSQL proof.
+// Native-GHS withdrawal leg — issue #389 (withdrawal workstream). Real-PostgreSQL proof.
 //
 // PROVES:
 //   A. Flag OFF (default) — the route refuses 503 with ZERO mutation.

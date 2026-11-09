@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * GHS FUNDING PLANNER (issue #389, Agent A) — explicit, previewable, and
+ * GHS FUNDING PLANNER (issue #389, withdrawal workstream) — explicit, previewable, and
  * quote-bound. NO money mutation happens here: a preview plans; only an
  * explicit user consent + a fresh, unexpired, owner-scoped, one-time quote
  * is CONSUMED inside the withdrawal transaction by

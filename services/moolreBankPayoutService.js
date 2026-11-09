@@ -5,7 +5,7 @@
 // PROVIDER BOUNDARY ONLY. This module owns Moolre's bank API: the bank
 // directory, account-name validation, transfer initiation and transfer status.
 // It owns no balances, no beneficiaries, no ledger, no routes and no
-// reconciliation. Agent A's financial authority decides what money means; this
+// reconciliation. the withdrawal workstream's financial authority decides what money means; this
 // adapter only reports, as exactly as the provider allows, what Moolre received
 // and what Moolre said.
 //
@@ -672,7 +672,7 @@ class MoolreBankPayoutService {
     /**
      * Initiate one bank payout.
      *
-     * CALL-SHAPE CONTRACT (agreed with Agent A on PR #392):
+     * CALL-SHAPE CONTRACT (agreed with the withdrawal workstream on PR #392):
      *   canonical: { referenceId, amountGhsExact, recipientAccountNumber,
      *                bankCode, payerMessage?, payeeNote? }
      *   accepted aliases from the settled consumer call site:

@@ -243,7 +243,7 @@ jobs:
         run: npx prisma generate
 
       - name: 'Guard: the pinned #391 adapter commit must be fetchable'
-        # §392 — the adapter-contract proof reads Agent B's published service
+        # §392 — the adapter-contract proof reads the adapter workstream's published service
         # straight out of git at an exact commit. A shallow clone may not hold
         # that object, and a money-path contract proof that silently skips is
         # worse than one that fails, so this lane fetches the exact commit and

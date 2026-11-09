@@ -2,7 +2,7 @@
 // =============================================================================
 // #392 workstream 3 — CONTRACT COMPATIBILITY WITH #391's REAL ADAPTER.
 //
-// This suite does not re-declare the adapter. It reads Agent B's published
+// This suite does not re-declare the adapter. It reads the adapter workstream's published
 // service straight out of git at the agreed commit, loads it, and drives it
 // through THIS branch's pre-dispatch capability check and validation mapping.
 // A fake port in the other suites can only prove what I believed the contract

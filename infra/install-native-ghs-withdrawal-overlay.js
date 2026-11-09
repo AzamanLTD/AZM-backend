@@ -3,7 +3,7 @@
 // infra/install-native-ghs-withdrawal-overlay.js — native-GHS withdrawal leg.
 //
 // Idempotent structural overlay for the native-GHS WITHDRAWAL authority
-// (issue #389, Agent A). Mirrors the established overlay family: safe on an
+// (issue #389, withdrawal workstream). Mirrors the established overlay family: safe on an
 // empty database, safe on a populated production database, safe to re-run any
 // number of times, and it NEVER rewrites existing rows.
 //

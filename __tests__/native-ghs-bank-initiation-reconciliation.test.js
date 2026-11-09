@@ -9,7 +9,7 @@
 // SAME payout identity, so this suite drives one payout through both:
 //
 //   1. processNativeGhsWithdrawal  -> quote, debit, reservation
-//   2. dispatchNaturalGhsBankWithdrawal with Agent B's REAL MoolreBankPayoutService
+//   2. dispatchNaturalGhsBankWithdrawal with the adapter workstream's REAL MoolreBankPayoutService
 //      (loaded from git @ the agreed commit) whose transfer POST answers
 //      txstatus '1' -> the provider's SUCCESSFUL observation
 //   3. WithdrawalReconciliationWorker._reconcileOne observing SUCCESSFUL

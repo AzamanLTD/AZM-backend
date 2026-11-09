@@ -1,7 +1,7 @@
 # The GHS asset behind a USDC-funded shortfall conversion
 
 **Scope:** `feature/native-ghs-withdrawal-leg` @ PR #392. Source-based accounting
-investigation for issue #389 / Agent C's concern. **No ledger posting, counter,
+investigation for issue #389 / the settlement review's concern. **No ledger posting, counter,
 account or policy was changed by this report.** It records what the code
 currently asserts and the decisions only the owner can make.
 

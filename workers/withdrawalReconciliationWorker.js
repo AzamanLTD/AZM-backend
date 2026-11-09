@@ -41,7 +41,7 @@ class WithdrawalReconciliationWorker {
         this.mtn = mtnDisbursementService;
         this.email = emailService || null;
         this.sms = smsService || null;
-        // §P0-2: the BANK payout adapter (Agent B owns the provider contract;
+        // §P0-2: the BANK payout adapter (the adapter workstream owns the provider contract;
         // this worker owns reconciliation). Optional: the bank rail stays
         // dependency-injected and default-off, so an unbound port simply
         // parks BANK rows instead of polling them on the wrong rail.

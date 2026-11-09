@@ -1794,7 +1794,7 @@ exports.getWithdrawalStatus = async (req, res) => {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// NATIVE-GHS PAYOUT SURFACE (issue #389, Agent A)
+// NATIVE-GHS PAYOUT SURFACE (issue #389, withdrawal workstream)
 //
 // GHS is denominated, debited, reserved and dispatched in GHS. No rate is
 // consulted anywhere in a GHS-only payout; the ONLY rate in this flow belongs
@@ -2219,7 +2219,7 @@ exports.ghsWithdrawal = async (req, res) => {
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
-// BANK PAYOUT SURFACE (issue #389 section 4, Agent A)
+// BANK PAYOUT SURFACE (issue #389 section 4, withdrawal workstream)
 //
 // Explicitly typed BANK destination — never inferred. The provider call is
 // §P0 BANK CAPABILITY BEFORE ECONOMICS. "The method exists" is not "the rail can
@@ -2249,7 +2249,7 @@ function bankPayoutIsAvailable(port) {
     }
 }
 
-// delegated to the INJECTED `moolreBankPayoutPort` (Agent B's adapter, not
+// delegated to the INJECTED `moolreBankPayoutPort` (the adapter workstream's adapter, not
 // edited here); when that capability is not bound the route refuses 503 with
 // ZERO mutation instead of guessing a rail. Economics, operation identity,
 // reservation, state machine, reversal and reconciliation are the SAME

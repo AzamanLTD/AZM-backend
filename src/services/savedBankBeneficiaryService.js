@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * SAVED BANK PAYOUT BENEFICIARIES (issue #389 section 4, Agent A)
+ * SAVED BANK PAYOUT BENEFICIARIES (issue #389 section 4, withdrawal workstream)
  * =============================================================================
  * A bank destination is a SECRET, not a display string. The account number is
  * persisted only as a versioned AES-256-GCM envelope (the repo's established
@@ -69,7 +69,7 @@ function normalizeAccountNumber(value) {
 }
 
 /**
- * Ask the provider (Agent B's adapter, injected as `port`) what account this
+ * Ask the provider (the adapter workstream's adapter, injected as `port`) what account this
  * number is. The provider's answer is the ONLY thing that can make a
  * beneficiary verified; a stale directory, an outage, an AVD02 and an
  * inconclusive answer are all distinct, and none of them counts as verified.

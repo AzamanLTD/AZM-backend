@@ -3,7 +3,7 @@
 // Provider-backed saved bank beneficiary validation (issue #389 P0-3).
 // Real PostgreSQL.
 //
-// The provider (Agent B's adapter, injected as the port) is the ONLY authority
+// The provider (the adapter workstream's adapter, injected as the port) is the ONLY authority
 // that can make a beneficiary verified. PROVES:
 //   A. A successful validation stores the PROVIDER's account name and the
 //      provider's bank name/timestamp, and marks the row verified.
@@ -79,7 +79,7 @@ maybe('provider-backed bank beneficiary validation (real PostgreSQL)', () => {
         return app;
     }
 
-    /** A faithful stand-in for Agent B's adapter's validation surface. */
+    /** A faithful stand-in for the adapter workstream's adapter's validation surface. */
     function providerPort({
         banks = [{ code: 'GCB', name: 'GCB BANK LIMITED' }],
         stale = false,
