@@ -329,8 +329,19 @@ flags, both default **false**, and neither is enabled by this contract.
 
 Explicitly **not** decided, implemented or implied here:
 
-- **The authority-latch redesign.** No table, trigger or migration is added
-  for it; the design is unapproved and the current behaviour stays fail-closed.
+- **The authority-latch redesign beyond its current state.** Three distinct
+  claims, and this contract makes only the first two of the first sentence:
+  it IS **implemented** (nullable `FiatLiquidityState.authorityActivatedAt`,
+  migration `20261107000000_p5d_authority_latch`, the same column added
+  idempotently by `infra/install-fiat-liquidity-overlay.js`, plus fail-closed
+  readers, an activation preflight and a transactional projection update); it
+  is **not database-enforced** (the migration adds a nullable column and
+  nothing else — no trigger, no CHECK, no owner or grant separation — so the
+  application's own role, which owns the table, can clear or drop it); and it
+  is **not operationally activated** (no production flag, latch or migration
+  has been applied by this contract). Do not read "the latch exists" as
+  "the latch cannot be tampered with", and do not read "not enforced" as "not
+  implemented".
 - **Business export streaming.** The export route's row and size ceiling is a
   streaming-design task. No row cap and no silent truncation is added by this
   contract.
