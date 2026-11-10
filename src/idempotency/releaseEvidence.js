@@ -248,7 +248,7 @@ const RELEASE_EVIDENCE = [
             'controllers/withdrawalController.js',
             'commitOperationClaimInTransaction: async (tx, claimFacts) =>',
             "const committed = await tx.financialOperation.updateMany({ where: { id: operation.id, status: 'IN_PROGRESS' },",
-            { file: '__tests__/native-ghs-bank-quote.test.js', name: 'A: BANK quote -> consent -> payout, exact 8dp debit, quote consumed once' },
+            { file: '__tests__/native-ghs-bank-quote.test.js', name: 'A: a BANK shortfall quote is non-executable and never reaches the payout port' },
         ),
     },
 
@@ -258,7 +258,7 @@ const RELEASE_EVIDENCE = [
         key: 'POST /ghs/quote',
         policy: 'RELEASE_5XX',
         kind: CONVERGENT,
-        test: { file: '__tests__/native-ghs-quote-intent-binding.test.js', name: 'A: a quote for payee A cannot fund payee B, and is not burned by the attempt' },
+        test: { file: '__tests__/native-ghs-quote-intent-binding.test.js', name: 'A: no quote can fund payee A or payee B — the backing refusal precedes intent binding' },
         note: 'Quoting posts no ledger entry and moves no balance (asserted in the cited test via ledgerTransaction.count()). A released claim can only mint another unconsumed quote; a quote is spendable only through the wired POST /ghs under its own claim and intent binding.',
     },
     {
@@ -266,7 +266,7 @@ const RELEASE_EVIDENCE = [
         key: 'POST /bank/quote',
         policy: 'RELEASE_5XX',
         kind: CONVERGENT,
-        test: { file: '__tests__/native-ghs-bank-quote.test.js', name: 'B2: a changed amount cannot spend the quote' },
+        test: { file: '__tests__/native-ghs-bank-quote.test.js', name: 'B2: a changed amount cannot spend a quote' },
         note: 'Same quote authority as the MoMo quote (ghsFundingPlanner.quoteGhsShortfall): no money moves at quote time, and the quote is consumed only by the wired POST /bank under its own claim, bound to amount, payee and bank code.',
     },
 

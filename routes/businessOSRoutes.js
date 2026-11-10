@@ -3395,20 +3395,29 @@ router.post('/pos/cash-sale', requirePermission('orders.manage'), wrap(async (re
     const bpId = await getBusinessProfileId(req);
     const { items, idempotencyKey, cashReceived, tipAmount, source, locationId, tableId, customerId } = req.body;
 
-    const { PosOrderService } = require('../services/businessOS/posOrderService');
-    const result = await new PosOrderService(prisma).createOrder({
-        businessProfileId: bpId,
-        actorId: req.user.id,
-        items,
-        paymentMethod: 'CASH',
-        cashGiven: cashReceived,
-        idempotencyKey,
-        tipAmount,
-        source: source || 'POS_CASH_SALE',
-        locationId,
-        tableId,
-        customerId,
-    });
+    const { PosOrderService, applyPosErrorResponse, isPosOrderError } = require('../services/businessOS/posOrderService');
+    let result;
+    try {
+        result = await new PosOrderService(prisma).createOrder({
+            businessProfileId: bpId,
+            actorId: req.user.id,
+            items,
+            paymentMethod: 'CASH',
+            cashGiven: cashReceived,
+            idempotencyKey,
+            tipAmount,
+            source: source || 'POS_CASH_SALE',
+            locationId,
+            tableId,
+            customerId,
+        });
+    } catch (err) {
+        // WP-POS-C0 — this legacy alias delegates to the same settlement
+        // authority, so it must answer with the same typed contract instead of
+        // flattening the refusal into the generic 400 below.
+        if (isPosOrderError(err)) return applyPosErrorResponse(res, err);
+        throw err;
+    }
 
     const payload = {
         success: true,
