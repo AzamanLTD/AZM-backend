@@ -1,4 +1,5 @@
 const logger = require('../src/config/logger');
+const { requireKyc } = require('../middleware/requireKyc');
 const express = require('express');
 const router = express.Router();
 const withdrawalController = require('../controllers/withdrawalController');
@@ -36,7 +37,7 @@ const protect = authMiddleware.protect;
 // idempotency claim and before any controller money movement. A saved/demo
 // fallback rate is display-only and never opens this gate.
 router.post('/fiat',
-    protect, require2FA(),
+    protect, requireKyc('withdraw'), require2FA(),
     requireFreshFxRate(),
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
     validate(fiatWithdrawalSchema),
@@ -57,7 +58,7 @@ router.post('/ghs/quote',
     withdrawalController.ghsFundingPlan);
 
 router.post('/ghs',
-    protect, require2FA(),
+    protect, requireKyc('withdraw'), require2FA(),
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
     validate(ghsWithdrawalSchema),
     withdrawalController.ghsWithdrawal);
@@ -67,7 +68,7 @@ router.post('/ghs',
 // the balance being spent against cannot be honestly valued on a stale
 // oracle, even when the payout destination itself is on-chain USDC.
 router.post('/crypto',
-    protect, require2FA(),
+    protect, requireKyc('withdraw'), require2FA(),
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
     validate(cryptoWithdrawalSchema),
     withdrawalController.cryptoWithdrawal);
@@ -88,7 +89,7 @@ router.post('/bank/quote',
 // GHS-only payout is not an FX transaction). The provider is the injected
 // bank port; when unbound the handler refuses 503 before any mutation.
 router.post('/bank',
-    protect, require2FA(),
+    protect, requireKyc('withdraw'), require2FA(),
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
     validate(bankWithdrawalSchema),
     withdrawalController.bankWithdrawal);

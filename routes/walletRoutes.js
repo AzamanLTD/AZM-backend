@@ -6,6 +6,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const { requireKyc } = require('../middleware/requireKyc');
 const { Prisma } = require('@prisma/client');
 const ledger = require('../services/ledgerService');
 const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
@@ -129,7 +130,7 @@ const { requireFreshFxRate } = require('../middleware/fxTransactionGateMiddlewar
 // dispatches and are NOT FX-gated. A saved/demo fallback rate never opens
 // the gate. Classification is shared — see the module comment above.
 router.post('/withdraw',
-    protectActive, require2FA(),
+    protectActive, requireKyc('withdraw'), require2FA(),
     requireFreshFxRate({ when: 'MOMO_PAYOUT_DESTINATION' }),
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
     walletController.requestWithdrawal);
@@ -150,7 +151,7 @@ router.get('/saved',           protect,       walletController.getSavedWallets);
 router.delete('/saved/:id',    protectActive, walletController.deleteSavedWallet);
 
 // Fiat deposit gateway (initialize)
-router.post('/deposit/initialize', protectActive, idempotency(), walletController.initializeFiatDeposit);
+router.post('/deposit/initialize', protectActive, requireKyc('deposit'), idempotency(), walletController.initializeFiatDeposit);
 
 // Polygon deposit address (Phase C: Tatum HD wallet derivation)
 router.get('/deposit-address/polygon', protect, walletController.getPolygonDepositAddress);
@@ -224,7 +225,7 @@ router.get('/pool-withdrawal-preview', protect, async (req, res) => {
 // at or above that magnitude is refused with USDC_AMOUNT_STRING_REQUIRED
 // rather than silently rounded, because JSON.parse may already have destroyed
 // the last digit. Over-precision (>8dp) is USDC_AMOUNT_PRECISION.
-router.post('/internal-transfer', protectActive, require2FA(),
+router.post('/internal-transfer', protectActive, requireKyc('p2p'), require2FA(),
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), async (req, res) => {
     const prisma = req.app.get('prisma');
     const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
