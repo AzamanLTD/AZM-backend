@@ -25,6 +25,31 @@ const priceService = require('../services/businessPriceService');
 const url = process.env.TEST_DATABASE_URL;
 const run = url ? describe : describe.skip;
 
+// CI fail-closed (WP-1.10I-P1): a missing TEST_DATABASE_URL in CI is a
+// CONFIGURATION FAILURE, never a licence to report green. Without this, an
+// unconfigured CI job would run zero proofs and still pass, because
+// `describe.skip` is indistinguishable from success in the job summary.
+// Locally the intentional skip is preserved: a developer with no disposable
+// database is not failing a build.
+//
+// This suite deliberately does NOT use __tests__/helpers/testDatabaseGuard.js.
+// That guard proves database identity through GitHub Actions container
+// introspection and OIDC-scoped wiring; adopting it would rebuild this suite's
+// connection and CI identity model, and this suite runs no table-wide
+// maintenance statements (the case the guard exists for). The gap is reported
+// for review rather than improvised here.
+const IS_CI = Boolean(process.env.CI || process.env.GITHUB_ACTIONS);
+
+if (!url && IS_CI) {
+    test('WP-1.10 CI configuration: TEST_DATABASE_URL must be set', () => {
+        throw new Error(
+            'TEST_DATABASE_URL is not set in CI. The GHS checkout containment '
+            + 'proofs (22 tests) cannot run, and a skipped suite must not be '
+            + 'reported as a passing build.',
+        );
+    });
+}
+
 run('WP-1.10 — storefront GHS checkout guard (PostgreSQL)', () => {
     let prisma;
     let legacyRouter, integrityRouter;
