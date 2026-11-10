@@ -39,6 +39,8 @@ const TOTP_MAX_ATTEMPTS = Number(process.env.APP_UNLOCK_TOTP_MAX_ATTEMPTS || 5);
 const TOTP_WINDOW_MS = Number(process.env.APP_UNLOCK_TOTP_WINDOW_MS || 15 * 60 * 1000);
 const PIN_WINDOW_MS = Number(process.env.APP_UNLOCK_PIN_WINDOW_MS || 15 * 60 * 1000);
 const TOTP_WINDOW_SECONDS = Number(process.env.APP_UNLOCK_TOTP_REPLAY_TTL || 90);
+// RFC 6238 default step used by speakeasy; the replay claim is keyed by this.
+const TOTP_STEP_SECONDS = 30;
 
 const PIN_ATTEMPT_LUA = `
 local n = redis.call('INCR', KEYS[1])
@@ -47,6 +49,25 @@ return n
 `;
 
 const PIN_RESET_LUA = `return redis.call('DEL', KEYS[1])`;
+
+/**
+ * WP-D: the security-state authority is unavailable.
+ *
+ * This is NOT a credential failure. It means the shared store that owns attempt
+ * budgets and replay claims cannot be reached, so the service cannot know how
+ * many attempts this account has already spent. Guessing (a fresh window, a
+ * per-process counter, or "the store is down so let it through") is exactly the
+ * failure this code exists to prevent, so the answer is a typed refusal.
+ */
+const STATE_UNAVAILABLE_CODE = 'APP_UNLOCK_STATE_UNAVAILABLE';
+
+class AppUnlockStateUnavailableError extends Error {
+    constructor(message) {
+        super(message || 'Security state unavailable');
+        this.name = 'AppUnlockStateUnavailableError';
+        this.code = STATE_UNAVAILABLE_CODE;
+    }
+}
 
 /** Attempt counter: Redis when present, synchronous Map otherwise (dev/test). */
 const _memoryCounters = new Map();
@@ -61,13 +82,48 @@ class AppUnlockService {
         this.prisma = prisma;
         this.smsService = smsService;
         this._redis = smsService && smsService._redisClient ? smsService._redisClient : null;
+        // Same rule the SMS OTP store applies: process memory is a development
+        // convenience, never a production attempt authority.
+        this.isProduction = process.env.NODE_ENV === 'production'
+            || Boolean(smsService && smsService.isProduction);
+    }
+
+    /**
+     * The attempt budget MUST come from one shared, atomic store.
+     *
+     * - Redis present  -> the atomic INCR+PEXPIRE script is the authority.
+     * - Not in prod    -> the synchronous Map is acceptable (single process).
+     * - In prod        -> refuse: two instances would otherwise hand the same
+     *                     account two independent budgets, and a restart would
+     *                     clear a lockout.
+     */
+    _assertAuthoritativeStore() {
+        if (this._redis) return;
+        if (this.isProduction) {
+            throw new AppUnlockStateUnavailableError(
+                'Authoritative security state unavailable: no shared attempt store is configured.'
+            );
+        }
+    }
+
+    /** Run one Redis command, converting a driver failure into a typed refusal. */
+    async _redisCall(fn) {
+        try {
+            return await fn();
+        } catch (err) {
+            logger.error({ err: err && err.message }, '[appUnlock] security state command failed');
+            throw new AppUnlockStateUnavailableError();
+        }
     }
 
     // ---------------------------------------------------------------- budgets
     async _bumpAttempts(userId) {
         const key = `appunlock:pin:attempts:${userId}`;
+        this._assertAuthoritativeStore();
         if (this._redis) {
-            const n = await this._redis.eval(PIN_ATTEMPT_LUA, 1, key, String(PIN_WINDOW_MS));
+            const n = await this._redisCall(
+                () => this._redis.eval(PIN_ATTEMPT_LUA, 1, key, String(PIN_WINDOW_MS))
+            );
             return Number(n);
         }
         const now = Date.now();
@@ -83,8 +139,9 @@ class AppUnlockService {
 
     async _clearAttempts(userId) {
         const key = `appunlock:pin:attempts:${userId}`;
+        this._assertAuthoritativeStore();
         if (this._redis) {
-            await this._redis.eval(PIN_RESET_LUA, 1, key);
+            await this._redisCall(() => this._redis.eval(PIN_RESET_LUA, 1, key));
         } else {
             _memoryCounters.delete(key);
         }
@@ -92,8 +149,9 @@ class AppUnlockService {
 
     async _attemptsLeft(userId) {
         const key = `appunlock:pin:attempts:${userId}`;
+        this._assertAuthoritativeStore();
         if (this._redis) {
-            const raw = await this._redis.get(key);
+            const raw = await this._redisCall(() => this._redis.get(key));
             return Math.max(0, PIN_MAX_ATTEMPTS - Number(raw || 0));
         }
         const rec = _memoryCounters.get(key);
@@ -135,6 +193,18 @@ class AppUnlockService {
 
     // -------------------------------------------------------------------- PIN
     async verifyPin(user, pin) {
+        try {
+            return await this._verifyPinInner(user, pin);
+        } catch (err) {
+            if (err && err.code === STATE_UNAVAILABLE_CODE) {
+                logger.error({ userId: user && user.id }, '[appUnlock] PIN refused: security state unavailable');
+                return { ok: false, code: STATE_UNAVAILABLE_CODE, status: 503 };
+            }
+            throw err;
+        }
+    }
+
+    async _verifyPinInner(user, pin) {
         if (typeof pin !== 'string' || pin.length === 0) {
             return { ok: false, code: 'PIN_REQUIRED', status: 400 };
         }
@@ -236,8 +306,9 @@ class AppUnlockService {
      */
     async _totpAttemptsLeft(userId) {
         const key = `appunlock:totp:attempts:${userId}`;
+        this._assertAuthoritativeStore();
         if (this._redis) {
-            const raw = await this._redis.get(key);
+            const raw = await this._redisCall(() => this._redis.get(key));
             return Math.max(0, TOTP_MAX_ATTEMPTS - Number(raw || 0));
         }
         const rec = _memoryCounters.get(key);
@@ -247,8 +318,11 @@ class AppUnlockService {
 
     async _bumpTotpAttempts(userId) {
         const key = `appunlock:totp:attempts:${userId}`;
+        this._assertAuthoritativeStore();
         if (this._redis) {
-            return Number(await this._redis.eval(PIN_ATTEMPT_LUA, 1, key, String(TOTP_WINDOW_MS)));
+            return Number(await this._redisCall(
+                () => this._redis.eval(PIN_ATTEMPT_LUA, 1, key, String(TOTP_WINDOW_MS))
+            ));
         }
         const now = Date.now();
         const rec = _memoryCounters.get(key);
@@ -263,11 +337,24 @@ class AppUnlockService {
 
     async _clearTotpAttempts(userId) {
         const key = `appunlock:totp:attempts:${userId}`;
-        if (this._redis) await this._redis.eval(PIN_RESET_LUA, 1, key);
+        this._assertAuthoritativeStore();
+        if (this._redis) await this._redisCall(() => this._redis.eval(PIN_RESET_LUA, 1, key));
         else _memoryCounters.delete(key);
     }
 
     async verifyTotp(user, token) {
+        try {
+            return await this._verifyTotpInner(user, token);
+        } catch (err) {
+            if (err && err.code === STATE_UNAVAILABLE_CODE) {
+                logger.error({ userId: user && user.id }, '[appUnlock] TOTP refused: security state unavailable');
+                return { ok: false, code: STATE_UNAVAILABLE_CODE, status: 503 };
+            }
+            throw err;
+        }
+    }
+
+    async _verifyTotpInner(user, token) {
         if (typeof token !== 'string' || token.trim().length === 0) {
             return { ok: false, code: 'TOTP_REQUIRED', status: 400 };
         }
@@ -282,13 +369,15 @@ class AppUnlockService {
             return { ok: false, code: 'TOTP_LOCKED', status: 429, attemptsLeft: 0 };
         }
 
-        const valid = speakeasy.totp.verify({
+        // verifyDelta also reports WHICH step matched, so the replay claim can be
+        // bound to the accepted time-step without ever storing the code.
+        const matched = speakeasy.totp.verifyDelta({
             secret: user.twoFactorSecret,
             encoding: 'base32',
             token: token.trim(),
             window: 1,
         });
-        if (!valid) {
+        if (!matched || typeof matched.delta !== 'number') {
             const remaining = Math.max(0, TOTP_MAX_ATTEMPTS - used);
             logger.warn({ userId: user.id, attemptsLeft: remaining }, '[appUnlock] TOTP refused');
             return {
@@ -301,28 +390,52 @@ class AppUnlockService {
 
         await this._clearTotpAttempts(user.id);
 
-        const claimed = await this._claimTotpCode(user.id, token.trim());
+        const step = this._timeStepFor(new Date(), matched.delta);
+        const claimed = await this._claimTotpStep(user.id, step);
         if (!claimed) {
+            logger.warn({ userId: user.id }, '[appUnlock] TOTP replay refused');
             return { ok: false, code: 'TOTP_REPLAYED', status: 409 };
         }
         return { ok: true, code: 'TOTP_OK', status: 200 };
     }
 
     /**
-     * Atomic single-use claim for a TOTP value. Redis SET NX is the atomic
-     * primitive; without Redis the platform is single-process (dev/test) and the
-     * Map check is equivalent.
+     * Durable, atomic single-use claim on the TOTP TIME-STEP.
+     *
+     * Redis SET NX was atomic but not durable, and an instance without Redis had
+     * no shared state at all — so a Redis restart inside a 90s window re-opened
+     * replay, and a second instance accepted the same code independently. The
+     * claim now lives in PostgreSQL: the unique (userId, step) index makes
+     * "exactly one winner" the database's decision, not a read-then-write race
+     * in application code, and the row survives any process or cache restart.
+     *
+     * Only the step index and the user are stored. The code, its digest and the
+     * shared secret are never persisted.
      */
-    async _claimTotpCode(userId, token) {
-        const digest = crypto.createHash('sha256').update(`${userId}:${token}`).digest('hex');
-        const key = `appunlock:totp:used:${userId}:${digest}`;
-        if (this._redis) {
-            const res = await this._redis.set(key, '1', 'EX', TOTP_WINDOW_SECONDS, 'NX');
-            return res === 'OK';
+    _timeStepFor(date, delta) {
+        const stepSeconds = TOTP_STEP_SECONDS;
+        return Math.floor(date.getTime() / 1000 / stepSeconds) + (delta || 0);
+    }
+
+    async _claimTotpStep(userId, step) {
+        if (!this.prisma || typeof this.prisma.appUnlockTotpClaim?.create !== 'function') {
+            throw new AppUnlockStateUnavailableError(
+                'Replay authority unavailable: the durable claim table is not reachable.'
+            );
         }
-        if (_memoryCounters.has(key)) return false;
-        _memoryCounters.set(key, { n: 1, resetAt: Date.now() + TOTP_WINDOW_SECONDS * 1000 });
-        return true;
+        try {
+            // Bounded cleanup: claims older than an hour can never be matched by
+            // a template/step inside the acceptance window again.
+            await this.prisma.appUnlockTotpClaim.deleteMany({
+                where: { userId, createdAt: { lt: new Date(Date.now() - 60 * 60 * 1000) } },
+            });
+            await this.prisma.appUnlockTotpClaim.create({ data: { userId, step } });
+            return true;
+        } catch (err) {
+            if (err && err.code === 'P2002') return false; // unique violation: already used
+            logger.error({ err: err && err.message }, '[appUnlock] replay claim failed');
+            throw new AppUnlockStateUnavailableError();
+        }
     }
 
     // -------------------------------------------------------------------- SMS
@@ -425,4 +538,6 @@ class AppUnlockService {
 // only). Tests clear them between cases; production uses Redis.
 AppUnlockService._resetMemoryState = () => { _memoryCounters.clear(); };
 
-module.exports = { AppUnlockService, PURPOSES, PIN_MAX_ATTEMPTS };
+module.exports = {
+    AppUnlockService, PURPOSES, PIN_MAX_ATTEMPTS, STATE_UNAVAILABLE_CODE,
+};

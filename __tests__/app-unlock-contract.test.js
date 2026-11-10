@@ -40,7 +40,27 @@ function makeUser(overrides = {}) {
 }
 
 function makePrisma(user) {
+  // WP-D: the TOTP replay claim is a DURABLE table now, so the stub has to
+  // model it — including the unique (userId, step) constraint that decides
+  // "exactly one winner". Without this the service correctly refuses with
+  // APP_UNLOCK_STATE_UNAVAILABLE, which is a different test.
+  const claims = new Set();
+  const claimKey = (userId, step) => `${userId}:${step}`;
   return {
+    appUnlockTotpClaim: {
+      create: async ({ data }) => {
+        const key = claimKey(data.userId, data.step);
+        if (claims.has(key)) {
+          const err = new Error('Unique constraint failed on the fields: (`userId`,`step`)');
+          err.code = 'P2002';
+          throw err;
+        }
+        claims.add(key);
+        return { id: key, createdAt: new Date(), ...data };
+      },
+      deleteMany: async () => ({ count: 0 }),
+      count: async () => claims.size,
+    },
     user: {
       findUnique: jest.fn(async () => user),
       update: jest.fn(async ({ data }) => ({ ...user, ...data })),

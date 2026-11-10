@@ -1820,6 +1820,20 @@ model SystemFiatPool {
 /// Append-only raw provider observations. Never rewritten; contradictory
 /// terminal evidence is preserved here and quarantined via
 /// ReconciliationException, never silently dropped (§P.5-D docs §3.3).
+/// WP-D: the durable TOTP anti-replay claim. One row per accepted code, keyed by
+/// the 30-second time-step index — the code itself is never stored. The unique
+/// (userId, step) index is what makes "exactly one winner" a database
+/// guarantee instead of an application-level check.
+model AppUnlockTotpClaim {
+  id        String   @id @default(uuid())
+  userId    Int
+  step      Int
+  createdAt DateTime @default(now())
+
+  @@unique([userId, step])
+  @@index([userId, createdAt])
+}
+
 model FiatProviderEvent {
   id               String   @id @default(uuid())
   provider         String // MOOLRE | MTN_MOMO | AZM_WEBHOOK | AZM_TREASURY (audited internal)
