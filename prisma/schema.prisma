@@ -835,13 +835,13 @@ model User {
   receivedReviews Review[] @relation("ReceivedReviews")
 
   // Misc
-  savedWallets       SavedWallet[]
-  savedMomoAccounts  SavedMomoAccount[]
+  savedWallets         SavedWallet[]
+  savedMomoAccounts    SavedMomoAccount[]
   savedServiceAccounts SavedServiceAccount[]
-  notifications      Notification[]
-  earnedBadges       Badge[]             @relation("UserBadges")
-  leaderboardRecords LeaderboardRecord[]
-  accountFeedbacks   AccountFeedback[]
+  notifications        Notification[]
+  earnedBadges         Badge[]               @relation("UserBadges")
+  leaderboardRecords   LeaderboardRecord[]
+  accountFeedbacks     AccountFeedback[]
 
   // V3: Social Friend System
   sentFriendRequests     Friendship[]    @relation("FriendshipRequester")
@@ -996,12 +996,12 @@ model User {
   businessGroups      BusinessGroup[]
 
   // AZM Staking for Nitro
-  azmStakes      AzmStake[]
-  changelogViews ChangelogView[]
-  onchainSweeps  OnchainSweep[]
+  azmStakes              AzmStake[]
+  changelogViews         ChangelogView[]
+  onchainSweeps          OnchainSweep[]
+  savedBankBeneficiaries SavedBankBeneficiary[]
 
   @@index([phoneHash])
-  savedBankBeneficiaries SavedBankBeneficiary[]
 }
 
 // =============================================================================
@@ -1378,8 +1378,8 @@ model Withdrawal {
   // infra overlay) — a Withdrawal row can never exist without its
   // canonical row.
   transactionHistoryId String?  @db.VarChar(36)
-  amountGhs Decimal? @db.Decimal(20, 2)
-  settlementCurrency String?
+  amountGhs            Decimal? @db.Decimal(20, 2)
+  settlementCurrency   String?
   totalGasFee          Decimal  @default(0.0) @db.Decimal(20, 8)
   vendorGasShare       Decimal  @default(0.0) @db.Decimal(20, 8)
   adminGasShare        Decimal  @default(0.0) @db.Decimal(20, 8)
@@ -1599,12 +1599,11 @@ model FxSavedRate {
   // age policy version, oracle mode) — enough to revalidate the snapshot.
   validation Json?
 
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([pair, savedAt(sort: Desc)])
 }
-
 
 // QR Forge scan tracking (Phase 3)
 model QrScan {
@@ -1907,22 +1906,45 @@ model FiatLiquidityReservation {
 /// Singleton aggregate of claimable GHS liquidity. Every transition is a
 /// guarded conditional update in the same transaction as its evidence/state
 /// row; sums over receipts/reservations are the reconciliation target.
+/// §WP-E — DATABASE-ENFORCED, APPEND-ONLY AUTHORITY ACTIVATION RECORD.
+///
+/// Deliberately NOT a column on FiatLiquidityState. That table is owned by the
+/// application runtime role, so a "one-way latch" stored there is a code
+/// convention the runtime role can undo (UPDATE ... SET NULL) or delete. This
+/// record is owned by a dedicated role, the runtime role holds SELECT only, and
+/// BEFORE UPDATE/DELETE/TRUNCATE triggers refuse mutation as defence in depth
+/// (see prisma/migrations/20261110230000_p5d_enforced_authority_activation).
+///
+/// id = 1 is enforced by a CHECK, so activation happens at most once and a
+/// second activation cannot silently replace the first. Every evidence column
+/// is NOT NULL and non-blank: an activation row is a control decision with a
+/// named approver, never an anonymous flag flip and never proof that customer
+/// money or GHS assets exist.
+model FiatLiquidityAuthorityActivation {
+  id                Int      @id
+  activatedAt       DateTime @default(now())
+  activatedBy       String
+  approvedBy        String
+  evidenceReference String
+  evidenceDigest    String
+}
+
 model FiatLiquidityState {
-  id                    Int     @id @default(1)
+  id                    Int       @id @default(1)
   // §P.5-D ONE-WAY ACTIVATION LATCH (docs §4.1). Written ONCE by
   // fiatLiquidityActivationService.activateAuthority() and never cleared: once
   // SystemFiatPool has been written as a GHS projection, clearing the
   // GlobalSettings Boolean must NOT reinterpret those pesewas as USDC.
   authorityActivatedAt  DateTime?
-  availableGhs          Decimal @default(0) @db.Decimal(20, 2)
-  reservedGhs           Decimal @default(0) @db.Decimal(20, 2)
-  inTransitGhs          Decimal @default(0) @db.Decimal(20, 2)
-  paidOutGhs            Decimal @default(0) @db.Decimal(20, 2)
+  availableGhs          Decimal   @default(0) @db.Decimal(20, 2)
+  reservedGhs           Decimal   @default(0) @db.Decimal(20, 2)
+  inTransitGhs          Decimal   @default(0) @db.Decimal(20, 2)
+  paidOutGhs            Decimal   @default(0) @db.Decimal(20, 2)
   // §P.5-D quarantine bucket: GHS claimed by a quarantined reservation
   // (RECONCILIATION_REQUIRED). Held funds are counted but NEVER spendable —
   // a released-then-contradicted payout moves its returned amount here
   // instead of leaving it claimable (docs §3.4).
-  reconciliationHeldGhs Decimal @default(0) @db.Decimal(20, 2)
+  reconciliationHeldGhs Decimal   @default(0) @db.Decimal(20, 2)
 
   updatedAt DateTime @updatedAt
 }
@@ -1983,21 +2005,21 @@ model EwaWithdrawalIntent {
 }
 
 model TransactionHistory {
-  id                String            @id @default(uuid())
-  userId            Int
-  type              TransactionType
-  amountUsdc        Decimal           @db.Decimal(20, 8)
-  feeUsdc           Decimal           @default(0) @db.Decimal(20, 8)
-  txHash            String?           @unique
+  id                 String            @id @default(uuid())
+  userId             Int
+  type               TransactionType
+  amountUsdc         Decimal           @db.Decimal(20, 8)
+  feeUsdc            Decimal           @default(0) @db.Decimal(20, 8)
+  txHash             String?           @unique
   // --- Moolre collection on-ramp (2026-06-23) — all nullable/additive ---
-  providerRef       String? // Moolre tracking UUID (TR099 data field)
-  payerMsisdn       String? // MSISDN that paid — stored raw, masked before display
-  initiatedByUserId Int? // User who triggered this deposit (null = USSD walk-up)
-  metadata          Json? // { provider, network, amountGhs, rateAtInitiation, ... }
-  amountGhs Decimal? @db.Decimal(20, 2)
+  providerRef        String? // Moolre tracking UUID (TR099 data field)
+  payerMsisdn        String? // MSISDN that paid — stored raw, masked before display
+  initiatedByUserId  Int? // User who triggered this deposit (null = USSD walk-up)
+  metadata           Json? // { provider, network, amountGhs, rateAtInitiation, ... }
+  amountGhs          Decimal?          @db.Decimal(20, 2)
   settlementCurrency String?
-  status            TransactionStatus @default(PENDING)
-  createdAt         DateTime          @default(now())
+  status             TransactionStatus @default(PENDING)
+  createdAt          DateTime          @default(now())
 
   user User @relation(fields: [userId], references: [id])
 
@@ -2843,10 +2865,10 @@ model BusinessSubcategory {
 }
 
 model BusinessProfile {
-  id              String           @id @default(uuid())
-  userId          Int
-  bizId           String           @unique // BIZ-XXXXXXXXX (9 digits after prefix)
-  moolrePaymentId String?          @unique // *203*<id># USSD payment ID for businesses (Moolre on-ramp, 2026-06-23)
+  id                String             @id @default(uuid())
+  userId            Int
+  bizId             String             @unique // BIZ-XXXXXXXXX (9 digits after prefix)
+  moolrePaymentId   String?            @unique // *203*<id># USSD payment ID for businesses (Moolre on-ramp, 2026-06-23)
   // Marketplace hierarchy additions (2026-06-24)
   // WORKSTREAM D (2026-10-21) — the business's ADDITIONAL declared offerings,
   // a subset of the canonical BusinessCategory enum. The PRIMARY category
@@ -2855,22 +2877,22 @@ model BusinessProfile {
   // types or description words). Backward compatible: existing records keep
   // an empty list, which is a VALID state (no additional offerings).
   offeredCategories BusinessCategory[] @default([])
-  subcategory     String? // wire value from BusinessSubcategory (e.g. "RESTAURANT_FINE_DINING")
-  priceRange      Int? // 1=₵  2=₵₵  3=₵₵₵  4=₵₵₵₵
-  amenities       String[] // ["WIFI","PARKING","AC","POOL"] — profile-level amenities
-  cuisineTypes    String[] // Food & Bev only: ["GHANAIAN","CHINESE","CONTINENTAL"]
-  businessMeta    Json? // category-specific extended fields
-  businessName    String           @db.VarChar(100)
-  category        BusinessCategory @default(OTHER)
-  description     String?          @db.VarChar(500)
-  website         String?          @db.VarChar(255)
-  logoUrl         String?
-  coverPhotoUrl   String?          @db.VarChar(500) // Marketplace UI: business cover photo
+  subcategory       String? // wire value from BusinessSubcategory (e.g. "RESTAURANT_FINE_DINING")
+  priceRange        Int? // 1=₵  2=₵₵  3=₵₵₵  4=₵₵₵₵
+  amenities         String[] // ["WIFI","PARKING","AC","POOL"] — profile-level amenities
+  cuisineTypes      String[] // Food & Bev only: ["GHANAIAN","CHINESE","CONTINENTAL"]
+  businessMeta      Json? // category-specific extended fields
+  businessName      String             @db.VarChar(100)
+  category          BusinessCategory   @default(OTHER)
+  description       String?            @db.VarChar(500)
+  website           String?            @db.VarChar(255)
+  logoUrl           String?
+  coverPhotoUrl     String?            @db.VarChar(500) // Marketplace UI: business cover photo
   // Ad appearance customization (2026-07-06): lets a business pick its own
   // marketplace card tint from the business portal instead of always
   // inheriting the category-default tint. Hex string e.g. "#FFAA00", null
   // falls back to category tint (existing behavior in collapsible_business_bar.dart).
-  adAccentColor   String?          @db.VarChar(7)
+  adAccentColor     String?            @db.VarChar(7)
 
   // Business stake balance (2026-09-14): the reserable security deposit a
   // business posts; business no-show penalties are deducted from it with a
@@ -2884,12 +2906,12 @@ model BusinessProfile {
 
   // Admin moderation (WS4): a suspended business is hidden/blocked from new
   // activity until an admin unsuspends it. suspendReason is operator-facing.
-  isSuspended      Boolean        @default(false)
-  isPausedByOwner  Boolean        @default(false) // owner-initiated pause — stops new orders/bookings without admin suspension
-  allowOverbooking Boolean        @default(false) // Module 06: opt-in overbooking against expected no-shows
-  groupId          String? // optional FK to BusinessGroup for multi-brand owners
-  group            BusinessGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
-  suspendReason    String?        @db.VarChar(500)
+  isSuspended            Boolean        @default(false)
+  isPausedByOwner        Boolean        @default(false) // owner-initiated pause — stops new orders/bookings without admin suspension
+  allowOverbooking       Boolean        @default(false) // Module 06: opt-in overbooking against expected no-shows
+  groupId                String? // optional FK to BusinessGroup for multi-brand owners
+  group                  BusinessGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  suspendReason          String?        @db.VarChar(500)
   // MARKETPLACE MIX P1 (§9 D-5, MARKETPLACE_MIX_REDESIGN_2026-10-10.md):
   // explicit marketplace-visibility capability — the business's eligibility
   // for the public cross-business discovery feed (Mix). This is a SEPARATE
@@ -2898,7 +2920,7 @@ model BusinessProfile {
   // other. Default true preserves today's "every unsuspended, unpaused
   // business is publicly discoverable" behavior — flipping it to false hides
   // the business from Mix WITHOUT touching its custom storefront.
-  isPubliclyDiscoverable Boolean @default(true)
+  isPubliclyDiscoverable Boolean        @default(true)
 
   // Public contact info
   phoneNumber  String? @db.VarChar(20)
@@ -3346,14 +3368,14 @@ model CatalogSection {
 // =============================================================================
 
 model CatalogSectionTaxonomy {
-  id                  String  @id // MEALS | STARTERS | SIDES | DRINKS | DESSERTS | ROOMS | RIDES | RETAIL_ITEMS | SERVICES | UNMAPPED
-  label               String  @db.VarChar(60) // display metadata ("Main dishes")
-  description         String? @db.VarChar(200)
+  id                   String   @id // MEALS | STARTERS | SIDES | DRINKS | DESSERTS | ROOMS | RIDES | RETAIL_ITEMS | SERVICES | UNMAPPED
+  label                String   @db.VarChar(60) // display metadata ("Main dishes")
+  description          String?  @db.VarChar(200)
   // Per-category validity (D-2): the categories whose feeds may surface this
   // chip (wire values). Empty = applies to every category.
   applicableCategories String[]
-  displayOrder        Int     @default(0)
-  isActive            Boolean @default(true)
+  displayOrder         Int      @default(0)
+  isActive             Boolean  @default(true)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -3432,21 +3454,21 @@ model BusinessProduct {
 // =============================================================================
 
 model BusinessPrice {
-  id                String          @id @default(uuid())
+  id                String    @id @default(uuid())
   businessProductId String
-  currency          String          @db.VarChar(3) // "GHS" today; multi-country-ready
-  amountExact       Decimal         @db.Decimal(20, 2) // canonical 2dp; never a float; > 0 (free-item model separately approved, not in v1)
-  scope             String          @default("DEFAULT") // DEFAULT | BRANCH
+  currency          String    @db.VarChar(3) // "GHS" today; multi-country-ready
+  amountExact       Decimal   @db.Decimal(20, 2) // canonical 2dp; never a float; > 0 (free-item model separately approved, not in v1)
+  scope             String    @default("DEFAULT") // DEFAULT | BRANCH
   locationId        String? // null = all branches; set for BRANCH scope
-  status            String          @default("ACTIVE") // ACTIVE | ARCHIVED (soft, keeps history)
-  confirmedByType   String          @default("BUSINESS") // BUSINESS | ADMIN | MIGRATION
+  status            String    @default("ACTIVE") // ACTIVE | ARCHIVED (soft, keeps history)
+  confirmedByType   String    @default("BUSINESS") // BUSINESS | ADMIN | MIGRATION
   confirmedById     String? // auditable confirming actor (userId / adminId)
   confirmedAt       DateTime? // set on every confirmation; part of the audit trail
   note              String? // audit note (e.g. backfill batch id)
-  effectiveFrom     DateTime        @default(now())
+  effectiveFrom     DateTime  @default(now())
   effectiveTo       DateTime? // null = current
 
-  businessProduct   BusinessProduct @relation(fields: [businessProductId], references: [id], onDelete: Cascade)
+  businessProduct BusinessProduct @relation(fields: [businessProductId], references: [id], onDelete: Cascade)
 
   @@index([businessProductId, currency, status, effectiveTo])
 }
@@ -7492,25 +7514,25 @@ model CustodyEvidence {
 /// The identifier payload is AES-256-GCM ciphertext; only the keyed fingerprint
 /// and a short display mask are queryable. This model cannot pay anything.
 model SavedServiceAccount {
-  id                    String    @id @default(uuid())
-  userId                Int
-  serviceCode           String    @db.VarChar(64)
-  providerCode          String    @db.VarChar(64)
-  nickname              String    @db.VarChar(64)
+  id           String @id @default(uuid())
+  userId       Int
+  serviceCode  String @db.VarChar(64)
+  providerCode String @db.VarChar(64)
+  nickname     String @db.VarChar(64)
 
-  accountDataCiphertext String    @db.Text
-  accountDataKeyVersion String    @db.VarChar(16)
-  serviceTemplateVersion String @db.VarChar(16) @default("1") // registry schemaVersion that validated the fields
-  accountFingerprint    String    @db.Char(64)
-  accountMask           String    @db.VarChar(32)
+  accountDataCiphertext  String @db.Text
+  accountDataKeyVersion  String @db.VarChar(16)
+  serviceTemplateVersion String @default("1") @db.VarChar(16) // registry schemaVersion that validated the fields
+  accountFingerprint     String @db.Char(64)
+  accountMask            String @db.VarChar(32)
 
-  verificationStatus    String    @default("UNVERIFIED")
-  verifiedAt            DateTime?
-  isPrimary             Boolean   @default(false)
-  lastUsedAt            DateTime?
+  verificationStatus String    @default("UNVERIFIED")
+  verifiedAt         DateTime?
+  isPrimary          Boolean   @default(false)
+  lastUsedAt         DateTime?
 
-  createdAt             DateTime  @default(now())
-  updatedAt             DateTime  @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -7544,9 +7566,8 @@ model SavedBankBeneficiary {
   envelopeVersion     Int       @default(2)
   createdAt           DateTime  @default(now())
   updatedAt           DateTime  @updatedAt
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  user                User      @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([userId, accountNumberHmac])
   @@index([userId, status])
-
 }

@@ -367,6 +367,14 @@ payout gate — so the regime is latched:
   database. **There is no supported deactivation procedure.** Rolling back to
   legacy USDC settlement requires a new database, not a flag change.
 
+**The latch is application-enforced, not database-enforced.** This table is
+owned by the application's own role, which can clear or drop the column. §WP-E
+adds a separate append-only activation record with role separation and a runtime
+self-check that stays closed until that separation is actually observed; see
+[authority-activation-enforcement.md](authority-activation-enforcement.md). It is
+closed on the current deployment topology and does not change the regime
+described here.
+
 **Operator activation procedure** (the only sanctioned order):
 
 1. Drain: resolve every dispatch-eligible legacy fiat withdrawal. `PENDING`,

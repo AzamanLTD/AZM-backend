@@ -338,6 +338,13 @@ Explicitly **not** decided, implemented or implied here:
   is **not database-enforced** (the migration adds a nullable column and
   nothing else — no trigger, no CHECK, no owner or grant separation — so the
   application's own role, which owns the table, can clear or drop it); and it
+  is still not database-enforced after §WP-E, which adds the separate
+  append-only `FiatLiquidityAuthorityActivation` record and the runtime
+  self-check that refuses to report it enforced unless ownership separation and
+  least privilege are actually observed — see
+  `docs/authority-activation-enforcement.md`. That gate is closed on the current
+  deployed topology (one role is both migration authority and runtime, so it
+  owns the record) and nothing financial consumes it yet; and it
   is **not operationally activated** (no production flag, latch or migration
   has been applied by this contract). Do not read "the latch exists" as
   "the latch cannot be tampered with", and do not read "not enforced" as "not
