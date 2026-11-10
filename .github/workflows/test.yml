@@ -261,6 +261,13 @@ jobs:
         # db push the ADD COLUMN IF NOT EXISTS no-ops.
         run: node infra/install-business-offered-categories-overlay.js
 
+      - name: Install app-unlock TOTP claim authority
+        # WP-D packaging: the durable single-use TOTP claim table is created by
+        # an overlay installer because the release path (npm run release) runs
+        # installers and never `prisma migrate deploy`. Without it app-unlock
+        # TOTP fails closed (503). Idempotent; mirrors the release chain.
+        run: node infra/install-app-unlock-totp-claim.js
+
       - name: Install inventory restock authority
         run: node infra/install-inventory-restock-overlay.js
 
