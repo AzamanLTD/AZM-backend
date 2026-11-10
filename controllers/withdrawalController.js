@@ -1820,6 +1820,10 @@ const _ghsErrorStatus = (code) => {
         case 'USDC_INSUFFICIENT_BALANCE':
         case 'NATIVE_GHS_QUOTE_INTENT_MISMATCH':
         case 'NATIVE_GHS_QUOTE_INVALID':
+        // WP-C: the platform cannot evidence the GHS a shortfall conversion would
+        // create. 409 (the request is well-formed, the server's state forbids it),
+        // matching GHS_CHECKOUT_UNAVAILABLE's convention rather than 400/500.
+        case 'NATIVE_GHS_SHORTFALL_BACKING_UNAVAILABLE':
             return 409;
         case 'BANK_FEE_POLICY_UNEVIDENCED':
         case 'NATIVE_GHS_LIQUIDITY_AUTHORITY_REQUIRED':
@@ -2004,6 +2008,22 @@ exports.ghsFundingPlan = async (req, res) => {
                 return res.status(resolved.status).json(resolved.body);
             }
             declaredDestination = resolved.destination;
+        }
+        // WP-C: the preview states the shortfall and why it is NOT executable.
+        // It deliberately does not mint a quote: a quote the execution service
+        // will refuse is a lie with an expiry date.
+        if (ghsFundingPlanner.SHORTFALL_EXECUTION_ENABLED === false) {
+            return res.status(200).json({
+                success: true,
+                plan,
+                quote: null,
+                shortfallFunding: {
+                    executable: false,
+                    code: ghsFundingPlanner.SHORTFALL_BACKING_UNAVAILABLE_CODE,
+                    message: ghsFundingPlanner.SHORTFALL_BACKING_UNAVAILABLE_MESSAGE,
+                },
+                usdcBalanceExact: new Prisma.Decimal(user?.availableBalance ?? 0).toFixed(8),
+            });
         }
         const quote = await ghsFundingPlanner.quoteGhsShortfall({
             prisma,

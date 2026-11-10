@@ -115,6 +115,25 @@ class NativeGhsWithdrawalError extends Error {
   }
 }
 
+/**
+ * The platform cannot establish the GHS backing this shortfall conversion would
+ * create. Deliberately distinct from insufficient customer funds, an invalid
+ * destination, an expired quote and any provider outcome — those are refusals
+ * ABOUT THE REQUEST; this one is a refusal ABOUT THE PLATFORM.
+ */
+class NativeGhsShortfallBackingUnavailableError extends NativeGhsWithdrawalError {
+  constructor(details = null) {
+    super(
+      'Converting USDC to GHS for this withdrawal is not available: the platform cannot '
+      + 'yet evidence the GHS it would issue. Nothing was converted, no USDC was debited '
+      + 'and no GHS was credited. Withdraw from your existing GHS balance instead.',
+      'NATIVE_GHS_SHORTFALL_BACKING_UNAVAILABLE',
+      details,
+    );
+    this.name = 'NativeGhsShortfallBackingUnavailableError';
+  }
+}
+
 /** Fail-closed rollout read: absent row / absent column / error => disabled. */
 async function isNativeGhsWithdrawalEnabled(db) {
   try {
@@ -237,6 +256,14 @@ async function processNativeGhsWithdrawal(prisma, userId, args, opts = {}) {
       'Native-GHS payouts require the P5-D fiat-liquidity authority. Governance is unresolved — nothing was reserved.',
       'NATIVE_GHS_LIQUIDITY_AUTHORITY_REQUIRED'
     );
+  }
+
+  // ── WP-C: the USDC-funded shortfall conversion is refused ─────────────────
+  // Checked BEFORE prisma.$transaction and before any quote is consumed, so a
+  // refusal leaves: no quote burned, no reservation, no ledger row, no provider
+  // call. The route's idempotency claim is released by the 4xx disposition.
+  if (quoteId) {
+    throw new NativeGhsShortfallBackingUnavailableError({ quotedShortfall: true });
   }
 
   return prisma.$transaction(async (tx) => {
@@ -2155,6 +2182,7 @@ module.exports = {
   DISPATCH_RAIL,
   GHS_NATIVE_FEE_POLICY,
   NativeGhsWithdrawalError,
+  NativeGhsShortfallBackingUnavailableError,
   isNativeGhsWithdrawalEnabled,
   toExactPesewa,
   processNativeGhsWithdrawal,

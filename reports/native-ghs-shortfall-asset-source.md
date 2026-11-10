@@ -1,5 +1,10 @@
 # The GHS asset behind a USDC-funded shortfall conversion
 
+> **STATUS (2026-11-10, WP-C): EXECUTION REFUSED.** The conversion described
+> below is now disabled in code. No GHS asset source has been established, so
+> the platform refuses to perform it. See §7.
+
+
 **Scope:** `feature/native-ghs-withdrawal-leg` @ PR #392. Source-based accounting
 investigation for issue #389 / the settlement review's concern. **No ledger posting, counter,
 account or policy was changed by this report.** It records what the code
@@ -121,3 +126,80 @@ by guessing.
 Until one of these is decided, the shortfall feature **must not be described as
 accounting-ready**. Its customer-facing arithmetic is exact and reversible; its
 asset-side provenance is not established.
+
+## 7. Execution is refused until the asset source exists (WP-C)
+
+### 7.1 What is refused
+
+A shortfall funded from the customer's USDC does not execute. The refusal is
+implemented at the shared economic authority, not at a single route:
+
+| Layer | File | Effect |
+|---|---|---|
+| Quote issuance | `src/services/ghsFundingPlanner.js` `quoteGhsShortfall` | refuses before `createServerTransactionQuote`; no executable quote row can exist |
+| Execution | `src/services/nativeGhsWithdrawalService.js` `processNativeGhsWithdrawal` | refuses when `quoteId` is present, before `prisma.$transaction` opens |
+| HTTP mapping | `controllers/withdrawalController.js` `_ghsErrorStatus` | `NATIVE_GHS_SHORTFALL_BACKING_UNAVAILABLE` → **409** |
+
+Refusing at quote issuance closes every present and future caller; refusing
+again at execution means a quote minted before this change (a historical,
+unconsumed row) still cannot be consumed. The refusal precedes the transaction,
+so no quote is consumed, no reservation is created, no ledger row is posted, no
+provider is called, and the route's `releaseOn4xx` disposition releases the
+idempotency claim rather than leaving a committed one.
+
+### 7.2 What the refusal means
+
+`NATIVE_GHS_SHORTFALL_BACKING_UNAVAILABLE` means: *the platform cannot evidence
+the GHS asset that this conversion would record.* It is deliberately distinct
+from insufficient customer USDC, insufficient native GHS, an invalid
+destination, an expired rate quote, a provider rejection and an unknown provider
+outcome, each of which keeps its own code and status.
+
+The preview endpoint still returns the plan (shortfall in GHS, indicative USDC,
+rate) but with `quote: null` and:
+
+```json
+"shortfallFunding": {
+  "executable": false,
+  "code": "NATIVE_GHS_SHORTFALL_BACKING_UNAVAILABLE",
+  "message": "..."
+}
+```
+
+An indicative estimate is not executable: there is no quote identity to
+present, so the execution service has nothing it could accept.
+
+### 7.3 What remains supported
+
+GHS payouts funded from independently evidenced GHS liquidity authority
+balances are unchanged, including MoMo, bank and native-GHS rails, the quote
+path for GHS-only payouts, provider dispatch, and the reversal of historical
+funded withdrawals.
+
+### 7.4 How historical transactions are represented in tests
+
+`__tests__/native-ghs-funded-shortfall-reversal.test.js` no longer creates its
+data by running the forbidden conversion. `acceptMixedPayout` seeds an
+already-committed historical operation directly: the USDC compare-and-set
+debit, the same four-line `ASSET_CONVERSION` posting
+(`user:<id>:liability` → `clearing:conversion`, `fiat:momo:ghs` →
+`ghs:user:<id>:liability`), the `nativeGhsBalance` projection bump, the native
+GHS debit, the `Withdrawal` mirror and the P5-D liquidity reservation the
+reversal releases. It mints no quote and calls no funding method. A drift
+assertion fails if the replica stops producing the metadata fields the reversal
+reads.
+
+### 7.5 Evidence required before this can ever be enabled
+
+1. A named, reconciled source of the GHS asset credited to `fiat:momo:ghs`
+   (treasury holding, merchant float, or an executed conversion with a real
+   counterparty), evidenced by a trusted external observation.
+2. A ledger counterparty for the other side of that asset, so the conversion is
+   a transfer between two evidenced positions rather than a creation.
+3. A reconciliation proving that source balance covers outstanding GHS
+   liabilities before each conversion.
+4. An owner decision on pooled versus segregated backing (WP-1.8A A1) and on
+   the rail (A2).
+
+Until all four exist, `SHORTFALL_EXECUTION_ENABLED` stays `false` and no
+configuration can turn it on: the constant is code, not an environment flag.

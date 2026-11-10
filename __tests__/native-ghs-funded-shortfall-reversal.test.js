@@ -60,6 +60,7 @@ if (hasDb) {
     // transaction, so its writes go through the TRANSACTION client: a delegate
     // spy cannot see them and Prisma 6 has no $use. A client EXTENSION does see
     // transaction queries, so the extended client is what the injected run uses.
+    const fiatLiquidity = require('../src/services/fiatLiquidityService');
     const injection = { target: null };
     let xprisma;
 
@@ -124,12 +125,144 @@ if (hasDb) {
     const tokenFor = (user) => jwt.sign({ id: user.id, role: 'USER' }, process.env.JWT_SECRET, { expiresIn: '1h' });
     const auth = (r, user) => r.set('Authorization', `Bearer ${tokenFor(user)}`);
 
-    async function mintShortfallQuote(user, amountGhs = '50.00') {
-        const res = await auth(request(buildApp()).post('/api/withdraw/ghs/quote'), user)
-            .set('Idempotency-Key', randomUUID())
-            .send({ destination: DEST, network: 'MTN', amountGhs });
-        expect(res.status).toBe(200);
-        return res.body.quote;
+    // ── HISTORICAL FUNDED SHORTFALL FIXTURE ────────────────────────────────
+    // WP-C: a USDC→GHS shortfall conversion can no longer be EXECUTED (the
+    // platform cannot evidence the GHS asset it would create), so a fixture
+    // may no longer obtain its historical data by running one. These rows must
+    // describe an operation that was committed BEFORE the refusal existed,
+    // because the reversal obligation for those still has to work.
+    //
+    // The seeding below replays the exact posting the historical execution
+    // committed, through the same ledger and wallet primitives, in the same
+    // order, with the same identities — but it never calls
+    // processNativeGhsWithdrawal and never mints a conversion quote. It is a
+    // STANDING REPLICA of the old funding block: if that block's ledger lines
+    // or metadata shape ever change, this fixture must change with it, and the
+    // drift assertion at the end of this block is what fails first.
+    const HIST_FUNDING_LEDGER_PREFIX = 'ledger:wallet:withdrawal-ghs-funding:';
+    const HIST_FUNDING_CONVERSION_PREFIX = 'withdrawal-ghs-funding:';
+    const HIST_DEBIT_KEY_PREFIX = 'ledger:wallet:withdrawal-ghs:';
+    // The suite's historical rate (line 52 RATE = 12.5 GHS/USDC), so the
+    // seeded conversion produces the same USDC debit the old fixture asserted.
+    const HIST_RATE = '12.50000000';
+
+    async function seedHistoricalFundedShortfall({
+        user, reference, amountGhs, feeGhs = '0.00', shortfallGhs,
+    }) {
+        const shortfall = new Prisma.Decimal(shortfallGhs);
+        const rate = new Prisma.Decimal(HIST_RATE);
+        // The historical debit was the exact 8dp quotient of the shortfall.
+        const usdcDebit = shortfall.dividedBy(rate).toDecimalPlaces(8, Prisma.Decimal.ROUND_HALF_UP);
+        const recipient = new Prisma.Decimal(amountGhs);
+        const fee = new Prisma.Decimal(feeGhs);
+        const totalDebit = recipient.plus(fee);
+        const funding = {
+            mode: 'USDC_SHORTFALL_FUNDED',
+            conversionIdentity: HIST_FUNDING_CONVERSION_PREFIX + reference,
+            ledgerIdempotencyKey: HIST_FUNDING_LEDGER_PREFIX + reference,
+            quoteId: `historical-quote-${reference}`,
+            shortfallGhs: shortfall.toFixed(2),
+            usdcDebitedExact: usdcDebit.toFixed(8),
+            rateGhsPerUsdcExact: rate.toFixed(8),
+        };
+
+        await prisma.$transaction(async (tx) => {
+            // (1) USDC liability CAS debit.
+            const debited = await tx.user.updateMany({
+                where: { id: user.id, availableBalance: { gte: usdcDebit.toFixed(8) } },
+                data: { availableBalance: { decrement: usdcDebit } },
+            });
+            if (debited.count !== 1) throw new Error('fixture: insufficient seeded USDC');
+
+            // (2) The historical ASSET_CONVERSION posting, leg for leg.
+            await ledger.post(tx, {
+                idempotencyKey: funding.ledgerIdempotencyKey,
+                entryType: 'ASSET_CONVERSION',
+                description: `GHS shortfall funding for withdrawal ${reference}`,
+                userId: user.id,
+                reference,
+                relatedEntity: 'transactionHistory',
+                conversion: {
+                    identity: funding.conversionIdentity,
+                    rate,
+                    quoteReference: funding.quoteId,
+                },
+                lines: [
+                    { account: `user:${user.id}:liability`, debit: usdcDebit },
+                    { account: 'clearing:conversion', credit: usdcDebit },
+                    { account: 'fiat:momo:ghs', debit: shortfall },
+                    { account: `ghs:user:${user.id}:liability`, credit: shortfall },
+                ],
+                metadata: { settlementCurrency: 'GHS_NATIVE', quoteId: funding.quoteId },
+            });
+
+            // (3) Projection bump in the same transaction.
+            await tx.user.update({
+                where: { id: user.id },
+                data: { nativeGhsBalance: { increment: shortfall } },
+            });
+
+            // (4) The historical native-GHS debit of recipient + fee.
+            await ghsWallet.debitNativeGhs({
+                tx,
+                userId: user.id,
+                amountGhs: totalDebit,
+                idempotencyKey: `${HIST_DEBIT_KEY_PREFIX}${reference}`,
+                description: `Native GHS withdrawal ${reference}`,
+                reference,
+                relatedEntity: 'transactionHistory',
+                metadata: { settlementCurrency: 'GHS_NATIVE', provider: 'MOOLRE_DISBURSEMENT', rail: 'MOMO', funding: funding.mode },
+            });
+
+            // (4b) P5-D liquidity claim — the historical execution reserved the
+            // payout against the GHS pool before dispatch. The reversal RELEASES
+            // this reservation, so the historical state must contain it.
+            await fiatLiquidity.reserveForPayout(tx, {
+                reference,
+                amountGhs: recipient,
+                provider: 'MOOLRE_DISBURSEMENT',
+                rail: 'MOMO',
+                destination: DEST,
+            });
+
+            // (5) Canonical operation row + payout mirror.
+            const record = await tx.transactionHistory.create({
+                data: {
+                    userId: user.id,
+                    type: 'WITHDRAWAL_FIAT',
+                    amountUsdc: new Prisma.Decimal(0),
+                    feeUsdc: new Prisma.Decimal(0),
+                    txHash: reference,
+                    status: 'PENDING',
+                    amountGhs: recipient,
+                    settlementCurrency: 'GHS_NATIVE',
+                    metadata: {
+                        settlementCurrency: 'GHS_NATIVE',
+                        asset: 'GHS',
+                        amountGhs: recipient.toFixed(2),
+                        payoutGhs: recipient.toFixed(2),
+                        totalDebitGhs: totalDebit.toFixed(2),
+                        feeGhs: fee.toFixed(2),
+                        feePolicy: { code: 'ZERO_FEE_V1', feeGhs: fee.toFixed(2) },
+                        provider: 'MOOLRE_DISBURSEMENT',
+                        rail: 'MOMO',
+                        network: 'MTN',
+                        destination: DEST,
+                        funding,
+                        ledgerReserved: true,
+                        economicsDeferred: false,
+                    },
+                },
+                select: { id: true },
+            });
+            await tx.$executeRawUnsafe(
+                'INSERT INTO "Withdrawal" ("userId", "amount", "amountGhs", "settlementCurrency", "payoutMethod", "network", "destination", "status", "transactionHistoryId", "createdAt", "updatedAt") '
+                + 'VALUES ($1, 0, $2::numeric, $3, $4, $5, $6, $7, $8, now(), now())',
+                user.id, recipient.toFixed(2), 'GHS_NATIVE', 'MOMO', 'MTN', DEST, 'PENDING', record.id,
+            );
+        });
+
+        return { funding, usdcDebit, shortfall, totalDebit };
     }
 
     async function balancesOf(userId) {
@@ -144,7 +277,7 @@ if (hasDb) {
         };
     }
 
-    /** The representative mixed-funded payout: GHS 20.00, USDC 1000.00, GHS 50.00 out. */
+    /** The representative mixed-funded payout: GHS 20.00 held, GHS 30.00 funded from USDC, GHS 50.00 out. */
     async function acceptMixedPayout({ reference = `GHST-${randomUUID()}`, amountGhs = '50.00', ghs = 20, usdc = 1000 } = {}) {
         await setSettings();
         const user = await seedUser(prisma, { nativeGhsBalance: 0, availableBalance: 0 });
@@ -176,15 +309,36 @@ if (hasDb) {
                 data: { availableBalance: { increment: new Prisma.Decimal(amount) } },
             });
         });
-        const quote = await mintShortfallQuote(user, amountGhs);
-        const facts = await svc.processNativeGhsWithdrawal(prisma, user.id, {
-            amountGhs,
-            destination: DEST,
-            network: 'MTN',
-            reference,
-            quoteId: quote.quoteId,
+
+        // HISTORICAL: the shortfall was converted when that was still possible.
+        const shortfallGhs = new Prisma.Decimal(amountGhs).minus(new Prisma.Decimal(ghs));
+        const seeded = await seedHistoricalFundedShortfall({
+            user, reference, amountGhs, shortfallGhs,
         });
-        return { user, quote, facts, reference };
+
+        // Drift guard: the reversal reads THESE fields off metadata.funding. If
+        // the replica stops producing them, the fixture is wrong, not the code.
+        const row = await prisma.transactionHistory.findUnique({
+            where: { txHash: reference }, select: { metadata: true },
+        });
+        expect(row.metadata.funding.mode).toBe('USDC_SHORTFALL_FUNDED');
+        for (const k of ['conversionIdentity', 'ledgerIdempotencyKey', 'quoteId',
+            'shortfallGhs', 'usdcDebitedExact', 'rateGhsPerUsdcExact']) {
+            expect(row.metadata.funding[k]).toBeDefined();
+        }
+        expect(seeded.funding.shortfallGhs).toBe(shortfallGhs.toFixed(2));
+
+        // Compatibility shape for assertions that describe the HISTORICAL
+        // conversion's economics (amounts, identity), not a live quote.
+        const quoteView = {
+            quoteId: seeded.funding.quoteId,
+            shortfallGhs: seeded.funding.shortfallGhs,
+            usdcDebit: seeded.funding.usdcDebitedExact,
+            usdcDebitExact: seeded.funding.usdcDebitedExact,
+            rateGhsPerUsdcExact: seeded.funding.rateGhsPerUsdcExact,
+            historical: true,
+        };
+        return { user, funding: seeded.funding, quote: quoteView, facts: { historical: true }, reference };
     }
 
     const definitiveRejection = () => ({
@@ -610,19 +764,37 @@ if (hasDb) {
     });
 
     // ── 8. §6 MoMo fee policy is isolated from the bank rail ────────────────
-    test('BANK_PAYOUT_FEE_GHS does not move the MoMo shortfall plan or its quote', async () => {
+    test('BANK_PAYOUT_FEE_GHS does not move the MoMo shortfall plan, and the plan stays non-executable', async () => {
         await setSettings();
         const user = await seedUser(prisma, { nativeGhsBalance: 20, availableBalance: 1000 });
 
-        const baseline = await mintShortfallQuote(user, '50.00');
-        const planOf = (q) => ({ shortfall: q.shortfallGhs, usdc: q.usdcAmount, rate: q.rateGhsPerUsdc });
+        // WP-C: the plan is still computed and disclosed; what is gone is the
+        // EXECUTABLE quote. The bank-fee policy must not move either the plan's
+        // economics or the refusal.
+        const planOf = async () => {
+            const res = await auth(request(buildApp()).post('/api/withdraw/ghs/quote'), user)
+                .set('Idempotency-Key', randomUUID())
+                .send({ destination: DEST, network: 'MTN', amountGhs: '50.00' });
+            expect(res.status).toBe(200);
+            expect(res.body.quote).toBeNull();
+            expect(res.body.shortfallFunding).toMatchObject({
+                executable: false,
+                code: 'NATIVE_GHS_SHORTFALL_BACKING_UNAVAILABLE',
+            });
+            return {
+                shortfall: res.body.plan.shortfallGhs,
+                recipient: res.body.plan.recipientGhs,
+                fee: res.body.plan.feeGhs,
+            };
+        };
+
+        const baseline = await planOf();
+        expect(baseline.shortfall).toBe('30.00');
 
         for (const value of ['', '0', '7.25', 'not-a-number']) {
             if (value === '') delete process.env.BANK_PAYOUT_FEE_GHS;
             else process.env.BANK_PAYOUT_FEE_GHS = value;
-            const q = await mintShortfallQuote(user, '50.00');
-            expect(planOf(q)).toEqual(planOf(baseline));
-            expect(q.shortfallGhs).toBe('30.00');
+            expect(await planOf()).toEqual(baseline);
         }
         delete process.env.BANK_PAYOUT_FEE_GHS;
         // and the service's own per-rail policy agreement

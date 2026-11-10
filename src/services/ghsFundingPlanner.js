@@ -26,6 +26,35 @@ const SHORTFALL_ROUTE = 'USDC_TO_GHS_SHORTFALL';
 const QUOTE_PURPOSE = 'withdrawal';
 const QUOTE_IDENTITY_KIND = 'ghs_shortfall_funding';
 
+// ─── SHORTFALL BACKING: the authoritative refusal ───────────────────────────
+// A USDC→GHS shortfall conversion would debit the customer's USDC liability,
+// credit a GHS liability and record a GHS ASSET at the debit-normal GHS asset
+// account — while nothing in the platform establishes that AZAMAN acquired that
+// GHS from anyone. `clearing:conversion` is an internal suspense account, not a
+// settled counterparty, so it cannot evidence the asset.
+//
+// Until an independently established GHS acquisition source exists AND is
+// reconciled, the conversion must not execute. The refusal lives HERE, in the
+// one authority that can mint an executable shortfall quote, so a controller,
+// a script or a future route cannot re-enable the economics by calling it.
+//
+// This is NOT any of: insufficient USDC, insufficient GHS, bad destination,
+// expired rate, provider rejection, unknown provider outcome. It says the
+// PLATFORM cannot back the GHS it would create.
+const SHORTFALL_BACKING_UNAVAILABLE_CODE = 'NATIVE_GHS_SHORTFALL_BACKING_UNAVAILABLE';
+const SHORTFALL_EXECUTION_ENABLED = false;
+const SHORTFALL_BACKING_UNAVAILABLE_MESSAGE =
+  'Converting USDC to GHS for this withdrawal is not available: the platform cannot yet '
+  + 'evidence the GHS it would issue. Nothing was converted, no USDC was debited and no GHS '
+  + 'was credited. Withdraw from your existing GHS balance instead.';
+
+function shortfallBackingRefusal() {
+  return new GhsFundingPlannerError(
+    SHORTFALL_BACKING_UNAVAILABLE_MESSAGE,
+    SHORTFALL_BACKING_UNAVAILABLE_CODE,
+  );
+}
+
 class GhsFundingPlannerError extends Error {
   constructor(message, code) {
     super(message);
@@ -121,6 +150,11 @@ async function quoteGhsShortfall({ prisma, marketOracle, userId, shortfallGhs, i
   if (!intent || !intent.rail || intent.recipientGhs === undefined || intent.recipientGhs === null) {
     throw new Error('quoteGhsShortfall requires the payout intent (rail, recipientGhs, destinationIdentity) it funds');
   }
+  if (!SHORTFALL_EXECUTION_ENABLED) {
+    // Refuse BEFORE createServerTransactionQuote: no TransactionQuote row, no
+    // consumed identity, nothing for the withdrawal service to spend.
+    throw shortfallBackingRefusal();
+  }
   const intentDigest = payoutIntentDigest(intent);
   const quote = await quotes.createServerTransactionQuote({
     prisma,
@@ -187,4 +221,8 @@ module.exports = {
   payoutIntentDigest,
   planGhsPayoutFunding,
   quoteGhsShortfall,
+  SHORTFALL_BACKING_UNAVAILABLE_CODE,
+  SHORTFALL_BACKING_UNAVAILABLE_MESSAGE,
+  SHORTFALL_EXECUTION_ENABLED,
+  shortfallBackingRefusal,
 };

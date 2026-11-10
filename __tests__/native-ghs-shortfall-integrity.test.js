@@ -93,85 +93,107 @@ if (hasDb) {
         return { ghs: new Prisma.Decimal(u.nativeGhsBalance).toFixed(2), usdc: new Prisma.Decimal(u.availableBalance).toFixed(8) };
     };
 
-    test('quote direction is USDC→GHS on the shortfall route', async () => {
+    // ── WP-C: the executable shortfall quote no longer exists ───────────────
+    // The proofs below keep their original subject — DIRECTION correctness, the
+    // disclosed-debit-equals-debit rule, and zero mutation when the split has
+    // moved — but they now prove it against the refusal, because a USDC-funded
+    // conversion may not execute until the platform can evidence the GHS asset
+    // it would create. Historical rows (already committed) keep the old shape
+    // and are exercised in native-ghs-funded-shortfall-reversal.test.js.
+
+    // "TransactionQuote" is created by infra/install-transaction-quote-overlay.js,
+    // so it has no Prisma delegate: count it through SQL or the assertion would
+    // silently test an undefined property.
+    const quoteCount = async () => {
+        const rows = await prisma.$queryRaw`SELECT count(*)::int AS c FROM "TransactionQuote"`;
+        return rows[0].c;
+    };
+
+    test('the shortfall route refuses to mint a direction-bearing conversion quote', async () => {
         await setSettings();
         const user = await seedUser(prisma, { nativeGhsBalance: 20 });
+        const before = await quoteCount();
+
         const quoted = await quotePost(buildApp(), user, { amountGhs: '50.00' });
+
         expect(quoted.status).toBe(200);
-        expect(quoted.body.quote.routeIdentity).toEqual({
-            inputAsset: 'USDC', outputAsset: 'GHS', selectedRoute: 'USDC_TO_GHS_SHORTFALL',
+        expect(quoted.body.quote).toBeNull();
+        expect(quoted.body.plan.requiresQuote).toBe(true);
+        expect(quoted.body.plan.shortfallGhs).toBe('30.00');
+        expect(quoted.body.shortfallFunding).toEqual({
+            executable: false,
+            code: 'NATIVE_GHS_SHORTFALL_BACKING_UNAVAILABLE',
+            message: expect.stringContaining('cannot yet evidence the GHS'),
         });
-        expect(quoted.body.quote.shortfallGhs).toBe('30.00');
+        // No quote row is persisted, so no direction can be read backwards by a
+        // settlement path and nothing can be consumed later.
+        expect(await quoteCount()).toBe(before);
     });
 
-    test('disclosed 8dp USDC debit equals the actual debit; theoretical 12dp is never the price', async () => {
+    test('a shortfall execution refuses with the backing code and debits nothing', async () => {
         await setSettings();
         const user = await seedUser(prisma, { nativeGhsBalance: 20, availableBalance: 1000 });
         const app = buildApp();
-        const quoted = await quotePost(app, user, { amountGhs: '50.00' });
-        const q = quoted.body.quote;
-        expect(q.usdcDebit).toMatch(/^\d+\.\d{8}$/);
-        expect(q.usdcDebit).toBe(q.usdcDebitExact);
-        expect(new Prisma.Decimal(q.usdcDebitTheoretical).toDecimalPlaces(8, Prisma.Decimal.ROUND_HALF_UP).toFixed(8)).toBe(q.usdcDebit);
-
         const before = await ghsOf(user.id);
-        const res = await ghsPost(app, user, { amountGhs: '50.00', quoteId: q.quoteId });
-        expect(res.status).toBe(202);
-        const after = await ghsOf(user.id);
-        const usdcSpent = new Prisma.Decimal(before.usdc).minus(new Prisma.Decimal(after.usdc));
-        expect(usdcSpent.toFixed(8)).toBe(q.usdcDebit);
-        // The GHS wallet contributed exactly its native balance (20.00) and the
-        // quoted USDC funded the rest (30.00); the payout was 50.00 in total, so
-        // the wallet lands at zero and no GHS was created beyond the funded
-        // shortfall.
-        expect(after.ghs).toBe('0.00');
-        expect(new Prisma.Decimal(before.ghs).minus(new Prisma.Decimal(after.ghs)).toFixed(2)).toBe('20.00');
-    });
+        const reservationsBefore = await prisma.fiatLiquidityReservation.count();
+        // seedUser seeds a DEPOSIT_CRYPTO row, so the invariant is "unchanged
+        // and no WITHDRAWAL row", not "zero rows".
+        const txBefore = await prisma.transactionHistory.count({ where: { userId: user.id } });
 
-    test('GHS credited after the quote: stale quote refused, no USDC debited, quote not consumed', async () => {
-        await setSettings();
-        const user = await seedUser(prisma, { nativeGhsBalance: 20, availableBalance: 1000 });
-        const app = buildApp();
-        const quoted = await quotePost(app, user, { amountGhs: '50.00' });
-        const q = quoted.body.quote;
-        const before = await ghsOf(user.id);
+        const res = await ghsPost(app, user, { amountGhs: '50.00', quoteId: randomUUID() });
 
-        // the customer receives GHS 30 while reviewing the quote
-        await prisma.user.update({ where: { id: user.id }, data: { nativeGhsBalance: { increment: 30 } } });
-        const mid = await ghsOf(user.id);
-
-        const res = await ghsPost(app, user, { amountGhs: '50.00', quoteId: q.quoteId });
-        expect(res.status).toBeGreaterThanOrEqual(400);
-        expect(res.status).toBeLessThan(500);
-        expect(res.body.code).toBe('NATIVE_GHS_QUOTE_INTENT_CHANGED');
+        expect(res.status).toBe(409);
+        expect(res.body.code).toBe('NATIVE_GHS_SHORTFALL_BACKING_UNAVAILABLE');
+        expect(res.body.message).toContain('no USDC was debited');
 
         const after = await ghsOf(user.id);
-        expect(after.usdc).toBe(mid.usdc); // zero USDC moved
-        expect(after.ghs).toBe(mid.ghs);   // zero GHS moved
-        expect(before.usdc).toBe(after.usdc);
-        expect(await prisma.fiatLiquidityReservation.count({ where: { reference: res.body.reference || 'none' } })).toBe(0);
+        expect(after.usdc).toBe(before.usdc);  // no USDC debit
+        expect(after.ghs).toBe(before.ghs);    // no GHS credit, no GHS debit
+        expect(await prisma.fiatLiquidityReservation.count()).toBe(reservationsBefore);
+        expect(await prisma.transactionHistory.count({ where: { userId: user.id } })).toBe(txBefore);
+        // `type` is an enum: filter in JS rather than sending a String filter.
+        const types = (await prisma.transactionHistory.findMany({
+            where: { userId: user.id }, select: { type: true },
+        })).map((r) => String(r.type));
+        expect(types.filter((t) => t.startsWith('WITHDRAWAL'))).toHaveLength(0);
     });
 
-    test('GHS spent after the quote: stale quote refused, nothing converted', async () => {
+    test('a refused shortfall leaves no withdrawal, no ledger posting and no consumed quote', async () => {
         await setSettings();
         const user = await seedUser(prisma, { nativeGhsBalance: 20, availableBalance: 1000 });
         const app = buildApp();
-        const quoted = await quotePost(app, user, { amountGhs: '50.00' });
-        const q = quoted.body.quote;
+        const ledgerBefore = await prisma.ledgerTransaction.count();
+        const quoteBefore = await quoteCount();
+
+        const res = await ghsPost(app, user, { amountGhs: '50.00', quoteId: randomUUID() });
+
+        expect(res.status).toBe(409);
+        expect(res.body.code).toBe('NATIVE_GHS_SHORTFALL_BACKING_UNAVAILABLE');
+        expect(await prisma.withdrawal.count({ where: { userId: user.id } })).toBe(0);
+        expect(await prisma.ledgerTransaction.count()).toBe(ledgerBefore);
+        expect(await quoteCount()).toBe(quoteBefore);
+    });
+
+    test('GHS spent after a quote: the refusal is the same and nothing is converted', async () => {
+        await setSettings();
+        const user = await seedUser(prisma, { nativeGhsBalance: 20, availableBalance: 1000 });
+        const app = buildApp();
 
         await prisma.user.update({ where: { id: user.id }, data: { nativeGhsBalance: { decrement: 10 } } });
         const mid = await ghsOf(user.id);
 
-        const res = await ghsPost(app, user, { amountGhs: '50.00', quoteId: q.quoteId });
-        expect(res.status).toBeGreaterThanOrEqual(400);
-        expect(res.body.code).toBe('NATIVE_GHS_QUOTE_INTENT_CHANGED');
+        const res = await ghsPost(app, user, { amountGhs: '50.00', quoteId: randomUUID() });
+        expect(res.status).toBe(409);
+        expect(res.body.code).toBe('NATIVE_GHS_SHORTFALL_BACKING_UNAVAILABLE');
 
         const after = await ghsOf(user.id);
         expect(after.usdc).toBe(mid.usdc);
         expect(after.ghs).toBe(mid.ghs);
-        // the quote was NOT burned by the refusal: the customer can re-quote and pay
+        // and the preflight still reports the plan honestly, unchanged by the
+        // refusal
         const requote = await quotePost(app, user, { amountGhs: '50.00' });
         expect(requote.status).toBe(200);
-        expect(requote.body.quote.shortfallGhs).toBe('40.00');
+        expect(requote.body.plan.shortfallGhs).toBe('40.00');
+        expect(requote.body.quote).toBeNull();
     });
 });

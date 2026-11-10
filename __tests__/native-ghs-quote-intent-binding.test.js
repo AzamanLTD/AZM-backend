@@ -94,52 +94,56 @@ if (hasDb) {
         return !!rows?.[0]?.consumedAt;
     };
 
-    test('A: a quote for payee A cannot fund payee B, and is not burned by the attempt', async () => {
+    // ── WP-C: the executable shortfall quote no longer exists ───────────────
+    // The intent-binding guard below (quote names its payee and amount) still
+    // protects HISTORICAL quotes, but no new one can be minted, so every attempt
+    // now stops at the earlier, stronger refusal. These tests prove that
+    // precedence and that the refusal is inert — not that binding was removed.
+
+    test('A: no quote can fund payee A or payee B — the backing refusal precedes intent binding', async () => {
         await setSettings();
         const user = await seedUser(prisma, { nativeGhsBalance: 20, availableBalance: 1000 });
         const app = buildApp();
 
         const quoted = await quotePost(app, user, { amountGhs: '50.00', destination: PAYEE_A });
         expect(quoted.status).toBe(200);
-        const { quoteId } = quoted.body.quote;
-        expect(quoted.body.quote.intent.rail).toBe('MOMO');
-        expect(quoted.body.quote.intent.recipientGhs).toBe('50.00');
+        expect(quoted.body.quote).toBeNull();
+        expect(quoted.body.shortfallFunding).toMatchObject({
+            executable: false, code: 'NATIVE_GHS_SHORTFALL_BACKING_UNAVAILABLE',
+        });
 
         const before = await stateOf(user.id);
         const ledgerBefore = await prisma.ledgerTransaction.count();
+        const quoteId = randomUUID();
 
-        const wrongPayee = await ghsPost(app, user, { amountGhs: '50.00', quoteId, destination: PAYEE_B });
-        expect(wrongPayee.status).toBe(409);
-        expect(wrongPayee.body.code).toBe('NATIVE_GHS_QUOTE_INTENT_MISMATCH');
+        for (const destination of [PAYEE_B, PAYEE_A]) {
+            const res = await ghsPost(app, user, { amountGhs: '50.00', quoteId, destination });
+            expect(res.status).toBe(409);
+            expect(res.body.code).toBe('NATIVE_GHS_SHORTFALL_BACKING_UNAVAILABLE');
+            // The intent guard is not reached: the refusal is earlier and stronger.
+            expect(res.body.code).not.toBe('NATIVE_GHS_QUOTE_INTENT_MISMATCH');
+        }
         expect(await stateOf(user.id)).toEqual(before);
         expect(await prisma.ledgerTransaction.count()).toBe(ledgerBefore);
-        // The refusal must not consume what the customer consented to.
         expect(await quoteConsumed(quoteId)).toBe(false);
-
-        const rightPayee = await ghsPost(app, user, { amountGhs: '50.00', quoteId, destination: PAYEE_A });
-        expect(rightPayee.status).toBe(202);
-        expect(await quoteConsumed(quoteId)).toBe(true);
-        const after = await stateOf(user.id);
-        expect(new Prisma.Decimal(after.usdc).lessThan(new Prisma.Decimal(before.usdc))).toBe(true);
     });
 
-    test('B: a quote for 50.00 cannot fund a 60.00 payout', async () => {
+    test('B: a 60.00 payout cannot spend a quote, and the refusal names the backing', async () => {
         await setSettings();
         const user = await seedUser(prisma, { nativeGhsBalance: 20, availableBalance: 1000 });
         const app = buildApp();
 
         const quoted = await quotePost(app, user, { amountGhs: '50.00', destination: PAYEE_A });
-        const { quoteId } = quoted.body.quote;
+        expect(quoted.body.quote).toBeNull();
         const before = await stateOf(user.id);
 
-        const res = await ghsPost(app, user, { amountGhs: '60.00', quoteId, destination: PAYEE_A });
+        const res = await ghsPost(app, user, { amountGhs: '60.00', quoteId: randomUUID(), destination: PAYEE_A });
         expect(res.status).toBe(409);
-        expect(res.body.code).toBe('NATIVE_GHS_QUOTE_INTENT_MISMATCH');
+        expect(res.body.code).toBe('NATIVE_GHS_SHORTFALL_BACKING_UNAVAILABLE');
         expect(await stateOf(user.id)).toEqual(before);
-        expect(await quoteConsumed(quoteId)).toBe(false);
     });
 
-    test('C: the API cannot mint an unbound quote, and one minted by hand is still refused', async () => {
+    test('C: the API cannot mint an unbound quote, and the planner cannot mint any executable quote', async () => {
         await setSettings();
         const user = await seedUser(prisma, { nativeGhsBalance: 20, availableBalance: 1000 });
         const app = buildApp();
@@ -149,23 +153,19 @@ if (hasDb) {
         const unbound = await quotePost(app, user, { amountGhs: '50.00' });
         expect(unbound.status).toBe(400);
 
-        // Defence in depth: even a quote minted without a payee (here, straight
-        // through the planner) cannot be spent on a payout that names one.
+        // Defence in depth: the planner itself refuses, so even a caller inside
+        // the process cannot mint a quote the intent guard would have covered.
         const planner = require('../src/services/ghsFundingPlanner');
         const plan = planner.planGhsPayoutFunding({ amountGhs: '50.00', feeGhs: 0, availableNativeGhs: '20.00' });
-        const manual = await planner.quoteGhsShortfall({
+        await expect(planner.quoteGhsShortfall({
             prisma,
             marketOracle: undefined,
             userId: user.id,
             shortfallGhs: plan.shortfallGhs,
             intent: { rail: 'MOMO', recipientGhs: plan.recipientGhs, feeGhs: plan.feeGhs, destinationIdentity: null },
-        });
-        expect(manual.intent.destinationIdentity).toBe(null);
+        })).rejects.toMatchObject({ code: 'NATIVE_GHS_SHORTFALL_BACKING_UNAVAILABLE' });
 
         const before = await stateOf(user.id);
-        const res = await ghsPost(app, user, { amountGhs: '50.00', quoteId: manual.quoteId, destination: PAYEE_A });
-        expect(res.status).toBe(409);
-        expect(res.body.code).toBe('NATIVE_GHS_QUOTE_INTENT_MISMATCH');
         expect(await stateOf(user.id)).toEqual(before);
     });
 

@@ -144,7 +144,15 @@ if (hasDb) {
     };
 
     // ── A. the lifecycle ───────────────────────────────────────────────────
-    test('A: BANK quote -> consent -> payout, exact 8dp debit, quote consumed once', async () => {
+    // ── WP-C: no executable BANK shortfall quote can exist ─────────────────
+    // The bank quote lifecycle below used to fund a payout from USDC. That
+    // conversion is refused until the platform can evidence the GHS asset it
+    // would create, so each scenario now proves the refusal is inert: no quote
+    // identity, no debit, no provider call, nothing consumed.
+
+    const BACKING = 'NATIVE_GHS_SHORTFALL_BACKING_UNAVAILABLE';
+
+    test('A: a BANK shortfall quote is non-executable and never reaches the payout port', async () => {
         await setSettings();
         const user = await seedUser(prisma, { nativeGhsBalance: 20, availableBalance: 1000 });
         const bene = await makeBeneficiary(user.id);
@@ -152,85 +160,66 @@ if (hasDb) {
         const app = buildApp(port);
 
         const quoted = await quotePost(app, user, { amountGhs: '100.00', beneficiaryId: bene.id });
-        expect(quoted.status).toBe(200);
-        expect(quoted.body.quote.intent.rail).toBe('BANK');
-        expect(quoted.body.quote.intent.recipientGhs).toBe('100.00');
-        expect(quoted.body.quote.intent.destinationIdentity).toMatch(/^fp:[A-Za-z0-9_-]+@GCB$/);
-        expect(quoted.body.plan.shortfallGhs).toBe('80.00');
-        const { quoteId } = quoted.body.quote;
-        const usdcDebit = quoted.body.quote.usdcDebit;
+        // The BANK preview maps the refusal to the status itself (the GHS
+        // preview returns 200 with a non-executable estimate). Either way no
+        // quote identity exists.
+        expect(quoted.status).toBe(409);
+        expect(quoted.body.code).toBe(BACKING);
+        expect(quoted.body.quote).toBeUndefined();
 
         const before = await stateOf(user.id);
-        const res = await bankPost(app, user, { amountGhs: '100.00', beneficiaryId: bene.id, quoteId });
-        expect(res.status).toBe(202);
-        expect(res.body.success).toBe(true);
-
-        const after = await stateOf(user.id);
-        // USDC: exactly the disclosed 8dp debit.
-        expect(new Prisma.Decimal(before.available).minus(after.available).toFixed(8)).toBe(usdcDebit);
-        expect(after.nativeGhs).toBe('0.00');
-        expect(after.withdrawals).toBe(before.withdrawals + 1);
-        expect(await quoteConsumed(quoteId)).toBe(true);
-
-        // E. replay: the same quote cannot fund a second payout.
-        const replay = await bankPost(app, user, { amountGhs: '100.00', beneficiaryId: bene.id, quoteId });
-        expect(replay.status).toBeGreaterThanOrEqual(400);
+        const res = await bankPost(app, user, { amountGhs: '100.00', beneficiaryId: bene.id, quoteId: randomUUID() });
+        expect(res.status).toBe(409);
+        expect(res.body.code).toBe(BACKING);
+        expect(await stateOf(user.id)).toEqual(before);
+        expect(port.initiateBankTransfer).not.toHaveBeenCalled();
     });
 
-    // ── B. intent mismatches ───────────────────────────────────────────────
-    test('B1: the same digits under a DIFFERENT bank code cannot spend the quote', async () => {
+    test('B1: a changed bank code cannot spend a quote — refused before the payee is examined', async () => {
         await setSettings();
         const user = await seedUser(prisma, { nativeGhsBalance: 20, availableBalance: 1000 });
         const bene = await makeBeneficiary(user.id, { bankCode: 'GCB' });
         const port = bankPort();
         const app = buildApp(port);
         const quoted = await quotePost(app, user, { amountGhs: '100.00', beneficiaryId: bene.id });
-        expect(quoted.status).toBe(200);
-        const { quoteId } = quoted.body.quote;
-        expect(quoted.body.quote.intent.destinationIdentity).toMatch(/@GCB$/);
+        expect(quoted.status).toBe(409);
 
-        // The payee record now names a different bank for the same digits. The
-        // account number is only unique WITHIN a bank, so this is a different
-        // payee and the consent no longer covers it.
         await prisma.savedBankBeneficiary.update({ where: { id: bene.id }, data: { bankCode: 'ECO' } });
 
         const before = await stateOf(user.id);
-        const res = await bankPost(app, user, { amountGhs: '100.00', beneficiaryId: bene.id, quoteId });
-        expect(res.status).toBeGreaterThanOrEqual(400);
-        expect(String(res.body.code || '')).toBe('NATIVE_GHS_QUOTE_INTENT_MISMATCH');
+        const res = await bankPost(app, user, { amountGhs: '100.00', beneficiaryId: bene.id, quoteId: randomUUID() });
+        expect(res.status).toBe(409);
+        expect(res.body.code).toBe(BACKING);
         expect(await stateOf(user.id)).toEqual(before);
-        expect(await quoteConsumed(quoteId)).toBe(false);
         expect(port.initiateBankTransfer).not.toHaveBeenCalled();
     });
 
-    test('B2: a changed amount cannot spend the quote', async () => {
+    test('B2: a changed amount cannot spend a quote', async () => {
         await setSettings();
         const user = await seedUser(prisma, { nativeGhsBalance: 20, availableBalance: 1000 });
         const bene = await makeBeneficiary(user.id);
         const port = bankPort();
         const app = buildApp(port);
-        const quoted = await quotePost(app, user, { amountGhs: '100.00', beneficiaryId: bene.id });
-        const { quoteId } = quoted.body.quote;
+        await quotePost(app, user, { amountGhs: '100.00', beneficiaryId: bene.id });
         const before = await stateOf(user.id);
-        const res = await bankPost(app, user, { amountGhs: '111.00', beneficiaryId: bene.id, quoteId });
-        expect(res.status).toBeGreaterThanOrEqual(400);
+        const res = await bankPost(app, user, { amountGhs: '111.00', beneficiaryId: bene.id, quoteId: randomUUID() });
+        expect(res.status).toBe(409);
+        expect(res.body.code).toBe(BACKING);
         expect(await stateOf(user.id)).toEqual(before);
-        expect(await quoteConsumed(quoteId)).toBe(false);
         expect(port.initiateBankTransfer).not.toHaveBeenCalled();
     });
 
-    test('B3: a BANK quote cannot fund a MoMo payout', async () => {
+    test('B3: a MoMo payout cannot spend a bank shortfall quote', async () => {
         await setSettings();
         const user = await seedUser(prisma, { nativeGhsBalance: 20, availableBalance: 1000 });
         const bene = await makeBeneficiary(user.id);
         const app = buildApp(bankPort());
-        const quoted = await quotePost(app, user, { amountGhs: '100.00', beneficiaryId: bene.id });
-        const { quoteId } = quoted.body.quote;
+        await quotePost(app, user, { amountGhs: '100.00', beneficiaryId: bene.id });
         const before = await stateOf(user.id);
-        const res = await ghsPost(app, user, { amountGhs: '100.00', destination: '233241234567', quoteId });
-        expect(res.status).toBeGreaterThanOrEqual(400);
+        const res = await ghsPost(app, user, { amountGhs: '100.00', destination: '233241234567', quoteId: randomUUID() });
+        expect(res.status).toBe(409);
+        expect(res.body.code).toBe(BACKING);
         expect(await stateOf(user.id)).toEqual(before);
-        expect(await quoteConsumed(quoteId)).toBe(false);
     });
 
     // ── C. beneficiary scoping and verification ────────────────────────────
@@ -262,23 +251,20 @@ if (hasDb) {
     });
 
     // ── D. balance changed after the quote ─────────────────────────────────
-    test('D: a native balance change after the quote refuses and keeps the quote', async () => {
+    test('D: a native balance change never reaches the split check — the refusal is earlier', async () => {
         await setSettings();
         const user = await seedUser(prisma, { nativeGhsBalance: 20, availableBalance: 1000 });
         const bene = await makeBeneficiary(user.id);
         const port = bankPort();
         const app = buildApp(port);
-        const quoted = await quotePost(app, user, { amountGhs: '100.00', beneficiaryId: bene.id });
-        const { quoteId } = quoted.body.quote;
-        // The customer received GHS in the meantime: the quoted shortfall (80)
-        // is no longer the real one (70).
+        await quotePost(app, user, { amountGhs: '100.00', beneficiaryId: bene.id });
         await prisma.user.update({ where: { id: user.id }, data: { nativeGhsBalance: 30 } });
         const before = await stateOf(user.id);
-        const res = await bankPost(app, user, { amountGhs: '100.00', beneficiaryId: bene.id, quoteId });
-        expect(res.status).toBeGreaterThanOrEqual(400);
-        expect(String(res.body.code || '')).toBe('NATIVE_GHS_QUOTE_INTENT_CHANGED');
+        const res = await bankPost(app, user, { amountGhs: '100.00', beneficiaryId: bene.id, quoteId: randomUUID() });
+        expect(res.status).toBe(409);
+        expect(res.body.code).toBe(BACKING);
+        expect(res.body.code).not.toBe('NATIVE_GHS_QUOTE_INTENT_CHANGED');
         expect(await stateOf(user.id)).toEqual(before);
-        expect(await quoteConsumed(quoteId)).toBe(false);
         expect(port.initiateBankTransfer).not.toHaveBeenCalled();
     });
 

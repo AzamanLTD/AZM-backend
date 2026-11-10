@@ -218,9 +218,14 @@ describe('native-GHS withdrawal leg (real PostgreSQL)', () => {
         expect(res.status).toBe(202);
         await waitForDispatch(res.body.reference);
         expect(dispatcher.initiateTransfer).toHaveBeenCalledTimes(1);
+        // WP-C: no shortfall quote is executable any more, and the estimate is
+        // still returned without a quote identity or an FX dependency.
         const quote = await quotePost(app, user, { amountGhs: '900.00' });
-        expect(quote.status).toBeGreaterThanOrEqual(400);
-        expect(quote.status).toBeLessThan(500);
+        expect(quote.status).toBe(200);
+        expect(quote.body.quote).toBeNull();
+        expect(quote.body.shortfallFunding).toMatchObject({
+            executable: false, code: 'NATIVE_GHS_SHORTFALL_BACKING_UNAVAILABLE',
+        });
     });
 
     // ── D. shortfall ────────────────────────────────────────────────────────
@@ -238,50 +243,35 @@ describe('native-GHS withdrawal leg (real PostgreSQL)', () => {
         expect(after.availableBalance.toFixed(8)).toBe('1000.00000000');
     });
 
-    test('consented shortfall quote funds EXACTLY the shortfall and is consumed once', async () => {
+    test('a consented shortfall cannot fund a payout: refused, nothing converted, quote untouched', async () => {
         await setSettings();
         const user = await ghsUser({ ghs: 20, usdc: 1000 });
-        const app = buildApp({ initiateTransfer: jest.fn(async () => ({ success: true, transactionId: 'MOO-GHS-3' })) });
+        const dispatcher = { initiateTransfer: jest.fn(async () => ({ success: true, transactionId: 'MOO-X' })) };
+        const app = buildApp(dispatcher);
 
         const quoted = await quotePost(app, user, { amountGhs: '50.00' });
         expect(quoted.status).toBe(200);
-        const quoteId = quoted.body.quote.quoteId;
-        const usdcDebit = new Prisma.Decimal(quoted.body.quote.usdcDebitExact);
-        expect(quoteId).toBeTruthy();
-        expect(quoted.body.quote.shortfallGhs).toBe('30.00');
+        expect(quoted.body.quote).toBeNull();
+        expect(quoted.body.plan.shortfallGhs).toBe('30.00');
 
-        // quote creation is NOT a money movement
-        const preQuote = await prisma.user.findUnique({ where: { id: user.id }, select: { availableBalance: true, nativeGhsBalance: true } });
-        expect(preQuote.availableBalance.toFixed(8)).toBe('1000.00000000');
-        expect(preQuote.nativeGhsBalance.toFixed(2)).toBe('20.00');
+        const before = await prisma.user.findUnique({
+            where: { id: user.id }, select: { nativeGhsBalance: true, availableBalance: true },
+        });
+        const ledgerBefore = await prisma.ledgerTransaction.count();
 
-        const res = await ghsPost(app, user, { amountGhs: '50.00', quoteId });
-        expect(res.status).toBe(202);
-        const { reference } = res.body;
-        await waitForDispatch(reference);
-        expect(res.body.data.funding.mode).toBe('USDC_SHORTFALL_FUNDED');
+        const res = await ghsPost(app, user, { amountGhs: '50.00', quoteId: require('crypto').randomUUID() });
+        expect(res.status).toBe(409);
+        expect(res.body.code).toBe('NATIVE_GHS_SHORTFALL_BACKING_UNAVAILABLE');
 
-        const after = await prisma.user.findUnique({ where: { id: user.id }, select: { availableBalance: true, nativeGhsBalance: true } });
-        expect(after.availableBalance.toFixed(8)).toBe(new Prisma.Decimal(1000).minus(usdcDebit).toFixed(8));
-        expect(after.nativeGhsBalance.toFixed(2)).toBe('0.00');
-
-        const [conversion] = await ledgerKeys(`ledger:wallet:withdrawal-ghs-funding:${reference}`);
-        expect(conversion).toBeTruthy();
-        expect(conversion.entryType).toBe('ASSET_CONVERSION');
-
-        // replay with a NEW reference: the quote is one-time
-        const replay = await ghsPost(app, user, { amountGhs: '50.00', quoteId });
-        expect(replay.status).toBeGreaterThanOrEqual(400);
-        expect(replay.status).toBeLessThan(500);
-        const final = await prisma.user.findUnique({ where: { id: user.id }, select: { availableBalance: true } });
-        expect(final.availableBalance.toFixed(8)).toBe(after.availableBalance.toFixed(8));
+        const after = await prisma.user.findUnique({
+            where: { id: user.id }, select: { nativeGhsBalance: true, availableBalance: true },
+        });
+        expect(after.nativeGhsBalance.toFixed(2)).toBe(before.nativeGhsBalance.toFixed(2));
+        expect(after.availableBalance.toFixed(8)).toBe(before.availableBalance.toFixed(8));
+        expect(await prisma.ledgerTransaction.count()).toBe(ledgerBefore);
+        expect(dispatcher.initiateTransfer).not.toHaveBeenCalled();
     });
 
-    // ── F. amplification: rejection reverses once ──────────────────────────
-    // NOTE: the reversal is driven by the adapter's TYPED outcome
-    // (`err.outcome`/`err.providerOutcome`), never by the exception itself —
-    // an untyped throw is uncertainty and must NOT refund (see
-    // __tests__/native-ghs-dispatch-outcomes.test.js).
     test('definitive provider rejection reverses ONCE: GHS restored, reservation released', async () => {
         await setSettings();
         const user = await ghsUser({ ghs: 300, usdc: 1000 });
