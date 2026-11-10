@@ -437,7 +437,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             expect(dec((await state()).availableGhs)).toBe(25); // unchanged
         });
 
-        test('a treasury opening lands RECEIVED — ONLY confirmTreasuryOpening with a durable external funding observation unlocks it', async () => {
+        test('a treasury opening REFUSES to unlock from a caller assertion — only a real external observation counts', async () => {
             const { receipt } = await inTx((tx) => fiatLiquidity.recordReceipt(tx, {
                 provider: 'AZM_TREASURY', rail: 'INTERNAL',
                 dedupKey: 'treasury:t1', amountGhs: 500, treasury: true,
@@ -446,33 +446,107 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             expect(receipt.status).toBe('RECEIVED');
             expect(dec((await state()).availableGhs)).toBe(0);
 
-            // no funding reference → refused (caller JSON is not evidence)
+            // (1) The REMOVED contract: a funding reference + channel is an
+            // assertion, not evidence. It can no longer unlock anything.
             await expect(inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
-                dedupKey: 'treasury:t1', confirmedBy: 1, fundingReference: '  ', fundingChannel: 'BANK',
-            }))).rejects.toMatchObject({ code: 'LIQUIDITY_INVALID_EVIDENCE' });
-            // invalid channel → refused
+                dedupKey: 'treasury:t1', confirmedBy: 1,
+                fundingReference: 'BANK-REF-1', fundingChannel: 'BANK',
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_TREASURY_FUNDING_EVIDENCE_UNAVAILABLE' });
+            expect(dec((await state()).availableGhs)).toBe(0);
+            // …and no provider event was manufactured from that assertion.
+            expect(await prisma.fiatProviderEvent.findUnique({
+                where: { dedupKey: 'event:treasury-funding:BANK-REF-1' },
+            })).toBeNull();
+
+            // (2) Pointing at an observation that does not exist is refused.
             await expect(inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
-                dedupKey: 'treasury:t1', confirmedBy: 1, fundingReference: 'BANK-REF-1', fundingChannel: 'CASH_UNDER_MATTRESS',
-            }))).rejects.toMatchObject({ code: 'LIQUIDITY_INVALID_EVIDENCE' });
+                dedupKey: 'treasury:t1', confirmedBy: 1,
+                providerEventDedupKey: 'event:treasury-funding:BANK-REF-1',
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_TREASURY_FUNDING_EVIDENCE_UNAVAILABLE' });
+
+            // (3) A legacy AZM_TREASURY event is a CIRCULAR self-attestation:
+            // the platform's own marker can never evidence its own funding.
+            await prisma.fiatProviderEvent.create({ data: {
+                provider: 'AZM_TREASURY', rail: 'BANK', direction: 'INBOUND', status: 'FUNDED',
+                providerRef: 'BANK-REF-1', dedupKey: 'event:treasury-funding:BANK-REF-1', amountGhs: 500,
+                relatedReference: 'treasury:t1',
+            } });
+            await expect(inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+                dedupKey: 'treasury:t1', confirmedBy: 1,
+                providerEventDedupKey: 'event:treasury-funding:BANK-REF-1',
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_TREASURY_FUNDING_EVIDENCE_UNAVAILABLE' });
             expect(dec((await state()).availableGhs)).toBe(0);
 
-            // a real external funding observation becomes DURABLE evidence
+            // (4) An amount-mismatched external observation contradicts.
+            await prisma.fiatProviderEvent.create({ data: {
+                provider: 'MOOLRE', rail: 'BANK', direction: 'INBOUND', status: 'FUNDED',
+                providerRef: 'MOOLRE-TRS-1', dedupKey: 'event:moolre-treasury:wrong-amount', amountGhs: 499.99,
+            } });
+            await expect(inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+                dedupKey: 'treasury:t1', confirmedBy: 1,
+                providerEventDedupKey: 'event:moolre-treasury:wrong-amount',
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_CONFLICTING_EVIDENCE' });
+            expect(dec((await state()).availableGhs)).toBe(0);
+
+            // (5) A GENUINE settled external inbound observation does unlock it.
+            await prisma.fiatProviderEvent.create({ data: {
+                provider: 'MOOLRE', rail: 'BANK', direction: 'INBOUND', status: 'FUNDED',
+                providerRef: 'MOOLRE-TRS-OK', dedupKey: 'event:moolre-treasury:ok', amountGhs: 500,
+            } });
             const { receipt: confirmed } = await inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
-                dedupKey: 'treasury:t1', confirmedBy: 1, fundingReference: 'BANK-REF-1', fundingChannel: 'BANK',
+                dedupKey: 'treasury:t1', confirmedBy: 1,
+                providerEventDedupKey: 'event:moolre-treasury:ok',
             }));
             expect(confirmed.status).toBe('AVAILABLE');
             expect(dec((await state()).availableGhs)).toBe(500);
-            const fundingEvent = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey: 'event:treasury-funding:BANK-REF-1' } });
-            expect(fundingEvent).not.toBeNull();
-            expect(fundingEvent.provider).toBe('AZM_TREASURY');
-            expect(Number(fundingEvent.amountGhs)).toBe(500);
+            expect(confirmed.evidence.treasuryFunding).toMatchObject({
+                provider: 'MOOLRE', status: 'FUNDED', amountGhs: '500',
+            });
+            // durable single-use binding on the observation
+            const bound = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey: 'event:moolre-treasury:ok' } });
+            expect(bound.relatedReference).toBe('treasury:t1');
 
-            // replay: no double count
+            // (6) Replay: no double count.
             const { replay } = await inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
-                dedupKey: 'treasury:t1', confirmedBy: 1, fundingReference: 'BANK-REF-1', fundingChannel: 'BANK',
+                dedupKey: 'treasury:t1', confirmedBy: 1,
+                providerEventDedupKey: 'event:moolre-treasury:ok',
             }));
             expect(replay).toBe(true);
             expect(dec((await state()).availableGhs)).toBe(500);
+        });
+
+        test('the same external observation cannot fund a SECOND treasury opening', async () => {
+            const a = await inTx((tx) => fiatLiquidity.recordReceipt(tx, {
+                provider: 'AZM_TREASURY', rail: 'INTERNAL', dedupKey: 'treasury:dup-a',
+                amountGhs: 100, treasury: true, evidence: { kind: 'AUDITED_TREASURY_OPENING' },
+            }));
+            const b = await inTx((tx) => fiatLiquidity.recordReceipt(tx, {
+                provider: 'AZM_TREASURY', rail: 'INTERNAL', dedupKey: 'treasury:dup-b',
+                amountGhs: 100, treasury: true, evidence: { kind: 'AUDITED_TREASURY_OPENING' },
+            }));
+            await prisma.fiatProviderEvent.create({ data: {
+                provider: 'MOOLRE', rail: 'BANK', direction: 'INBOUND', status: 'SETTLED',
+                providerRef: 'MOOLRE-DUP', dedupKey: 'event:moolre-treasury:dup', amountGhs: 100,
+            } });
+            await inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+                dedupKey: a.receipt.dedupKey, providerEventDedupKey: 'event:moolre-treasury:dup',
+            }));
+            await expect(inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+                dedupKey: b.receipt.dedupKey, providerEventDedupKey: 'event:moolre-treasury:dup',
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_CONFLICTING_EVIDENCE' });
+            expect(dec((await state()).availableGhs)).toBe(100); // one funding, one claim
+
+            // The second opening is funded by its OWN observation, so the suite
+            // leaves no unconfirmed RECEIVED receipt behind for the
+            // reconciliation sweep to flag in a later test.
+            await prisma.fiatProviderEvent.create({ data: {
+                provider: 'MOOLRE', rail: 'BANK', direction: 'INBOUND', status: 'SETTLED',
+                providerRef: 'MOOLRE-DUP-2', dedupKey: 'event:moolre-treasury:dup-2', amountGhs: 100,
+            } });
+            await inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+                dedupKey: b.receipt.dedupKey, providerEventDedupKey: 'event:moolre-treasury:dup-2',
+            }));
+            expect(dec((await state()).availableGhs)).toBe(200);
         });
 
         test('liquidateProfits (authority ON) creates NO spendable GHS — a NON-AVAILABLE audited opening only (blocker 1)', async () => {
@@ -495,12 +569,17 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             expect(Number(opening.amountGhs)).toBe(671.00); // 50 USDC × 13.42 — priced, not custody
             expect(dec((await state()).availableGhs)).toBe(0); // zero claimable liquidity
 
-            // unlocking it requires the external funding boundary
-            await inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+            // NOT unlockable by assertion: a MoMo reference typed by the caller
+            // is not a provider observation, so the opening stays non-available.
+            await expect(inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
                 dedupKey: opening.dedupKey, confirmedBy: 1,
                 fundingReference: 'MOVO-98765', fundingChannel: 'MOMO',
-            }));
-            expect(dec((await state()).availableGhs)).toBe(671.00);
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_TREASURY_FUNDING_EVIDENCE_UNAVAILABLE' });
+            await expect(inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+                dedupKey: opening.dedupKey, confirmedBy: 1,
+                providerEventDedupKey: 'event:treasury-funding:MOVO-98765',
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_TREASURY_FUNDING_EVIDENCE_UNAVAILABLE' });
+            expect(dec((await state()).availableGhs)).toBe(0);
         });
 
         test('RECONCILIATION_REQUIRED and REVERSED receipts can never be confirmed AVAILABLE', async () => {

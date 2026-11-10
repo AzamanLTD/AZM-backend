@@ -97,6 +97,37 @@ class GhsEvidenceRequiredError extends Error {
     }
 }
 
+/**
+ * A treasury opening cannot be promoted to spendable GHS because no genuine,
+ * independently recorded external funding observation backs it.
+ *
+ * This is a DISTINCT failure from "not enough liquidity" and from "bad input":
+ * the caller may have supplied perfectly well-formed arguments and the receipt
+ * may be a legitimate audited opening — the missing thing is third-party
+ * evidence, which AZAMAN cannot manufacture for itself.
+ */
+class TreasuryFundingEvidenceUnavailableError extends Error {
+    constructor(message, details = null) {
+        super(message);
+        this.name = 'TreasuryFundingEvidenceUnavailableError';
+        this.code = 'LIQUIDITY_TREASURY_FUNDING_EVIDENCE_UNAVAILABLE';
+        this.details = details;
+    }
+}
+
+// ─── treasury funding evidence contract ─────────────────────────────────────
+// A treasury opening (RECEIVED) may become AVAILABLE only when a REAL external
+// provider observation already exists in FiatProviderEvent and matches it.
+//
+// The observation must come from a provider that is not AZAMAN: AZM_TREASURY is
+// an audited INTERNAL marker written by this platform, so treating it as
+// funding evidence is circular — it would let a caller's assertion ("BANK-REF-1
+// on the BANK rail") become independent evidence purely by being persisted.
+// AZM_WEBHOOK is accepted because it records an authenticated provider callback.
+const TREASURY_FUNDING_PROVIDERS = Object.freeze(['MOOLRE', 'MTN_MOMO', 'AZM_WEBHOOK']);
+const TREASURY_FUNDING_SETTLED_STATUSES = Object.freeze(['FUNDED', 'SETTLED', 'SUCCESS', 'PAID', 'COMPLETED']);
+const LIQUIDITY_TREASURY_EVIDENCE_UNAVAILABLE = 'LIQUIDITY_TREASURY_FUNDING_EVIDENCE_UNAVAILABLE';
+
 // ─── exact GHS decimals ─────────────────────────────────────────────────────
 
 // GHS has exactly 2 fractional digits (pesewas). Evidence or amounts carrying
@@ -995,7 +1026,7 @@ async function confirmReconciliationMatch(tx, {
  * USDC liquidation can never unlock spendable GHS by itself.
  */
 async function confirmTreasuryOpening(tx, {
-    dedupKey, confirmedBy = null, fundingReference, fundingChannel,
+    dedupKey, confirmedBy = null, providerEventDedupKey = null,
 }) {
     await ensureStateRow(tx);
     const receipt = await tx.fiatLiquidityReceipt.findUnique({ where: { dedupKey } });
@@ -1006,31 +1037,66 @@ async function confirmTreasuryOpening(tx, {
             `[fiatLiquidity] receipt ${dedupKey} in state ${receipt.status} cannot be confirmed (RECEIVED treasury opening only)`
         );
     }
-    if (!fundingReference || typeof fundingReference !== 'string' || fundingReference.trim().length < 3) {
-        throw new InvalidEvidenceError(
-            '[fiatLiquidity] confirming a treasury opening requires an external funding reference (e.g. bank/MoMo transfer id)'
+
+    // The caller may only POINT AT an observation. It may never describe one:
+    // fundingReference/fundingChannel are assertions, and this function no
+    // longer accepts them (see the removed AZM_TREASURY self-attestation).
+    if (!providerEventDedupKey || typeof providerEventDedupKey !== 'string' || providerEventDedupKey.trim().length < 3) {
+        throw new TreasuryFundingEvidenceUnavailableError(
+            '[fiatLiquidity] a treasury opening can only be confirmed against an independently recorded external '
+            + 'funding observation (FiatProviderEvent.dedupKey). A caller-supplied funding reference or channel is '
+            + 'an assertion, not evidence, and can never unlock spendable GHS.',
+            { dedupKey, receiptAmountGhs: receipt.amountGhs?.toString() ?? null },
         );
     }
-    if (!['BANK', 'MOMO', 'OTHER'].includes(fundingChannel)) {
-        throw new InvalidEvidenceError('[fiatLiquidity] fundingChannel must be BANK, MOMO or OTHER');
-    }
 
-    // The funding observation becomes DURABLE evidence, not caller JSON.
-    const fundingEventDedupKey = `event:treasury-funding:${fundingReference.trim()}`;
-    const { event: fundingEvent } = await recordProviderEvent(tx, {
-        provider: 'AZM_TREASURY',
-        rail: fundingChannel === 'BANK' ? 'BANK' : fundingChannel === 'MOMO' ? 'MOMO' : 'INTERNAL',
-        direction: 'INBOUND',
-        status: 'FUNDED',
-        providerRef: fundingReference.trim(),
-        dedupKey: fundingEventDedupKey,
-        amountGhs: receipt.amountGhs,
-        relatedReference: dedupKey,
-        raw: { fundingChannel, confirmedBy },
+    const observation = await tx.fiatProviderEvent.findUnique({
+        where: { dedupKey: providerEventDedupKey.trim() },
     });
-    if (fundingEvent.amountGhs == null || !fundingEvent.amountGhs.equals(receipt.amountGhs)) {
+    if (!observation) {
+        throw new TreasuryFundingEvidenceUnavailableError(
+            `[fiatLiquidity] no external funding observation ${providerEventDedupKey.trim()} exists — treasury `
+            + 'confirmation requires a durable provider-recorded event, and this platform cannot create one for itself.',
+            { dedupKey, providerEventDedupKey: providerEventDedupKey.trim() },
+        );
+    }
+    if (!TREASURY_FUNDING_PROVIDERS.includes(observation.provider)) {
+        throw new TreasuryFundingEvidenceUnavailableError(
+            `[fiatLiquidity] observation ${observation.dedupKey} is provider ${observation.provider}, which is not a `
+            + 'trusted external funding source (AZM_TREASURY is an internal marker and cannot evidence its own funding).',
+            { dedupKey, provider: observation.provider },
+        );
+    }
+    if (observation.direction !== 'INBOUND') {
+        throw new TreasuryFundingEvidenceUnavailableError(
+            `[fiatLiquidity] observation ${observation.dedupKey} is ${observation.direction}; treasury funding requires INBOUND.`,
+            { dedupKey, direction: observation.direction },
+        );
+    }
+    if (!TREASURY_FUNDING_SETTLED_STATUSES.includes(String(observation.status).toUpperCase())) {
+        throw new TreasuryFundingEvidenceUnavailableError(
+            `[fiatLiquidity] observation ${observation.dedupKey} is ${observation.status}; treasury funding requires a `
+            + `settled inbound status (${TREASURY_FUNDING_SETTLED_STATUSES.join('/')}).`,
+            { dedupKey, status: observation.status },
+        );
+    }
+    if (observation.amountGhs == null) {
         throw new ConflictingEvidenceError(
-            '[fiatLiquidity] funding observation amount contradicts the treasury opening'
+            `[fiatLiquidity] observation ${observation.dedupKey} carries no amount and cannot back a treasury opening`
+        );
+    }
+    if (!observation.amountGhs.equals(receipt.amountGhs)) {
+        throw new ConflictingEvidenceError(
+            `[fiatLiquidity] observation ${observation.dedupKey} amount ${observation.amountGhs} contradicts treasury `
+            + `opening ${dedupKey} amount ${receipt.amountGhs}`
+        );
+    }
+    // Durable single-use: an observation already bound to another receipt
+    // (or to another economic identity) can never fund a second one.
+    if (observation.relatedReference != null && String(observation.relatedReference) !== String(dedupKey)) {
+        throw new ConflictingEvidenceError(
+            `[fiatLiquidity] observation ${observation.dedupKey} is already bound to ${observation.relatedReference} `
+            + `and cannot also fund ${dedupKey}`
         );
     }
 
@@ -1039,6 +1105,10 @@ async function confirmTreasuryOpening(tx, {
         data: { status: 'AVAILABLE', confirmedAt: new Date() },
     });
     if (claim.count !== 1) throw new ConflictingEvidenceError('[fiatLiquidity] treasury confirmation raced');
+    await tx.fiatProviderEvent.update({
+        where: { id: observation.id },
+        data: { relatedReference: String(dedupKey) },
+    });
     const updated = await tx.fiatLiquidityReceipt.update({
         where: { id: receipt.id },
         data: {
@@ -1046,9 +1116,12 @@ async function confirmTreasuryOpening(tx, {
                 ...(receipt.evidence ?? {}),
                 confirmedBy,
                 treasuryFunding: {
-                    fundingReference: fundingReference.trim(),
-                    fundingChannel,
-                    providerEventDedupKey: fundingEventDedupKey,
+                    providerEventDedupKey: observation.dedupKey,
+                    provider: observation.provider,
+                    rail: observation.rail ?? null,
+                    providerRef: observation.providerRef ?? null,
+                    status: observation.status,
+                    amountGhs: observation.amountGhs.toString(),
                 },
             },
         },
@@ -1758,6 +1831,9 @@ module.exports = {
     recordReceipt,
     confirmReconciliationMatch,
     confirmTreasuryOpening,
+    TreasuryFundingEvidenceUnavailableError,
+    LIQUIDITY_TREASURY_EVIDENCE_UNAVAILABLE,
+    TREASURY_FUNDING_PROVIDERS,
     reserveForPayout,
     markReservationInTransit,
     settleReservation,
