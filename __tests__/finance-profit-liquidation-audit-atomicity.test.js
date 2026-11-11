@@ -4,6 +4,9 @@ if (!hasDb) console.warn('[finance-profit-liquidation-audit-atomicity] TEST_DATA
 
 describeOrSkip('profit liquidation audit atomicity (real PostgreSQL)', () => {
     let prisma, financeService, adminId;
+    let fiatLiquidityActivation;
+    let priorSettingsMode = null;
+    let priorLatch;
 
     beforeAll(async () => {
         process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -11,10 +14,25 @@ describeOrSkip('profit liquidation audit atomicity (real PostgreSQL)', () => {
         const { PrismaClient } = require('@prisma/client');
         prisma = new PrismaClient();
         financeService = require('../services/finance.service');
+        fiatLiquidityActivation = require('../src/services/fiatLiquidityActivationService');
         const admin = await prisma.user.create({
             data: { username: `liq_admin_${Date.now()}`, email: `liq_admin_${Date.now()}@test.local`, password: 'test_password', role: 'ADMIN' }
         });
         adminId = admin.id;
+
+        // §P.5-D FIXTURE ISOLATION. This suite asserts LEGACY USDC liquidation
+        // arithmetic (the pool is incremented by the liquidated amount), but it
+        // never established the regime: the effective mode is (Boolean OR latch),
+        // so a latch left behind by an earlier suite silently turned every
+        // liquidation into a treasury opening that does not touch the pool.
+        // Capture what we found so the shared singleton can be put back exactly.
+        priorSettingsMode = await prisma.globalSettings.findUnique({
+            where: { id: 1 }, select: { fiatLiquidityAuthorityEnabled: true },
+        });
+        const priorState = await prisma.fiatLiquidityState.findUnique({
+            where: { id: 1 }, select: { authorityActivatedAt: true },
+        });
+        priorLatch = priorState ? priorState.authorityActivatedAt : undefined; // undefined = row absent
     });
 
     beforeEach(async () => {
@@ -24,6 +42,28 @@ describeOrSkip('profit liquidation audit atomicity (real PostgreSQL)', () => {
         await prisma.systemFiatPool.deleteMany();
         await prisma.systemProfitFees.create({ data: { id: 1, balance: 100 } });
         await prisma.systemFiatPool.create({ data: { id: 1, balance: 10 } });
+
+        // Explicit LEGACY USDC mode: Boolean false AND no latch. Both components
+        // are set, because the regime is their OR — clearing only one leaves the
+        // suite dependent on whatever ran before it.
+        await prisma.globalSettings.upsert({
+            where: { id: 1 },
+            update: { fiatLiquidityAuthorityEnabled: false },
+            create: { id: 1, fiatLiquidityAuthorityEnabled: false },
+        });
+        await prisma.fiatLiquidityState.upsert({
+            where: { id: 1 },
+            update: { authorityActivatedAt: null },
+            create: { id: 1, availableGhs: 0, reservedGhs: 0, inTransitGhs: 0, paidOutGhs: 0, updatedAt: new Date() },
+        });
+
+        // Prove it through the production reader rather than assuming the writes
+        // did what they look like they do.
+        const mode = await fiatLiquidityActivation.readMode(prisma);
+        expect(mode.active).toBe(false);
+        expect(mode.flagged).toBe(false);
+        expect(mode.latched).toBe(false);
+        expect(mode.authorityUnit).toBe('USDC');
     });
 
     afterEach(async () => {
@@ -39,6 +79,25 @@ describeOrSkip('profit liquidation audit atomicity (real PostgreSQL)', () => {
         if (prisma) {
             await prisma.auditLog.deleteMany({ where: { actorId: adminId } });
             await prisma.user.delete({ where: { id: adminId } }).catch(() => {});
+
+            // Put the shared mode back exactly as found. Only the two fields this
+            // suite touched are restored; unrelated GlobalSettings values and the
+            // rest of the liquidity state are left alone.
+            if (priorSettingsMode) {
+                await prisma.globalSettings.update({
+                    where: { id: 1 },
+                    data: { fiatLiquidityAuthorityEnabled: priorSettingsMode.fiatLiquidityAuthorityEnabled === true },
+                }).catch(() => {});
+            }
+            if (priorLatch === undefined) {
+                // The row did not exist before this suite; remove only what we made.
+                await prisma.fiatLiquidityState.deleteMany({ where: { id: 1 } }).catch(() => {});
+            } else {
+                await prisma.fiatLiquidityState.update({
+                    where: { id: 1 }, data: { authorityActivatedAt: priorLatch },
+                }).catch(() => {});
+            }
+
             await prisma.$disconnect();
         }
     });

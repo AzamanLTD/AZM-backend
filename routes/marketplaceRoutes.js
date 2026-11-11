@@ -87,7 +87,13 @@ router.post('/checkin/verify', protect, async (req, res) => {
             token, businessUserId: req.user.id,
         });
         res.json(result);
-    } catch (e) { res.status(400).json({ success: false, message: e.message }); }
+    } catch (e) {
+        if (e && e.code && String(e.code).startsWith('QR_SIGNING_KEY')) {
+            return res.status(503).json({ success: false, code: e.code, message: 'QR check-in is temporarily unavailable.' });
+        }
+        const status = e && e.code === 'QR_TOKEN_ALREADY_USED' ? 409 : 400;
+        res.status(status).json({ success: false, code: e.code, message: e.message });
+    }
 });
 
 // GET /api/marketplace/checkin/search — search customer by AZM ID for check-in

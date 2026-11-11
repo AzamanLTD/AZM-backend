@@ -158,7 +158,10 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
         await prisma.$executeRaw`DELETE FROM "ReconciliationException" WHERE "entityType" = 'TRANSACTION'`;
         await prisma.fiatLiquidityState.upsert({
             where: { id: 1 },
-            update: { availableGhs: 0, reservedGhs: 0, inTransitGhs: 0, paidOutGhs: 0, reconciliationHeldGhs: 0 },
+            // `authorityActivatedAt: null` is a TEST-ONLY reset of the one-way
+            // §P.5-D activation latch so each case starts from a known regime.
+            // Production code never clears it (fiatLiquidityActivationService).
+            update: { availableGhs: 0, reservedGhs: 0, inTransitGhs: 0, paidOutGhs: 0, reconciliationHeldGhs: 0, authorityActivatedAt: null },
             create: { id: 1, availableGhs: 0, reservedGhs: 0, inTransitGhs: 0, paidOutGhs: 0, reconciliationHeldGhs: 0 },
         });
         await prisma.systemFiatPool.upsert({
@@ -434,7 +437,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             expect(dec((await state()).availableGhs)).toBe(25); // unchanged
         });
 
-        test('a treasury opening lands RECEIVED — ONLY confirmTreasuryOpening with a durable external funding observation unlocks it', async () => {
+        test('a treasury opening REFUSES to unlock from a caller assertion — only a real external observation counts', async () => {
             const { receipt } = await inTx((tx) => fiatLiquidity.recordReceipt(tx, {
                 provider: 'AZM_TREASURY', rail: 'INTERNAL',
                 dedupKey: 'treasury:t1', amountGhs: 500, treasury: true,
@@ -443,33 +446,107 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             expect(receipt.status).toBe('RECEIVED');
             expect(dec((await state()).availableGhs)).toBe(0);
 
-            // no funding reference → refused (caller JSON is not evidence)
+            // (1) The REMOVED contract: a funding reference + channel is an
+            // assertion, not evidence. It can no longer unlock anything.
             await expect(inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
-                dedupKey: 'treasury:t1', confirmedBy: 1, fundingReference: '  ', fundingChannel: 'BANK',
-            }))).rejects.toMatchObject({ code: 'LIQUIDITY_INVALID_EVIDENCE' });
-            // invalid channel → refused
+                dedupKey: 'treasury:t1', confirmedBy: 1,
+                fundingReference: 'BANK-REF-1', fundingChannel: 'BANK',
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_TREASURY_FUNDING_EVIDENCE_UNAVAILABLE' });
+            expect(dec((await state()).availableGhs)).toBe(0);
+            // …and no provider event was manufactured from that assertion.
+            expect(await prisma.fiatProviderEvent.findUnique({
+                where: { dedupKey: 'event:treasury-funding:BANK-REF-1' },
+            })).toBeNull();
+
+            // (2) Pointing at an observation that does not exist is refused.
             await expect(inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
-                dedupKey: 'treasury:t1', confirmedBy: 1, fundingReference: 'BANK-REF-1', fundingChannel: 'CASH_UNDER_MATTRESS',
-            }))).rejects.toMatchObject({ code: 'LIQUIDITY_INVALID_EVIDENCE' });
+                dedupKey: 'treasury:t1', confirmedBy: 1,
+                providerEventDedupKey: 'event:treasury-funding:BANK-REF-1',
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_TREASURY_FUNDING_EVIDENCE_UNAVAILABLE' });
+
+            // (3) A legacy AZM_TREASURY event is a CIRCULAR self-attestation:
+            // the platform's own marker can never evidence its own funding.
+            await prisma.fiatProviderEvent.create({ data: {
+                provider: 'AZM_TREASURY', rail: 'BANK', direction: 'INBOUND', status: 'FUNDED',
+                providerRef: 'BANK-REF-1', dedupKey: 'event:treasury-funding:BANK-REF-1', amountGhs: 500,
+                relatedReference: 'treasury:t1',
+            } });
+            await expect(inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+                dedupKey: 'treasury:t1', confirmedBy: 1,
+                providerEventDedupKey: 'event:treasury-funding:BANK-REF-1',
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_TREASURY_FUNDING_EVIDENCE_UNAVAILABLE' });
             expect(dec((await state()).availableGhs)).toBe(0);
 
-            // a real external funding observation becomes DURABLE evidence
+            // (4) An amount-mismatched external observation contradicts.
+            await prisma.fiatProviderEvent.create({ data: {
+                provider: 'MOOLRE', rail: 'BANK', direction: 'INBOUND', status: 'FUNDED',
+                providerRef: 'MOOLRE-TRS-1', dedupKey: 'event:moolre-treasury:wrong-amount', amountGhs: 499.99,
+            } });
+            await expect(inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+                dedupKey: 'treasury:t1', confirmedBy: 1,
+                providerEventDedupKey: 'event:moolre-treasury:wrong-amount',
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_CONFLICTING_EVIDENCE' });
+            expect(dec((await state()).availableGhs)).toBe(0);
+
+            // (5) A GENUINE settled external inbound observation does unlock it.
+            await prisma.fiatProviderEvent.create({ data: {
+                provider: 'MOOLRE', rail: 'BANK', direction: 'INBOUND', status: 'FUNDED',
+                providerRef: 'MOOLRE-TRS-OK', dedupKey: 'event:moolre-treasury:ok', amountGhs: 500,
+            } });
             const { receipt: confirmed } = await inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
-                dedupKey: 'treasury:t1', confirmedBy: 1, fundingReference: 'BANK-REF-1', fundingChannel: 'BANK',
+                dedupKey: 'treasury:t1', confirmedBy: 1,
+                providerEventDedupKey: 'event:moolre-treasury:ok',
             }));
             expect(confirmed.status).toBe('AVAILABLE');
             expect(dec((await state()).availableGhs)).toBe(500);
-            const fundingEvent = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey: 'event:treasury-funding:BANK-REF-1' } });
-            expect(fundingEvent).not.toBeNull();
-            expect(fundingEvent.provider).toBe('AZM_TREASURY');
-            expect(Number(fundingEvent.amountGhs)).toBe(500);
+            expect(confirmed.evidence.treasuryFunding).toMatchObject({
+                provider: 'MOOLRE', status: 'FUNDED', amountGhs: '500',
+            });
+            // durable single-use binding on the observation
+            const bound = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey: 'event:moolre-treasury:ok' } });
+            expect(bound.relatedReference).toBe('treasury:t1');
 
-            // replay: no double count
+            // (6) Replay: no double count.
             const { replay } = await inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
-                dedupKey: 'treasury:t1', confirmedBy: 1, fundingReference: 'BANK-REF-1', fundingChannel: 'BANK',
+                dedupKey: 'treasury:t1', confirmedBy: 1,
+                providerEventDedupKey: 'event:moolre-treasury:ok',
             }));
             expect(replay).toBe(true);
             expect(dec((await state()).availableGhs)).toBe(500);
+        });
+
+        test('the same external observation cannot fund a SECOND treasury opening', async () => {
+            const a = await inTx((tx) => fiatLiquidity.recordReceipt(tx, {
+                provider: 'AZM_TREASURY', rail: 'INTERNAL', dedupKey: 'treasury:dup-a',
+                amountGhs: 100, treasury: true, evidence: { kind: 'AUDITED_TREASURY_OPENING' },
+            }));
+            const b = await inTx((tx) => fiatLiquidity.recordReceipt(tx, {
+                provider: 'AZM_TREASURY', rail: 'INTERNAL', dedupKey: 'treasury:dup-b',
+                amountGhs: 100, treasury: true, evidence: { kind: 'AUDITED_TREASURY_OPENING' },
+            }));
+            await prisma.fiatProviderEvent.create({ data: {
+                provider: 'MOOLRE', rail: 'BANK', direction: 'INBOUND', status: 'SETTLED',
+                providerRef: 'MOOLRE-DUP', dedupKey: 'event:moolre-treasury:dup', amountGhs: 100,
+            } });
+            await inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+                dedupKey: a.receipt.dedupKey, providerEventDedupKey: 'event:moolre-treasury:dup',
+            }));
+            await expect(inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+                dedupKey: b.receipt.dedupKey, providerEventDedupKey: 'event:moolre-treasury:dup',
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_CONFLICTING_EVIDENCE' });
+            expect(dec((await state()).availableGhs)).toBe(100); // one funding, one claim
+
+            // The second opening is funded by its OWN observation, so the suite
+            // leaves no unconfirmed RECEIVED receipt behind for the
+            // reconciliation sweep to flag in a later test.
+            await prisma.fiatProviderEvent.create({ data: {
+                provider: 'MOOLRE', rail: 'BANK', direction: 'INBOUND', status: 'SETTLED',
+                providerRef: 'MOOLRE-DUP-2', dedupKey: 'event:moolre-treasury:dup-2', amountGhs: 100,
+            } });
+            await inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+                dedupKey: b.receipt.dedupKey, providerEventDedupKey: 'event:moolre-treasury:dup-2',
+            }));
+            expect(dec((await state()).availableGhs)).toBe(200);
         });
 
         test('liquidateProfits (authority ON) creates NO spendable GHS — a NON-AVAILABLE audited opening only (blocker 1)', async () => {
@@ -492,12 +569,17 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             expect(Number(opening.amountGhs)).toBe(671.00); // 50 USDC × 13.42 — priced, not custody
             expect(dec((await state()).availableGhs)).toBe(0); // zero claimable liquidity
 
-            // unlocking it requires the external funding boundary
-            await inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+            // NOT unlockable by assertion: a MoMo reference typed by the caller
+            // is not a provider observation, so the opening stays non-available.
+            await expect(inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
                 dedupKey: opening.dedupKey, confirmedBy: 1,
                 fundingReference: 'MOVO-98765', fundingChannel: 'MOMO',
-            }));
-            expect(dec((await state()).availableGhs)).toBe(671.00);
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_TREASURY_FUNDING_EVIDENCE_UNAVAILABLE' });
+            await expect(inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+                dedupKey: opening.dedupKey, confirmedBy: 1,
+                providerEventDedupKey: 'event:treasury-funding:MOVO-98765',
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_TREASURY_FUNDING_EVIDENCE_UNAVAILABLE' });
+            expect(dec((await state()).availableGhs)).toBe(0);
         });
 
         test('RECONCILIATION_REQUIRED and REVERSED receipts can never be confirmed AVAILABLE', async () => {
@@ -1295,32 +1377,41 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             });
         }
 
-        test('a LEGACY withdrawal (no reservation) under authority flag ON keeps the LEGACY recorded-row regime — the flag never converts it', async () => {
+        test('a LEGACY withdrawal (no reservation) under authority flag ON is PARKED, never priced against the GHS projection', async () => {
             await seedFreshRates(); // 13.42
             await setAuthorityFlag(true);
             const settings = await workerSettings({ threshold: 100, max: 500 });
             const worker = buildWorker();
-            worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ _provider: 'mtn', provider: 'MTN_MOMO_DISBURSEMENT', status: 'ACCEPTED', data: { reference: 'MTN-Q1L' }, providerRef: 'MTN-Q1L' }) };
+            worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ _provider: 'mtn', provider: 'MTN_MOMO_DISBURSEMENT', status: 'ACCEPTED' }) };
 
-            // authority headroom is DRAINED (500 GHS available << the 100 USDC
-            // ≡ 1342 GHS authority floor) while the LEGACY pool projection is
-            // healthy (500). The old flag-global code flagged this row with
-            // AUTHORITY_HEADROOM_BELOW_THRESHOLD; the per-row regime code MUST
-            // dispatch it — this recorded row predates §P.5-D and the flag
-            // must not rewrite its meaning.
+            // The GHS projection holds 500 (which the OLD code compared against
+            // the 100 USDC threshold and the 20 USDC amount: both passed, so it
+            // dispatched 268.40 GHS from a 500 GHS pool). Under the latched
+            // regime the row is refused instead of being priced in the wrong unit.
             await seedAvailable({ amountGhs: 500 });
             const user = await seedUser(prisma, { availableBalance: 200 });
             await pendingAutoWithdrawal(user, 20);
 
             const results = await worker._processBatch(settings, { isManualTrigger: true });
-            expect(results.flagged).toBe(0);
-            expect(results.processed).toBe(1);
-            expect(results.details.flaggedManualReview).toHaveLength(0);
-            // no liquidity history was invented for the legacy row
-            expect(await prisma.fiatLiquidityReservation.count({ where: { reference: { contains: String(user.id) } } })).toBe(0);
-            // the legacy USDC pool projection gauge was used and decremented
-            expect(results.poolBalance).toBe(500 - 20);
-            expect(worker.mtn.initiateTransfer).toHaveBeenCalledWith(expect.objectContaining({ amountGhs: parseFloat((20 * 13.42).toFixed(2)) }));
+            expect(results.processed).toBe(0);
+            expect(results.flagged).toBe(1);
+            expect(results.details.flaggedManualReview[0].reason).toBe('LEGACY_ROW_UNDER_AUTHORITY_REGIME');
+            expect(worker.mtn.initiateTransfer).not.toHaveBeenCalled();
+            // the projection was NOT decremented and no unread gauge was reported
+            expect(results.poolBalance).toBeNull();
+            const st = await state();
+            expect(dec(st.availableGhs)).toBeCloseTo(500, 2);
+            const parkedRow = await prisma.withdrawal.findFirst({ where: { userId: user.id } });
+            expect(parkedRow.status).toBe('NEEDS_MANUAL_REVIEW');
+            // ReconciliationException is overlay-provisioned (a raw table, not a
+            // Prisma model) — read it through SQL, as operators do.
+            const exceptions = await prisma.$queryRawUnsafe(
+                'SELECT "reason", "status" FROM "ReconciliationException" WHERE "entityType" = $1 AND "entityId" = $2',
+                'WITHDRAWAL', String(parkedRow.id)
+            );
+            expect(exceptions).toHaveLength(1);
+            expect(exceptions[0].reason).toBe('LEGACY_ROW_UNDER_AUTHORITY_REGIME');
+            expect(exceptions[0].status).toBe('OPEN');
         });
 
         test('an authority-RECORDED withdrawal hits the operational headroom floor (threshold converted to GHS at the live rate) and stays RESERVED', async () => {
@@ -1357,18 +1448,16 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             expect(flagged.status).toBe('NEEDS_MANUAL_REVIEW');
         });
 
-        test('a LEGACY withdrawal pays out through the LEGACY pool policy (authority flag ON) — the worker itself never reserves', async () => {
-            await seedFreshRates(); // 13.42 → threshold 100 USDC ≡ 1342 GHS
-            await setAuthorityFlag(true);
+        test('a LEGACY withdrawal pays out through the LEGACY pool policy while the authority has NEVER been activated', async () => {
+            await seedFreshRates(); // 13.42
+            await setAuthorityFlag(false); // genuinely pre-P.5-D: latch unset, pool is USDC
             const settings = await workerSettings({ threshold: 100, max: 5000 });
             const worker = buildWorker();
             worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ _provider: 'mtn', provider: 'MTN_MOMO_DISBURSEMENT', status: 'ACCEPTED', data: { reference: 'MTN-Q2' }, providerRef: 'MTN-Q2' }) };
 
-            // seeding 2000 GHS of claimable availability ALSO mirrors the
-            // legacy pool projection to 2000 — healthy for the legacy gate.
-            await seedAvailable({ amountGhs: 2000 });
+            await prisma.systemFiatPool.update({ where: { id: 1 }, data: { balance: 2000 } });
             const user = await seedUser(prisma, { availableBalance: 200 });
-            await pendingAutoWithdrawal(user, 20); // 20 USDC ≡ 268.40 GHS
+            await pendingAutoWithdrawal(user, 20); // 20 USDC
 
             const results = await worker._processBatch(settings, { isManualTrigger: true });
             expect(results.processed).toBe(1);
@@ -1376,9 +1465,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             expect(results.details.flaggedManualReview).toHaveLength(0);
             const rz = await prisma.fiatLiquidityReservation.findMany({ where: { reference: { contains: String(user.id) } } });
             expect(rz).toHaveLength(0); // the worker itself never reserves
-            // the legacy USDC pool projection gauge decremented — legacy regime
             expect(results.poolBalance).toBe(2000 - 20);
-            // dispatch evidence was recorded durably
             const dispatched = results.details.processed[0];
             expect(dispatched.referenceId).toBeDefined();
             const ev = await prisma.fiatProviderEvent.findFirst({ where: { direction: 'OUTBOUND', relatedReference: dispatched.referenceId } });
@@ -1476,9 +1563,10 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             // 4. the provider received EXACTLY the reserved 268.40 — not the
             //    recalculated 315.00
             expect(worker.mtn.initiateTransfer).toHaveBeenCalledWith(expect.objectContaining({
-                referenceId: reference, amountGhs: 268.40,
+                referenceId: reference, amountGhs: '268.40',
             }));
-            expect(results.details.processed[0].amountGhs).toBe(268.40);
+            // §r42.2: the boundary carries an exact 2-dp STRING, not a double.
+            expect(results.details.processed[0].amountGhs).toBe('268.40');
 
             // 5. the reservation row itself still carries exactly 268.40
             const rzAfter = await prisma.fiatLiquidityReservation.findUnique({ where: { reference } });
@@ -1526,7 +1614,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             const results = await worker._processBatch(settings, { isManualTrigger: true });
             expect(results.processed).toBe(1);
             expect(results.details.flaggedManualReview).toHaveLength(0);
-            expect(worker.mtn.initiateTransfer).toHaveBeenCalledWith(expect.objectContaining({ referenceId: reference, amountGhs: 268.40 }));
+            expect(worker.mtn.initiateTransfer).toHaveBeenCalledWith(expect.objectContaining({ referenceId: reference, amountGhs: '268.40' }));
             // reserved → IN_TRANSIT for exactly the reserved amount; the
             // authority figures never touched the legacy pool
             const st = await state();

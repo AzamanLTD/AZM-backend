@@ -73,6 +73,17 @@ describeOrSkip('Smart Route final authorization race', () => {
         await prisma.$executeRawUnsafe('TRUNCATE TABLE "LedgerTransaction", "JournalEntry", "LedgerAccount", "RestrictedObligation" RESTART IDENTITY CASCADE');
     }, 15000);
 
+    beforeEach(async () => {
+        // Universal USDC transaction gate: route executions demand a FRESH
+        // external rate observation (a truncated GlobalSettings row has a
+        // null lastExternalSync → untrusted cache → fail closed).
+        await prisma.globalSettings.upsert({
+            where: { id: 1 },
+            update: { liveRetailRate: 15, liveUsdToGhs: 15, lastExternalSync: new Date(), lastRateSync: new Date(), liveRateSource: 'KOTANI_PAY' },
+            create: { id: 1, liveRetailRate: 15, liveUsdToGhs: 15, lastExternalSync: new Date(), lastRateSync: new Date(), liveRateSource: 'KOTANI_PAY' },
+        });
+    });
+
     function makeSvc({ dispatcher = null, vaultService = null } = {}) {
         const { SmartRouteService } = require('../services/smartRouteService');
         return new SmartRouteService({

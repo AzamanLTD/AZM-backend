@@ -41,6 +41,12 @@ jobs:
     # runner still only needs a fraction of the main lane's 90-minute budget.
     timeout-minutes: 45
 
+    # The database guard authenticates the runner with an OIDC token; without
+    # this permission the lane fails closed instead of guessing.
+    permissions:
+      contents: read
+      id-token: write
+
     services:
       postgres:
         image: postgres:16
@@ -78,12 +84,95 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: 'Guard: authenticate the runner (GitHub OIDC)'
+        # GITHUB_ACTIONS=true, a container label and a run id are all settable by
+        # anyone; none of them authenticates a runner. The database guard enables
+        # its CI branch only for a GitHub Actions OIDC token whose RS256 signature
+        # verifies against GitHub's published JWKS and whose issuer, audience,
+        # expiry, repository and workflow claims match. The token is written to a
+        # private file and never printed.
+        run: |
+          set -euo pipefail
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "::error::This job cannot request an OIDC token (needs permissions: id-token: write). The database guard would refuse, so the lane stops here rather than degrading."
+            exit 1
+          fi
+          TOKEN_FILE="${RUNNER_TEMP:-/tmp}/azm-ci-oidc.jwt"
+          curl -sS -f -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+            "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=azm-test-db-guard" \
+            | node -e 'let body = ""; process.stdin.on("data", (chunk) => { body += chunk; }).on("end", () => { const token = JSON.parse(body).value; if (!token) process.exit(1); require("fs").writeFileSync(process.argv[1], token, { mode: 0o600 }); });' "$TOKEN_FILE"
+          test -s "$TOKEN_FILE"
+          echo "AZM_CI_OIDC_TOKEN_PATH=${TOKEN_FILE}" >> "$GITHUB_ENV"
+          echo "Runner OIDC token acquired (value never printed)."
+
+      - name: 'Guard: identify the PostgreSQL service container (exact identity)'
+        # §392 — the database guard compares the server's own reported address
+        # against an INDEPENDENT expectation, never against a private subnet: a
+        # remote server behind a loopback port-forward or tunnel sits inside any
+        # subnet we might allow. That expectation is this container's address,
+        # read from docker itself, and exported to the test steps.
+        #
+        # Ambiguity is fatal on purpose: zero or several candidates, or several
+        # network addresses, means the identity cannot be established, and an
+        # unclear expectation must never silently disable the check.
+        run: |
+          set -euo pipefail
+          mapfile -t CANDIDATES < <(docker ps -q --filter "ancestor=postgres:16")
+          if [ "${#CANDIDATES[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one postgres:16 service container, found ${#CANDIDATES[@]}. The database identity cannot be established; refusing to run with an unprovable target."
+            exit 1
+          fi
+          CONTAINER="${CANDIDATES[0]}"
+          mapfile -t ADDRESSES < <(docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "$CONTAINER" | sed '/^[[:space:]]*$/d')
+          if [ "${#ADDRESSES[@]}" -ne 1 ]; then
+            echo "::error::Expected exactly one network address for container ${CONTAINER}, found ${#ADDRESSES[@]}. Refusing to guess."
+            exit 1
+          fi
+          ADDRESS="${ADDRESSES[0]}"
+          if ! printf '%s' "$ADDRESS" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+            echo "::error::Container address '${ADDRESS}' is not a dotted IPv4 address."
+            exit 1
+          fi
+          echo "PostgreSQL service container: ${CONTAINER}"
+          echo "Exact expected database address: ${ADDRESS}"
+          echo "AZM_TEST_PG_CONTAINER=${CONTAINER}" >> "$GITHUB_ENV"
+          echo "AZM_EXPECTED_TEST_DB_ADDRESS=${ADDRESS}" >> "$GITHUB_ENV"
+          # The service-container id from the job.services context: where the
+          # workflow can supply it, the docker-selected container must be that one.
+          SERVICE_CONTAINER='${{ job.services.postgres.id }}'
+          # MANDATORY. The guard will not fall back to a docker ps selection: the
+          # container it verifies must be the service container this job declared.
+          if [ -z "$SERVICE_CONTAINER" ]; then
+            echo "::error::job.services.postgres.id is empty. This job declares services.postgres, so the service container id must be available; refusing rather than falling back to a docker ps selection."
+            exit 1
+          fi
+          case "$SERVICE_CONTAINER" in
+            *[!0-9a-fA-F]*)
+              echo "::error::job.services.postgres.id (${SERVICE_CONTAINER}) is not a hexadecimal container id."
+              exit 1
+              ;;
+          esac
+          if [ "${#SERVICE_CONTAINER}" -ne 64 ]; then
+            echo "::error::job.services.postgres.id (${SERVICE_CONTAINER}) is ${#SERVICE_CONTAINER} characters, not a full 64-character container id."
+            exit 1
+          fi
+          echo "AZM_CI_SERVICE_CONTAINER_ID=${SERVICE_CONTAINER}" >> "$GITHUB_ENV"
+          echo "Service container declared by the job: ${SERVICE_CONTAINER}"
+
       - name: 'Guard: Postgres must be in production commit mode'
         # THE lane invariant. The main battery tunes synchronous_commit=off for
         # speed on its disposable database — that tuning must NEVER leak here.
         # If this step fails, someone tuned this lane's database: revert it.
         run: |
-          CONTAINER=$(docker ps --filter "ancestor=postgres:16" --format "{{ .ID }}" | head -1)
+          set -euo pipefail
+          # Reuse the container the identity step selected. There is ONE way this
+          # lane decides which PostgreSQL it is talking to.
+          CONTAINER="${AZM_TEST_PG_CONTAINER:?the identity step must export AZM_TEST_PG_CONTAINER}"
+          ADDRESS=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "$CONTAINER" | sed '/^[[:space:]]*$/d')
+          if [ "${ADDRESS}" != "${AZM_EXPECTED_TEST_DB_ADDRESS:?the identity step must export AZM_EXPECTED_TEST_DB_ADDRESS}" ]; then
+            echo "::error::The service container address is '${ADDRESS}', not the expected '${AZM_EXPECTED_TEST_DB_ADDRESS}'. The database identity is unstable; refusing to run."
+            exit 1
+          fi
           MODE=$(docker exec "$CONTAINER" psql -U postgres -d azm_test -tAc "SHOW synchronous_commit")
           echo "synchronous_commit = ${MODE}"
           if [ "${MODE}" != "on" ]; then
@@ -114,6 +203,17 @@ jobs:
         # r42: the FinancialOperation claim table behind the Idempotency-Key
         # financial authority. Mirrors the release chain (npm run release).
         run: node infra/install-r42-idempotency-overlay.js
+
+      - name: Install GHS wallet + FX saved-rate overlay
+        # FX-balance workstream: nativeGhsBalance CHECK floor + FxSavedRate
+        # guards. Mirrors the release chain (npm run release). The demo rate
+        # seed self-suppresses off disposable test DBs.
+        run: node infra/install-ghs-wallet-overlay.js
+
+      - name: Install native-GHS settlement overlay
+        run: node infra/install-native-ghs-settlement-overlay.js
+      - name: Install native-GHS withdrawal overlay
+        run: node infra/install-native-ghs-withdrawal-overlay.js
       - name: Install standalone payment requests overlay
         # PaymentRequest table (server-owned request resource behind
         # /api/payment-requests). Mirrors the release chain (npm run release)
@@ -142,6 +242,112 @@ jobs:
       - name: Generate Prisma client
         run: npx prisma generate
 
+      - name: 'Guard: the pinned #391 adapter commit must be fetchable'
+        # §392 — the adapter-contract proof reads the adapter workstream's published service
+        # straight out of git at an exact commit. A shallow clone may not hold
+        # that object, and a money-path contract proof that silently skips is
+        # worse than one that fails, so this lane fetches the exact commit and
+        # fails loudly when it cannot.
+        env:
+          ADAPTER_SHA: ea0e580f2d507e242c4b18e62f2a52175f621d8a
+        run: |
+          set -euo pipefail
+          if ! git cat-file -e "${ADAPTER_SHA}:services/moolreBankPayoutService.js" 2>/dev/null; then
+            git fetch --depth=1 origin "${ADAPTER_SHA}" \
+              || git fetch --depth=2 origin refs/pull/391/head
+          fi
+          if ! git cat-file -e "${ADAPTER_SHA}:services/moolreBankPayoutService.js" 2>/dev/null; then
+            echo "::error::The pinned #391 adapter commit ${ADAPTER_SHA} is not available in this clone. The contract proof must not be skipped."
+            exit 1
+          fi
+          echo "Pinned #391 adapter ${ADAPTER_SHA} is present."
+
+      - name: Apply control-plane migration (migration-only tables)
+        # `prisma db push` creates only the models declared in schema.prisma. The
+        # control-plane tables live solely in the 20260828040000 migration, so a
+        # permission-gated admin route answers 403 until it is applied — which
+        # would let a review-queue assertion pass without exercising the
+        # successful response. Idempotent: objects that already exist (or seeds
+        # that already ran) are tolerated; any other error fails the lane.
+        run: |
+          set -o pipefail
+          psql "${TEST_DATABASE_URL%%\?*}" -v ON_ERROR_STOP=0 \
+            -f prisma/migrations/20260828040000_control_plane_staff_access/migration.sql \
+            2>&1 | tee /tmp/control-plane.log
+          if grep -E "ERROR" /tmp/control-plane.log \
+             | grep -vE "42P07|42710|42P06|42701|23505|42P16|already exists"; then
+            echo "::error::control-plane migration failed with a non-tolerable error."
+            exit 1
+          fi
+          echo "control-plane schema present."
+
+      - name: Test database identity guard (production commit mode)
+        # The guard in front of the table-wide orphan sweep is money-path
+        # infrastructure: its refusals are the only thing standing between that
+        # statement and a database that is not provably disposable. It runs here,
+        # as its own named step, before any integration suite, so this lane can
+        # never be green with the guard unproven.
+        run: |
+          set -euo pipefail
+          if [ -z "${AZM_EXPECTED_TEST_DB_ADDRESS:-}" ] || [ -z "${AZM_TEST_PG_CONTAINER:-}" ] || [ -z "${AZM_CI_OIDC_TOKEN_PATH:-}" ] || [ -z "${AZM_CI_SERVICE_CONTAINER_ID:-}" ]; then
+            echo "::error::The database identity is not established (AZM_EXPECTED_TEST_DB_ADDRESS / AZM_TEST_PG_CONTAINER / AZM_CI_OIDC_TOKEN_PATH / AZM_CI_SERVICE_CONTAINER_ID). The guard would refuse, so the lane stops here."
+            exit 1
+          fi
+          echo "Expected database address: ${AZM_EXPECTED_TEST_DB_ADDRESS} (container ${AZM_TEST_PG_CONTAINER})"
+          npx jest __tests__/test-database-guard.test.js --runInBand --forceExit
+
+      - name: Native-GHS financial-integrity suites (production commit mode)
+        # §392 — the native-GHS money paths (park/review, pre-dispatch
+        # revalidation, dispatch ownership, reconciliation, reversal atomicity,
+        # shortfall integrity, and the #391 adapter contract) must be proven in
+        # CI, not only locally. Explicit filenames: a glob would silently absorb
+        # or drop a suite as files move.
+        #
+        # ORDER IS DELIBERATE. This step runs BEFORE the settlement battery: a few
+        # of these suites assert absolute GHS liquidity and a freshly provisioned
+        # database is the only honest fixture for that, while their residue is
+        # cleared by the settlement battery's own TRUNCATE cleanup.
+        run: |
+          NG_SUITES=(
+            "__tests__/native-ghs-withdrawal.test.js"
+            "__tests__/native-ghs-wallet.test.js"
+            "__tests__/native-ghs-quote-intent-binding.test.js"
+            "__tests__/native-ghs-bank-quote.test.js"
+            "__tests__/native-ghs-destination-snapshot.test.js"
+            "__tests__/native-ghs-bank-predispatch-revalidation.test.js"
+            "__tests__/native-ghs-bank-adapter-contract.test.js"
+            "__tests__/native-ghs-bank-dispatch-status.test.js"
+            "__tests__/native-ghs-bank-initiation-reconciliation.test.js"
+            "__tests__/native-ghs-bank-reconciliation.test.js"
+            "__tests__/native-ghs-dispatch-outcomes.test.js"
+            "__tests__/native-ghs-reconciliation.test.js"
+            "__tests__/native-ghs-admin-review.test.js"
+            "__tests__/native-ghs-reversal-atomicity.test.js"
+            "__tests__/native-ghs-funded-shortfall-reversal.test.js"
+            "__tests__/native-ghs-shortfall-integrity.test.js"
+            "__tests__/native-ghs-settlement.test.js"
+            "__tests__/native-ghs-risk-gating.test.js"
+            "__tests__/native-ghs-risk-hardening.test.js"
+            "__tests__/native-ghs-trusted-age-risk.test.js"
+            # §P.5-D mixed-regime over-dispatch: a legacy row under the latched
+            # GHS authority is parked (LEGACY_ROW_UNDER_AUTHORITY_REGIME) and never
+            # priced against the GHS projection. Needs the reconciliation + fiat
+            # liquidity overlays this lane already installs.
+            "__tests__/p5d-legacy-under-authority-regime.test.js"
+            # §P.5-D latched regime contract: Boolean cleared after activation,
+            # reversal under the latch, activation/creation mutual exclusion,
+            # projection sync and unit-explicit readers.
+            "__tests__/p5d-latched-regime-contract.test.js"
+          )
+          # Fail before jest if the identity expectation is missing: the suites
+          # themselves refuse under GitHub Actions, but the lane must not depend
+          # on a test file to notice that its own wiring is broken.
+          if [ -z "${AZM_EXPECTED_TEST_DB_ADDRESS:-}" ]; then
+            echo "::error::AZM_EXPECTED_TEST_DB_ADDRESS is not set. The native-GHS suites must run against a proven database identity."
+            exit 1
+          fi
+          npx jest --runInBand --forceExit "${NG_SUITES[@]}"
+
       - name: Financial-integrity suites (production commit mode)
         # The explicit settlement/reconciliation/reversal set. Every suite here
         # proves a money-movement invariant that must hold under real commit
@@ -155,6 +361,13 @@ jobs:
           # jest receives one broken regex matching nothing (run 35512019320).
           SUITES=(
             "__tests__/p2p-settlement-integrity.test.js"
+            # Zero-value fee semantics (PR #394): a configured 0 must mean 0
+            # while the GlobalSettings fallback stays intact. These are real
+            # PostgreSQL suites; they must run in this lane, not by hand.
+            "__tests__/zero-fee-p2p-profiles.test.js"
+            "__tests__/zero-fee-susu-semantics.test.js"
+            "__tests__/zero-fee-susu-legacy.test.js"
+            "__tests__/zero-fee-trade-projection.http.test.js"
             "__tests__/azm-auction-settlement-integrity.test.js"
             "__tests__/dine-in-customer-order-settlement.test.js"
             "__tests__/p5e-model-b-settlement.test.js"
@@ -218,6 +431,9 @@ jobs:
             # claim/state-machine proofs and the wired multi-currency
             # conversion exactly-once identity.
             "__tests__/r42-shared-idempotency-authority.pg.test.js"
+            # claim-release robustness: transient DB errors on the release must
+            # never leave a phantom IN_PROGRESS identity behind a delivered 4xx
+            "__tests__/idempotency-claim-release-retry.test.js"
             # §r42 follow-up review — trade initiation idempotency: the
             # false releaseOn4xx declaration is removed and the post-commit
             # failure RETAIN, concurrent duplicate, and pre-economics release
@@ -245,15 +461,37 @@ jobs:
             # decimal/privacy/authorization contracts, against the REAL
             # controller + middleware over real PostgreSQL.
             "__tests__/payment-requests-authority.pg.test.js"
+            # ── hardening candidate suites (PR #399) ──────────────────────────
+            # These six were absent from this lane's explicit selection, so the
+            # only place they could run was the full sweep in test.yml — which
+            # the audit gate had been stopping before any test started. Each is
+            # a real-PostgreSQL suite; none needs Redis (app-unlock-durable-state
+            # uses an in-process store and states so; the real-Redis gap stays
+            # with app-unlock-redis.integration.test.js, which skips loudly).
+            # p5e creates and drops its own PostgreSQL roles, which this lane's
+            # postgres service user may do.
+            "__tests__/totp-step-clock-divergence.pg.test.js"
+            "__tests__/totp-global-replay-protection.pg.test.js"
+            "__tests__/p5e-enforced-authority-activation.pg.test.js"
+            "__tests__/app-unlock-durable-state.test.js"
+            "__tests__/app-unlock-claim-installer-wiring.test.js"
+            "__tests__/pos-settlement-containment.test.js"
           )
           npx jest --runInBand --forceExit "${SUITES[@]}"
 
       - name: 'Guard: re-verify commit mode was never relaxed mid-run'
         run: |
-          CONTAINER=$(docker ps --filter "ancestor=postgres:16" --format "{{ .ID }}" | head -1)
+          set -euo pipefail
+          CONTAINER="${AZM_TEST_PG_CONTAINER:?the identity step must export AZM_TEST_PG_CONTAINER}"
+          ADDRESS=$(docker inspect -f '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "$CONTAINER" | sed '/^[[:space:]]*$/d')
+          if [ "${ADDRESS}" != "${AZM_EXPECTED_TEST_DB_ADDRESS:?the identity step must export AZM_EXPECTED_TEST_DB_ADDRESS}" ]; then
+            echo "::error::The service container address changed during the run (now: '${ADDRESS}', expected '${AZM_EXPECTED_TEST_DB_ADDRESS}'). The database identity was not stable; the rehearsal is invalid."
+            exit 1
+          fi
           MODE=$(docker exec "$CONTAINER" psql -U postgres -d azm_test -tAc "SHOW synchronous_commit")
           if [ "${MODE}" != "on" ]; then
             echo "::error::synchronous_commit was relaxed during the run (now: ${MODE}). The durability rehearsal is invalid."
             exit 1
           fi
+          echo "Database identity held at ${AZM_EXPECTED_TEST_DB_ADDRESS} for the whole run."
           echo "Durability rehearsal completed in production commit mode (synchronous_commit=on)."

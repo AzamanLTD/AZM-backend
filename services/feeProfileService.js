@@ -19,7 +19,12 @@ const logger = require('../src/config/logger');
  *
  * @param {import('@prisma/client').PrismaClient} prisma
  * @param {{ vendorId?: number, buyerId?: number, amountCrypto?: number }} context
- * @returns {Promise<{ platformFeePct: number, adminSplitPct: number, vendorSplitPct: number, exitFeePct: number, profileId: string, profileName: string }>}
+ * `matchedProfile` is the ONLY reliable signal that a real profile applied.
+ * A matched profile may legitimately carry 0 in any percentage field, so
+ * callers must not infer "no profile" from a zero value, nor "profile" from
+ * a profileId string.
+ *
+ * @returns {Promise<{ matchedProfile: boolean, platformFeePct: number, adminSplitPct: number, vendorSplitPct: number, exitFeePct: number, profileId: string, profileName: string }>}
  */
 async function resolveFeeProfile(prisma, { vendorId, buyerId, amountCrypto } = {}) {
     const now = new Date();
@@ -41,6 +46,7 @@ async function resolveFeeProfile(prisma, { vendorId, buyerId, amountCrypto } = {
         // Table might not exist yet (pre-migration) — return defaults gracefully
         logger.warn('[feeProfileService] AdminFeeProfile query failed (table may not exist):', e.message);
         return {
+            matchedProfile: false,
             platformFeePct: 0,
             adminSplitPct: 0,
             vendorSplitPct: 0,
@@ -90,6 +96,7 @@ async function resolveFeeProfile(prisma, { vendorId, buyerId, amountCrypto } = {
     // 5. If still nothing (DB is empty), return zeros so caller uses GlobalSettings
     if (!bestMatch) {
         return {
+            matchedProfile: false,
             platformFeePct: 0,
             adminSplitPct: 0,
             vendorSplitPct: 0,
@@ -100,6 +107,7 @@ async function resolveFeeProfile(prisma, { vendorId, buyerId, amountCrypto } = {
     }
 
     return {
+        matchedProfile: true,
         platformFeePct: Number(bestMatch.platformFeePct),
         adminSplitPct: Number(bestMatch.adminSplitPct),
         vendorSplitPct: Number(bestMatch.vendorSplitPct),

@@ -343,58 +343,75 @@ exports.updateBookingStatus = async (req, res) => {
 };
 
 // GET /api/transit/bookings/:id/checkin-qr
+// The service contract is (prisma, { bookingId, customerId }). The previous
+// call passed (bookingId, userId) and therefore threw "bookingId is required"
+// on every request: this route could never issue a QR.
 exports.generateTransitCheckInQR = async (req, res) => {
     const prisma = req.app.get('prisma');
-    const { qrCheckInService } = require('../services/qrCheckInService') || { qrCheckInService: require('../services/qrCheckInService') };
     try {
         const userId = req.user.id;
         const bookingId = req.params.id;
+        const svc = require('../services/qrCheckInService');
 
-        const booking = await prisma.transitBooking.findUnique({
-            where: { id: bookingId }
-        });
-
+        const booking = await prisma.transitBooking.findUnique({ where: { id: bookingId } });
         if (!booking) {
             return res.status(404).json({ success: false, message: 'Booking not found.' });
         }
         if (booking.customerId !== userId) {
             return res.status(403).json({ success: false, message: 'Not authorized.' });
         }
-        if (booking.status !== 'CONFIRMED' && booking.status !== 'IN_PROGRESS') {
-            return res.status(409).json({ success: false, message: 'Booking must be CONFIRMED or IN_PROGRESS to generate QR.' });
+        if (booking.status !== 'CONFIRMED') {
+            // A QR only exists to claim the CONFIRMED -> IN_PROGRESS transition,
+            // so issuing one for any other state would be a dead code.
+            return res.status(409).json({
+                success: false,
+                message: `Booking must be CONFIRMED to generate QR (current: ${booking.status}).`,
+            });
         }
 
-        const svc = qrCheckInService || require('../services/qrCheckInService');
-        const tokenData = await svc.generateTransitCheckInToken(bookingId, userId);
-        return res.status(200).json({ success: true, qrData: tokenData });
+        const tokenData = await svc.generateTransitCheckInToken(prisma, { bookingId, customerId: userId });
+        return res.status(200).json({ success: true, ...tokenData });
     } catch (err) {
+        if (err && err.code && String(err.code).startsWith('QR_SIGNING_KEY')) {
+            // Fail closed as an availability problem, not a client error, and
+            // never echo the key or its value.
+            logger.error({ code: err.code }, '[transit.generateTransitCheckInQR] signing key unavailable');
+            return res.status(503).json({ success: false, code: err.code, message: 'QR check-in is temporarily unavailable.' });
+        }
         logger.error({ err: err }, '[transit.generateTransitCheckInQR] error');
-        return res.status(500).json({ success: false, message: err.message });
+        return res.status(400).json({ success: false, message: err.message });
     }
 };
 
 // POST /api/transit/boarding
+// The QR string is a SIGNED TOKEN, never a booking id. The previous call
+// handed it to transitCheckIn as if it were one, so the signature, the
+// expiry, the customer binding and the business binding were all bypassed.
 exports.transitBoarding = async (req, res) => {
     const prisma = req.app.get('prisma');
-    const { qrCheckInService } = require('../services/qrCheckInService') || { qrCheckInService: require('../services/qrCheckInService') };
     try {
         const userId = req.user.id;
-        const { code } = req.body;
-        
-        if (!code) {
+        const token = req.body.token || req.body.code; // `code` kept for older clients
+        if (!token) {
             return res.status(400).json({ success: false, message: 'QR code is required.' });
         }
 
-        const svc = qrCheckInService || require('../services/qrCheckInService');
-        const result = await svc.transitCheckIn(code, userId, prisma);
-        
-        if (!result.success) {
-            return res.status(400).json(result);
-        }
-
+        const svc = require('../services/qrCheckInService');
+        const result = await svc.verifyTransitTokenAndBoard(prisma, { token, businessUserId: userId });
         return res.status(200).json(result);
     } catch (err) {
+        if (err && err.code && String(err.code).startsWith('QR_SIGNING_KEY')) {
+            logger.error({ code: err.code }, '[transit.transitBoarding] signing key unavailable');
+            return res.status(503).json({ success: false, code: err.code, message: 'QR check-in is temporarily unavailable.' });
+        }
+        if (err && err.name === 'QrTokenError') {
+            // A rejected token is a client problem; it must not surface as 500.
+            // A token that was already consumed is a conflict, not a bad
+            // request: the caller's QR was valid, the booking just moved on.
+            const status = err.code === 'QR_TOKEN_ALREADY_USED' ? 409 : 400;
+            return res.status(status).json({ success: false, code: err.code, message: err.message });
+        }
         logger.error({ err: err }, '[transit.transitBoarding] error');
-        return res.status(500).json({ success: false, message: err.message });
+        return res.status(400).json({ success: false, message: err.message });
     }
 };

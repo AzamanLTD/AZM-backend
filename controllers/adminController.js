@@ -11,6 +11,7 @@ const withdrawalBridge = require('../services/withdrawalBridgeService'); // r18 
 const rbac = require('./adminRbacController'); // r272 finding 3 — the declared approval-tier authority
 const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 const financeService = require('../services/finance.service');
+const nativeGhsWithdrawalService = require('../src/services/nativeGhsWithdrawalService');
 const { resolvePayoutOwner } = require('../services/payoutProviderOwnership');
 const { recordReconciliationException } = require('../services/reconciliationExceptionService');
 
@@ -767,6 +768,10 @@ exports.liquidateProfits = async (req, res) => {
                 amountLiquidated: data.amountLiquidated,
                 newProfitFees:    data.newProfitFees,
                 newFiatPool:      data.newFiatPool,
+                newFiatPoolUnit:   data.newFiatPoolUnit,
+                newFiatPoolRegime: data.newFiatPoolRegime,
+                fiatPoolCredited:  data.fiatPoolCredited,
+                treasuryOpeningRecorded: data.treasuryOpeningRecorded,
                 timestamp:        new Date().toISOString()
             });
         } catch (socketErr) {
@@ -775,7 +780,9 @@ exports.liquidateProfits = async (req, res) => {
 
         return res.status(200).json({
             success: true,
-            message: `Liquidated ${data.amountLiquidated} USDC from profit fees to fiat pool.`,
+            message: data.treasuryOpeningRecorded
+                ? `Liquidated ${data.amountLiquidated} USDC from profit fees and recorded a NON-AVAILABLE AZM treasury opening. No spendable GHS entered the fiat pool.`
+                : `Liquidated ${data.amountLiquidated} USDC from profit fees to fiat pool.`,
             data
         });
     } catch (error) {
@@ -950,6 +957,12 @@ exports.getProfitBreakdown = async (req, res) => {
         const now = new Date();
         const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
 
+        // §P.5-D: this handler published fiatPoolUnit from an undeclared
+        // variable (a ReferenceError on every call, latent until the unit was
+        // added). The snapshot read makes the unit and the balance consistent
+        // and the endpoint working.
+        const fiatPoolMode = await require('../src/services/fiatLiquidityActivationService').readModeAndPool(prisma);
+
         const [profitFees, fiatPool, hotWallet, masterCrypto, profitLogs, dailySnapshots] = await Promise.all([
             prisma.systemProfitFees.findUnique({ where: { id: 1 } }).catch(() => ({ balance: 0 })),
             prisma.systemFiatPool.findUnique({ where: { id: 1 } }).catch(() => ({ balance: 0 })),
@@ -1016,7 +1029,8 @@ exports.getProfitBreakdown = async (req, res) => {
                 // Current system pool balances
                 pools: {
                     profitFees: profitFees?.balance || 0,
-                    fiatPool: fiatPool?.balance || 0,
+                    fiatPool: fiatPoolMode.balance,
+                    fiatPoolUnit: fiatPoolMode.currency,
                     hotWallet: hotWallet?.balance || 0,
                     masterCrypto: masterCrypto?.balance || 0
                 },
@@ -1437,7 +1451,7 @@ exports.getPendingWithdrawals = async (req, res) => {
         return res.status(200).json({
             success: true,
             data: {
-                pending,
+                pending: pending.map(projectWithdrawalForOperator),
                 frozen,
                 counts: {
                     // Page length only — the original contract.
@@ -1785,27 +1799,54 @@ exports.rejectWithdrawal = async (req, res) => {
             // rolls the whole rejection back.
             let reversed;
             try {
-                reversed = await prisma.$transaction(async (tx) => {
-                    const claimed = await tx.withdrawal.updateMany({
-                        where: { id: withdrawalId, status: { in: ['PENDING', 'APPROVED'] } },
-                        data: { status: 'REJECTED' }
-                    });
-                    if (claimed.count === 0) {
-                        throw new Error('WITHDRAWAL_ALREADY_FINALIZED');
-                    }
-                    const result = await financeService.reverseFiatWithdrawal(prisma, canonical.txHash, {
-                        tx,
+                if (canonical.settlementCurrency === 'GHS_NATIVE') {
+                    // Native GHS: the USDC reversal would refund zero (the
+                    // canonical amount is 0 — the money is in amountGhs).
+                    // §P1-1: NO pre-claim here. Moving the mirror out of its
+                    // admin state outside the reversal's transaction left it
+                    // sitting at PENDING after a refusal — claimable by the
+                    // dispatcher — while the operator was told nothing was
+                    // refunded. The reversal now claims the state it observes,
+                    // atomically, and a refusal leaves the row untouched.
+                    reversed = await _reverseCanonicalForAdmin(prisma, {
+                        canonical,
+                        withdrawalId,
                         reason: `admin_rejection:${reason}`
                     });
-                    if (!result || result.alreadyReversed) {
-                        // The canonical row moved under us (settled or
-                        // already reversed) — the mirror claim must roll back.
-                        throw new Error('WITHDRAWAL_CANONICAL_ALREADY_FINALIZED');
-                    }
-                    return result;
-                });
+                    // No status write here: the GHS reversal already marked the
+                    // mirror FAILED inside its own transaction, which is the
+                    // honest label (the payout failed and the money came back).
+                    // Forcing REJECTED afterwards would contradict it.
+                } else {
+                    reversed = await prisma.$transaction(async (tx) => {
+                        const claimed = await tx.withdrawal.updateMany({
+                            where: { id: withdrawalId, status: { in: ['PENDING', 'APPROVED'] } },
+                            data: { status: 'REJECTED' }
+                        });
+                        if (claimed.count === 0) {
+                            throw new Error('WITHDRAWAL_ALREADY_FINALIZED');
+                        }
+                        const result = await financeService.reverseFiatWithdrawal(prisma, canonical.txHash, {
+                            tx,
+                            reason: `admin_rejection:${reason}`
+                        });
+                        if (!result || result.alreadyReversed) {
+                            // The canonical row moved under us (settled or
+                            // already reversed) — the mirror claim must roll back.
+                            throw new Error('WITHDRAWAL_CANONICAL_ALREADY_FINALIZED');
+                        }
+                        return result;
+                    });
+                }
             } catch (err) {
                 if (err.message === 'WITHDRAWAL_ALREADY_FINALIZED') throw err;
+                if (err.message === 'NATIVE_GHS_REVERSAL_REFUSED') {
+                    return res.status(409).json({
+                        success: false,
+                        message: 'The GHS payout could not be reversed safely; nothing was refunded. It stays visible for reconciliation.',
+                        data: { withdrawalId, canonicalStatus: canonical.status, evidence: err.detail || null }
+                    });
+                }
                 if (err.message === 'WITHDRAWAL_CANONICAL_ALREADY_FINALIZED') {
                     return res.status(409).json({
                         success: false,
@@ -2140,6 +2181,7 @@ exports.getSystemHealth = async (req, res) => {
     const prisma = getReadPrisma(req.app);
 
     try {
+        const fiatPoolMode = await require('../src/services/fiatLiquidityActivationService').readModeAndPool(prisma);
         const [masterCrypto, hotWallet, fiatPool, profitFees, settings, recentTrades, recentDeposits] = await Promise.all([
             prisma.systemMasterCrypto.findUnique({ where: { id: 1 } }).catch(() => null),
             prisma.systemHotWallet.findUnique({ where: { id: 1 } }).catch(() => null),
@@ -2168,13 +2210,30 @@ exports.getSystemHealth = async (req, res) => {
         return res.status(200).json({
             success: true,
             data: {
-                pools: {
-                    masterCrypto: masterCrypto?.balance || 0,
-                    hotWallet: hotWallet?.balance || 0,
-                    fiatPool: fiatPool?.balance || 0,
-                    profitFees: profitFees?.balance || 0,
-                    totalSystemValue: (masterCrypto?.balance || 0) + (hotWallet?.balance || 0) + (fiatPool?.balance || 0) + (profitFees?.balance || 0)
-                },
+                pools: (() => {
+                    // §P.5-D UNIT DISCIPLINE: once the GHS authority is latched,
+                    // SystemFiatPool is a GHS projection. Adding it to a USDC total
+                    // would silently mix units, so it is reported separately and
+                    // excluded from the USDC total.
+                    const mode = fiatPoolMode;
+                    // The USDC contribution comes from the SAME snapshot as the
+                    // displayed value. A separately fetched SystemFiatPool could
+                    // already hold GHS if activation committed in between, and
+                    // adding that to a USDC total is a mixed-unit lie.
+                    const fiatPoolInUsdc = mode.active ? 0 : (Number(mode.balance) || 0);
+                    return {
+                        masterCrypto: masterCrypto?.balance || 0,
+                        hotWallet: hotWallet?.balance || 0,
+                        fiatPool: mode.balance,
+                        fiatPoolUnit: mode.currency,
+                        fiatPoolRegime: mode.active ? 'GHS_AUTHORITY' : 'LEGACY_USDC_POOL',
+                        profitFees: profitFees?.balance || 0,
+                        totalSystemValue: (Number(masterCrypto?.balance) || 0) + (Number(hotWallet?.balance) || 0)
+                            + fiatPoolInUsdc + (Number(profitFees?.balance) || 0),
+                        totalSystemValueUnit: 'USDC',
+                        fiatPoolExcludedFromUsdcTotal: mode.active,
+                    };
+                })(),
 
                 oracle: {
                     liveUsdToGhs: settings?.liveUsdToGhs || 0,
@@ -2258,7 +2317,17 @@ exports.getPayoutSettings = async (req, res) => {
             return res.status(404).json({ success: false, message: 'GlobalSettings not found.' });
         }
 
-        const fiatPool = await prisma.systemFiatPool.findUnique({ where: { id: 1 } });
+        // ONE snapshot: a concurrent activation must never make the admin UI
+        // show a GHS projection under a USDC label (or the reverse).
+        const fiatPoolView = await require('../src/services/fiatLiquidityActivationService').readModeAndPool(prisma);
+        const fiatPool = { balance: fiatPoolView.balance };
+        const fiatPoolMode = fiatPoolView;
+        const fiatPoolUnit = fiatPoolView.currency;
+        const fiatPoolAlertThreshold = fiatPoolUnit === 'GHS'
+            ? new Prisma.Decimal(require('../services/finance.service').FIAT_POOL_ALERT_THRESH)
+                .times(new Prisma.Decimal(String(settings?.liveRetailRate || 0)))
+                .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP)
+            : new Prisma.Decimal(require('../services/finance.service').FIAT_POOL_ALERT_THRESH);
 
         return res.status(200).json({
             success: true,
@@ -2270,7 +2339,14 @@ exports.getPayoutSettings = async (req, res) => {
             },
             pool: {
                 balance: fiatPool ? fiatPool.balance : 0,
-                alertThreshold: 5000 // FIAT_POOL_ALERT_THRESH from finance.service
+                // §P.5-D: this column is a GHS projection once the authority is
+                // latched; the unit is stated rather than assumed.
+                currency: fiatPoolUnit,
+                // The floor is stated IN THE POOL'S UNIT: a GHS projection is
+                // never compared with (or published beside) a 5000 USDC floor.
+                alertThreshold: fiatPoolAlertThreshold,
+                alertThresholdUsdc: 5000,
+                alertThresholdCurrency: fiatPoolUnit,
             }
         });
     } catch (error) {
@@ -2354,6 +2430,42 @@ exports.updatePayoutSettings = async (req, res) => {
  * Returns withdrawals flagged as NEEDS_MANUAL_REVIEW.
  * Supports cursor pagination.
  */
+// ── OPERATOR DISPLAY PROJECTION ─────────────────────────────────────────────
+// A legacy BANK withdrawal row can store a FULL account number in `destination`
+// (masking was added later; old rows were never rewritten). Both operator read
+// paths return the stored Withdrawal object, so without a projection the queue
+// hands the review client a complete account number. This is a DISPLAY
+// projection: it never touches the row, the beneficiary, dispatch, the provider
+// or reconciliation — only what an operator is shown.
+const ACCOUNT_MASK_VISIBLE_DIGITS = 4;
+
+function maskBankDestinationForDisplay(value) {
+    if (value === null || value === undefined) return null;
+    const raw = String(value).trim();
+    if (raw === '') return null;
+    // Already masked: preserve the existing representation rather than
+    // degrading it (re-masking "*********0123" would shorten its shield).
+    if (raw.includes('*')) return raw;
+    const digits = raw.replace(/\D/g, '');
+    if (!digits) return null; // nothing displayable, and nothing to guess at
+    if (digits.length <= ACCOUNT_MASK_VISIBLE_DIGITS) return `****${digits}`;
+    const visible = digits.slice(-ACCOUNT_MASK_VISIBLE_DIGITS);
+    const hidden = Math.min(12, digits.length - ACCOUNT_MASK_VISIBLE_DIGITS);
+    return `${'*'.repeat(hidden)}${visible}`;
+}
+
+/**
+ * Returns the withdrawal safe for an operator response. BANK destinations are
+ * masked; every other payout type (MoMo, crypto) is passed through untouched so
+ * a wallet address or phone number is never mangled into a bank mask.
+ */
+function projectWithdrawalForOperator(withdrawal) {
+    if (!withdrawal) return withdrawal;
+    const isBank = String(withdrawal.payoutMethod || '').toUpperCase() === 'BANK';
+    if (!isBank) return { ...withdrawal };
+    return { ...withdrawal, destination: maskBankDestinationForDisplay(withdrawal.destination) };
+}
+
 exports.getNeedsManualReview = async (req, res) => {
     const prisma = getReadPrisma(req.app);
 
@@ -2405,14 +2517,15 @@ exports.getNeedsManualReview = async (req, res) => {
         // parked and which resolution actions are backend-provable. Rows
         // parked before the fail-closed evidence fix carry no phase — the
         // backend then only ever proves ESCALATE for them.
-        const parkingEvidence = await _manualReviewParkingEvidence(prisma, withdrawals.map((w) => w.id));
+        const parkingEvidence = await _manualReviewParkingEvidence(prisma, withdrawals);
         for (const w of withdrawals) {
             w.manualReview = parkingEvidence.get(w.id) || { reasons: [], resolutionOptions: ['ESCALATE'] };
         }
+        const projected = withdrawals.map(projectWithdrawalForOperator);
 
         return res.status(200).json({
             success: true,
-            withdrawals,
+            withdrawals: projected,
             count: withdrawals.length,
             pagination: envelope
         });
@@ -2421,6 +2534,57 @@ exports.getNeedsManualReview = async (req, res) => {
         return res.status(500).json({ success: false, message: error.message });
     }
 };
+
+/**
+ * Admin-side canonical reversal, rail-aware.
+ *
+ * A native-GHS payout is NOT a USDC withdrawal: its canonical row carries
+ * amountUsdc 0 and the real money in amountGhs, so the legacy USDC reversal
+ * would mark the payout FAILED while refunding nothing — the customer's GHS
+ * stays debited and the operator sees a "refunded" payout. The GHS authority
+ * refunds the exact GHS and is atomic across the liability, any USDC shortfall
+ * funding, the conversion posting and the reservation.
+ *
+ * The GHS reversal only accepts a payout it can still claim (PENDING /
+ * DISPATCHING). Admin states (APPROVED, NEEDS_MANUAL_REVIEW) are moved to
+ * PENDING as the claim and put back if the reversal refuses, so a refusal can
+ * never destroy the row's state.
+ */
+async function _reverseCanonicalForAdmin(prisma, { canonical, withdrawalId, reason }) {
+    if (canonical.settlementCurrency !== 'GHS_NATIVE') {
+        return { nativeGhs: false };
+    }
+    const mirror = await prisma.withdrawal.findFirst({
+        where: { id: withdrawalId },
+        select: { status: true },
+    });
+    // §P1-1: the observed admin/review state is the state the reversal is
+    // allowed to claim. There is no separate claim and therefore no
+    // compensation to get wrong: success, refusal and failure are all decided
+    // inside the reversal's single transaction, and a refusal mutates nothing.
+    const observed = mirror?.status ? String(mirror.status) : null;
+    const result = await nativeGhsWithdrawalService.reverseNativeGhsWithdrawal(prisma, {
+        reference: canonical.txHash,
+        reason,
+        allowedMirrorStatuses: observed ? [observed] : [],
+    });
+    if (!result || result.reversed !== true) {
+        // One message for every refusal reason: the caller (and the operator)
+        // need "nothing was refunded", not a taxonomy. The specific reason
+        // travels in `code` and in the evidence payload.
+        const err = new Error('NATIVE_GHS_REVERSAL_REFUSED');
+        err.code = result?.reason || 'NATIVE_GHS_REVERSAL_REFUSED';
+        err.detail = result || null;
+        throw err;
+    }
+    return {
+        nativeGhs: true,
+        alreadyReversed: false,
+        refundedAmount: Number(result.amountGhs),
+        refundedCurrency: 'GHS',
+        amountGhs: result.amountGhs,
+    };
+}
 
 // =============================================================================
 // NEEDS_MANUAL_REVIEW RESOLUTION (P0 dead-end fix, 2026-10-08)
@@ -2455,7 +2619,11 @@ const REVIEW_SAFE_PARKING_REASONS = new Set([
     'MISSING_RECIPIENT_PHONE',
     'AUTHORITY_HEADROOM_BELOW_THRESHOLD',
     'INSUFFICIENT_POOL_LIQUIDITY',
-    'DISBURSEMENT_DISPATCH_FAILED'
+    'DISBURSEMENT_DISPATCH_FAILED',
+    // §6: the saved payee no longer matches the destination confirmed at
+    // acceptance. The check runs BEFORE the dispatch claim, so the provider
+    // was provably never called — RESUME/REJECT are both provable.
+    'BANK_DESTINATION_CHANGED'
 ]);
 
 // Anomaly reasons where the provider MAY have paid and the external outcome
@@ -2481,25 +2649,85 @@ const REVIEW_SAFE_PHASES = new Set(['PRE_DISPATCH', 'DISPATCH_FAILED_PROVEN']);
  * bucketed for the review listing. Raw SQL — the exception queue is a
  * migration-backed table without a Prisma model.
  */
-async function _manualReviewParkingEvidence(prisma, withdrawalIds) {
+/**
+ * Allowlist for the post-dispatch bookkeeping steps an operator may see. Any
+ * value that is not a known step name is dropped rather than echoed: the
+ * projection must never become a channel for raw error text.
+ */
+const BOOKKEEPING_STEPS = new Set(['PARK_METADATA', 'PROVIDER_EVENT', 'OWNERSHIP', 'IN_TRANSIT']);
+
+function _allowlistedBookkeepingSteps(value) {
+    if (!Array.isArray(value)) return [];
+    return value
+        .map((step) => String(step))
+        .filter((step) => BOOKKEEPING_STEPS.has(step));
+}
+
+async function _manualReviewParkingEvidence(prisma, withdrawals) {
     const evidence = new Map();
-    if (!Array.isArray(withdrawalIds) || withdrawalIds.length === 0) return evidence;
-    const rows = await prisma.$queryRawUnsafe(
+    const rows = Array.isArray(withdrawals) ? withdrawals : [];
+    if (rows.length === 0) return evidence;
+
+    // §P1-2 EVIDENCE MUST NAME THIS PAYOUT. ReconciliationException.entityId is
+    // a bare string with no foreign key, so rows survive the payout they were
+    // written for, and a re-provisioned database can hand a fresh withdrawal an
+    // id an old row already names. Grouping by entityId alone therefore showed
+    // one payout's exception reason and resolution options on another's review
+    // card. The canonical reference is the durable identity, so evidence is
+    // matched on it.
+    const txIds = rows.map((w) => w.transactionHistoryId).filter((v) => v !== null && v !== undefined);
+    const referenceByWithdrawal = new Map();
+    if (txIds.length > 0) {
+        const txs = await prisma.transactionHistory.findMany({
+            where: { id: { in: txIds } },
+            select: { id: true, txHash: true },
+        });
+        const refByTxId = new Map((txs || []).map((t) => [t.id, t.txHash || null]));
+        for (const w of rows) {
+            referenceByWithdrawal.set(w.id, refByTxId.get(w.transactionHistoryId) || null);
+        }
+    }
+
+    const raw = await prisma.$queryRawUnsafe(
         'SELECT "entityId", "reason", "reference", "details", "firstSeenAt", "lastSeenAt" FROM "ReconciliationException" ' +
         'WHERE "status" = \'OPEN\' AND "entityType" = $1 AND "entityId" = ANY($2::text[]) ' +
         'ORDER BY "lastSeenAt" DESC',
-        'WITHDRAWAL', withdrawalIds.map(String)
+        'WITHDRAWAL', rows.map((w) => String(w.id))
     );
-    for (const row of rows || []) {
+
+    for (const row of raw || []) {
         const id = Number(row.entityId);
+        const expectedReference = referenceByWithdrawal.get(id) || null;
+        const rowReference = row.reference ? String(row.reference) : null;
+        if (expectedReference) {
+            // The payout's identity is known: only evidence naming it describes
+            // it. A null-reference row cannot be shown to belong here.
+            if (rowReference !== expectedReference) continue;
+        } else if (rowReference) {
+            // No canonical reference of our own, but the evidence names one:
+            // it belongs to some other payout, provably not this one.
+            continue;
+        }
         const entry = evidence.get(id) || { reasons: [], resolutionOptions: ['ESCALATE'] };
-        entry.reasons.push({
+        const projected = {
             reason: String(row.reason),
             phase: row.details?.phase || null,
-            reference: row.reference || null,
+            reference: rowReference,
             firstSeenAt: row.firstSeenAt,
             lastSeenAt: row.lastSeenAt
-        });
+        };
+        // §1 OPERATOR VISIBILITY. A bookkeeping failure after a transfer POST is
+        // only useful to an operator if they can see WHICH steps landed. Read-only
+        // projection: allowlisted step names and a decision only. Raw database
+        // errors, SQL, payloads, account numbers and beneficiary data stay in the
+        // durable row and are never sent to the review client.
+        if (String(row.reason) === 'PARK_BOOKKEEPING_INCOMPLETE') {
+            const detail = row.details || {};
+            projected.failedSteps = _allowlistedBookkeepingSteps(detail.failedSteps);
+            projected.recordedSteps = _allowlistedBookkeepingSteps(detail.recordedSteps);
+            projected.decision = typeof detail.decision === 'string' ? detail.decision.slice(0, 40) : null;
+        }
+        entry.reasons.push(projected);
         evidence.set(id, entry);
     }
     return evidence;
@@ -2516,11 +2744,21 @@ async function _manualReviewParkingEvidence(prisma, withdrawalIds) {
 async function _reviewEligibility(prisma, withdrawal, canonical) {
     const blockers = [];
 
+    // IDENTITY SCOPING. entityId is a bare string with no foreign key, and the
+    // queue is raw SQL: rows survive row deletes, and a reprovisioned or
+    // swept database can hand a fresh withdrawal a numeric id that an older
+    // row already names. Binding another payout's anomaly to THIS withdrawal
+    // would either block a provably-safe reversal or, worse, present the wrong
+    // evidence to an operator. So when the payout's durable reference is known,
+    // only rows naming that reference (or naming none, which is the legacy
+    // shape) may describe it.
+    const canonicalReference = canonical?.txHash ? String(canonical.txHash) : null;
     const withdrawalExceptions = await prisma.$queryRawUnsafe(
         'SELECT "reason", "reference", "details", "lastSeenAt" FROM "ReconciliationException" ' +
         'WHERE "status" = \'OPEN\' AND "entityType" = $1 AND "entityId" = $2 ' +
+        'AND ($3::text IS NULL OR "reference" IS NULL OR "reference" = $3) ' +
         'ORDER BY "lastSeenAt" DESC',
-        'WITHDRAWAL', String(withdrawal.id)
+        'WITHDRAWAL', String(withdrawal.id), canonicalReference
     );
 
     const safeReasons = [];
@@ -2570,10 +2808,39 @@ async function _reviewEligibility(prisma, withdrawal, canonical) {
         }
     }
 
+    // §P1-1 A RESUME NEEDS A DISPATCHER. Setting NEEDS_MANUAL_REVIEW back to
+    // PENDING only re-enters a pipeline that actually selects the row. Two cases
+    // have no such consumer:
+    //   - native-GHS rows: the fiat batch worker deliberately excludes them
+    //     (their amount is a zero-valued USDC mirror), and native GHS is
+    //     dispatched inline at acceptance, so nothing re-runs that gate. RESUME
+    //     would leave the customer's money reserved forever while the operator
+    //     was told the payout "resumed".
+    //   - BANK_DESTINATION_CHANGED: the saved payee no longer matches the
+    //     destination accepted with the quote. Re-running dispatch against the
+    //     NEW payee would silently redirect an accepted payout to an account the
+    //     customer never confirmed, and re-running it against the OLD details is
+    //     impossible (that is what changed). Neither is a redispatch path.
+    // Until a customer-confirmed destination-reconfirmation flow exists, these
+    // are rejected/reversed, never resumed.
+    const resumeBlockers = [];
+    const isNativeGhs = String(withdrawal.settlementCurrency || '') === 'GHS_NATIVE';
+    const destinationChanged = safeReasons.some((r) => r.reason === 'BANK_DESTINATION_CHANGED')
+        || (withdrawalExceptions || []).some((r) => String(r.reason) === 'BANK_DESTINATION_CHANGED');
+    if (isNativeGhs) {
+        resumeBlockers.push('No dispatcher claims native-GHS withdrawals: a resume would re-enter a pipeline that never selects this row.');
+    }
+    if (destinationChanged) {
+        resumeBlockers.push('The accepted destination changed. Re-dispatching would pay an account the customer never confirmed; reject and let the customer create a new withdrawal against the re-validated payee.');
+    }
+
     return {
         mayMove: blockers.length === 0,
         blockers,
         safeReasons,
+        resumeBlocked: resumeBlockers.length > 0,
+        resumeBlockers,
+        resolutionOptions: (blockers.length === 0 && resumeBlockers.length === 0) ? ['RESUME', 'REJECT', 'ESCALATE'] : ['REJECT', 'ESCALATE'],
         canonicalReference: canonical?.txHash || null,
         canonicalStatus: canonical ? canonical.status : null
     };
@@ -2630,6 +2897,20 @@ exports.resolveManualReview = async (req, res) => {
                     data: { withdrawalId, blockers: eligibility.blockers }
                 });
             }
+        }
+
+        // §P1-1 RESUME is only honest where a real redispatch path exists.
+        if (action === 'RESUME' && eligibility.resumeBlocked) {
+            return res.status(409).json({
+                success: false,
+                code: 'RESUME_NOT_AVAILABLE',
+                message: 'Resuming is not available for this payout. Reject it to restore the customer\'s funds through the canonical reversal, and the customer can create a new withdrawal once the destination is confirmed.',
+                data: {
+                    withdrawalId,
+                    blockers: eligibility.resumeBlockers,
+                    availableActions: eligibility.resolutionOptions
+                }
+            });
         }
 
         // ── RESUME: provably-undispatched row re-enters the payout pipeline.
@@ -2730,26 +3011,51 @@ exports.resolveManualReview = async (req, res) => {
         if (canonical) {
             let reversed;
             try {
-                reversed = await prisma.$transaction(async (tx) => {
-                    const claimed = await tx.withdrawal.updateMany({
-                        where: { id: withdrawalId, status: 'NEEDS_MANUAL_REVIEW' },
-                        data: { status: 'REJECTED' }
-                    });
-                    if (claimed.count === 0) {
-                        throw new Error('WITHDRAWAL_ALREADY_FINALIZED');
-                    }
-                    const result = await financeService.reverseFiatWithdrawal(prisma, canonical.txHash, {
-                        tx,
+                if (canonical.settlementCurrency === 'GHS_NATIVE') {
+                    // Native GHS: refund the REAL GHS through its own authority
+                    // (the USDC reversal would refund zero). The reversal also
+                    // flips the canonical row FAILED, single-winner.
+                    // §P1-1: no pre-claim. A refusal used to leave this row at
+                    // PENDING (claimable by the dispatcher) while the operator
+                    // was told it "stays in review". The reversal now claims
+                    // NEEDS_MANUAL_REVIEW inside its own transaction, so a
+                    // refusal genuinely leaves the row in review.
+                    reversed = await _reverseCanonicalForAdmin(prisma, {
+                        canonical,
+                        withdrawalId,
                         reason: `manual_review_rejection:${reason}`
                     });
-                    if (!result || result.alreadyReversed) {
-                        throw new Error('WITHDRAWAL_CANONICAL_ALREADY_FINALIZED');
-                    }
-                    return result;
-                });
+                    // See above: the GHS reversal owns the terminal mirror
+                    // status (FAILED), so it is not overwritten here.
+                } else {
+                    reversed = await prisma.$transaction(async (tx) => {
+                        const claimed = await tx.withdrawal.updateMany({
+                            where: { id: withdrawalId, status: 'NEEDS_MANUAL_REVIEW' },
+                            data: { status: 'REJECTED' }
+                        });
+                        if (claimed.count === 0) {
+                            throw new Error('WITHDRAWAL_ALREADY_FINALIZED');
+                        }
+                        const result = await financeService.reverseFiatWithdrawal(prisma, canonical.txHash, {
+                            tx,
+                            reason: `manual_review_rejection:${reason}`
+                        });
+                        if (!result || result.alreadyReversed) {
+                            throw new Error('WITHDRAWAL_CANONICAL_ALREADY_FINALIZED');
+                        }
+                        return result;
+                    });
+                }
             } catch (err) {
                 if (err.message === 'WITHDRAWAL_ALREADY_FINALIZED') {
                     return res.status(409).json({ success: false, message: 'Withdrawal was resolved concurrently — refresh to see its final state.' });
+                }
+                if (err.message === 'NATIVE_GHS_REVERSAL_REFUSED') {
+                    return res.status(409).json({
+                        success: false,
+                        message: 'The GHS payout could not be reversed safely; nothing was refunded and the row stays in review.',
+                        data: { withdrawalId, canonicalStatus: canonical.status, evidence: err.detail || null }
+                    });
                 }
                 if (err.message === 'WITHDRAWAL_CANONICAL_ALREADY_FINALIZED') {
                     return res.status(409).json({ success: false, message: 'The linked withdrawal transaction was finalized concurrently. Refusing to refund twice — please refresh.' });

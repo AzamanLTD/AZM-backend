@@ -1,4 +1,9 @@
 jest.mock('../utils/securityCheck', () => ({ runDoubleCheck: jest.fn().mockResolvedValue(undefined) }));
+jest.mock('../src/services/fiatLiquidityActivationService', () => ({
+    readMode: jest.fn().mockResolvedValue({ active: false, flagged: false, latched: false, activatedAt: null, currency: 'USDC' }),
+    readModeAndPool: jest.fn().mockResolvedValue({ active: false, flagged: false, latched: false, activatedAt: null, currency: 'USDC', balance: 0 }),
+    lockRegime: jest.fn().mockResolvedValue(undefined),
+}));
 jest.mock('../services/ledgerService', () => ({ post: jest.fn().mockResolvedValue({ id: 'j1', transaction: { id: 'lt1' } }), accountBalance: jest.fn(), // r39/P1: real exact-decimal parser surface kept in the mock.
 toExactDecimal: (v) => new (require('@prisma/client').Prisma).Decimal(String(v)) }));
 jest.mock('../services/restrictedObligationService', () => ({

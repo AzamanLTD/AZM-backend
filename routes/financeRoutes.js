@@ -5,6 +5,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const { requireKyc } = require('../middleware/requireKyc');
 const express                  = require('express');
 const router                   = express.Router();
 const financeController        = require('../controllers/finance.controller');
@@ -50,7 +51,7 @@ const withdrawalController     = require('../controllers/withdrawalController');
 // NOTE: `protectActive` (ban guard) is kept as the alias's session guard, one
 // notch stronger than the canonical route's `protect`.
 router.post('/withdraw/fiat',
-    protectActive,
+    protectActive, requireKyc('withdraw'),
     require2FA(),
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true, identity: 'POST /api/withdraw/fiat' }),
     validate(fiatWithdrawalSchema),

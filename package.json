@@ -11,9 +11,12 @@
     "install:susu": "node infra/install-susu-overlay.js",
     "install:fiat-liquidity": "node infra/install-fiat-liquidity-overlay.js",
     "install:model-b-settlement": "node infra/install-model-b-settlement-overlay.js",
+    "install:ghs-wallet": "node infra/install-ghs-wallet-overlay.js",
+    "install:native-ghs-settlement": "node infra/install-native-ghs-settlement-overlay.js",
+    "install:native-ghs-withdrawal": "node infra/install-native-ghs-withdrawal-overlay.js",
     "seed:susu": "node infra/seed-susu-foundation.js",
     "seed:demo": "node prisma/seed-demo.js",
-    "release": "node infra/install-prod-drift-remediation.js && node infra/install-susu-overlay.js && node infra/install-transaction-quote-overlay.js && node infra/seed-susu-foundation.js && node infra/install-business-os-overlay.js && node infra/install-inventory-restock-overlay.js && node infra/install-reservation-capacity-overlay.js && node infra/install-e2ee-server-blind-overlay.js && node infra/install-phase3-overlay.js && node infra/install-payout-reconciliation-infra.js && node infra/install-fiat-liquidity-overlay.js && node infra/install-model-b-settlement-overlay.js && node infra/install-r16-execution-identity-overlay.js && node infra/install-r19-smartroute-execution-snapshot-overlay.js && node infra/install-r42-idempotency-overlay.js && node infra/install-payment-requests-overlay.js && node infra/install-business-price-overlay.js && node infra/install-marketplace-discovery-overlay.js && node infra/install-business-offered-categories-overlay.js",
+    "release": "node infra/install-prod-drift-remediation.js && node infra/install-susu-overlay.js && node infra/install-transaction-quote-overlay.js && node infra/seed-susu-foundation.js && node infra/install-business-os-overlay.js && node infra/install-inventory-restock-overlay.js && node infra/install-reservation-capacity-overlay.js && node infra/install-saved-service-accounts-overlay.js && node infra/install-e2ee-server-blind-overlay.js && node infra/install-phase3-overlay.js && node infra/install-payout-reconciliation-infra.js && node infra/install-fiat-liquidity-overlay.js && node infra/install-model-b-settlement-overlay.js && node infra/install-ghs-wallet-overlay.js && node infra/install-native-ghs-settlement-overlay.js && node infra/install-native-ghs-withdrawal-overlay.js && node infra/install-r16-execution-identity-overlay.js && node infra/install-r19-smartroute-execution-snapshot-overlay.js && node infra/install-r42-idempotency-overlay.js && node infra/install-payment-requests-overlay.js && node infra/install-business-price-overlay.js && node infra/install-marketplace-discovery-overlay.js && node infra/install-business-offered-categories-overlay.js && node infra/install-app-unlock-totp-claim.js",
     "route-check": "node scripts/route-checker.js",
     "db:recovery-drill": "bash scripts/db-recovery-drill.sh"
   },
@@ -27,7 +30,6 @@
     "@simplewebauthn/server": "^13.3.2",
     "@simplewebauthn/typescript-types": "^8.3.4",
     "@socket.io/redis-adapter": "^8.3.0",
-    "archiver": "^8.0.0",
     "axios": "^1.20.0",
     "bcryptjs": "^2.4.3",
     "bullmq": "^5.81.2",
@@ -40,7 +42,7 @@
     "jsonwebtoken": "^9.0.3",
     "libsodium-wrappers": "^0.8.4",
     "morgan": "^1.12.0",
-    "multer": "^2.3.0",
+    "multer": "^2.5.0",
     "node-cron": "^4.2.1",
     "pdfkit": "^0.16.0",
     "pg": "^8.22.0",
@@ -53,7 +55,8 @@
     "tsx": "^4.23.13",
     "uuid": "^14.0.1",
     "ws": "^8.21.3",
-    "zod": "^4.4.3"
+    "yazl": "^3.3.1",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.4",
@@ -61,7 +64,8 @@
     "jest": "^29.7.0",
     "pg-mem": "^3.0.14",
     "prisma": "^6.19.2",
-    "supertest": "^7.0.0"
+    "supertest": "^7.0.0",
+    "yauzl": "^3.4.0"
   },
   "overrides": {
     "deepmerge-ts": "^8.0.1",
@@ -70,7 +74,8 @@
     },
     "teeny-request": {
       "uuid": "^11.1.1"
-    }
+    },
+    "google-gax": "5.0.4"
   },
   "engines": {
     "node": "24.x"

@@ -97,6 +97,37 @@ class GhsEvidenceRequiredError extends Error {
     }
 }
 
+/**
+ * A treasury opening cannot be promoted to spendable GHS because no genuine,
+ * independently recorded external funding observation backs it.
+ *
+ * This is a DISTINCT failure from "not enough liquidity" and from "bad input":
+ * the caller may have supplied perfectly well-formed arguments and the receipt
+ * may be a legitimate audited opening — the missing thing is third-party
+ * evidence, which AZAMAN cannot manufacture for itself.
+ */
+class TreasuryFundingEvidenceUnavailableError extends Error {
+    constructor(message, details = null) {
+        super(message);
+        this.name = 'TreasuryFundingEvidenceUnavailableError';
+        this.code = 'LIQUIDITY_TREASURY_FUNDING_EVIDENCE_UNAVAILABLE';
+        this.details = details;
+    }
+}
+
+// ─── treasury funding evidence contract ─────────────────────────────────────
+// A treasury opening (RECEIVED) may become AVAILABLE only when a REAL external
+// provider observation already exists in FiatProviderEvent and matches it.
+//
+// The observation must come from a provider that is not AZAMAN: AZM_TREASURY is
+// an audited INTERNAL marker written by this platform, so treating it as
+// funding evidence is circular — it would let a caller's assertion ("BANK-REF-1
+// on the BANK rail") become independent evidence purely by being persisted.
+// AZM_WEBHOOK is accepted because it records an authenticated provider callback.
+const TREASURY_FUNDING_PROVIDERS = Object.freeze(['MOOLRE', 'MTN_MOMO', 'AZM_WEBHOOK']);
+const TREASURY_FUNDING_SETTLED_STATUSES = Object.freeze(['FUNDED', 'SETTLED', 'SUCCESS', 'PAID', 'COMPLETED']);
+const LIQUIDITY_TREASURY_EVIDENCE_UNAVAILABLE = 'LIQUIDITY_TREASURY_FUNDING_EVIDENCE_UNAVAILABLE';
+
 // ─── exact GHS decimals ─────────────────────────────────────────────────────
 
 // GHS has exactly 2 fractional digits (pesewas). Evidence or amounts carrying
@@ -123,9 +154,13 @@ function toExactGhsDecimal(value, { field = 'amountGhs' } = {}) {
 
 // ─── flag ───────────────────────────────────────────────────────────────────
 
-const isAuthorityEnabled = async (prisma) => {
-    const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
-    return settings?.fiatLiquidityAuthorityEnabled === true;
+// §P.5-D EFFECTIVE MODE — THE SINGLE SOURCE OF TRUTH.
+// Authority mode is TRUE when the Boolean is on OR the one-way latch is set;
+// clearing the Boolean after activation must never restore USDC meaning. The
+// read fails closed (a read error throws rather than reporting legacy mode).
+const isAuthorityEnabled = async (db) => {
+    const activation = require('./fiatLiquidityActivationService');
+    return activation.isAuthorityModeActive(db);
 };
 
 // ─── provider-observation identity (docs §3.3) ───────────────────────────────
@@ -991,7 +1026,7 @@ async function confirmReconciliationMatch(tx, {
  * USDC liquidation can never unlock spendable GHS by itself.
  */
 async function confirmTreasuryOpening(tx, {
-    dedupKey, confirmedBy = null, fundingReference, fundingChannel,
+    dedupKey, confirmedBy = null, providerEventDedupKey = null,
 }) {
     await ensureStateRow(tx);
     const receipt = await tx.fiatLiquidityReceipt.findUnique({ where: { dedupKey } });
@@ -1002,31 +1037,66 @@ async function confirmTreasuryOpening(tx, {
             `[fiatLiquidity] receipt ${dedupKey} in state ${receipt.status} cannot be confirmed (RECEIVED treasury opening only)`
         );
     }
-    if (!fundingReference || typeof fundingReference !== 'string' || fundingReference.trim().length < 3) {
-        throw new InvalidEvidenceError(
-            '[fiatLiquidity] confirming a treasury opening requires an external funding reference (e.g. bank/MoMo transfer id)'
+
+    // The caller may only POINT AT an observation. It may never describe one:
+    // fundingReference/fundingChannel are assertions, and this function no
+    // longer accepts them (see the removed AZM_TREASURY self-attestation).
+    if (!providerEventDedupKey || typeof providerEventDedupKey !== 'string' || providerEventDedupKey.trim().length < 3) {
+        throw new TreasuryFundingEvidenceUnavailableError(
+            '[fiatLiquidity] a treasury opening can only be confirmed against an independently recorded external '
+            + 'funding observation (FiatProviderEvent.dedupKey). A caller-supplied funding reference or channel is '
+            + 'an assertion, not evidence, and can never unlock spendable GHS.',
+            { dedupKey, receiptAmountGhs: receipt.amountGhs?.toString() ?? null },
         );
     }
-    if (!['BANK', 'MOMO', 'OTHER'].includes(fundingChannel)) {
-        throw new InvalidEvidenceError('[fiatLiquidity] fundingChannel must be BANK, MOMO or OTHER');
-    }
 
-    // The funding observation becomes DURABLE evidence, not caller JSON.
-    const fundingEventDedupKey = `event:treasury-funding:${fundingReference.trim()}`;
-    const { event: fundingEvent } = await recordProviderEvent(tx, {
-        provider: 'AZM_TREASURY',
-        rail: fundingChannel === 'BANK' ? 'BANK' : fundingChannel === 'MOMO' ? 'MOMO' : 'INTERNAL',
-        direction: 'INBOUND',
-        status: 'FUNDED',
-        providerRef: fundingReference.trim(),
-        dedupKey: fundingEventDedupKey,
-        amountGhs: receipt.amountGhs,
-        relatedReference: dedupKey,
-        raw: { fundingChannel, confirmedBy },
+    const observation = await tx.fiatProviderEvent.findUnique({
+        where: { dedupKey: providerEventDedupKey.trim() },
     });
-    if (fundingEvent.amountGhs == null || !fundingEvent.amountGhs.equals(receipt.amountGhs)) {
+    if (!observation) {
+        throw new TreasuryFundingEvidenceUnavailableError(
+            `[fiatLiquidity] no external funding observation ${providerEventDedupKey.trim()} exists — treasury `
+            + 'confirmation requires a durable provider-recorded event, and this platform cannot create one for itself.',
+            { dedupKey, providerEventDedupKey: providerEventDedupKey.trim() },
+        );
+    }
+    if (!TREASURY_FUNDING_PROVIDERS.includes(observation.provider)) {
+        throw new TreasuryFundingEvidenceUnavailableError(
+            `[fiatLiquidity] observation ${observation.dedupKey} is provider ${observation.provider}, which is not a `
+            + 'trusted external funding source (AZM_TREASURY is an internal marker and cannot evidence its own funding).',
+            { dedupKey, provider: observation.provider },
+        );
+    }
+    if (observation.direction !== 'INBOUND') {
+        throw new TreasuryFundingEvidenceUnavailableError(
+            `[fiatLiquidity] observation ${observation.dedupKey} is ${observation.direction}; treasury funding requires INBOUND.`,
+            { dedupKey, direction: observation.direction },
+        );
+    }
+    if (!TREASURY_FUNDING_SETTLED_STATUSES.includes(String(observation.status).toUpperCase())) {
+        throw new TreasuryFundingEvidenceUnavailableError(
+            `[fiatLiquidity] observation ${observation.dedupKey} is ${observation.status}; treasury funding requires a `
+            + `settled inbound status (${TREASURY_FUNDING_SETTLED_STATUSES.join('/')}).`,
+            { dedupKey, status: observation.status },
+        );
+    }
+    if (observation.amountGhs == null) {
         throw new ConflictingEvidenceError(
-            '[fiatLiquidity] funding observation amount contradicts the treasury opening'
+            `[fiatLiquidity] observation ${observation.dedupKey} carries no amount and cannot back a treasury opening`
+        );
+    }
+    if (!observation.amountGhs.equals(receipt.amountGhs)) {
+        throw new ConflictingEvidenceError(
+            `[fiatLiquidity] observation ${observation.dedupKey} amount ${observation.amountGhs} contradicts treasury `
+            + `opening ${dedupKey} amount ${receipt.amountGhs}`
+        );
+    }
+    // Durable single-use: an observation already bound to another receipt
+    // (or to another economic identity) can never fund a second one.
+    if (observation.relatedReference != null && String(observation.relatedReference) !== String(dedupKey)) {
+        throw new ConflictingEvidenceError(
+            `[fiatLiquidity] observation ${observation.dedupKey} is already bound to ${observation.relatedReference} `
+            + `and cannot also fund ${dedupKey}`
         );
     }
 
@@ -1035,6 +1105,10 @@ async function confirmTreasuryOpening(tx, {
         data: { status: 'AVAILABLE', confirmedAt: new Date() },
     });
     if (claim.count !== 1) throw new ConflictingEvidenceError('[fiatLiquidity] treasury confirmation raced');
+    await tx.fiatProviderEvent.update({
+        where: { id: observation.id },
+        data: { relatedReference: String(dedupKey) },
+    });
     const updated = await tx.fiatLiquidityReceipt.update({
         where: { id: receipt.id },
         data: {
@@ -1042,9 +1116,12 @@ async function confirmTreasuryOpening(tx, {
                 ...(receipt.evidence ?? {}),
                 confirmedBy,
                 treasuryFunding: {
-                    fundingReference: fundingReference.trim(),
-                    fundingChannel,
-                    providerEventDedupKey: fundingEventDedupKey,
+                    providerEventDedupKey: observation.dedupKey,
+                    provider: observation.provider,
+                    rail: observation.rail ?? null,
+                    providerRef: observation.providerRef ?? null,
+                    status: observation.status,
+                    amountGhs: observation.amountGhs.toString(),
                 },
             },
         },
@@ -1441,6 +1518,125 @@ const settleIfRecorded = async (tx, args) => {
     return { skipped: false, ...(await settleReservation(tx, args)) };
 };
 
+/**
+ * REPAIR: advance a still-RESERVED reservation to IN_TRANSIT when the dispatch
+ * that moved the money is durably recorded but the lifecycle write never
+ * landed (a crash between the provider's answer and the bookkeeping).
+ *
+ * The dispatch observation is written BEFORE the lifecycle transition, so its
+ * presence is evidence that a POST left this process. Settlement requires
+ * IN_TRANSIT; without this repair a crash would make the provider's own
+ * SUCCESSFUL answer look like a contradiction and quarantine a completed
+ * payout.
+ *
+ * EVERY condition below is required, and anything unexpected fails closed:
+ *   - the exact payout reference, matched on the event's own related reference;
+ *   - a KNOWN provider identity (never an arbitrary string from a payload);
+ *   - BANK or MOMO rail, OUTBOUND direction, status still open;
+ *   - the exact dispatch-event identity for THIS provider and reference;
+ *   - the event amount equal to the reservation amount, to the pesewa;
+ *   - no contradictory event from a DIFFERENT provider for the same reference;
+ *   - the reservation is exactly RESERVED (single-winner compare-and-set).
+ *
+ * It never increases availableGhs, never refunds, never settles, never creates
+ * a reservation or reference, and never asks the provider anything.
+ */
+// The provider identity allowed to prove a dispatch is bound to the RAIL, not
+// merely "a known provider". An event claiming MTN_MOMO_DISBURSEMENT with a BANK
+// rail and a copied BANK source is not proof that the BANK rail ever posted.
+const PROVIDER_FOR_RAIL = Object.freeze({
+    BANK: 'MOOLRE_DISBURSEMENT',
+    MOMO: 'MTN_MOMO_DISBURSEMENT',
+});
+const KNOWN_PROVIDER_IDENTITIES = new Set(Object.values(PROVIDER_FOR_RAIL));
+
+async function repairInTransitFromDispatchEvidence(tx, { reference, providerTxId = null } = {}) {
+    const refuse = (reason, extra = {}) => ({ repaired: false, reason, ...extra });
+    if (!reference) return refuse('NO_REFERENCE');
+    const ref = String(reference);
+
+    const reservation = await tx.fiatLiquidityReservation.findUnique({ where: { reference: ref } });
+    if (!reservation) return refuse('NO_RESERVATION');
+    if (reservation.status !== 'RESERVED') return refuse('NOT_RESERVED', { status: reservation.status });
+
+    const events = await tx.fiatProviderEvent.findMany({
+        where: { relatedReference: ref, direction: 'OUTBOUND' },
+        select: { id: true, provider: true, rail: true, status: true, amountGhs: true, dedupKey: true, relatedReference: true, raw: true },
+    });
+
+    // A second provider holding evidence for this reference is a double
+    // dispatch or a rail-identity defect: never pick one, never repair.
+    const providers = new Set(events.map((e) => e.provider));
+    if (providers.size > 1) {
+        return refuse('CONFLICTING_PROVIDER_EVIDENCE', { providers: [...providers] });
+    }
+
+    // The rail this payout is canonically on, read from the authorities that own
+    // it. Without it an event on the other rail could "prove" a dispatch that
+    // never happened here.
+    const canonicalRow = await tx.transactionHistory.findUnique({
+        where: { txHash: ref },
+        select: { id: true, metadata: true },
+    });
+    if (!canonicalRow) return refuse('NO_CANONICAL_ROW');
+    const mirrorRow = await tx.withdrawal.findFirst({
+        where: { transactionHistoryId: canonicalRow.id },
+        select: { payoutMethod: true },
+    });
+    const expectedRail = String(canonicalRow.metadata?.rail || mirrorRow?.payoutMethod || '').toUpperCase();
+    if (expectedRail !== 'BANK' && expectedRail !== 'MOMO') return refuse('RAIL_CONTEXT_UNKNOWN');
+
+    const BANK_DISPATCH_SOURCES = new Set(['bank_dispatch_initiation', 'bank_dispatch_parked']);
+    const exactOf = (value) => toExactGhsDecimal(value);
+
+    const expectedProvider = PROVIDER_FOR_RAIL[expectedRail];
+    const evidence = events.find((event) => (
+        event.provider === expectedProvider
+        && event.rail === expectedRail
+        && event.relatedReference === ref
+        && event.dedupKey === `event:payout-dispatch:${event.provider}:${ref}`
+        && event.status !== 'SUCCESSFUL'
+        && event.status !== 'FAILED'
+        // The event must actually be DISPATCH evidence from the path that posts,
+        // not an unrelated status observation that happens to share the key.
+        && (expectedRail === 'BANK'
+            ? BANK_DISPATCH_SOURCES.has(String(event.raw?.source || ''))
+            : true)
+    ));
+    if (!evidence) return refuse('NO_DISPATCH_EVIDENCE', { expectedRail });
+    let amountsEqual;
+    try {
+        // Exact decimal equality: never binary floating point for money.
+        amountsEqual = exactOf(evidence.amountGhs).equals(exactOf(reservation.amountGhs));
+    } catch (err) {
+        return refuse('AMOUNT_UNCOMPARABLE', { error: err?.message });
+    }
+    if (!amountsEqual) {
+        // One pesewa out is still not proof about this money.
+        return refuse('AMOUNT_MISMATCH', { eventAmountGhs: String(evidence.amountGhs), reservationAmountGhs: String(reservation.amountGhs) });
+    }
+
+    const claim = await tx.fiatLiquidityReservation.updateMany({
+        where: { id: reservation.id, status: 'RESERVED' },
+        data: {
+            status: 'IN_TRANSIT',
+            ...(reservation.providerRef == null && providerTxId != null
+                ? { providerRef: String(providerTxId) }
+                : {}),
+        },
+    });
+    if (claim.count !== 1) return refuse('REPAIR_CLAIM_LOST');
+    await tx.fiatLiquidityState.update({
+        where: { id: 1 },
+        data: {
+            reservedGhs: { decrement: reservation.amountGhs },
+            inTransitGhs: { increment: reservation.amountGhs },
+        },
+    });
+    await syncPoolProjection(tx);
+    return { repaired: true, amountGhs: reservation.amountGhs, provider: evidence.provider };
+}
+
 const releaseIfRecorded = async (tx, args) => {
     const rz = await tx.fiatLiquidityReservation.findUnique({ where: { reference: args.reference } });
     if (!rz) return { skipped: true };
@@ -1635,12 +1831,16 @@ module.exports = {
     recordReceipt,
     confirmReconciliationMatch,
     confirmTreasuryOpening,
+    TreasuryFundingEvidenceUnavailableError,
+    LIQUIDITY_TREASURY_EVIDENCE_UNAVAILABLE,
+    TREASURY_FUNDING_PROVIDERS,
     reserveForPayout,
     markReservationInTransit,
     settleReservation,
     releaseReservation,
     inTransitIfRecorded,
     settleIfRecorded,
+    repairInTransitFromDispatchEvidence,
     releaseIfRecorded,
     reconcile,
     liquiditySummary,

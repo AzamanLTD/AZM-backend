@@ -103,8 +103,8 @@ describeOrSkip('r16 P0-A: Smart Route execution identity', () => {
     async function seedFiatEnv() {
         await prisma.globalSettings.upsert({
             where: { id: 1 },
-            update: { liveRetailRate: 15, liveUsdToGhs: 15 },
-            create: { id: 1, liveRetailRate: 15, liveUsdToGhs: 15 }
+            update: { liveRetailRate: 15, liveUsdToGhs: 15, lastExternalSync: new Date(), lastRateSync: new Date(), liveRateSource: 'KOTANI_PAY' },
+            create: { id: 1, liveRetailRate: 15, liveUsdToGhs: 15, lastExternalSync: new Date(), lastRateSync: new Date(), liveRateSource: 'KOTANI_PAY' }
         });
         await prisma.systemFiatPool.upsert({ where: { id: 1 }, update: { balance: 100000 }, create: { id: 1, balance: 100000 } });
         await prisma.systemMasterCrypto.upsert({ where: { id: 1 }, update: { balance: 0 }, create: { id: 1, balance: 0 } });
@@ -198,6 +198,17 @@ describeOrSkip('r16 P0-A: Smart Route execution identity', () => {
         const refreshedRoute = await prisma.smartRoute.findUnique({ where: { id: route.id } });
         expect(refreshedRoute.totalRuns).toBe(1);
         expect(refreshedRoute.nextRunAt.getTime()).toBeGreaterThan(Date.now()); // occurrence consumed
+    });
+
+    beforeEach(async () => {
+        // Universal USDC transaction gate: route executions demand a FRESH
+        // external rate observation (a truncated GlobalSettings row has a
+        // null lastExternalSync → untrusted cache → fail closed).
+        await prisma.globalSettings.upsert({
+            where: { id: 1 },
+            update: { liveRetailRate: 15, liveUsdToGhs: 15, lastExternalSync: new Date(), lastRateSync: new Date(), liveRateSource: 'KOTANI_PAY' },
+            create: { id: 1, liveRetailRate: 15, liveUsdToGhs: 15, lastExternalSync: new Date(), lastRateSync: new Date(), liveRateSource: 'KOTANI_PAY' },
+        });
     });
 
     test('2: scheduled worker + concurrent manual run-now consume the same due occurrence exactly once', async () => {
