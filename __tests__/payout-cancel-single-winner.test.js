@@ -95,6 +95,12 @@ const MARK = `swp-${Date.now()}`;
             create: { fromCurrency: from, toCurrency: to, rate, fetchedAt, source: 'TEST' },
         });
 
+    // The cross-border susu routes now sit behind the action-boundary KYC gate
+    // (`requireKyc('susu')` on both /contribute and /payout), so a fixture left
+    // at the schema default UNVERIFIED identity is refused 403 before any
+    // economic logic runs. KYC refusal itself is proved by the kyc-* suites;
+    // these fixtures represent verified customers so the settlement contracts
+    // under test are the thing being exercised.
     const mkUser = async (i, opts = {}) =>
         prisma.user.create({
             data: {
@@ -103,6 +109,7 @@ const MARK = `swp-${Date.now()}`;
                 password: 'x',
                 availableBalance: opts.available ?? 0,
                 escrowLockedBalance: opts.locked ?? 0,
+                kycStatus: 'VERIFIED',
             },
         });
 
