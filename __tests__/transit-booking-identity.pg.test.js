@@ -152,12 +152,27 @@ run('transit booking identity (PostgreSQL)', () => {
         let text = null;
         let jsonPayload = null;
         let settle = null;
-        const done = new Promise((resolve, reject) => { settle = { resolve, reject }; });
+        // What the claim looked like AT THE INSTANT the response was serialized.
+        // The authority's contract is that a release is durable BEFORE the
+        // response leaves; capturing the row here is the evidence for it.
+        let claimAtDelivery = null;
+        let settled = false;
+        const done = new Promise((resolve, reject) => {
+            settle = {
+                resolve: () => { if (!settled) { settled = true; resolve(); } },
+                reject: (e) => { if (!settled) { settled = true; reject(e); } },
+            };
+        });
         const res = {
             statusCode: 200,
             locals: {},
             status(c) { statusCode = c; this.statusCode = c; return this; },
             json(payload) {
+                const opId = res.locals && res.locals.financialOperation
+                    && res.locals.financialOperation.id;
+                claimAtDelivery = opId
+                    ? prisma.financialOperation.findUnique({ where: { id: opId } }).catch(() => 'READ_FAILED')
+                    : Promise.resolve(null);
                 jsonPayload = payload;
                 text = JSON.stringify(payload);
                 // Every terminal path (middleware refusal, replay, or the
@@ -168,11 +183,18 @@ run('transit booking identity (PostgreSQL)', () => {
         };
         mw(req, res, async (err) => {
             if (err) return settle.reject(err);
-            try { await ctrl.bookTripSeats(req, res); settle.resolve(); }
-            catch (e) { settle.reject(e); }
+            // DO NOT settle when the handler returns. `res.json` is what the
+            // client observes, and the middleware sends it from a `.finally()`
+            // AFTER a claim release. Settling on the handler's return resolves
+            // the "response" while the release is still in flight, so a test
+            // that reads the claim straight afterwards is racing the release
+            // it is trying to observe (this is the T9 phantom-identity flake:
+            // the row was still present because the DELETE had not run yet).
+            try { await ctrl.bookTripSeats(req, res); }
+            catch (e) { return settle.reject(e); }
         }).catch(settle.reject);
         await done;
-        return { statusCode, text, jsonPayload };
+        return { statusCode, text, jsonPayload, claimAtDelivery: await claimAtDelivery };
     }
 
     const countBookings = () => prisma.transitBooking.count();
@@ -422,6 +444,13 @@ run('transit booking identity (PostgreSQL)', () => {
             body: { seatIds: ['1A'], passengerNames: ['Ama'], customerNote: null },
         });
         expect(conflict.statusCode).toBe(400);
+
+        // The release is durable BEFORE the response leaves: at the instant the
+        // response was serialized the claim was already gone. This is the
+        // ordering the flake was hiding — the old harness settled on the
+        // handler's return, so it could read the claim while the middleware was
+        // still releasing it.
+        expect(conflict.claimAtDelivery).toBeNull();
 
         // NO phantom identity: the claim was released (releaseOn4xx — the
         // claim only commits inside the booking transaction, so an
