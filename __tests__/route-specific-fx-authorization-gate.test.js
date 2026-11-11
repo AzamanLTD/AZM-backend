@@ -152,6 +152,8 @@ describe('Universal USDC transaction gate — route-level pin (real PostgreSQL)'
     let prisma;
     let app;
     let originalSettings;
+    let gateUser;
+    const { seedUser } = require('./helpers/factories');
 
     const setFreshRate = (rate = 12.5) =>
         prisma.globalSettings.upsert({
@@ -190,7 +192,21 @@ describe('Universal USDC transaction gate — route-level pin (real PostgreSQL)'
             where: { id: 1 },
             select: { liveRetailRate: true, liveUsdToGhs: true, liveRateSource: true, lastExternalSync: true, lastRateSync: true },
         });
-        mockAuthUserId = 'gate-pin-user';
+        // WP-G: the placeholder identity 'gate-pin-user' predates route-level
+        // KYC. requireKyc resolves the live row by its Int primary key, so a
+        // placeholder string made Prisma reject the lookup and the middleware
+        // (correctly) failed closed with 503 before the FX gate could answer.
+        // The gate tests now authenticate as a REAL, KYC-verified user.
+        // NOTE: the gate identity is seeded per test (see beforeEach) — the
+        // afterEach TRUNCATE wipes "User", so a beforeAll identity would be
+        // gone by the second test and every later request would 401 USER_GONE.
+    });
+
+    // WP-G: every test that reaches the FX gate authenticates as a REAL,
+    // KYC-verified user, re-created for each test after the truncate above.
+    beforeEach(async () => {
+        gateUser = await seedUser(prisma, { availableBalance: 50 });
+        mockAuthUserId = gateUser.id;
     });
 
     // The dispatch-proof regressions (1m-2/1m-3/5) now persist REAL rows
@@ -466,6 +482,10 @@ describe('Universal USDC transaction gate — route-level pin (real PostgreSQL)'
         const isGuard = (l) => /protectGuard|protectActiveGuard|require2FAGuard/.test(sig(l.handle));
         const isGate = (l) => sig(l.handle).includes('freshFxRate') || sig(l.handle).includes('usdcTransactionGate');
         const isIdempotency = (l) => /Idempotency-Key|idempotency/i.test(sig(l.handle));
+        // WP-G: the KYC gate is a guard, not a replacement for one — it must
+        // sit BEFORE the FX gate (it is a cheaper, earlier refusal) and must
+        // never be moved behind it to keep a test green.
+        const isKyc = (l) => /kycGate/.test(sig(l.handle));
 
         const mountsChecked = [];
         for (const [prefix, router] of ROUTER_BY_PREFIX) {
@@ -482,6 +502,10 @@ describe('Universal USDC transaction gate — route-level pin (real PostgreSQL)'
                     for (const gi of guardIdxs) {
                         expect(gi).toBeLessThan(gateIdx); // auth/ban/2FA first
                     }
+                    const kycIdx = stack.findIndex(isKyc);
+                    if (kycIdx >= 0) {
+                        expect(kycIdx).toBeLessThan(gateIdx); // KYC before the gate
+                    }
                     const idemIdx = stack.findIndex(isIdempotency);
                     if (idemIdx >= 0) {
                         expect(gateIdx).toBeLessThan(idemIdx); // then idempotency
@@ -493,6 +517,53 @@ describe('Universal USDC transaction gate — route-level pin (real PostgreSQL)'
         }
         // Every GATED_ROUTES entry was found in a real router stack.
         expect(new Set(mountsChecked).size).toBe(GATED_ROUTES.length);
+    });
+
+    test('1k: KYC ORDERING — identity is checked BEFORE the FX gate, and KYC enforcement is intact', async () => {
+        // Stack level: requireKyc is mounted ahead of the FX gate on the
+        // destination-conditional money route, not behind it.
+        const walletRouter = require('../routes/walletRoutes');
+        const withdrawLayer = walletRouter.stack.find((l) => l.route && l.route.path === '/withdraw');
+        expect(withdrawLayer).toBeTruthy();
+        const handlers = withdrawLayer.route.stack.map((l) => String(l.handle));
+        const kycAt = handlers.findIndex((h) => /kycGate/.test(h));
+        const gateAt = handlers.findIndex((h) => /freshFxRate|usdcTransactionGate/.test(h));
+        expect(kycAt).toBeGreaterThanOrEqual(0);
+        expect(gateAt).toBeGreaterThanOrEqual(0);
+        expect(kycAt).toBeLessThan(gateAt);
+
+        await setStaleRate();
+        const body = { amount: 5, destination: '0244000000123', destinationType: 'MOMO' };
+
+        // Behavioural level: an unverified identity is refused BY KYC, with KYC's
+        // own typed code, before the FX gate is ever consulted — even though the
+        // rate is stale and the gate would also have refused.
+        for (const [kycStatus, expectedCode] of [
+            ['PENDING', 'KYC_PENDING'],
+            ['REJECTED', 'KYC_REJECTED'],
+            ['UNVERIFIED', 'KYC_REQUIRED'],
+        ]) {
+            const blocked = await seedUser(prisma, { availableBalance: 50, kycStatus });
+            const prevAuth = mockAuthUserId;
+            mockAuthUserId = blocked.id;
+            const res = await request(app).post('/api/wallet/withdraw').send(body);
+            expect(res.status).toBe(403);
+            expect(res.body.code).toBe(expectedCode);
+            expect(res.body.kycStatus).toBe(kycStatus);
+            expect(res.body.usdcTransactionGate).toBeUndefined(); // the gate never ran
+            mockAuthUserId = prevAuth;
+        }
+
+        // A verified identity passes KYC and IS then refused by the FX gate,
+        // proving the KYC gate did not displace or disable the gate behind it.
+        const verified = await seedUser(prisma, { availableBalance: 50 });
+        const prevAuth = mockAuthUserId;
+        mockAuthUserId = verified.id;
+        const gated = await request(app).post('/api/wallet/withdraw').send(body);
+        expect(gated.status).toBe(503);
+        expect(['RATE_STALE', 'RATE_UNAVAILABLE']).toContain(gated.body.code);
+        expect(gated.body.usdcTransactionGate).toBe('CLOSED');
+        mockAuthUserId = prevAuth;
     });
 
     test('4: fresh rate → the gate PASSES: controllers answer with their own validation, never the gate refusal', async () => {
