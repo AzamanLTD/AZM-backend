@@ -72,7 +72,11 @@ function currentStep(now = new Date()) {
     return Math.floor(now.getTime() / 1000 / TOTP_STEP_SECONDS);
 }
 
-/** The step whose code matched, given a speakeasy delta. */
+/**
+ * The step whose code matched, given a speakeasy delta computed at `now`.
+ * Callers must pass the SAME instant they handed to `verifyDelta`, never a
+ * fresh `new Date()` — see the divergence note in `verifyAndClaimTotp`.
+ */
 function matchedStep(now, delta) {
     return currentStep(now) + (Number.isInteger(delta) ? delta : 0);
 }
@@ -106,6 +110,18 @@ async function verifyAndClaimTotp({ prisma, userId, secret, token, window = DEFA
 
     // verifyDelta, never verify: the boolean API cannot tell us WHICH step
     // matched, and claiming the wrong step re-opens adjacent-window replay.
+    //
+    // §WP-F FIX — ONE CAPTURED INSTANT, NOT TWO CLOCKS.
+    // The delta is relative to whichever instant verification used. If
+    // verification reads its own clock while `matchedStep()` uses `now`, a 30s
+    // boundary crossed between the two shifts the two counters apart by one, so
+    // the row records a step that never matched and the step that DID match
+    // stays unspent — the same code is then accepted again on the next pass.
+    // `time` therefore pins verification to the identical captured instant.
+    // Speakeasy 2.0.0 `_counter()` does `options.time * 1000`: the unit is
+    // SECONDS (milliseconds silently become a far-future counter and never
+    // match), so the captured Date is converted once, here.
+    const verificationTimeSeconds = Math.floor(now.getTime() / 1000);
     let matched;
     try {
         matched = speakeasy.totp.verifyDelta({
@@ -113,6 +129,7 @@ async function verifyAndClaimTotp({ prisma, userId, secret, token, window = DEFA
             encoding: 'base32',
             token: token.trim(),
             window,
+            time: verificationTimeSeconds,
         });
     } catch (err) {
         // A malformed secret is a refusal, not an infrastructure failure.
@@ -123,7 +140,9 @@ async function verifyAndClaimTotp({ prisma, userId, secret, token, window = DEFA
         return { ok: false, code: TOTP_CODES.INVALID };
     }
 
-    const step = matchedStep(now, matched.delta);
+    // Same captured instant as the verification above: counter(now) + delta is
+    // the step whose code matched, with no clock read in between.
+    const step = matchedStep(new Date(verificationTimeSeconds * 1000), matched.delta);
 
     try {
         // Bounded cleanup only touches claims that can no longer be matched by
