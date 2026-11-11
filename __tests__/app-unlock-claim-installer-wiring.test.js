@@ -173,14 +173,17 @@ describe('WP-D packaging — the claim table is installed by the real release pa
 
     test('the Prisma model matches the installed shape', () => {
         const schema = read('prisma/schema.prisma');
-        const model = schema.match(/model AppUnlockTotpClaim \{([\s\S]*?)\n\}/);
+        const model = schema.match(/model TotpStepClaim \{([\s\S]*?)\n\}/);
         expect(model).toBeTruthy();
         const body = model[1];
         expect(body).toMatch(/\bid\s+String\s+@id\b/);
         expect(body).toMatch(/\buserId\s+Int\b/);
         expect(body).toMatch(/\bstep\s+Int\b/);
         expect(body).toMatch(/\bcreatedAt\s+DateTime\b/);
-        expect(body).toMatch(/@@unique\(\[userId, step\]\)/);
-        expect(body).toMatch(/@@index\(\[userId, createdAt\]\)/);
+        // WP-F maps the constraint and index names onto the physical table WP-D
+        // shipped, so the unique/index survive a model rename unchanged.
+        expect(body).toMatch(/@@unique\(\[userId, step\]/);
+        expect(body).toMatch(/@@index\(\[userId, createdAt\]/);
+        expect(body).toMatch(/@@map\("AppUnlockTotpClaim"\)/);
     });
 });

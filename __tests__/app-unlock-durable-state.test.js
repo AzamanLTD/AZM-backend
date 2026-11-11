@@ -113,7 +113,7 @@ if (!hasDb && IS_CI) {
     });
 
     beforeEach(async () => {
-        await prisma.appUnlockTotpClaim.deleteMany({});
+        await prisma.totpStepClaim.deleteMany({});
     });
 
     afterAll(async () => {
@@ -198,7 +198,7 @@ if (!hasDb && IS_CI) {
         ]);
         expect(results.filter((r) => r.ok).length).toBe(1);
         expect(results.filter((r) => r.code === 'TOTP_REPLAYED').length).toBe(1);
-        expect(await prisma.appUnlockTotpClaim.count({ where: { userId: user.id } })).toBe(1);
+        expect(await prisma.totpStepClaim.count({ where: { userId: user.id } })).toBe(1);
     });
 
     // ── 5. durability across a reconstructed service / restart ─────────────
@@ -215,7 +215,7 @@ if (!hasDb && IS_CI) {
         expect((await restarted.verifyTotp(user, token)).code).toBe('TOTP_REPLAYED');
 
         // The claim row carries no code and no secret: only the step index.
-        const claim = await prisma.appUnlockTotpClaim.findFirst({ where: { userId: user.id } });
+        const claim = await prisma.totpStepClaim.findFirst({ where: { userId: user.id } });
         expect(Object.keys(claim).sort()).toEqual(['createdAt', 'id', 'step', 'userId']);
         expect(JSON.stringify(claim)).not.toContain(token);
     });
@@ -246,7 +246,7 @@ if (!hasDb && IS_CI) {
         const broken = svc({
             store: makeSharedStore(),
             prismaClient: {
-                appUnlockTotpClaim: {
+                totpStepClaim: {
                     deleteMany: async () => ({ count: 0 }),
                     create: async () => { throw new Error('connection terminated'); },
                 },

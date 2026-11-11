@@ -9,6 +9,13 @@
 const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client');
 const ledger = require('../services/ledgerService');
+const {
+    verifyAndClaimTotp,
+    sendTotpFailure,
+    sendTotpUnavailable,
+    TOTP_CODES,
+} = require('../src/services/totpStepClaimService');
+
 const restrictedObligations = require('../services/restrictedObligationService');
 const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 
@@ -336,7 +343,6 @@ exports.addSavedWallet = async (req, res) => {
         // who has access to a logged-in session from quietly seeding a
         // withdrawal address.
         const bcrypt = require('bcryptjs');
-        const speakeasy = require('speakeasy');
         const userRow = await prisma.user.findUnique({
             where: { id: userId },
             select: { password: true, isTwoFactorEnabled: true, twoFactorSecret: true },
@@ -349,13 +355,15 @@ exports.addSavedWallet = async (req, res) => {
                     message: 'Two-factor token required to save a payout address.',
                 });
             }
-            const ok = speakeasy.totp.verify({
+            const verdict = await verifyAndClaimTotp({
+                prisma,
+                userId,
                 secret: userRow.twoFactorSecret,
-                encoding: 'base32',
                 token: totpToken,
-                window: 1,
             });
-            if (!ok) return res.status(401).json({ success: false, message: 'Invalid 2FA token.' });
+            if (!verdict.ok) {
+                return sendTotpFailure(res, verdict, { invalidStatus: 401, invalidMessage: 'Invalid 2FA token.' });
+            }
         } else {
             if (!password) {
                 return res.status(401).json({
@@ -452,6 +460,7 @@ exports.addSavedWallet = async (req, res) => {
 
         res.status(201).json({ success: true, wallet: newWallet, message: "Account verified and saved!" });
     } catch (error) {
+        if (error && error.code === TOTP_CODES.UNAVAILABLE) return sendTotpUnavailable(res);
         logger.error("Save Wallet Error:", error);
         res.status(500).json({ success: false, message: "Server error saving account." });
     }

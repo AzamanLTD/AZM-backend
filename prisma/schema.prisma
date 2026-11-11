@@ -1819,18 +1819,26 @@ model SystemFiatPool {
 /// Append-only raw provider observations. Never rewritten; contradictory
 /// terminal evidence is preserved here and quarantined via
 /// ReconciliationException, never silently dropped (§P.5-D docs §3.3).
-/// WP-D: the durable TOTP anti-replay claim. One row per accepted code, keyed by
-/// the 30-second time-step index — the code itself is never stored. The unique
-/// (userId, step) index is what makes "exactly one winner" a database
-/// guarantee instead of an application-level check.
-model AppUnlockTotpClaim {
+/// WP-D → WP-F: durable, GLOBAL single-use TOTP time-step claims. One row per
+/// accepted code, keyed by the 30-second step index — the code itself is never
+/// stored. The unique (userId, step) index is what makes "exactly one winner" a
+/// database guarantee instead of an application-level check.
+///
+/// WP-F renamed the model to the neutral `TotpStepClaim` because every general
+/// second-factor path (require2FA, 2FA enable/disable, saved-MoMo, payout
+/// address, admin actions) now shares it, not just app-unlock. The physical
+/// table name is preserved by `@@map`, so existing claim rows survive and no
+/// data migration is involved. The claim is NOT partitioned by route: a step
+/// spent on one path is spent on all of them.
+model TotpStepClaim {
   id        String   @id @default(uuid())
   userId    Int
   step      Int
   createdAt DateTime @default(now())
 
-  @@unique([userId, step])
-  @@index([userId, createdAt])
+  @@unique([userId, step], map: "AppUnlockTotpClaim_userId_step_key")
+  @@index([userId, createdAt], map: "AppUnlockTotpClaim_userId_createdAt_idx")
+  @@map("AppUnlockTotpClaim")
 }
 
 model FiatProviderEvent {

@@ -25,7 +25,10 @@
 
 const crypto = require('crypto');
 const bcrypt = require('bcryptjs');
-const speakeasy = require('speakeasy');
+const {
+    verifyAndClaimTotp,
+    TOTP_CODES,
+} = require('../src/services/totpStepClaimService');
 const logger = require('../src/config/logger');
 
 const PURPOSES = Object.freeze({
@@ -39,8 +42,6 @@ const TOTP_MAX_ATTEMPTS = Number(process.env.APP_UNLOCK_TOTP_MAX_ATTEMPTS || 5);
 const TOTP_WINDOW_MS = Number(process.env.APP_UNLOCK_TOTP_WINDOW_MS || 15 * 60 * 1000);
 const PIN_WINDOW_MS = Number(process.env.APP_UNLOCK_PIN_WINDOW_MS || 15 * 60 * 1000);
 const TOTP_WINDOW_SECONDS = Number(process.env.APP_UNLOCK_TOTP_REPLAY_TTL || 90);
-// RFC 6238 default step used by speakeasy; the replay claim is keyed by this.
-const TOTP_STEP_SECONDS = 30;
 
 const PIN_ATTEMPT_LUA = `
 local n = redis.call('INCR', KEYS[1])
@@ -369,15 +370,30 @@ class AppUnlockService {
             return { ok: false, code: 'TOTP_LOCKED', status: 429, attemptsLeft: 0 };
         }
 
-        // verifyDelta also reports WHICH step matched, so the replay claim can be
-        // bound to the accepted time-step without ever storing the code.
-        const matched = speakeasy.totp.verifyDelta({
-            secret: user.twoFactorSecret,
-            encoding: 'base32',
-            token: token.trim(),
-            window: 1,
-        });
-        if (!matched || typeof matched.delta !== 'number') {
+        // §WP-F — verification and the single-use claim are ONE call into the
+        // shared authority. App-unlock no longer has a private implementation:
+        // a code accepted here is spent for require2FA, the 2FA enable/disable
+        // routes, saved-MoMo, the payout address and the admin actions too.
+        let verdict;
+        try {
+            verdict = await verifyAndClaimTotp({
+                prisma: this.prisma,
+                userId: user.id,
+                secret: user.twoFactorSecret,
+                token: token.trim(),
+            });
+        } catch (err) {
+            if (err && err.code === TOTP_CODES.UNAVAILABLE) {
+                return { ok: false, code: STATE_UNAVAILABLE_CODE, status: 503 };
+            }
+            throw err;
+        }
+
+        if (!verdict.ok) {
+            if (verdict.code === TOTP_CODES.REPLAYED) {
+                logger.warn({ userId: user.id }, '[appUnlock] TOTP replay refused');
+                return { ok: false, code: 'TOTP_REPLAYED', status: 409 };
+            }
             const remaining = Math.max(0, TOTP_MAX_ATTEMPTS - used);
             logger.warn({ userId: user.id, attemptsLeft: remaining }, '[appUnlock] TOTP refused');
             return {
@@ -389,53 +405,7 @@ class AppUnlockService {
         }
 
         await this._clearTotpAttempts(user.id);
-
-        const step = this._timeStepFor(new Date(), matched.delta);
-        const claimed = await this._claimTotpStep(user.id, step);
-        if (!claimed) {
-            logger.warn({ userId: user.id }, '[appUnlock] TOTP replay refused');
-            return { ok: false, code: 'TOTP_REPLAYED', status: 409 };
-        }
         return { ok: true, code: 'TOTP_OK', status: 200 };
-    }
-
-    /**
-     * Durable, atomic single-use claim on the TOTP TIME-STEP.
-     *
-     * Redis SET NX was atomic but not durable, and an instance without Redis had
-     * no shared state at all — so a Redis restart inside a 90s window re-opened
-     * replay, and a second instance accepted the same code independently. The
-     * claim now lives in PostgreSQL: the unique (userId, step) index makes
-     * "exactly one winner" the database's decision, not a read-then-write race
-     * in application code, and the row survives any process or cache restart.
-     *
-     * Only the step index and the user are stored. The code, its digest and the
-     * shared secret are never persisted.
-     */
-    _timeStepFor(date, delta) {
-        const stepSeconds = TOTP_STEP_SECONDS;
-        return Math.floor(date.getTime() / 1000 / stepSeconds) + (delta || 0);
-    }
-
-    async _claimTotpStep(userId, step) {
-        if (!this.prisma || typeof this.prisma.appUnlockTotpClaim?.create !== 'function') {
-            throw new AppUnlockStateUnavailableError(
-                'Replay authority unavailable: the durable claim table is not reachable.'
-            );
-        }
-        try {
-            // Bounded cleanup: claims older than an hour can never be matched by
-            // a template/step inside the acceptance window again.
-            await this.prisma.appUnlockTotpClaim.deleteMany({
-                where: { userId, createdAt: { lt: new Date(Date.now() - 60 * 60 * 1000) } },
-            });
-            await this.prisma.appUnlockTotpClaim.create({ data: { userId, step } });
-            return true;
-        } catch (err) {
-            if (err && err.code === 'P2002') return false; // unique violation: already used
-            logger.error({ err: err && err.message }, '[appUnlock] replay claim failed');
-            throw new AppUnlockStateUnavailableError();
-        }
     }
 
     // -------------------------------------------------------------------- SMS

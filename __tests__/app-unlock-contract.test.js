@@ -29,7 +29,8 @@ const OTHER_PHONE = '+233209999999';
 
 function makeUser(overrides = {}) {
   return {
-    id: 'user-1',
+    // User.id is an Int in the real schema; the WP-F claim is keyed by it.
+    id: 1,
     phoneNumber: PHONE,
     phoneVerified: true,
     pinHash: null,
@@ -47,7 +48,7 @@ function makePrisma(user) {
   const claims = new Set();
   const claimKey = (userId, step) => `${userId}:${step}`;
   return {
-    appUnlockTotpClaim: {
+    totpStepClaim: {
       create: async ({ data }) => {
         const key = claimKey(data.userId, data.step);
         if (claims.has(key)) {
@@ -195,7 +196,7 @@ describe('PIN unlock', () => {
 
     const ok = await service.removePin(user, { currentPin: '4321' });
     expect(ok.ok).toBe(true);
-    expect(prisma.user.update).toHaveBeenCalledWith({ where: { id: 'user-1' }, data: { pinHash: null } });
+    expect(prisma.user.update).toHaveBeenCalledWith({ where: { id: 1 }, data: { pinHash: null } });
   });
 
   test('removal of a non-existent PIN is refused rather than reported as success', async () => {
@@ -245,7 +246,7 @@ describe('authenticator unlock', () => {
 describe('authenticator attempt reservation', () => {
     test('concurrent invalid codes only buy as many verification passes as the budget', async () => {
         const secret = speakeasy.generateSecret({ length: 20 }).base32;
-        const user = { id: 'res-1', isTwoFactorEnabled: true, twoFactorSecret: secret };
+        const user = { id: 903, isTwoFactorEnabled: true, twoFactorSecret: secret };
         const { service } = build();
         const spy = jest.spyOn(speakeasy.totp, 'verify');
 
@@ -312,7 +313,7 @@ describe('SMS unlock challenge', () => {
     });
     const issued = await service.sendSmsChallenge(user);
     const code = String(captured).match(/\b(\d{6})\b/)[1];
-    const attacker = makeUser({ id: 'user-2' });
+    const attacker = makeUser({ id: 2 });
     await expect(service.verifySmsChallenge(attacker, { challengeId: issued.data.challengeId, code }))
       .resolves.toMatchObject({ ok: false, code: 'CHALLENGE_INVALID' });
   });
