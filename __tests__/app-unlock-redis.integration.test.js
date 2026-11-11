@@ -118,19 +118,40 @@ describe('app unlock against real Redis', () => {
         spy.mockRestore();
     });
 
-    test('a TOTP code is claimed once across processes', async () => {
-        const secret = speakeasy.generateSecret({ length: 20 }).base32;
-        const u = user({ id: 903, twoFactorSecret: secret });
-        const token = speakeasy.totp({ secret, encoding: 'base32' });
+    // §WP-F CONTRACT CHANGE: the single-use claim for a TOTP step is DURABLE —
+    // it lives in a unique (userId, step) row, not in Redis. `prisma: {user:{}}`
+    // was a stub, so the shared claim authority could not run at all and the
+    // service correctly failed closed with 503; the old assertion called that a
+    // TOTP bypass. Two processes now means two service instances over ONE real
+    // database: that is the exclusion this test must prove. Redis below is only
+    // the attempt counter. Without a database the exclusion is unproven, so the
+    // test states that instead of asserting something it cannot check.
+    const hasDb = !!process.env.TEST_DATABASE_URL;
+    const totpClaimTitle = 'a TOTP step is claimed once across two service instances sharing one database';
+    (hasDb ? test : test.skip)(hasDb ? totpClaimTitle
+        : `skipped: ${totpClaimTitle} — TEST_DATABASE_URL not set, the durable claim is UNVERIFIED`, async () => {
+        const { PrismaClient } = require('@prisma/client');
+        const { seedUser } = require('./helpers/factories');
+        const prisma = new PrismaClient();
+        try {
+            const secret = speakeasy.generateSecret({ length: 20 }).base32;
+            // A real row: the claim table references the user, and the step
+            // counter is keyed on the id.
+            const seeded = await seedUser(prisma, { isTwoFactorEnabled: true, twoFactorSecret: secret });
+            const u = user({ id: seeded.id, twoFactorSecret: secret });
+            const token = speakeasy.totp({ secret, encoding: 'base32' });
 
-        const a = new AppUnlockService({ smsService, prisma: { user: {} } });
-        const b = new AppUnlockService({ smsService, prisma: { user: {} } });
+            const a = new AppUnlockService({ smsService, prisma });
+            const b = new AppUnlockService({ smsService, prisma });
 
-        const first = await a.verifyTotp(u, token);
-        const second = await b.verifyTotp(u, token);
-        expect(first.ok).toBe(true);
-        expect(second.ok).toBe(false);
-        expect(second.code).toBe('TOTP_REPLAYED');
+            const first = await a.verifyTotp(u, token);
+            const second = await b.verifyTotp(u, token);
+            expect(first.ok).toBe(true);
+            expect(second.ok).toBe(false);
+            expect(second.code).toBe('TOTP_REPLAYED');
+        } finally {
+            await prisma.$disconnect();
+        }
     });
 
     test('an unlock challenge is stored as a digest, not a plaintext code', async () => {
