@@ -15,8 +15,18 @@
 //      an explicit "not name-checked" statement.
 //   2. The full number is not copied into the metadata.
 //   3. A client-supplied destinationSnapshot is ignored on the payout route.
-//   4. A client-supplied destinationSnapshot cannot steer a quote's binding.
+//   4. A shortfall request is REFUSED before any quote exists (WP-C), and
+//      neither a client-supplied destinationSnapshot nor a forged beneficiaryId
+//      can turn that refusal into an executable route.
 //   5. The accepted response discloses what was recorded.
+//   6. The payout intent digest is a pure function of the SERVER-resolved
+//      destination identity, not of anything the caller asserts about it.
+//
+// NOTE ON (4): this file used to claim it proved "a client-supplied snapshot
+// cannot steer a quote binding". There is no quote to bind — `quoteGhsShortfall`
+// refuses while SHORTFALL_EXECUTION_ENABLED is false, deliberately, because the
+// platform cannot evidence the GHS a shortfall conversion would create. The
+// test now proves the refusal and the absence of every execution artefact.
 // =============================================================================
 
 const hasDb = !!process.env.TEST_DATABASE_URL;
@@ -77,7 +87,9 @@ if (hasDb) {
         app.set('prisma', prisma);
         app.set('logger', { error: () => {}, warn: () => {}, info: () => {} });
         app.set('emitBalanceUpdate', () => {});
-        app.set('paymentFailoverService', { initiateTransfer: jest.fn(async () => ({ success: true, transactionId: 'MOO-SNAP-1' })) });
+        // Exposed so a refusal test can assert the rail was never called.
+        app.__provider = { initiateTransfer: jest.fn(async () => ({ success: true, transactionId: 'MOO-SNAP-1' })) };
+        app.set('paymentFailoverService', app.__provider);
         app.use((req, res, next) => { req.io = { to: () => ({ emit: () => {} }), emit: () => {} }; next(); });
         app.use('/api/withdraw', require('../routes/withdrawalRoutes'));
         return app;
@@ -140,21 +152,103 @@ if (hasDb) {
         expect(JSON.stringify(metadata)).not.toContain('****9999');
     });
 
-    test('4: a client-supplied snapshot cannot steer a quote binding', async () => {
+    // Everything a refused shortfall must NOT leave behind, captured as an
+    // exact before/after delta so pre-existing rows from tests 1-3 cannot hide a
+    // movement (and cannot create one).
+    const financialState = async (userId) => {
+        const u = await prisma.user.findUnique({ where: { id: userId }, select: { availableBalance: true, nativeGhsBalance: true } });
+        const liq = await prisma.fiatLiquidityState.findUnique({
+            where: { id: 1 }, select: { availableGhs: true, reservedGhs: true, inTransitGhs: true, paidOutGhs: true },
+        });
+        const one = async (sql, ...args) => (await prisma.$queryRawUnsafe(sql, ...args))[0].n;
+        return {
+            usdc: u.availableBalance.toString(),
+            ghs: String(u.nativeGhsBalance ?? 0),
+            availableGhs: liq.availableGhs.toString(),
+            reservedGhs: liq.reservedGhs.toString(),
+            inTransitGhs: String(liq.inTransitGhs ?? 0),
+            paidOutGhs: String(liq.paidOutGhs ?? 0),
+            quotes: await one('SELECT count(*)::int AS n FROM "TransactionQuote" WHERE "userId" = $1', userId),
+            history: await one('SELECT count(*)::int AS n FROM "TransactionHistory" WHERE "userId" = $1', userId),
+            ledger: await one('SELECT count(*)::int AS n FROM "LedgerTransaction" WHERE "userId" = $1', userId),
+            journal: await one('SELECT count(*)::int AS n FROM "JournalEntry"'),
+            openClaims: await one(
+                `SELECT count(*)::int AS n FROM "FinancialOperation" WHERE "userId" = $1 AND "status" = 'IN_PROGRESS'`,
+                userId,
+            ),
+        };
+    };
+
+    test('4: a shortfall request is refused before any quote exists and cannot be steered into execution', async () => {
         await setSettings();
-        const user = await ghsUser();
+        const user = await ghsUser(); // GHS 300 against a GHS 500 payout: GHS 200 short
         const app = buildApp();
-        const quoted = await quotePost(app, user, {
-            amountGhs: '500.00', // above the wallet: forces a shortfall quote
-            destinationSnapshot: { fingerprint: 'forged-fingerprint', bankCode: 'GCB' },
+        const before = await financialState(user.id);
+
+        const refused = await quotePost(app, user, {
+            amountGhs: '500.00',
+            destinationSnapshot: { fingerprint: 'forged-fingerprint', bankCode: 'GCB', accountNumberMasked: '****9999' },
             beneficiaryId: 999999,
         });
-        expect(quoted.status).toBe(200);
-        const { intent } = quoted.body.quote;
-        // Bound to the number the server resolved, not to anything the caller asserted.
-        expect(intent.destinationIdentity).toBe(DEST);
-        expect(intent.destinationIdentity).not.toContain('forged');
-        expect(intent.rail).toBe('MOMO');
+
+        // 1. The refusal is the typed one, and it states the shortfall it will not fund.
+        expect(refused.status).toBe(200);
+        expect(refused.body.quote).toBeNull();
+        expect(refused.body.shortfallFunding).toMatchObject({
+            executable: false,
+            code: 'NATIVE_GHS_SHORTFALL_BACKING_UNAVAILABLE',
+        });
+        expect(refused.body.shortfallFunding.message).toBeTruthy();
+
+        // 2. No executable quote and no quote identity exists.
+        expect(refused.body.quoteId ?? null).toBeNull();
+        expect((await financialState(user.id)).quotes).toBe(before.quotes);
+
+        // 3-5. No USDC debited, no GHS credited or debited, no ledger or
+        // transaction-history posting. Compared field by field for a readable
+        // failure: these MUST be identical.
+        const after = await financialState(user.id);
+        expect(after.usdc).toBe(before.usdc);
+        expect(after.ghs).toBe(before.ghs);
+        expect(after.availableGhs).toBe(before.availableGhs);
+        expect(after.reservedGhs).toBe(before.reservedGhs);
+        expect(after.inTransitGhs).toBe(before.inTransitGhs);
+        expect(after.paidOutGhs).toBe(before.paidOutGhs);
+        expect(after.history).toBe(before.history);
+        expect(after.ledger).toBe(before.ledger);
+        expect(after.journal).toBe(before.journal);
+
+        // 6. No payout provider was called.
+        expect(app.__provider.initiateTransfer).not.toHaveBeenCalled();
+
+        // 7. No idempotency claim is left in a state that could later execute.
+        expect(after.openClaims).toBe(0);
+        expect(after.openClaims).toBe(before.openClaims);
+
+        // 8. Neither a forged snapshot nor a forged beneficiaryId changes the
+        // refusal or opens an alternative route.
+        const plain = await quotePost(app, user, { amountGhs: '500.00' });
+        expect(plain.status).toBe(refused.status);
+        expect(plain.body.quote).toBeNull();
+        expect(plain.body.shortfallFunding).toEqual(refused.body.shortfallFunding);
+        expect((await financialState(user.id)).quotes).toBe(before.quotes);
+        expect((await financialState(user.id)).usdc).toBe(before.usdc);
+        expect(JSON.stringify(refused.body)).not.toContain('forged');
+        expect(JSON.stringify(refused.body)).not.toContain('9999');
+    });
+
+    // 6. The digest is the pure boundary: it names the SERVER-resolved payout.
+    test('6: the payout intent digest binds the server-resolved destination, not client claims', async () => {
+        const { payoutIntentDigest } = require('../src/services/payoutIntent');
+        const intent = { rail: 'MOMO', recipientGhs: 500, destinationIdentity: DEST };
+        const base = payoutIntentDigest(intent);
+
+        expect(payoutIntentDigest({ ...intent })).toBe(base);
+        // Caller-asserted snapshot/metadata never enters the identity.
+        expect(payoutIntentDigest({ ...intent, destinationSnapshot: { fingerprint: 'forged' }, beneficiaryId: 999999 })).toBe(base);
+        // A different payee is a different promise.
+        expect(payoutIntentDigest({ ...intent, destinationIdentity: '2332412345670' })).not.toBe(base);
+        expect(payoutIntentDigest({ ...intent, recipientGhs: 501 })).not.toBe(base);
     });
 
     test('5: the accepted response discloses what was recorded', async () => {

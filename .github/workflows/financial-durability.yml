@@ -461,6 +461,21 @@ jobs:
             # decimal/privacy/authorization contracts, against the REAL
             # controller + middleware over real PostgreSQL.
             "__tests__/payment-requests-authority.pg.test.js"
+            # ── hardening candidate suites (PR #399) ──────────────────────────
+            # These six were absent from this lane's explicit selection, so the
+            # only place they could run was the full sweep in test.yml — which
+            # the audit gate had been stopping before any test started. Each is
+            # a real-PostgreSQL suite; none needs Redis (app-unlock-durable-state
+            # uses an in-process store and states so; the real-Redis gap stays
+            # with app-unlock-redis.integration.test.js, which skips loudly).
+            # p5e creates and drops its own PostgreSQL roles, which this lane's
+            # postgres service user may do.
+            "__tests__/totp-step-clock-divergence.pg.test.js"
+            "__tests__/totp-global-replay-protection.pg.test.js"
+            "__tests__/p5e-enforced-authority-activation.pg.test.js"
+            "__tests__/app-unlock-durable-state.test.js"
+            "__tests__/app-unlock-claim-installer-wiring.test.js"
+            "__tests__/pos-settlement-containment.test.js"
           )
           npx jest --runInBand --forceExit "${SUITES[@]}"
 

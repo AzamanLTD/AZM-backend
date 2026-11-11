@@ -89,9 +89,6 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Audit production dependencies
-        run: npm audit --omit=dev --audit-level=low
-
       - name: Prisma schema validation gate
         # Explicit, named validation of prisma/schema.prisma — do not rely on
         # `db push`/`generate` failing indirectly on a broken schema. A schema
@@ -425,3 +422,31 @@ jobs:
           PG_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
           BACKUP_DRILL_ALLOW_MUTATION: '1'
         run: npm run db:recovery-drill
+
+  # ── production dependency audit — its own REQUIRED job ──────────────────────
+  # It used to be a step inside `test`, so one advisory skipped every test,
+  # guard and installer check behind it: CI reported a red run that had executed
+  # no product code at all. The gate is unchanged (--audit-level=low, no
+  # continue-on-error, no advisory downgrade) — it simply no longer decides
+  # whether the tests run. The workflow still fails if either job fails.
+  audit:
+    name: production dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=low
