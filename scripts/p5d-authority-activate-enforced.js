@@ -124,7 +124,7 @@ async function activate(db, args) {
     }
 
     const [fnAcl] = await db.$queryRawUnsafe(
-        `SELECT has_function_privilege(current_user, 'public.azm_authority_activate(text,text,text,text,text,text[],text[])'::regprocedure, 'EXECUTE') AS can_execute`
+        `SELECT has_function_privilege(current_user, 'public.azm_authority_activate(text,text,text,text,text)'::regprocedure, 'EXECUTE') AS can_execute`
     );
     if (!fnAcl || fnAcl.can_execute !== true) {
         console.error(JSON.stringify({ ok: false, refused: 'OPERATOR_CREDENTIAL_NOT_NARROW', refusals: ['the activation role cannot EXECUTE the sanctioned activation function'] }, null, 2));
@@ -157,10 +157,9 @@ async function activate(db, args) {
     let activation;
     try {
         const [row] = await db.$queryRawUnsafe(
-            `SELECT public.azm_authority_activate($1, $2, $3, $4, $5, $6::text[], $7::text[]) AS result`,
+            `SELECT public.azm_authority_activate($1, $2, $3, $4, $5) AS result`,
             String(activatedBy), String(approvedBy), String(reason || 'operator activation'),
             String(evidenceReference), String(evidenceDigest),
-            BLOCKING_STATUSES, PARKED_STATUSES
         );
         activation = row && row.result;
     } catch (err) {

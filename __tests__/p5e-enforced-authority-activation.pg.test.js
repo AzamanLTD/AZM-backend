@@ -293,9 +293,8 @@ run('WP-E — database-enforced, append-only authority activation', () => {
         // flag, the projection and the audit row in one transaction.
         const [session] = await operator.$queryRawUnsafe('SELECT session_user AS s');
         await operator.$queryRawUnsafe(
-            `SELECT public.azm_authority_activate($1,$2,$3,$4,$5,$6::text[],$7::text[])`,
+            `SELECT public.azm_authority_activate($1,$2,$3,$4,$5)`,
             session.s, 'human-approver', 'p5e permitted activation', 'EXT-EVIDENCE-0001', 'b'.repeat(64),
-            ['PENDING', 'PROCESSING'], ['RECONCILIATION_REQUIRED']
         );
         sessionOperator = session.s;
         activationRecord = await enforcement.readActivationRecord(operator);
@@ -310,10 +309,9 @@ run('WP-E — database-enforced, append-only authority activation', () => {
         // The function refuses a second activation; the direct INSERT route is gone
         // (the operator holds no INSERT), so this is the only reachable path.
         await expect(operator.$queryRawUnsafe(
-            `SELECT public.azm_authority_activate($1,'second','second','EXT-EVIDENCE-0002',$2,$3::text[],$4::text[])`,
-            sessionOperator, 'c'.repeat(64), ['PENDING'], ['RECONCILIATION_REQUIRED']
+            `SELECT public.azm_authority_activate($1,'second','second','EXT-EVIDENCE-0002',$2)`,
+            sessionOperator, 'c'.repeat(64)
         )).rejects.toThrow(/ALREADY_ACTIVATED|already exists|23505/i);
-
         await expect(operator.$executeRawUnsafe(
             `INSERT INTO "FiatLiquidityAuthorityActivation" ("id","activatedBy","approvedBy","evidenceReference","evidenceDigest")
              VALUES (2,'second','second','EXT-EVIDENCE-0002','${'c'.repeat(64)}')`

@@ -17,7 +17,7 @@ const fs = require('fs');
 const path = require('path');
 
 const TABLE = 'public."FiatLiquidityAuthorityActivation"';
-const FN = 'public.azm_authority_activate(text,text,text,text,text,text[],text[])';
+const FN = 'public.azm_authority_activate(text,text,text,text,text)';
 const FN_NAME = 'public.azm_authority_activate';
 
 const DEFAULTS = {
@@ -30,14 +30,12 @@ const DEFAULTS = {
 
 const quoteIdent = (name) => '"' + String(name).replace(/"/g, '""') + '"';
 
-function functionSql(operator) {
-    const template = fs.readFileSync(path.join(__dirname, 'sql', 'azm_authority_activate.sql'), 'utf8');
-    return template.replace(/\{\{OPERATOR\}\}/g, operator.replace(/'/g, "''"));
-}
+const { functionSql } = require("./lib/authority-function-sql");
 
 async function installAuthorityActivationFunction(prisma, options = {}) {
     const { tableOwner, functionOwner, runtime, operator, migrator } = { ...DEFAULTS, ...options };
     const log = options.log || (() => {});
+    const roleScoped = options.roleScoped === true;
     const report = { applied: [], problems: [], functionOwner, operator };
 
     const roleExists = async (name) => {
@@ -67,11 +65,24 @@ async function installAuthorityActivationFunction(prisma, options = {}) {
     }
     report.applied.push('revoked function-owner memberships in both directions');
 
+    // An EXISTING function owner is re-checked, not assumed: a role that can log
+    // in or that carries CREATEROLE/SUPERUSER would defeat the whole boundary.
+    const [fnRole] = await prisma.$queryRawUnsafe(
+        'SELECT rolcanlogin, rolsuper, rolcreaterole FROM pg_roles WHERE rolname = $1', functionOwner);
+    if (!fnRole) report.problems.push('function owner role is missing');
+    else {
+        if (fnRole.rolcanlogin) {
+            await prisma.$executeRawUnsafe('ALTER ROLE ' + quoteIdent(functionOwner) + ' NOLOGIN');
+            report.applied.push('normalised existing function owner to NOLOGIN');
+        }
+        if (fnRole.rolsuper || fnRole.rolcreaterole) {
+            await prisma.$executeRawUnsafe('ALTER ROLE ' + quoteIdent(functionOwner) + ' NOSUPERUSER NOCREATEROLE');
+            report.applied.push('normalised existing function owner to NOSUPERUSER NOCREATEROLE');
+        }
+    }
+
     // 3. the function, owned by the function owner, EXECUTE only for the operator
-    await prisma.$executeRawUnsafe(functionSql(operator));
-    await prisma.$executeRawUnsafe(`ALTER FUNCTION ${FN} OWNER TO ${quoteIdent(functionOwner)}`);
-    await prisma.$executeRawUnsafe(`REVOKE ALL ON FUNCTION ${FN} FROM PUBLIC`);
-    await prisma.$executeRawUnsafe(`GRANT EXECUTE ON FUNCTION ${FN} TO ${quoteIdent(operator)}`);
+    await prisma.$executeRawUnsafe(functionSql(operator, functionOwner));
     report.applied.push(`install ${FN_NAME} owned by ${functionOwner}, EXECUTE -> ${operator}`);
 
     // 4. exactly the privileges the body needs, and no more
@@ -99,7 +110,8 @@ async function installAuthorityActivationFunction(prisma, options = {}) {
         } catch (err) {
             // A partially provisioned database (a minimal test schema, a fresh
             // install) must still get a sound function; the absence is reported.
-            report.skipped.push(`${qualified}: ${String(err.message).split('\n')[0]}`);
+            const detail = qualified + ': ' + String(err.message).split(String.fromCharCode(10))[0];
+            if (roleScoped) report.problems.push(detail); else report.skipped.push(detail);
         }
     }
     if (report.skipped.length) report.applied.push(`skipped grants for absent tables: ${report.skipped.join(', ')}`);

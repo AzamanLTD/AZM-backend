@@ -226,6 +226,7 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
         operator,
         log,
         dryRun: (typeof options !== 'undefined' ? options.dryRun : false) === true,
+        roleScoped: true,
     });
     } catch (fnErr) {
         fnReport = { ok: false, skipped: [String(fnErr.message).slice(0, 240)] };

@@ -23,7 +23,7 @@ const ROLE = {
     operator: `wph_operator_${RUN}`,
     migrator: `wph_migrator_${RUN}`,
 };
-const FN = 'public.azm_authority_activate(text,text,text,text,text,text[],text[])';
+const FN = 'public.azm_authority_activate(text,text,text,text,text)';
 const TABLE = 'public."FiatLiquidityAuthorityActivation"';
 const DIGEST = 'a'.repeat(64);
 
@@ -111,10 +111,10 @@ run('WP-H operator-only activation (real PostgreSQL logins)', () => {
     }, 60000);
 
     const activate = (client, over = {}) => client.$queryRawUnsafe(
-        `SELECT public.azm_authority_activate($1,$2,$3,$4,$5,$6::text[],$7::text[]) AS result`,
+        `SELECT public.azm_authority_activate($1,$2,$3,$4,$5) AS result`,
         over.operator || ROLE.operator, over.approver || 'approver-1', over.reason || 'month-end activation',
-        over.ref || 'evidence://wp-h/1', over.digest || DIGEST,
-        over.blocking || ['PENDING', 'PROCESSING'], over.parked || ['RECONCILIATION_REQUIRED']);
+        over.ref || 'evidence://wp-h/1', over.digest || DIGEST
+    );
 
     const recordCount = async () => (await admin.$queryRawUnsafe(`SELECT count(*)::int AS c FROM ${TABLE}`))[0].c;
     const latch = async () => (await admin.$queryRawUnsafe(
@@ -176,7 +176,7 @@ run('WP-H operator-only activation (real PostgreSQL logins)', () => {
 
     t('a non-operator login cannot execute the function', async () => {
         await expect(migrator.$queryRawUnsafe(
-            `SELECT public.azm_authority_activate($1,'a','r','e',$2,ARRAY['PENDING'],ARRAY['X'])`,
+            `SELECT public.azm_authority_activate($1,'a','r','e',$2)`,
             ROLE.migrator, DIGEST
         )).rejects.toThrow(/permission denied|42501/i);
         expect(await recordCount()).toBe(0);
@@ -202,11 +202,58 @@ run('WP-H operator-only activation (real PostgreSQL logins)', () => {
 
     t('malformed input is refused inside the database, before anything is written', async () => {
         await expect(activate(operator, { digest: 'not-a-digest' })).rejects.toThrow(/DIGEST_INVALID/);
-        await expect(activate(operator, { approver: '   ' })).rejects.toThrow(/EVIDENCE_INCOMPLETE/);
-        await expect(activate(operator, { operator: 'someone-else' })).rejects.toThrow(/OPERATOR_MISMATCH/);
-        await expect(activate(operator, { blocking: [] })).rejects.toThrow(/PREFLIGHT_STATUSES_INVALID/);
+        await expect(activate(operator, { approver: '   ' })).rejects.toThrow(/INPUT_INVALID/);
+        await expect(activate(operator, { operator: 'someone-else' })).rejects.toThrow(/OPERATOR_INVALID/);
         expect(await recordCount()).toBe(0);
     });
+
+    t('every required singleton is refused when absent, with zero writes', async () => {
+        const cases = ['public."FiatLiquidityState"', 'public."GlobalSettings"', 'public."SystemFiatPool"'];
+        for (const table of cases) {
+            const [row] = await admin.$queryRawUnsafe(`SELECT * FROM ${table} WHERE "id" = 1`);
+            await admin.$executeRawUnsafe(`DELETE FROM ${table} WHERE "id" = 1`);
+            await expect(activate(operator)).rejects.toThrow(/SINGLETON_MISSING/);
+            expect(await recordCount()).toBe(0);
+            const cols = Object.keys(row);
+            const ph = cols.map((_, i) => `$${i + 1}`).join(',');
+            await admin.$executeRawUnsafe(
+                `INSERT INTO ${table} (${cols.map((c) => `"${c}"`).join(',')}) VALUES (${ph})`,
+                ...cols.map((c) => row[c]));
+            expect((await admin.$queryRawUnsafe(`SELECT count(*)::int AS c FROM ${table} WHERE "id" = 1`))[0].c).toBe(1);
+        }
+    }, 60000);
+
+    t('a missing, disabled or substituted immutability trigger refuses before any write', async () => {
+        const tn = 'FiatLiquidityAuthorityActivation';
+        const T = `"${tn}"`;
+        const recreate = (suffix, event) => admin.$executeRawUnsafe(
+            `CREATE TRIGGER "${tn}_${suffix}" BEFORE ${event} ON ${T} FOR EACH ROW EXECUTE FUNCTION azm_authority_activation_immutable()`);
+
+        // (a) missing
+        await admin.$executeRawUnsafe(`DROP TRIGGER "${tn}_no_delete" ON ${T}`);
+        await expect(activate(operator)).rejects.toThrow(/ENFORCEMENT_NOT_ESTABLISHED/);
+        expect(await recordCount()).toBe(0);
+        await recreate('no_delete', 'DELETE');
+
+        // (b) disabled
+        await admin.$executeRawUnsafe(`ALTER TABLE ${T} DISABLE TRIGGER "${tn}_no_update"`);
+        await expect(activate(operator)).rejects.toThrow(/ENFORCEMENT_NOT_ESTABLISHED/);
+        expect(await recordCount()).toBe(0);
+        await admin.$executeRawUnsafe(`ALTER TABLE ${T} ENABLE TRIGGER "${tn}_no_update"`);
+
+        // (c) substituted function
+        await admin.$executeRawUnsafe('CREATE OR REPLACE FUNCTION public.azm_wph_stub_trigger() RETURNS trigger LANGUAGE plpgsql AS $s$ BEGIN RETURN NEW; END $s$');
+        await admin.$executeRawUnsafe(`DROP TRIGGER "${tn}_no_update" ON ${T}`);
+        await admin.$executeRawUnsafe(`CREATE TRIGGER "${tn}_no_update" BEFORE UPDATE ON ${T} FOR EACH ROW EXECUTE FUNCTION public.azm_wph_stub_trigger()`);
+        await expect(activate(operator)).rejects.toThrow(/ENFORCEMENT_NOT_ESTABLISHED/);
+        expect(await recordCount()).toBe(0);
+        await admin.$executeRawUnsafe(`DROP TRIGGER "${tn}_no_update" ON ${T}`);
+        await recreate('no_update', 'UPDATE');
+        await admin.$executeRawUnsafe('DROP FUNCTION public.azm_wph_stub_trigger()');
+
+        // restored boundary still activates
+        expect(await recordCount()).toBe(0);
+    }, 90000);
 
     t('an unresolved legacy withdrawal blocks activation and changes nothing', async () => {
         await admin.$executeRawUnsafe(
