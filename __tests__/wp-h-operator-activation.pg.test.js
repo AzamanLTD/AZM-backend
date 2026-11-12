@@ -208,15 +208,6 @@ run('WP-H operator-only activation (real PostgreSQL logins)', () => {
         expect(await recordCount()).toBe(0);
     });
 
-    t('a legacy-only latch is a contradiction, refused rather than repaired', async () => {
-        await admin.$executeRawUnsafe(`UPDATE "FiatLiquidityState" SET "authorityActivatedAt" = now() WHERE "id" = 1`);
-        await expect(activate(operator)).rejects.toThrow(/LEGACY_CONTRADICTION/);
-        expect(await recordCount()).toBe(0);
-        const state = await latch();
-        expect(state.flag).toBe(false); // nothing was latched for us
-        await admin.$executeRawUnsafe(`UPDATE "FiatLiquidityState" SET "authorityActivatedAt" = NULL WHERE "id" = 1`);
-    });
-
     t('an unresolved legacy withdrawal blocks activation and changes nothing', async () => {
         await admin.$executeRawUnsafe(
             `INSERT INTO "Withdrawal" ("status","payoutMethod","amount","settlementCurrency") VALUES ('PENDING','MTN_MOMO',50,NULL)`);
@@ -289,4 +280,10 @@ run('WP-H operator-only activation (real PostgreSQL logins)', () => {
         release();
         await reader;
     }, 60000);
+
+    // The upgrade path (a pre-set legacy latch with an inert sentinel projection)
+    // is proved in __tests__/p5e-enforced-authority-activation.pg.test.js test 8,
+    // which activates exactly that state and asserts the projection is synchronised.
+    // It cannot run here: this suite activates for real once, and the protected
+    // record is append-only by design.
 });

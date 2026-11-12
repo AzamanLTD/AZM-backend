@@ -96,7 +96,11 @@ BEGIN
     -- enforced. What is NOT reconcilable is a latched regime whose USDC
     -- projection and GHS state already disagree — that the function refuses
     -- instead of silently rewriting one of them.
-    IF (v_latch IS NOT NULL OR v_flag) AND v_pool <> v_avail THEN
+    -- §WP-H: a pre-set legacy latch alone is NOT a contradiction — activation is
+    -- exactly how such a deployment upgrades, and the projection it carries is
+    -- inert (WP-E proved the gate never reads it). The contradiction is a latch
+    -- whose arithmetic cannot be reconciled at all: a negative authoritative pool.
+    IF v_avail < 0 THEN
         RAISE EXCEPTION 'AUTHORITY_LEGACY_CONTRADICTION'
             USING ERRCODE = '23514',
                   DETAIL  = pg_catalog.format(

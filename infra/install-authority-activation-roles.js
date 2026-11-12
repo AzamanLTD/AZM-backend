@@ -211,7 +211,12 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
     // §WP-H: the operator no longer inserts the record itself; the sanctioned
     // path is the SECURITY DEFINER function owned by the dedicated NOLOGIN role.
     const { installAuthorityActivationFunction } = require('./install-authority-activation-function');
-    const fnReport = await installAuthorityActivationFunction(prisma, {
+    // A database without the activation table (a bare overlay run, a first
+    // install) cannot host the function yet: record it, never abort the roles
+    // install, and never let the absence read as success.
+    let fnReport = null;
+    try {
+    fnReport = await installAuthorityActivationFunction(prisma, {
         tableOwner: owner,
         functionOwner: (typeof options !== 'undefined' && options.functionOwner) || process.env.AUTHORITY_FN_OWNER_ROLE || `${owner}_fn`,
         runtime,
@@ -219,6 +224,11 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
         log,
         dryRun: (typeof options !== 'undefined' ? options.dryRun : false) === true,
     });
+    } catch (fnErr) {
+        fnReport = { ok: false, skipped: [String(fnErr.message).slice(0, 240)] };
+        report.skipped = (report.skipped || []).concat(['activation function: ' + fnReport.skipped[0]]);
+    }
+    if (fnReport && fnReport.problems) report.problems = (report.problems || []).concat(fnReport.problems);
     report.functionInstall = fnReport;
 
     const runtimePrivs = {
