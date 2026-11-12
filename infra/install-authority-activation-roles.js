@@ -210,12 +210,15 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
     // ── verify, then fail loudly ────────────────────────────────────────────
     // §WP-H: the operator no longer inserts the record itself; the sanctioned
     // path is the SECURITY DEFINER function owned by the dedicated NOLOGIN role.
+    // A bare overlay run (no role context) must not attempt role-scoped
+    // provisioning: it has no owner/operator credential to bind the function to.
+    const hasRoleContext = typeof options !== 'undefined' && Boolean(options && (options.owner || options.operator || options.runtime));
     const { installAuthorityActivationFunction } = require('./install-authority-activation-function');
     // A database without the activation table (a bare overlay run, a first
     // install) cannot host the function yet: record it, never abort the roles
     // install, and never let the absence read as success.
     let fnReport = null;
-    try {
+    if (hasRoleContext) try {
     fnReport = await installAuthorityActivationFunction(prisma, {
         tableOwner: owner,
         functionOwner: (typeof options !== 'undefined' && options.functionOwner) || process.env.AUTHORITY_FN_OWNER_ROLE || `${owner}_fn`,
@@ -252,7 +255,10 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
     for (const forbidden of ['insert', 'update', 'delete', 'truncate', 'trigger']) {
         if (runtimePrivs[forbidden]) report.problems.push(`runtime role still holds ${forbidden.toUpperCase()}`);
     }
-    if (operatorPrivs.insert) report.problems.push('operator role still holds direct INSERT on the activation record');
+    // Only a role-scoped run (the sanctioned procedure) can revoke the legacy
+    // direct INSERT; a bare overlay run has no role context and must not fail
+    // for a grant it was never asked to change.
+    if (hasRoleContext && operatorPrivs.insert) report.problems.push('operator role still holds direct INSERT on the activation record');
     for (const forbidden of ['update', 'delete', 'truncate']) {
         if (operatorPrivs[forbidden]) report.problems.push(`operator role still holds ${forbidden.toUpperCase()}`);
     }
