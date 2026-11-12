@@ -88,6 +88,7 @@ run('WP-E — database-enforced, append-only authority activation', () => {
     let runtime;
     let operator;
     let sessionOperator = null;
+    let fixtureReservationRef = null;
     let activationRecord = null;
 
     beforeAll(async () => {
@@ -166,6 +167,12 @@ run('WP-E — database-enforced, append-only authority activation', () => {
                     await admin.$executeRawUnsafe(`DROP ROLE IF EXISTS ${q(role)}`).catch(() => {});
                 }
                 // Leave the legacy latch exactly as this suite found it.
+                if (fixtureReservationRef) {
+                    // Only this run's own reservations: never a blanket DELETE.
+                    await admin.$executeRawUnsafe(
+                        `DELETE FROM "FiatLiquidityReservation"
+                          WHERE "reference" LIKE $1`, `${fixtureReservationRef}%`);
+                }
                 await admin.$executeRawUnsafe('UPDATE "FiatLiquidityState" SET "authorityActivatedAt" = NULL WHERE "id" = 1').catch(() => {});
                 await admin.$executeRawUnsafe('UPDATE "GlobalSettings" SET "fiatLiquidityAuthorityEnabled" = false WHERE "id" = 1').catch(() => {});
                 await admin.$disconnect();
@@ -281,16 +288,49 @@ run('WP-E — database-enforced, append-only authority activation', () => {
             await admin.$executeRawUnsafe('INSERT INTO "SystemFiatPool" ("id","balance") VALUES (1,0) ON CONFLICT ("id") DO NOTHING');
         });
 
-        // §WP-H: the preflight status policy is canonical and database-enforced now,
-        // so this fixture clears the exact rows the preflight would report instead
-        // of passing a narrowed array. Only the preflight's own candidate set goes:
-        // unresolved MoMo/FIAT payouts that have no reservation.
-        await admin.$executeRawUnsafe(
-            `DELETE FROM "Withdrawal" w
+        // §WP-H: the preflight status policy is canonical and database-enforced, so
+        // this fixture cannot narrow it. It also must not DELETE other suites' rows
+        // to get past it: on a shared database that silently destroys their state,
+        // and the previous unconditional .catch() hid the failure when it did.
+        //
+        // Instead the fixture SATISFIES the preflight the way production would: an
+        // unresolved payout is not a blocker when a reservation exists for it. Each
+        // candidate gets a reservation of this run's own making, tagged with a
+        // run-unique reference, and only those reservations are removed afterwards.
+        // A candidate that cannot be resolved this way is reported, never deleted.
+        const FIXTURE_REF = `wp-e-fixture-${SFX}-${Date.now()}`;
+        const candidates = await admin.$queryRawUnsafe(
+            `SELECT w."id", w."transactionHistoryId", t."txHash"
+               FROM "Withdrawal" w
+               LEFT JOIN "TransactionHistory" t ON t."id" = w."transactionHistoryId"
               WHERE w."status"::text = ANY(ARRAY['PENDING','APPROVED','PROCESSING','IN_TRANSIT','UNKNOWN','AWAITING_PROVIDER','PENDING_PROVIDER'])
                 AND (w."settlementCurrency" IS NULL OR w."settlementCurrency" <> 'GHS')
-                AND (w."payoutMethod" ILIKE '%MOMO%' OR w."payoutMethod" IN ('FIAT','MOBILE_MONEY','MTN_MOMO'))`
-        ).catch(() => {});
+                AND (w."payoutMethod" ILIKE '%MOMO%' OR w."payoutMethod" IN ('FIAT','MOBILE_MONEY','MTN_MOMO'))
+                AND NOT EXISTS (
+                    SELECT 1 FROM "FiatLiquidityReservation" r
+                     WHERE (t."txHash" IS NOT NULL AND r."reference" = t."txHash")
+                        OR (w."transactionHistoryId" IS NOT NULL AND r."relatedTransactionId" = w."transactionHistoryId"))`
+        );
+        const unresolvable = [];
+        for (const row of candidates) {
+            if (row.transactionHistoryId == null && !row.txHash) {
+                unresolvable.push(row.id);
+                continue;
+            }
+            await admin.$executeRawUnsafe(
+                `INSERT INTO "FiatLiquidityReservation" ("reference", "relatedTransactionId")
+                 VALUES ($1, $2)`,
+                row.txHash || `${FIXTURE_REF}-w${row.id}`, row.transactionHistoryId ?? null
+            );
+        }
+        if (unresolvable.length > 0) {
+            throw new Error(
+                `p5e cannot establish a preflight-clean fixture without deleting another suite's rows: `
+                + `withdrawal(s) ${unresolvable.join(', ')} are preflight candidates with no transaction `
+                + `reference a reservation could resolve. Investigate the owning suite instead of deleting them.`
+            );
+        }
+        fixtureReservationRef = FIXTURE_REF;
 
         const gate = await enforcement.readEnforcedAuthority(runtime);
         expect(gate.enforcedActive).toBe(false);

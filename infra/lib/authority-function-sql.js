@@ -5,13 +5,26 @@
 const fs = require('fs');
 const path = require('path');
 
+const { CANONICAL_TRIGGER_SOURCE } = require('../../src/services/authorityTriggerContract');
+
+const dollarQuote = (tag, text) => {
+    if (String(text).includes('$' + tag + '$')) {
+        throw new Error('canonical trigger source collides with the ' + tag + ' quoting tag');
+    }
+    return '$' + tag + '$' + text + '$' + tag + '$';
+};
+
 const FN = 'public.azm_authority_activate(text,text,text,text,text)';
 const q = (n) => '"' + String(n).replace(/"/g, '""') + '"';
 const lit = (s) => String(s).replace(/'/g, "''");
 
 function functionSql(operator, functionOwner) {
     const template = fs.readFileSync(path.join(__dirname, '..', 'sql', 'azm_authority_activate.sql'), 'utf8');
-    const body = template.replace(/\{\{OPERATOR\}\}/g, lit(operator));
+    const body = template
+        .replace(/\{\{OPERATOR\}\}/g, lit(operator))
+        // The canonical trigger body is injected, never hand-copied: one edit to
+        // the contract module reaches the database-side comparison unchanged.
+        .replace(/\{\{CANONICAL_TRIGGER_SOURCE\}\}/g, () => dollarQuote('canon', CANONICAL_TRIGGER_SOURCE));
     const owner = q(functionOwner);
     return `DO $ddl$ BEGIN
         EXECUTE $body$${body}$body$;

@@ -31,6 +31,10 @@ const DEFAULTS = {
 const quoteIdent = (name) => '"' + String(name).replace(/"/g, '""') + '"';
 
 const { functionSql } = require("./lib/authority-function-sql");
+const {
+    normaliseFunctionOwner,
+    verifyFunctionOwner,
+} = require("./lib/authority-role-normalisation");
 
 async function installAuthorityActivationFunction(prisma, options = {}) {
     const { tableOwner, functionOwner, runtime, operator, migrator } = { ...DEFAULTS, ...options };
@@ -56,30 +60,20 @@ async function installAuthorityActivationFunction(prisma, options = {}) {
     }
     if (options.dryRun) return report;
 
-    // 2. it must not be reachable through membership from any login
-    for (const other of [runtime, operator, migrator, tableOwner]) {
-        if (await roleExists(other)) {
-            await prisma.$executeRawUnsafe(`REVOKE ${quoteIdent(functionOwner)} FROM ${quoteIdent(other)}`);
-            await prisma.$executeRawUnsafe(`REVOKE ${quoteIdent(other)} FROM ${quoteIdent(functionOwner)}`);
-        }
-    }
-    report.applied.push('revoked function-owner memberships in both directions');
-
-    // An EXISTING function owner is re-checked, not assumed: a role that can log
-    // in or that carries CREATEROLE/SUPERUSER would defeat the whole boundary.
-    const [fnRole] = await prisma.$queryRawUnsafe(
-        'SELECT rolcanlogin, rolsuper, rolcreaterole FROM pg_roles WHERE rolname = $1', functionOwner);
-    if (!fnRole) report.problems.push('function owner role is missing');
-    else {
-        if (fnRole.rolcanlogin) {
-            await prisma.$executeRawUnsafe('ALTER ROLE ' + quoteIdent(functionOwner) + ' NOLOGIN');
-            report.applied.push('normalised existing function owner to NOLOGIN');
-        }
-        if (fnRole.rolsuper || fnRole.rolcreaterole) {
-            await prisma.$executeRawUnsafe('ALTER ROLE ' + quoteIdent(functionOwner) + ' NOSUPERUSER NOCREATEROLE');
-            report.applied.push('normalised existing function owner to NOSUPERUSER NOCREATEROLE');
-        }
-    }
+    // 2. NORMALISE THE OWNER, EXISTING OR NEW.
+    // A pre-created role is the dangerous case: creating a narrow role when it
+    // is absent says nothing about the role an attacker already installed. Every
+    // attribute, every membership in either direction and every direct object
+    // privilege is reconciled here, before the allowlist is applied, because
+    // this function is SECURITY DEFINER and runs with the owner's privileges.
+    const normalised = await normaliseFunctionOwner(prisma, functionOwner, { problems: report.problems });
+    report.applied.push(...normalised.applied);
+    report.normalisation = {
+        revokedMemberships: normalised.revokedMemberships,
+        revokedGrants: normalised.revokedGrants,
+        ownedObjects: normalised.ownership.owned,
+    };
+    if (!(await roleExists(functionOwner))) report.problems.push('function owner role is missing');
 
     // 3. the function, owned by the function owner, EXECUTE only for the operator
     await prisma.$executeRawUnsafe(functionSql(operator, functionOwner));
@@ -147,6 +141,17 @@ async function installAuthorityActivationFunction(prisma, options = {}) {
     const [opInsert] = await prisma.$queryRawUnsafe(
         `SELECT has_table_privilege($1, $2, 'INSERT') AS can_insert`, operator, TABLE);
     if (opInsert && opInsert.can_insert) report.problems.push('operator still holds direct INSERT on the activation record');
+
+    // 7. VERIFY THE RESULTING CATALOG STATE, not the statements we ran.
+    const verification = await verifyFunctionOwner(prisma, functionOwner, report.problems);
+    report.verification = {
+        attributes: verification.attributes,
+        memberships: verification.memberships,
+        tablePrivileges: verification.tablePrivileges,
+        columnUpdates: verification.columnUpdates,
+        explicitRoutines: verification.explicitRoutines,
+        ownedObjects: verification.ownership,
+    };
 
     report.ok = report.problems.length === 0;
     return report;

@@ -15,6 +15,9 @@
 --     silently becoming zero.
 --   • every write asserts exactly one affected row, so a partial or ambiguous
 --     update aborts the whole activation.
+--   • slice 6: the immutability trigger function's SOURCE TEXT is compared to
+--     the canonical shipped body. A CREATE OR REPLACE that keeps the OID, name
+--     and owner but guts the body is refused before anything is written.
 
 CREATE OR REPLACE FUNCTION public.azm_authority_activate(
     p_operator          text,
@@ -31,6 +34,11 @@ DECLARE
     c_key        constant text := 'azm.p5d.authority.activation';
     c_table      constant text := 'public."FiatLiquidityAuthorityActivation"';
     c_trigger_fn constant text := 'public.azm_authority_activation_immutable()';
+    -- CANONICAL TRIGGER IMPLEMENTATION (§WP-H slice 6). Substituted at install
+    -- time from src/services/authorityTriggerContract.js, which the drift test
+    -- ties to the shipped migration. Compared as TEXT, so no pgcrypto and no
+    -- database-side digest function is assumed or required.
+    c_trigger_src constant text := {{CANONICAL_TRIGGER_SOURCE}};
     -- CANONICAL. Mirrors fiatLiquidityActivationService.js exactly; the drift is
     -- caught by __tests__/wp-h-authority-policy-drift.test.js.
     c_blocking   constant text[] := ARRAY['PENDING','APPROVED','PROCESSING','IN_TRANSIT','UNKNOWN','AWAITING_PROVIDER','PENDING_PROVIDER'];
@@ -48,6 +56,9 @@ DECLARE
     v_tgtype     smallint;
     v_tgfoid     oid;
     v_fn_owner   text;
+    v_fn_src     text;
+    v_fn_lang    text;
+    v_fn_rettype oid;
     v_tbl_owner  text;
     v_latch      timestamptz;
     v_flag       boolean;
@@ -137,6 +148,31 @@ BEGIN
             USING ERRCODE = '42501',
                   DETAIL  = pg_catalog.format('trigger function owner %s is not the protected table owner %s',
                                               v_fn_owner, v_tbl_owner);
+    END IF;
+
+    -- 4b. THE IMPLEMENTATION ITSELF. Identity, ownership and enabled state all
+    --     survive an in-place body replacement: CREATE OR REPLACE keeps the OID,
+    --     the name and the owner, so every check above still passes while the
+    --     trigger has become a no-op. Only the source text distinguishes them.
+    SELECT p.prosrc, l.lanname, p.prorettype
+      INTO v_fn_src, v_fn_lang, v_fn_rettype
+      FROM pg_catalog.pg_proc p
+      JOIN pg_catalog.pg_language l ON l.oid = p.prolang
+     WHERE p.oid = c_trigger_fn::regprocedure;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'AUTHORITY_ENFORCEMENT_NOT_ESTABLISHED'
+            USING ERRCODE = '42501', DETAIL = 'the immutability trigger function is absent';
+    END IF;
+    IF v_fn_lang <> 'plpgsql' OR v_fn_rettype <> 'pg_catalog.trigger'::pg_catalog.regtype THEN
+        RAISE EXCEPTION 'AUTHORITY_ENFORCEMENT_NOT_ESTABLISHED'
+            USING ERRCODE = '42501',
+                  DETAIL  = pg_catalog.format('trigger function is %s returning %s, not a plpgsql trigger',
+                                              v_fn_lang, v_fn_rettype::pg_catalog.regtype);
+    END IF;
+    IF v_fn_src IS DISTINCT FROM c_trigger_src THEN
+        RAISE EXCEPTION 'AUTHORITY_ENFORCEMENT_NOT_ESTABLISHED'
+            USING ERRCODE = '42501',
+                  DETAIL  = 'the trigger function body has drifted from the shipped canonical implementation';
     END IF;
 
     -- 5. REQUIRED SINGLETONS. Absence refuses; it never becomes zero.
