@@ -87,6 +87,7 @@ run('WP-E — database-enforced, append-only authority activation', () => {
     let migrator;
     let runtime;
     let operator;
+    let sessionOperator = null;
     let activationRecord = null;
 
     beforeAll(async () => {
@@ -143,7 +144,9 @@ run('WP-E — database-enforced, append-only authority activation', () => {
             select: true, insert: false, update: false, delete: false, truncate: false, trigger: false,
         });
         expect(report.privileges.operator).toMatchObject({
-            select: true, insert: true, update: false, delete: false, truncate: false,
+            // §WP-H: the operator no longer INSERTs the record directly; its write
+            // path is EXECUTE on public.azm_authority_activate().
+            select: true, insert: false, update: false, delete: false, truncate: false,
         });
 
         runtime = new PrismaClient({ datasources: { db: { url: urlFor(ROLE.runtime) } } });
@@ -285,11 +288,16 @@ run('WP-E — database-enforced, append-only authority activation', () => {
 
     // ── 8. the one permitted activation ─────────────────────────────────────
     test('8. the activation role performs the one permitted activation', async () => {
-        await operator.$executeRawUnsafe(
-            `INSERT INTO "FiatLiquidityAuthorityActivation" ("id","activatedBy","approvedBy","evidenceReference","evidenceDigest")
-             VALUES (1,$1,$2,$3,$4)`,
-            'operator-role', 'human-approver', 'EXT-EVIDENCE-0001', 'b'.repeat(64)
+        // §WP-H: the operator no longer INSERTs the record. The sanctioned path is
+        // the SECURITY DEFINER function, which writes the record, the latch, the
+        // flag, the projection and the audit row in one transaction.
+        const [session] = await operator.$queryRawUnsafe('SELECT session_user AS s');
+        await operator.$queryRawUnsafe(
+            `SELECT public.azm_authority_activate($1,$2,$3,$4,$5,$6::text[],$7::text[])`,
+            session.s, 'human-approver', 'p5e permitted activation', 'EXT-EVIDENCE-0001', 'b'.repeat(64),
+            ['PENDING', 'PROCESSING'], ['RECONCILIATION_REQUIRED']
         );
+        sessionOperator = session.s;
         activationRecord = await enforcement.readActivationRecord(operator);
         expect(activationRecord.id).toBe(1);
         expect(activationRecord.approvedBy).toBe('human-approver');
@@ -299,15 +307,17 @@ run('WP-E — database-enforced, append-only authority activation', () => {
 
     // ── 10. one activation only: it cannot be replaced ──────────────────────
     test('10. a second activation cannot replace the first', async () => {
-        await expect(operator.$executeRawUnsafe(
-            `INSERT INTO "FiatLiquidityAuthorityActivation" ("id","activatedBy","approvedBy","evidenceReference","evidenceDigest")
-             VALUES (1,'second','second','EXT-EVIDENCE-0002','${'c'.repeat(64)}')`
-        )).rejects.toThrow(/already exists|duplicate|unique|singleton|check constraint|23505/i);
+        // The function refuses a second activation; the direct INSERT route is gone
+        // (the operator holds no INSERT), so this is the only reachable path.
+        await expect(operator.$queryRawUnsafe(
+            `SELECT public.azm_authority_activate($1,'second','second','EXT-EVIDENCE-0002',$2,$3::text[],$4::text[])`,
+            sessionOperator, 'c'.repeat(64), ['PENDING'], ['RECONCILIATION_REQUIRED']
+        )).rejects.toThrow(/ALREADY_ACTIVATED|already exists|23505/i);
 
         await expect(operator.$executeRawUnsafe(
             `INSERT INTO "FiatLiquidityAuthorityActivation" ("id","activatedBy","approvedBy","evidenceReference","evidenceDigest")
              VALUES (2,'second','second','EXT-EVIDENCE-0002','${'c'.repeat(64)}')`
-        )).rejects.toThrow(/check constraint|singleton|violates/i);
+        )).rejects.toThrow(/permission denied|insufficient_privilege|42501/i);
 
         const rows = await admin.$queryRawUnsafe('SELECT count(*)::int AS n FROM "FiatLiquidityAuthorityActivation"');
         expect(rows[0].n).toBe(1);

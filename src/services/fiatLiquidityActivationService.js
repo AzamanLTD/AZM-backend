@@ -61,6 +61,17 @@ class AuthorityDeactivationRefused extends Error {
     }
 }
 
+class AuthorityActivationSanctionedProcedureRequired extends Error {
+    constructor() {
+        super('[WP-H] activation under tri-state enforcement must go through the sanctioned operator '
+            + 'procedure (scripts/p5d-authority-activate-enforced.js -> public.azm_authority_activate). '
+            + 'No partial latch was written.');
+        this.name = 'AuthorityActivationSanctionedProcedureRequired';
+        this.code = 'AUTHORITY_ACTIVATION_SANCTIONED_PROCEDURE_REQUIRED';
+        this.statusCode = 409;
+    }
+}
+
 class AuthorityModeUnknownError extends Error {
     constructor(cause) {
         super('[P5-D] the liquidity regime could not be read, so the unit of SystemFiatPool is unknown. '
@@ -332,6 +343,12 @@ async function activationPreflight(prisma) {
  * Boolean change cannot reinterpret the GHS projection as USDC.
  */
 async function activateAuthority(prisma, { actor = 'operator', reason = null } = {}) {
+    // §WP-H: under tri-state enforcement a legacy-only activation is a DEFECT, not
+    // a shortcut: it would set the latch without the protected record and leave the
+    // regime UNKNOWN. The only sanctioned writer is the operator-only function.
+    if (require('./authorityState').enforcementMode() === 'tri_state') {
+        throw new AuthorityActivationSanctionedProcedureRequired();
+    }
     return prisma.$transaction(async (tx) => {
         // Serialize concurrent activations: two operators must not race the
         // preflight-then-write sequence.
@@ -424,6 +441,7 @@ module.exports = {
     AuthorityActivationRefused,
     AuthorityDeactivationRefused,
     AuthorityModeUnknownError,
+    AuthorityActivationSanctionedProcedureRequired,
     readMode,
     readModeAndPool,
     isAuthorityModeActive,

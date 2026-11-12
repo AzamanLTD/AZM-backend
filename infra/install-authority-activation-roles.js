@@ -186,7 +186,7 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
         `REVOKE ALL ON TABLE ${TABLE} FROM ${quoteIdent(runtime)}`,
         `REVOKE ALL ON TABLE ${TABLE} FROM ${quoteIdent(operator)}`,
         `GRANT SELECT ON TABLE ${TABLE} TO ${quoteIdent(runtime)}`,
-        `GRANT SELECT, INSERT ON TABLE ${TABLE} TO ${quoteIdent(operator)}`,
+        `GRANT SELECT ON TABLE ${TABLE} TO ${quoteIdent(operator)}`,
         `GRANT USAGE ON SCHEMA public TO ${quoteIdent(runtime)}`,
         `GRANT USAGE ON SCHEMA public TO ${quoteIdent(operator)}`,
     ];
@@ -208,6 +208,19 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
     }
 
     // ── verify, then fail loudly ────────────────────────────────────────────
+    // §WP-H: the operator no longer inserts the record itself; the sanctioned
+    // path is the SECURITY DEFINER function owned by the dedicated NOLOGIN role.
+    const { installAuthorityActivationFunction } = require('./install-authority-activation-function');
+    const fnReport = await installAuthorityActivationFunction(prisma, {
+        tableOwner: owner,
+        functionOwner: (typeof options !== 'undefined' && options.functionOwner) || process.env.AUTHORITY_FN_OWNER_ROLE || `${owner}_fn`,
+        runtime,
+        operator,
+        log,
+        dryRun: (typeof options !== 'undefined' ? options.dryRun : false) === true,
+    });
+    report.functionInstall = fnReport;
+
     const runtimePrivs = {
         select: await privilege(prisma, runtime, 'SELECT'),
         insert: await privilege(prisma, runtime, 'INSERT'),
@@ -229,7 +242,7 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
     for (const forbidden of ['insert', 'update', 'delete', 'truncate', 'trigger']) {
         if (runtimePrivs[forbidden]) report.problems.push(`runtime role still holds ${forbidden.toUpperCase()}`);
     }
-    if (!operatorPrivs.insert) report.problems.push('operator role cannot INSERT the activation record');
+    if (operatorPrivs.insert) report.problems.push('operator role still holds direct INSERT on the activation record');
     for (const forbidden of ['update', 'delete', 'truncate']) {
         if (operatorPrivs[forbidden]) report.problems.push(`operator role still holds ${forbidden.toUpperCase()}`);
     }
@@ -242,6 +255,7 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
     if (ownerRow && ownerRow.rolcanlogin) report.problems.push('owner role can log in');
     if (ownerRow && ownerRow.rolsuper) report.problems.push('owner role is a superuser');
 
+    if (fnReport && Array.isArray(fnReport.problems)) report.problems.push(...fnReport.problems);
     report.ok = report.problems.length === 0;
     report.applicable = {
         superuser: superuser && superuser.is_superuser === true,
