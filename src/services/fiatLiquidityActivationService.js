@@ -141,6 +141,35 @@ async function readMode(db) {
  *                    balance:Prisma.Decimal, source:string}>}
  */
 async function readModeAndPool(db) {
+    // §WP-H: the unit and the balance must come from ONE protected decision.
+    // requireAuthorityState() throws typed AUTHORITY_STATE_UNAVAILABLE when the
+    // protected state cannot be proved, so no caller can label an unprovable
+    // pool as USDC (or as GHS).
+    if (require('./authorityState').enforcementMode() === 'tri_state') {
+        const st = await require('./authorityState').requireAuthorityState(db);
+        const rows = await db.$queryRawUnsafe(`
+            SELECT s."authorityActivatedAt" AS "activatedAt",
+                   s."availableGhs"::text AS "availableGhs",
+                   p."balance"::text AS "projectionBalance"
+              FROM (SELECT 1 AS "id") AS anchor
+              LEFT JOIN "FiatLiquidityState" s ON s."id" = 1
+              LEFT JOIN "SystemFiatPool" p ON p."id" = 1`);
+        const row = rows[0] || {};
+        const active = st.state === 'ENFORCED_ACTIVE';
+        return {
+            active,
+            flagged: st.legacy ? st.legacy.flagged === true : false,
+            latched: st.activation != null,
+            activatedAt: row.activatedAt || null,
+            currency: st.unit,
+            authorityUnit: st.unit,
+            authorityState: st.state,
+            balance: active
+                ? new Prisma.Decimal(row.availableGhs ?? 0)
+                : (st.state === 'ENFORCED_INACTIVE' ? new Prisma.Decimal(row.projectionBalance ?? 0) : null),
+            source: active ? 'FiatLiquidityState.availableGhs' : 'SystemFiatPool.balance',
+        };
+    }
     const rows = await db.$queryRawUnsafe(`
         SELECT
             COALESCE(g."fiatLiquidityAuthorityEnabled", false) AS flagged,

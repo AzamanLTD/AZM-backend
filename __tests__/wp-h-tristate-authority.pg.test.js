@@ -324,4 +324,63 @@ describe('WP-H tri-state authority (real PostgreSQL logins)', () => {
         const broken = { $queryRawUnsafe: async () => { throw new Error('down'); } };
         await expect(A.requireAuthorityState(broken)).rejects.toMatchObject({ code: 'AUTHORITY_STATE_UNAVAILABLE' });
     }, 30000);
+
+    // ── the pool reader must publish ONE protected decision ──────────────────
+    t('readModeAndPool cannot label an unprovable state USDC', async () => {
+        const svc = require('../src/services/fiatLiquidityActivationService');
+        const prev = process.env.AUTHORITY_ENFORCEMENT_MODE;
+        process.env.AUTHORITY_ENFORCEMENT_MODE = 'tri_state';
+        try {
+            // Legacy latch + flag cleared: the protected record is ACTIVE, so the
+            // pool MUST be GHS. A mutable flag can never reinterpret it as USDC.
+            await admin.$executeRawUnsafe('UPDATE "GlobalSettings" SET "fiatLiquidityAuthorityEnabled" = false WHERE "id" = 1');
+            await admin.$executeRawUnsafe('UPDATE "FiatLiquidityState" SET "authorityActivatedAt" = NULL WHERE "id" = 1');
+            const active = await svc.readModeAndPool(runtime);
+            expect(active.authorityState).toBe('ENFORCED_ACTIVE');
+            expect(active.currency).toBe('GHS');
+            expect(active.authorityUnit).toBe('GHS');
+            expect(active.balance).not.toBeNull();
+
+            // An unprovable state must REFUSE, never fall back to USDC.
+            const broken = {
+                $queryRawUnsafe: async () => { throw new Error('down'); },
+                globalSettings: { findUnique: async () => { throw new Error('down'); } },
+                fiatLiquidityState: { findUnique: async () => { throw new Error('down'); } },
+            };
+            await expect(svc.readModeAndPool(broken)).rejects
+                .toMatchObject({ code: 'AUTHORITY_STATE_UNAVAILABLE' });
+        } finally {
+            if (prev === undefined) delete process.env.AUTHORITY_ENFORCEMENT_MODE;
+            else process.env.AUTHORITY_ENFORCEMENT_MODE = prev;
+        }
+    }, 30000);
+
+    // ── the worker must park, never dispatch, on an unprovable state ─────────
+    t('an UNKNOWN authority state parks the payout batch with zero dispatch', async () => {
+        const PayoutBatchWorker = require('../workers/payoutBatchWorker');
+        const prev = process.env.AUTHORITY_ENFORCEMENT_MODE;
+        // The unprovable state is injected at the database boundary: every
+        // authority query throws, which is exactly the "cannot prove the
+        // invariant" case the worker has to survive without dispatching.
+        const unprovable = { $queryRawUnsafe: async () => { throw new Error('down'); } };
+        let dispatches = 0;
+        const worker = new PayoutBatchWorker(
+            unprovable,
+            { emit() {} },
+            { initiateTransfer: async () => { dispatches += 1; throw new Error('MUST NOT DISPATCH'); } },
+            { create: async () => {} },
+        );
+        process.env.AUTHORITY_ENFORCEMENT_MODE = 'tri_state';
+        try {
+            const parked = await worker._processBatch(
+                { authorityEnabled: true, processingFeePercent: 0, minProcessingFee: 0, maxProcessingFee: 0, isActive: true },
+                { isManualTrigger: false },
+            );
+            expect(parked).toMatchObject({ parked: true, parkedReason: 'AUTHORITY_STATE_UNAVAILABLE', processed: 0, dispatched: 0 });
+            expect(dispatches).toBe(0);
+        } finally {
+            if (prev === undefined) delete process.env.AUTHORITY_ENFORCEMENT_MODE;
+            else process.env.AUTHORITY_ENFORCEMENT_MODE = prev;
+        }
+    }, 30000);
 });

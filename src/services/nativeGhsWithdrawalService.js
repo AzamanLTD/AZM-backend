@@ -250,7 +250,10 @@ async function processNativeGhsWithdrawal(prisma, userId, args, opts = {}) {
   // The P5-D fiat-liquidity authority is REQUIRED: the legacy SystemFiatPool
   // is a USDC scalar and cannot denominate a GHS payout. Fail closed rather
   // than reserve against a unit-less pool.
-  const authorityOn = await fiatLiquidity.isAuthorityEnabled(prisma).catch(() => false);
+  // §WP-H: do NOT collapse an authority failure into `false`. Under the
+  // tri-state regime a false here means "book as legacy USDC"; a typed
+  // AUTHORITY_STATE_UNAVAILABLE must reach the caller as a 503 instead.
+  const authorityOn = await fiatLiquidity.isAuthorityEnabled(prisma);
   if (!authorityOn) {
     throw new NativeGhsWithdrawalError(
       'Native-GHS payouts require the P5-D fiat-liquidity authority. Governance is unresolved — nothing was reserved.',
