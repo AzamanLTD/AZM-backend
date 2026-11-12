@@ -333,6 +333,16 @@ describe('WP-H tri-state authority (real PostgreSQL logins)', () => {
         try {
             // Legacy latch + flag cleared: the protected record is ACTIVE, so the
             // pool MUST be GHS. A mutable flag can never reinterpret it as USDC.
+            // Self-contained: this test owns its precondition instead of
+            // inheriting whichever activation an earlier test happened to leave.
+            const cnt = await admin.$queryRawUnsafe('SELECT count(*)::int AS c FROM "FiatLiquidityAuthorityActivation"');
+            if (cnt[0].c === 0) {
+                await operator.$executeRawUnsafe(
+                    `INSERT INTO "FiatLiquidityAuthorityActivation"
+                       ("id","activatedAt","activatedBy","approvedBy","evidenceReference","evidenceDigest")
+                     VALUES (1, NOW(), 'op-test', 'approver-test', 'evidence://wp-h/pool', repeat('a', 64))`
+                );
+            }
             await admin.$executeRawUnsafe('UPDATE "GlobalSettings" SET "fiatLiquidityAuthorityEnabled" = false WHERE "id" = 1');
             await admin.$executeRawUnsafe('UPDATE "FiatLiquidityState" SET "authorityActivatedAt" = NULL WHERE "id" = 1');
             const active = await svc.readModeAndPool(runtime);
@@ -383,4 +393,57 @@ describe('WP-H tri-state authority (real PostgreSQL logins)', () => {
             else process.env.AUTHORITY_ENFORCEMENT_MODE = prev;
         }
     }, 30000);
+
+    // ── two REAL sessions racing over the same lock key ─────────────────────
+    t('race A — a reader holding the shared lock blocks activation', async () => {
+        let release;
+        const held = new Promise((r) => { release = r; });
+        const reader = runtime.$transaction(async (tx) => {
+            await A.lockAuthorityShared(tx);
+            await held;
+            return 'reader-done';
+        }, { timeout: 30000 });
+        await new Promise((r) => setTimeout(r, 250));
+        // A DIFFERENT connection now asks for the exclusive side.
+        const refused = await operator.$transaction((tx) => A.tryLockAuthorityExclusive(tx));
+        expect(refused).toBe(false);
+        release();
+        await reader;
+        const granted = await operator.$transaction((tx) => A.tryLockAuthorityExclusive(tx));
+        expect(granted).toBe(true);
+    }, 60000);
+
+    t('race B — activation commits first, so the reader publishes GHS and the GHS balance', async () => {
+        const svc = require('../src/services/fiatLiquidityActivationService');
+        const prev = process.env.AUTHORITY_ENFORCEMENT_MODE;
+        process.env.AUTHORITY_ENFORCEMENT_MODE = 'tri_state';
+        try {
+            // The activating transaction: exclusive regime lock, protected record,
+            // latched flag + latch, and a projection that CONTRADICTS availableGhs.
+            // Until the operator-only SECURITY DEFINER function lands this runs as
+            // the administrative connection under the same exclusive lock, which is
+            // exactly the ordering that function must preserve.
+            await admin.$transaction(async (tx) => {
+                await A.lockAuthorityExclusive(tx);
+                const c = await tx.$queryRawUnsafe('SELECT count(*)::int AS c FROM "FiatLiquidityAuthorityActivation"');
+                if (c[0].c === 0) {
+                    await tx.$executeRawUnsafe(`INSERT INTO "FiatLiquidityAuthorityActivation"
+                        ("id","activatedAt","activatedBy","approvedBy","evidenceReference","evidenceDigest")
+                        VALUES (1, NOW(), 'op-race', 'approver-race', 'evidence://wp-h/race', repeat('b', 64))`);
+                }
+                await tx.$executeRawUnsafe('UPDATE "FiatLiquidityState" SET "authorityActivatedAt" = NOW(), "availableGhs" = 7777 WHERE "id" = 1');
+                await tx.$executeRawUnsafe('UPDATE "GlobalSettings" SET "fiatLiquidityAuthorityEnabled" = true WHERE "id" = 1');
+                await tx.$executeRawUnsafe('UPDATE "SystemFiatPool" SET "balance" = 13 WHERE "id" = 1');
+            }, { timeout: 30000 });
+
+            const mode = await svc.readModeAndPool(runtime);
+            expect(mode.authorityState).toBe('ENFORCED_ACTIVE');
+            expect(mode.authorityUnit).toBe('GHS');
+            expect(Number(mode.balance.toString())).toBe(7777);
+            expect(mode.source).toBe('FiatLiquidityState.availableGhs');
+        } finally {
+            if (prev === undefined) delete process.env.AUTHORITY_ENFORCEMENT_MODE;
+            else process.env.AUTHORITY_ENFORCEMENT_MODE = prev;
+        }
+    }, 60000);
 });

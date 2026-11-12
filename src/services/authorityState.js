@@ -274,7 +274,20 @@ async function tryLockAuthorityExclusive(tx) {
  * commit that depends on it.
  */
 async function withAuthoritySnapshot(tx, fn) {
-    await lockAuthorityShared(tx);
+    // §WP-H: failing to ACQUIRE the lock is itself an unprovable state. Without
+    // the lock the regime could change between the decision and the write, so a
+    // lock failure must surface as the typed UNKNOWN, never as a raw driver error
+    // that a caller might mistake for a transient blip and retry into a guess.
+    try {
+        await lockAuthorityShared(tx);
+    } catch (lockErr) {
+        throw new AuthorityStateUnavailable({
+            reason: UNKNOWN_REASON.INSPECTION_FAILED,
+            problems: ['AUTHORITY_LOCK_UNAVAILABLE'],
+            diagnostics: { error: lockErr?.message || String(lockErr) },
+            cause: lockErr,
+        });
+    }
     const resolved = await requireAuthorityState(tx);
     return fn(resolved);
 }
