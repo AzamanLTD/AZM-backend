@@ -271,6 +271,26 @@ run('WP-E — database-enforced, append-only authority activation', () => {
         ).catch(async () => {
             await admin.$executeRawUnsafe('UPDATE "GlobalSettings" SET "fiatLiquidityAuthorityEnabled" = true WHERE "id" = 1');
         });
+        // §WP-H: the activation function requires the SystemFiatPool singleton to
+        // exist, because synchronising that projection is part of the atomic act.
+        // A fixture that omits it is an incomplete authority, not an inactive one.
+        await admin.$executeRawUnsafe(
+            `INSERT INTO "SystemFiatPool" ("id","balance","updatedAt") VALUES (1,0,CURRENT_TIMESTAMP)
+             ON CONFLICT ("id") DO NOTHING`
+        ).catch(async () => {
+            await admin.$executeRawUnsafe('INSERT INTO "SystemFiatPool" ("id","balance") VALUES (1,0) ON CONFLICT ("id") DO NOTHING');
+        });
+
+        // §WP-H: the preflight status policy is canonical and database-enforced now,
+        // so this fixture clears the exact rows the preflight would report instead
+        // of passing a narrowed array. Only the preflight's own candidate set goes:
+        // unresolved MoMo/FIAT payouts that have no reservation.
+        await admin.$executeRawUnsafe(
+            `DELETE FROM "Withdrawal" w
+              WHERE w."status"::text = ANY(ARRAY['PENDING','APPROVED','PROCESSING','IN_TRANSIT','UNKNOWN','AWAITING_PROVIDER','PENDING_PROVIDER'])
+                AND (w."settlementCurrency" IS NULL OR w."settlementCurrency" <> 'GHS')
+                AND (w."payoutMethod" ILIKE '%MOMO%' OR w."payoutMethod" IN ('FIAT','MOBILE_MONEY','MTN_MOMO'))`
+        ).catch(() => {});
 
         const gate = await enforcement.readEnforcedAuthority(runtime);
         expect(gate.enforcedActive).toBe(false);
