@@ -143,7 +143,11 @@ async function installAuthorityActivationFunction(prisma, options = {}) {
     if (opInsert && opInsert.can_insert) report.problems.push('operator still holds direct INSERT on the activation record');
 
     // 7. VERIFY THE RESULTING CATALOG STATE, not the statements we ran.
-    const verification = await verifyFunctionOwner(prisma, functionOwner, report.problems);
+    // Role-scoped installs fail on any gap. A bare overlay run is a schema
+    // restore, not an authority install: its gaps are reported as skips, and it
+    // still never claims a verified boundary.
+    const verifySink = roleScoped ? report.problems : report.skipped;
+    const verification = await verifyFunctionOwner(prisma, functionOwner, verifySink);
     report.verification = {
         attributes: verification.attributes,
         memberships: verification.memberships,

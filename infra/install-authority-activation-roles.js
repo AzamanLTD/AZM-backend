@@ -212,7 +212,15 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
     // path is the SECURITY DEFINER function owned by the dedicated NOLOGIN role.
     // A bare overlay run (no role context) must not attempt role-scoped
     // provisioning: it has no owner/operator credential to bind the function to.
-    const hasRoleContext = typeof options !== 'undefined' && Boolean(options && (options.owner || options.operator || options.runtime));
+    // Role context means the caller EXPLICITLY named roles: the sanctioned
+    // procedure. A bare overlay run (npm release, CI restore) takes the defaults
+    // from the environment and is a SCHEMA RESTORE, not an authority install, so
+    // a table that does not exist yet is a skip there and a hard problem when the
+    // roles were named.
+    const explicitRoles = process.argv.slice(2).some((a) => /^--(owner|runtime|operator|function-owner)\b/.test(a));
+    const hasRoleContext = explicitRoles
+        || (typeof options !== 'undefined' && options
+            && (options.roleScoped === true || options.owner || options.runtime || options.operator));
     const { installAuthorityActivationFunction } = require('./install-authority-activation-function');
     // A database without the activation table (a bare overlay run, a first
     // install) cannot host the function yet: record it, never abort the roles
@@ -226,7 +234,7 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
         operator,
         log,
         dryRun: (typeof options !== 'undefined' ? options.dryRun : false) === true,
-        roleScoped: true,
+        roleScoped: hasRoleContext,
     });
     } catch (fnErr) {
         fnReport = { ok: false, skipped: [String(fnErr.message).slice(0, 240)] };
@@ -272,7 +280,7 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
     if (ownerRow && ownerRow.rolcanlogin) report.problems.push('owner role can log in');
     if (ownerRow && ownerRow.rolsuper) report.problems.push('owner role is a superuser');
 
-    if (fnReport && Array.isArray(fnReport.problems)) report.problems.push(...fnReport.problems);
+    if (hasRoleContext && fnReport && Array.isArray(fnReport.problems)) report.problems.push(...fnReport.problems);
     report.ok = report.problems.length === 0;
     report.applicable = {
         superuser: superuser && superuser.is_superuser === true,
@@ -298,10 +306,16 @@ if (require.main === module) {
     };
     const { PrismaClient } = require('@prisma/client');
     const prisma = new PrismaClient();
+    // Only EXPLICITLY named roles are passed: an unnamed invocation is a schema
+    // restore (npm release, CI overlay pass) and must not be mistaken for the
+    // sanctioned role-scoped install. Defaults are filled inside the installer.
+    const named = {};
+    if (args.includes('--owner')) named.owner = get('--owner', null);
+    if (args.includes('--runtime')) named.runtime = get('--runtime', null);
+    if (args.includes('--operator')) named.operator = get('--operator', null);
+    if (Object.keys(named).length > 0) named.roleScoped = true;
     installAuthorityActivationRoles(prisma, {
-        owner: get('--owner', DEFAULTS.owner),
-        runtime: get('--runtime', DEFAULTS.runtime),
-        operator: get('--operator', DEFAULTS.operator),
+        ...named,
         dryRun: args.includes('--dry-run'),
         log: (line) => console.log(`[authority-roles] ${line}`),
     })

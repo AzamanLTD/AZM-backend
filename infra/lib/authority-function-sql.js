@@ -33,17 +33,9 @@ function functionSql(operator, functionOwner) {
         EXECUTE $c$GRANT EXECUTE ON FUNCTION ${FN} TO ${q(operator)}$c$;
         EXECUTE $d$REVOKE ALL ON FUNCTION ${FN} FROM ${q(operator)}$d$;
         EXECUTE $e$GRANT EXECUTE ON FUNCTION ${FN} TO ${q(operator)}$e$;
-        EXECUTE $f$GRANT USAGE ON SCHEMA public TO ${owner}$f$;
-        EXECUTE $g$GRANT SELECT, INSERT ON TABLE public."FiatLiquidityAuthorityActivation" TO ${owner}$g$;
-        EXECUTE $h$GRANT SELECT ON TABLE public."FiatLiquidityState" TO ${owner}$h$;
-        EXECUTE $i$GRANT UPDATE ("authorityActivatedAt") ON TABLE public."FiatLiquidityState" TO ${owner}$i$;
-        EXECUTE $j$GRANT SELECT ON TABLE public."GlobalSettings" TO ${owner}$j$;
-        EXECUTE $k$GRANT UPDATE ("fiatLiquidityAuthorityEnabled") ON TABLE public."GlobalSettings" TO ${owner}$k$;
-        EXECUTE $l$GRANT SELECT, UPDATE ("balance") ON TABLE public."SystemFiatPool" TO ${owner}$l$;
-        EXECUTE $m$GRANT SELECT ON TABLE public."Withdrawal" TO ${owner}$m$;
-        EXECUTE $n$GRANT SELECT ON TABLE public."TransactionHistory" TO ${owner}$n$;
-        EXECUTE $o$GRANT SELECT ON TABLE public."FiatLiquidityReservation" TO ${owner}$o$;
-        EXECUTE $p$GRANT INSERT ON TABLE public."AdminSettingsAuditLog" TO ${owner}$p$;
+        -- Table/schema privileges are applied separately, one statement at a time,
+        -- because they depend on which tables actually exist: a database mid-restore
+        -- must still get a sound, correctly-owned function rather than none.
     END $ddl$;`;
 }
 
