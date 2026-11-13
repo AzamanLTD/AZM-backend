@@ -40,7 +40,7 @@ async function installAuthorityActivationFunction(prisma, options = {}) {
     const { tableOwner, functionOwner, runtime, operator, migrator } = { ...DEFAULTS, ...options };
     const log = options.log || (() => {});
     const roleScoped = options.roleScoped === true;
-    const report = { applied: [], problems: [], functionOwner, operator };
+    const report = { applied: [], problems: [], skipped: [], functionOwner, operator };
 
     const roleExists = async (name) => {
         const [row] = await prisma.$queryRawUnsafe('SELECT 1 AS e FROM pg_roles WHERE rolname = $1', name);
@@ -60,6 +60,17 @@ async function installAuthorityActivationFunction(prisma, options = {}) {
     }
     if (options.dryRun) return report;
 
+    // BARE MODE. A bare overlay/restore invocation names no roles, so it has no
+    // authority to bind a SECURITY DEFINER function to. Inferring a sanctioned
+    // install from DEFAULT role names used to make the restore chain fail on a
+    // clean database (the grant target did not exist yet). Skip, and say so.
+    if (!roleScoped) {
+        report.skipped.push('role-bound activation-function provisioning skipped: no roles were named');
+        report.applied.push('bare overlay/restore invocation: function provisioning and grants not attempted');
+        report.ok = report.problems.length === 0;
+        return report;
+    }
+
     // 2. NORMALISE THE OWNER, EXISTING OR NEW.
     // A pre-created role is the dangerous case: creating a narrow role when it
     // is absent says nothing about the role an attacker already installed. Every
@@ -74,6 +85,28 @@ async function installAuthorityActivationFunction(prisma, options = {}) {
         ownedObjects: normalised.ownership.owned,
     };
     if (!(await roleExists(functionOwner))) report.problems.push('function owner role is missing');
+
+    // STOP BEFORE INSTALLING. A role that failed its ownership audit must not own
+    // a fresh SECURITY DEFINER function: installing first and reporting after
+    // leaves a callable path behind a failed boundary. Nothing is reassigned —
+    // stray objects may belong to a different system boundary.
+    const unexpectedOwnership = (report.normalisation && report.normalisation.ownedObjects && report.normalisation.ownedObjects.unexpected) || [];
+    if (unexpectedOwnership.length > 0 || !(await roleExists(functionOwner))) {
+        let revoked = 0;
+        try {
+            const [existing] = await prisma.$queryRawUnsafe(
+                `SELECT to_regprocedure($1)::text AS fn`, FN);
+            if (existing && existing.fn) {
+                await prisma.$executeRawUnsafe(`REVOKE ALL ON FUNCTION ${FN} FROM PUBLIC`);
+                await prisma.$executeRawUnsafe(`REVOKE ALL ON FUNCTION ${FN} FROM ${quoteIdent(operator)}`);
+                revoked = 1;
+            }
+        } catch (_) { /* the function may not exist; the refusal below still holds */ }
+        report.skipped.push('activation function NOT installed or replaced: the function owner failed its audit');
+        if (revoked) report.applied.push('revoked EXECUTE on the existing activation function from PUBLIC and the operator');
+        report.ok = false;
+        return report;
+    }
 
     // 3. the function, owned by the function owner, EXECUTE only for the operator
     await prisma.$executeRawUnsafe(functionSql(operator, functionOwner));

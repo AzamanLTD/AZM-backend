@@ -58,6 +58,8 @@ const EXPECTED_COLUMN_UPDATE = {
 const ALLOWED_OWNED_ROUTINE_PREFIX = 'public.azm_authority_activate(';
 const isAllowedOwnedRoutine = (name) => String(name).startsWith(ALLOWED_OWNED_ROUTINE_PREFIX);
 
+const { revokeDefaultPrivileges, inspectDefaultPrivileges } = require('./authority-default-acl');
+
 const q = (name) => '"' + String(name).replace(/"/g, '""') + '"';
 const notSystem = SYSTEM_SCHEMAS.map((s) => `'${s}'`).join(',');
 
@@ -319,13 +321,15 @@ async function normaliseFunctionOwner(prisma, role, options = {}) {
     const revokedMemberships = await reconcileMemberships(prisma, role, applied);
     const revokedGrants = await revokeDirectPrivileges(prisma, role, applied);
     const ownership = await auditOwnership(prisma, role, problems);
-    return { applied, problems, revokedMemberships, revokedGrants, ownership };
+    const revokedDefaultGrants = await revokeDefaultPrivileges(prisma, role, applied);
+    return { applied, problems, revokedMemberships, revokedGrants, revokedDefaultGrants, ownership };
 }
 
 async function verifyFunctionOwner(prisma, role, problems) {
     const ownership = await auditOwnership(prisma, role, problems);
+    const defaultAcl = await inspectDefaultPrivileges(prisma, role, problems);
     const verified = await verifyResult(prisma, role, problems);
-    return { ...verified, ownership: ownership.owned };
+    return { ...verified, ownership: ownership.owned, defaultAcl: defaultAcl.entries };
 }
 
 module.exports = {

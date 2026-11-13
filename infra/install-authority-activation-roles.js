@@ -131,6 +131,9 @@ async function privilege(prisma, role, what) {
 }
 
 async function installAuthorityActivationRoles(prisma, options = {}) {
+    // Captured at ENTRY: later code destructures with defaults, so the caller's
+    // explicitness has to be read before anything can shadow it.
+    const callerNamedRoles = Boolean(options && (options.owner || options.runtime || options.operator || options.functionOwner));
     const owner = options.owner || DEFAULTS.owner;
     const runtime = options.runtime || DEFAULTS.runtime;
     const operator = options.operator || DEFAULTS.operator;
@@ -218,9 +221,8 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
     // a table that does not exist yet is a skip there and a hard problem when the
     // roles were named.
     const explicitRoles = process.argv.slice(2).some((a) => /^--(owner|runtime|operator|function-owner)\b/.test(a));
-    const hasRoleContext = explicitRoles
-        || (typeof options !== 'undefined' && options
-            && (options.roleScoped === true || options.owner || options.runtime || options.operator));
+    const hasRoleContext = explicitRoles || callerNamedRoles
+        || (typeof options !== 'undefined' && options && options.roleScoped === true);
     const { installAuthorityActivationFunction } = require('./install-authority-activation-function');
     // A database without the activation table (a bare overlay run, a first
     // install) cannot host the function yet: record it, never abort the roles
