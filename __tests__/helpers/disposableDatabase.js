@@ -25,26 +25,42 @@ async function createDisposableDatabase(tag) {
     await admin.$disconnect();
 
     const url = urlForDb(name) + '?schema=public';
-    execFileSync('npx', ['prisma', 'db', 'push', '--skip-generate', '--accept-data-loss'], {
-        env: { ...process.env, DATABASE_URL: url },
-        stdio: 'ignore',
-    });
 
-    // The release chain's overlay installers create tables that are NOT in
-    // schema.prisma (they are migration-managed), so a pushed database is not
-    // complete. Run the same sorted chain the CI lanes run.
-    const fs = require('fs');
-    const path = require('path');
-    const infraDir = path.join(__dirname, '..', '..', 'infra');
-    for (const f of fs.readdirSync(infraDir).filter((n) => n.startsWith('install-') && n.endsWith('.js')).sort()) {
-        try {
-            execFileSync('node', [path.join(infraDir, f)], {
-                env: { ...process.env, DATABASE_URL: url },
-                stdio: 'ignore',
-            });
-        } catch (err) {
-            throw new Error(`overlay installer ${f} failed while provisioning ${name}`);
+    // Provisioning is guarded: a failed push or a failed overlay installer must
+    // not leave an orphaned database behind, because the failure is exactly when
+    // nobody is looking for debris.
+    try {
+        execFileSync('npx', ['prisma', 'db', 'push', '--skip-generate', '--accept-data-loss'], {
+            env: { ...process.env, DATABASE_URL: url },
+            stdio: 'ignore',
+        });
+
+        // The release chain's overlay installers create tables that are NOT in
+        // schema.prisma (they are migration-managed), so a pushed database is not
+        // complete. Run the same sorted chain the CI lanes run.
+        const fs = require('fs');
+        const path = require('path');
+        const infraDir = path.join(__dirname, '..', '..', 'infra');
+        for (const f of fs.readdirSync(infraDir).filter((n) => n.startsWith('install-') && n.endsWith('.js')).sort()) {
+            try {
+                execFileSync('node', [path.join(infraDir, f)], {
+                    env: { ...process.env, DATABASE_URL: url },
+                    stdio: 'ignore',
+                });
+            } catch (err) {
+                throw new Error(`overlay installer ${f} failed while provisioning ${name}`);
+            }
         }
+    } catch (err) {
+        try {
+            const a = new PrismaClient({ datasources: { db: { url: urlForDb('postgres') } } });
+            try {
+                await a.$executeRawUnsafe(`DROP DATABASE IF EXISTS "${name}" WITH (FORCE)`);
+            } finally {
+                await a.$disconnect();
+            }
+        } catch (_) { /* the original failure is what matters */ }
+        throw err;
     }
 
     return {

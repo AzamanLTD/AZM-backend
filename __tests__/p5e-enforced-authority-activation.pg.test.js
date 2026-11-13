@@ -66,6 +66,9 @@ const ROLE = {
     owner: `${SFX}_owner`,
     runtime: `${SFX}_runtime`,
     operator: `${SFX}_operator`,
+    // Created by the function installer, derived from the table owner. It is a
+    // cluster-level object exactly like the others and must be dropped with them.
+    functionOwner: `${SFX}_owner_fn`, // the resolver derives `${owner}_fn`
 };
 const PASSWORD = `${SFX}${Math.random().toString(36).slice(2)}Aa1!`;
 
@@ -147,6 +150,7 @@ run('WP-E — database-enforced, append-only authority activation', () => {
             owner: ROLE.owner,
             runtime: ROLE.runtime,
             operator: ROLE.operator,
+            functionOwner: ROLE.functionOwner,
         });
         expect(report.problems).toEqual([]);
         expect(report.ok).toBe(true);
@@ -171,7 +175,7 @@ run('WP-E — database-enforced, append-only authority activation', () => {
             if (admin) {
                 await admin.$executeRawUnsafe('DROP TABLE IF EXISTS "FiatLiquidityAuthorityActivation" CASCADE');
                 await admin.$executeRawUnsafe('DROP FUNCTION IF EXISTS azm_authority_activation_immutable() CASCADE');
-                for (const role of [ROLE.runtime, ROLE.operator, ROLE.migrator, ROLE.owner]) {
+                for (const role of [ROLE.runtime, ROLE.operator, ROLE.migrator, ROLE.functionOwner, ROLE.owner]) {
                     await admin.$executeRawUnsafe(`DROP OWNED BY ${q(role)} CASCADE`).catch(() => {});
                     await admin.$executeRawUnsafe(`DROP ROLE IF EXISTS ${q(role)}`).catch(() => {});
                 }

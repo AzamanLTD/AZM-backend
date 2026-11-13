@@ -13,19 +13,25 @@ const ACL_KINDS = { r: 'TABLES', S: 'SEQUENCES', f: 'FUNCTIONS', T: 'TYPES' };
 async function revokeDefaultPrivileges(prisma, role, applied) {
     const rows = await prisma.$queryRawUnsafe(`
         SELECT n.nspname, d.defaclobjtype,
-               pg_get_userbyid(a.grantee) AS grantee
+               -- grantee OID 0 is PUBLIC, a pseudo-role that has no pg_roles entry.
+               -- pg_get_userbyid(0) is NULL, and quoting 'PUBLIC' as an identifier
+               -- would look for a role literally named PUBLIC and fail.
+               CASE WHEN a.grantee = 0::oid THEN 'PUBLIC'
+                    ELSE pg_get_userbyid(a.grantee) END AS grantee,
+               CASE WHEN a.grantee = 0::oid THEN true ELSE false END AS is_public,
+               min(a.grantee::text) AS grantee_oid
           FROM pg_default_acl d
           LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace
           CROSS JOIN LATERAL aclexplode(d.defaclacl) a
          WHERE d.defaclrole = ${oidSub()}
            AND a.grantee <> ${oidSub()}
-         GROUP BY 1,2,3`, role);
+         GROUP BY 1,2,3,4`, role);
     let count = 0;
     for (const r of rows || []) {
         const kind = ACL_KINDS[r.defaclobjtype];
         if (!kind) continue;
         const scope = r.nspname ? ` IN SCHEMA ${q(r.nspname)}` : '';
-        const grantee = r.grantee === null ? 'PUBLIC' : q(r.grantee);
+        const grantee = r.is_public || r.grantee === null || r.grantee === 'PUBLIC' ? 'PUBLIC' : q(r.grantee);
         await prisma.$executeRawUnsafe(
             `ALTER DEFAULT PRIVILEGES FOR ROLE ${q(role)}${scope} REVOKE ALL ON ${kind} FROM ${grantee}`);
         applied.push(`revoked default ${kind}${scope || ' (global)'} from ${grantee || 'PUBLIC'}`);
@@ -37,7 +43,8 @@ async function revokeDefaultPrivileges(prisma, role, applied) {
 async function inspectDefaultPrivileges(prisma, role, problems) {
     const rows = await prisma.$queryRawUnsafe(`
         SELECT coalesce(n.nspname, '(global)') AS scope, d.defaclobjtype,
-               coalesce(pg_get_userbyid(a.grantee), 'PUBLIC') AS grantee,
+               CASE WHEN a.grantee = 0::oid THEN 'PUBLIC'
+                    ELSE coalesce(pg_get_userbyid(a.grantee), a.grantee::text) END AS grantee,
                a.privilege_type
           FROM pg_default_acl d
           LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace
