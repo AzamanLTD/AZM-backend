@@ -4,7 +4,10 @@ on:
   push:
     branches: [main, develop]
   pull_request:
-    branches: [main]
+    # §WP-H: the integration branches carry the money-path work and must get the
+    # full lane on their PRs, not only PRs into main. Without this, PRs targeting
+    # integration/main-reconciliation received no test run at all.
+    branches: [main, 'integration/**']
   merge_group:
   workflow_dispatch:
 

@@ -473,6 +473,22 @@ jobs:
             "__tests__/totp-step-clock-divergence.pg.test.js"
             "__tests__/totp-global-replay-protection.pg.test.js"
             "__tests__/p5e-enforced-authority-activation.pg.test.js"
+            # §WP-H — the tri-state authority boundary: typed UNKNOWN refusals,
+            # the advisory-lock protocol and the four real PostgreSQL logins.
+            # Provisions its own disposable database and roles; needs no service.
+            "__tests__/wp-h-tristate-authority.pg.test.js"
+            # §WP-H slice 6 — the operator-only activation boundary and the
+            # canonical-policy drift guard. Both were previously only reachable
+            # through the full sweep. The operator suite provisions its own
+            # disposable database and its own NOLOGIN/LOGIN roles (as p5e does),
+            # so it runs unchanged on this lane's service user.
+            "__tests__/wp-h-operator-activation.pg.test.js"
+            "__tests__/wp-h-authority-policy-drift.test.js"
+            # §WP-H slice 6 — trigger-body integrity (the CREATE OR REPLACE
+            # attack) and least-privilege normalisation of a pre-poisoned
+            # function owner. Both disposable-database, real-role suites.
+            "__tests__/wp-h-trigger-integrity.pg.test.js"
+            "__tests__/wp-h-function-owner-privileges.pg.test.js"
             "__tests__/app-unlock-durable-state.test.js"
             "__tests__/app-unlock-claim-installer-wiring.test.js"
             "__tests__/pos-settlement-containment.test.js"

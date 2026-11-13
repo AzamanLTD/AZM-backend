@@ -27,7 +27,10 @@
 //   • the runtime role does not own the table and cannot SET ROLE to its owner;
 //   • the runtime role has SELECT but no INSERT/UPDATE/DELETE/TRUNCATE/TRIGGER;
 //   • all three immutability triggers exist and are enabled;
-//   • the trigger function is owned by the owner role, not the runtime role.
+//   • the trigger function is owned by the owner role, not the runtime role;
+//   • the trigger function's SOURCE TEXT is the canonical shipped body. A body
+//     replacement via CREATE OR REPLACE preserves OID, name and owner, so every
+//     check above still passes against a no-op trigger. Only the text differs.
 //
 // FAIL CLOSED, NEVER FALL BACK
 // Any error, any missing table, any privilege mismatch and any ownership overlap
@@ -41,6 +44,14 @@
 // adds a narrower, stronger authority for capabilities that must be provably
 // un-rewritable by the runtime. It never widens what the regime permits.
 // =============================================================================
+
+const {
+    CANONICAL_TRIGGER_SOURCE,
+    TRIGGER_SOURCE_SHA256,
+    TRIGGER_FUNCTION_REGPROCEDURE,
+    digestOfTriggerSource,
+    isCanonicalTriggerSource,
+} = require('./authorityTriggerContract');
 
 const TABLE_NAME = 'FiatLiquidityAuthorityActivation';
 const QUALIFIED_TABLE = `public."${TABLE_NAME}"`;
@@ -72,6 +83,8 @@ const PROBLEM = Object.freeze({
     RUNTIME_CAN_CREATE_TRIGGER: 'RUNTIME_CAN_CREATE_TRIGGER',
     TRIGGER_FUNCTION_MISSING: 'TRIGGER_FUNCTION_MISSING',
     TRIGGER_FUNCTION_OWNED_BY_RUNTIME: 'TRIGGER_FUNCTION_OWNED_BY_RUNTIME',
+    TRIGGER_IMPLEMENTATION_DRIFT: 'TRIGGER_IMPLEMENTATION_DRIFT',
+    TRIGGER_IMPLEMENTATION_UNVERIFIABLE: 'TRIGGER_IMPLEMENTATION_UNVERIFIABLE',
     TRIGGER_MISSING: 'TRIGGER_MISSING',
     TRIGGER_DISABLED: 'TRIGGER_DISABLED',
     ENFORCEMENT_PROBE_FAILED: 'ENFORCEMENT_PROBE_FAILED',
@@ -164,16 +177,37 @@ async function inspectEnforcement(db) {
 
     // Defence in depth must actually be present and enabled.
     try {
+        // Resolved by signature, not by bare name: a same-named function in
+        // another schema is not this boundary.
         const fnRows = await db.$queryRawUnsafe(`
-            SELECT pg_get_userbyid(p.proowner) AS fn_owner
+            SELECT pg_get_userbyid(p.proowner)                      AS fn_owner,
+                   p.prosrc                                          AS body,
+                   l.lanname                                         AS language,
+                   p.prorettype = 'pg_catalog.trigger'::pg_catalog.regtype AS returns_trigger
               FROM pg_proc p
-             WHERE p.proname = '${TRIGGER_FUNCTION}'
+              JOIN pg_language l ON l.oid = p.prolang
+             WHERE p.oid = to_regprocedure('${TRIGGER_FUNCTION_REGPROCEDURE}')
         `);
         if (!fnRows || fnRows.length === 0) {
             problems.push(PROBLEM.TRIGGER_FUNCTION_MISSING);
         } else {
-            const fnOwners = new Set(fnRows.map((r) => r.fn_owner));
-            if (fnOwners.has(identity.runtime_role)) problems.push(PROBLEM.TRIGGER_FUNCTION_OWNED_BY_RUNTIME);
+            const fn = fnRows[0];
+            if (fn.fn_owner === identity.runtime_role) problems.push(PROBLEM.TRIGGER_FUNCTION_OWNED_BY_RUNTIME);
+
+            // THE IMPLEMENTATION, not just its identity. This is the check that
+            // a CREATE OR REPLACE body swap cannot survive.
+            if (typeof fn.body !== 'string') {
+                problems.push(PROBLEM.TRIGGER_IMPLEMENTATION_UNVERIFIABLE);
+            } else {
+                diagnostics.triggerFunctionDigest = digestOfTriggerSource(fn.body);
+                diagnostics.expectedTriggerDigest = TRIGGER_SOURCE_SHA256;
+                if (fn.language !== 'plpgsql' || fn.returns_trigger !== true) {
+                    diagnostics.triggerFunctionLanguage = fn.language;
+                    problems.push(PROBLEM.TRIGGER_IMPLEMENTATION_DRIFT);
+                } else if (!isCanonicalTriggerSource(fn.body)) {
+                    problems.push(PROBLEM.TRIGGER_IMPLEMENTATION_DRIFT);
+                }
+            }
         }
     } catch (_) {
         problems.push(PROBLEM.ENFORCEMENT_PROBE_FAILED);
@@ -279,6 +313,7 @@ module.exports = {
     QUALIFIED_TABLE,
     REQUIRED_TRIGGERS,
     TRIGGER_FUNCTION,
+    CANONICAL_TRIGGER_SOURCE,
     AuthorityEnforcementUnavailable,
     inspectEnforcement,
     readActivationRecord,

@@ -61,6 +61,17 @@ class AuthorityDeactivationRefused extends Error {
     }
 }
 
+class AuthorityActivationSanctionedProcedureRequired extends Error {
+    constructor() {
+        super('[WP-H] activation under tri-state enforcement must go through the sanctioned operator '
+            + 'procedure (scripts/p5d-authority-activate-enforced.js -> public.azm_authority_activate). '
+            + 'No partial latch was written.');
+        this.name = 'AuthorityActivationSanctionedProcedureRequired';
+        this.code = 'AUTHORITY_ACTIVATION_SANCTIONED_PROCEDURE_REQUIRED';
+        this.statusCode = 409;
+    }
+}
+
 class AuthorityModeUnknownError extends Error {
     constructor(cause) {
         super('[P5-D] the liquidity regime could not be read, so the unit of SystemFiatPool is unknown. '
@@ -82,6 +93,21 @@ function _dec(v) {
  *                    activatedAt:Date|null, authorityUnit:'GHS'|'USDC'}>}
  */
 async function readMode(db) {
+    // §WP-H: under the tri-state regime the answer comes from the protected
+    // record and a positive enforcement inspection, and an unprovable state
+    // REFUSES (typed AUTHORITY_STATE_UNAVAILABLE) instead of collapsing to
+    // "legacy USDC". The default regime is unchanged; see docs/wp-h.
+    if (require('./authorityState').enforcementMode() === 'tri_state') {
+        const st = await require('./authorityState').requireAuthorityState(db);
+        return {
+            active: st.state === 'ENFORCED_ACTIVE',
+            flagged: st.legacy ? st.legacy.flagged === true : false,
+            latched: st.activation != null,
+            activatedAt: st.activation ? st.activation.activatedAt : null,
+            authorityUnit: st.unit,
+            authorityState: st.state,
+        };
+    }
     // FAIL CLOSED. A failed read is an UNKNOWN regime, never "legacy USDC".
     // Swallowing the error here would silently reinterpret the GHS projection
     // as USDC — the exact defect this service exists to prevent. A MISSING row
@@ -126,6 +152,49 @@ async function readMode(db) {
  *                    balance:Prisma.Decimal, source:string}>}
  */
 async function readModeAndPool(db) {
+    // §WP-H: ONE protected snapshot. The shared regime lock is taken FIRST,
+    // inside the same transaction that reads the balance, and held until commit.
+    // Activation holds the exclusive side of the same lock, so the decision and
+    // the balance it labels can never straddle an activation: either activation
+    // committed before this read (GHS + availableGhs) or it cannot commit until
+    // this read finishes (USDC + pool). Transaction-scoped: released at commit.
+    const authority = require('./authorityState');
+    if (authority.enforcementMode() === 'tri_state') {
+        const readUnderLock = async (client) => authority.withAuthoritySnapshot(client, async (st) => {
+            const rows = await client.$queryRawUnsafe(`
+                SELECT s."authorityActivatedAt" AS "activatedAt",
+                       s."availableGhs"::text AS "availableGhs",
+                       p."balance"::text AS "projectionBalance"
+                  FROM (SELECT 1 AS "id") AS anchor
+                  LEFT JOIN "FiatLiquidityState" s ON s."id" = 1
+                  LEFT JOIN "SystemFiatPool" p ON p."id" = 1`);
+            const row = rows[0] || {};
+            const active = st.state === authority.AUTHORITY_STATE.ENFORCED_ACTIVE;
+            const balance = active
+                ? new Prisma.Decimal(row.availableGhs ?? 0)
+                : (st.state === authority.AUTHORITY_STATE.ENFORCED_INACTIVE
+                    ? new Prisma.Decimal(row.projectionBalance ?? 0)
+                    : null);
+            return {
+                active,
+                flagged: st.legacy ? st.legacy.flagged === true : false,
+                latched: st.activation != null,
+                activatedAt: row.activatedAt || null,
+                currency: st.unit,
+                authorityUnit: st.unit,
+                authorityState: st.state,
+                balance,
+                source: active ? 'FiatLiquidityState.availableGhs' : 'SystemFiatPool.balance',
+            };
+        });
+        // A bare client opens its own transaction (one lock, one snapshot). A
+        // caller already inside a transaction is used as-is, so the lock is held
+        // through ITS commit rather than being released early here.
+        if (typeof db.$transaction === 'function') {
+            return db.$transaction((tx) => readUnderLock(tx), { timeout: 20000 });
+        }
+        return readUnderLock(db);
+    }
     const rows = await db.$queryRawUnsafe(`
         SELECT
             COALESCE(g."fiatLiquidityAuthorityEnabled", false) AS flagged,
@@ -155,6 +224,9 @@ async function readModeAndPool(db) {
 
 /** Convenience predicate used by the money paths. */
 async function isAuthorityModeActive(prisma) {
+    // Under the tri-state regime this NEVER answers a bare false for an
+    // unprovable state: it throws AUTHORITY_STATE_UNAVAILABLE, because `false`
+    // downstream means "book as legacy USDC".
     return (await readMode(prisma)).active;
 }
 
@@ -164,7 +236,21 @@ async function isAuthorityModeActive(prisma) {
  * mode while activation's preflight has already decided the old mode is safe.
  */
 async function lockRegime(tx) {
+    // §WP-H: the SAME key the tri-state module uses for its shared economic
+    // lock. Activation is the exclusive side of one protocol, not a separate
+    // lock universe; __tests__/wp-h-tristate-authority.pg.test.js asserts the
+    // two constants stay identical.
+    const { AUTHORITY_LOCK_KEY } = require('./authorityState');
+    if (AUTHORITY_LOCK_KEY !== ACTIVATION_LOCK_KEY) {
+        throw new Error('[WP-H] regime lock identity drift: activation and economic paths disagree');
+    }
     await tx.$executeRawUnsafe('SELECT pg_advisory_xact_lock(hashtext($1))', ACTIVATION_LOCK_KEY);
+}
+
+/** The shared side of the same protocol, for economic transactions. */
+async function lockRegimeShared(tx) {
+    const { lockAuthorityShared } = require('./authorityState');
+    await lockAuthorityShared(tx);
 }
 
 /**
@@ -257,6 +343,12 @@ async function activationPreflight(prisma) {
  * Boolean change cannot reinterpret the GHS projection as USDC.
  */
 async function activateAuthority(prisma, { actor = 'operator', reason = null } = {}) {
+    // §WP-H: under tri-state enforcement a legacy-only activation is a DEFECT, not
+    // a shortcut: it would set the latch without the protected record and leave the
+    // regime UNKNOWN. The only sanctioned writer is the operator-only function.
+    if (require('./authorityState').enforcementMode() === 'tri_state') {
+        throw new AuthorityActivationSanctionedProcedureRequired();
+    }
     return prisma.$transaction(async (tx) => {
         // Serialize concurrent activations: two operators must not race the
         // preflight-then-write sequence.
@@ -349,10 +441,12 @@ module.exports = {
     AuthorityActivationRefused,
     AuthorityDeactivationRefused,
     AuthorityModeUnknownError,
+    AuthorityActivationSanctionedProcedureRequired,
     readMode,
     readModeAndPool,
     isAuthorityModeActive,
     lockRegime,
+    lockRegimeShared,
     activationPreflight,
     activateAuthority,
     assertDeactivationAllowed,

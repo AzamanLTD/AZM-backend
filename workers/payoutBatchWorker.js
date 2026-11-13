@@ -252,6 +252,21 @@ class PayoutBatchWorker {
     }
 
     async _processBatch(settings, { isManualTrigger = false } = {}) {
+        // §WP-H UNKNOWN: resolve the authority regime BEFORE any other work.
+        // An unprovable state parks the batch: no row is claimed, no provider
+        // operation identity is minted, nothing is marked definitively failed.
+        try {
+            await fiatLiquidityActivation.isAuthorityModeActive(this.prisma);
+        } catch (authorityErr) {
+            if (authorityErr && authorityErr.code === 'AUTHORITY_STATE_UNAVAILABLE') {
+                logger.error(
+                    { code: authorityErr.code, reason: authorityErr.reason || null, problems: authorityErr.problems || null },
+                    '[payoutBatchWorker] authority state UNAVAILABLE — batch PARKED, zero dispatch',
+                );
+                return { parked: true, parkedReason: authorityErr.code, processed: 0, dispatched: 0 };
+            }
+            throw authorityErr;
+        }
         // §r42.4 — EVERY money comparison on this path is Decimal. These two
         // values decide whether a payout is dispatched or held, so the
         // configured figures are read as Decimals and only their numeric

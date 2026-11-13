@@ -31,7 +31,14 @@ const {
     splitSqlStatements,
 } = require('../infra/install-authority-activation-roles');
 
-const ADMIN_URL = process.env.TEST_DATABASE_URL;
+// ISOLATION: this suite mutates global activation state (drops and recreates the
+// protected record, its triggers and the legacy latch). It therefore runs in a
+// database of its own, created and dropped by the suite, and never touches the
+// shared test database.
+const SHARED_URL = process.env.TEST_DATABASE_URL;
+const { createDisposableDatabase } = require('./helpers/disposableDatabase');
+let ADMIN_URL = SHARED_URL;
+let disposableDb = null;
 const IS_CI = Boolean(process.env.CI || process.env.GITHUB_ACTIONS);
 const run = ADMIN_URL ? describe : describe.skip;
 
@@ -59,6 +66,9 @@ const ROLE = {
     owner: `${SFX}_owner`,
     runtime: `${SFX}_runtime`,
     operator: `${SFX}_operator`,
+    // Created by the function installer, derived from the table owner. It is a
+    // cluster-level object exactly like the others and must be dropped with them.
+    functionOwner: `${SFX}_owner_fn`, // the resolver derives `${owner}_fn`
 };
 const PASSWORD = `${SFX}${Math.random().toString(36).slice(2)}Aa1!`;
 
@@ -87,9 +97,13 @@ run('WP-E — database-enforced, append-only authority activation', () => {
     let migrator;
     let runtime;
     let operator;
+    let sessionOperator = null;
+    let fixtureReservationRef = null;
     let activationRecord = null;
 
     beforeAll(async () => {
+        disposableDb = await createDisposableDatabase('p5e');
+        ADMIN_URL = disposableDb.url;
         admin = new PrismaClient({ datasources: { db: { url: ADMIN_URL } } });
 
         // ── provisioning preconditions: fail loudly, never pass vacuously ────
@@ -136,6 +150,7 @@ run('WP-E — database-enforced, append-only authority activation', () => {
             owner: ROLE.owner,
             runtime: ROLE.runtime,
             operator: ROLE.operator,
+            functionOwner: ROLE.functionOwner,
         });
         expect(report.problems).toEqual([]);
         expect(report.ok).toBe(true);
@@ -143,7 +158,9 @@ run('WP-E — database-enforced, append-only authority activation', () => {
             select: true, insert: false, update: false, delete: false, truncate: false, trigger: false,
         });
         expect(report.privileges.operator).toMatchObject({
-            select: true, insert: true, update: false, delete: false, truncate: false,
+            // §WP-H: the operator no longer INSERTs the record directly; its write
+            // path is EXECUTE on public.azm_authority_activate().
+            select: true, insert: false, update: false, delete: false, truncate: false,
         });
 
         runtime = new PrismaClient({ datasources: { db: { url: urlFor(ROLE.runtime) } } });
@@ -158,11 +175,17 @@ run('WP-E — database-enforced, append-only authority activation', () => {
             if (admin) {
                 await admin.$executeRawUnsafe('DROP TABLE IF EXISTS "FiatLiquidityAuthorityActivation" CASCADE');
                 await admin.$executeRawUnsafe('DROP FUNCTION IF EXISTS azm_authority_activation_immutable() CASCADE');
-                for (const role of [ROLE.runtime, ROLE.operator, ROLE.migrator, ROLE.owner]) {
+                for (const role of [ROLE.runtime, ROLE.operator, ROLE.migrator, ROLE.functionOwner, ROLE.owner]) {
                     await admin.$executeRawUnsafe(`DROP OWNED BY ${q(role)} CASCADE`).catch(() => {});
                     await admin.$executeRawUnsafe(`DROP ROLE IF EXISTS ${q(role)}`).catch(() => {});
                 }
                 // Leave the legacy latch exactly as this suite found it.
+                if (fixtureReservationRef) {
+                    // Only this run's own reservations: never a blanket DELETE.
+                    await admin.$executeRawUnsafe(
+                        `DELETE FROM "FiatLiquidityReservation"
+                          WHERE "reference" LIKE $1`, `${fixtureReservationRef}%`);
+                }
                 await admin.$executeRawUnsafe('UPDATE "FiatLiquidityState" SET "authorityActivatedAt" = NULL WHERE "id" = 1').catch(() => {});
                 await admin.$executeRawUnsafe('UPDATE "GlobalSettings" SET "fiatLiquidityAuthorityEnabled" = false WHERE "id" = 1').catch(() => {});
                 await admin.$disconnect();
@@ -246,6 +269,10 @@ run('WP-E — database-enforced, append-only authority activation', () => {
         expect(membership.operator_member).toBe(false);
     });
 
+    afterAll(async () => {
+        if (disposableDb) await disposableDb.drop();
+    }, 120000);
+
     // ── 11. application code reports INACTIVE before activation ─────────────
     test('11. the gate reports inactive while no activation record exists', async () => {
         const gate = await enforcement.readEnforcedAuthority(runtime);
@@ -268,6 +295,59 @@ run('WP-E — database-enforced, append-only authority activation', () => {
         ).catch(async () => {
             await admin.$executeRawUnsafe('UPDATE "GlobalSettings" SET "fiatLiquidityAuthorityEnabled" = true WHERE "id" = 1');
         });
+        // §WP-H: the activation function requires the SystemFiatPool singleton to
+        // exist, because synchronising that projection is part of the atomic act.
+        // A fixture that omits it is an incomplete authority, not an inactive one.
+        await admin.$executeRawUnsafe(
+            `INSERT INTO "SystemFiatPool" ("id","balance","updatedAt") VALUES (1,0,CURRENT_TIMESTAMP)
+             ON CONFLICT ("id") DO NOTHING`
+        ).catch(async () => {
+            await admin.$executeRawUnsafe('INSERT INTO "SystemFiatPool" ("id","balance") VALUES (1,0) ON CONFLICT ("id") DO NOTHING');
+        });
+
+        // §WP-H: the preflight status policy is canonical and database-enforced, so
+        // this fixture cannot narrow it. It also must not DELETE other suites' rows
+        // to get past it: on a shared database that silently destroys their state,
+        // and the previous unconditional .catch() hid the failure when it did.
+        //
+        // Instead the fixture SATISFIES the preflight the way production would: an
+        // unresolved payout is not a blocker when a reservation exists for it. Each
+        // candidate gets a reservation of this run's own making, tagged with a
+        // run-unique reference, and only those reservations are removed afterwards.
+        // A candidate that cannot be resolved this way is reported, never deleted.
+        const FIXTURE_REF = `wp-e-fixture-${SFX}-${Date.now()}`;
+        const candidates = await admin.$queryRawUnsafe(
+            `SELECT w."id", w."transactionHistoryId", t."txHash"
+               FROM "Withdrawal" w
+               LEFT JOIN "TransactionHistory" t ON t."id" = w."transactionHistoryId"
+              WHERE w."status"::text = ANY(ARRAY['PENDING','APPROVED','PROCESSING','IN_TRANSIT','UNKNOWN','AWAITING_PROVIDER','PENDING_PROVIDER'])
+                AND (w."settlementCurrency" IS NULL OR w."settlementCurrency" <> 'GHS')
+                AND (w."payoutMethod" ILIKE '%MOMO%' OR w."payoutMethod" IN ('FIAT','MOBILE_MONEY','MTN_MOMO'))
+                AND NOT EXISTS (
+                    SELECT 1 FROM "FiatLiquidityReservation" r
+                     WHERE (t."txHash" IS NOT NULL AND r."reference" = t."txHash")
+                        OR (w."transactionHistoryId" IS NOT NULL AND r."relatedTransactionId" = w."transactionHistoryId"))`
+        );
+        const unresolvable = [];
+        for (const row of candidates) {
+            if (row.transactionHistoryId == null && !row.txHash) {
+                unresolvable.push(row.id);
+                continue;
+            }
+            await admin.$executeRawUnsafe(
+                `INSERT INTO "FiatLiquidityReservation" ("reference", "relatedTransactionId")
+                 VALUES ($1, $2)`,
+                row.txHash || `${FIXTURE_REF}-w${row.id}`, row.transactionHistoryId ?? null
+            );
+        }
+        if (unresolvable.length > 0) {
+            throw new Error(
+                `p5e cannot establish a preflight-clean fixture without deleting another suite's rows: `
+                + `withdrawal(s) ${unresolvable.join(', ')} are preflight candidates with no transaction `
+                + `reference a reservation could resolve. Investigate the owning suite instead of deleting them.`
+            );
+        }
+        fixtureReservationRef = FIXTURE_REF;
 
         const gate = await enforcement.readEnforcedAuthority(runtime);
         expect(gate.enforcedActive).toBe(false);
@@ -285,11 +365,15 @@ run('WP-E — database-enforced, append-only authority activation', () => {
 
     // ── 8. the one permitted activation ─────────────────────────────────────
     test('8. the activation role performs the one permitted activation', async () => {
-        await operator.$executeRawUnsafe(
-            `INSERT INTO "FiatLiquidityAuthorityActivation" ("id","activatedBy","approvedBy","evidenceReference","evidenceDigest")
-             VALUES (1,$1,$2,$3,$4)`,
-            'operator-role', 'human-approver', 'EXT-EVIDENCE-0001', 'b'.repeat(64)
+        // §WP-H: the operator no longer INSERTs the record. The sanctioned path is
+        // the SECURITY DEFINER function, which writes the record, the latch, the
+        // flag, the projection and the audit row in one transaction.
+        const [session] = await operator.$queryRawUnsafe('SELECT session_user AS s');
+        await operator.$queryRawUnsafe(
+            `SELECT public.azm_authority_activate($1,$2,$3,$4,$5)`,
+            session.s, 'human-approver', 'p5e permitted activation', 'EXT-EVIDENCE-0001', 'b'.repeat(64),
         );
+        sessionOperator = session.s;
         activationRecord = await enforcement.readActivationRecord(operator);
         expect(activationRecord.id).toBe(1);
         expect(activationRecord.approvedBy).toBe('human-approver');
@@ -299,15 +383,16 @@ run('WP-E — database-enforced, append-only authority activation', () => {
 
     // ── 10. one activation only: it cannot be replaced ──────────────────────
     test('10. a second activation cannot replace the first', async () => {
-        await expect(operator.$executeRawUnsafe(
-            `INSERT INTO "FiatLiquidityAuthorityActivation" ("id","activatedBy","approvedBy","evidenceReference","evidenceDigest")
-             VALUES (1,'second','second','EXT-EVIDENCE-0002','${'c'.repeat(64)}')`
-        )).rejects.toThrow(/already exists|duplicate|unique|singleton|check constraint|23505/i);
-
+        // The function refuses a second activation; the direct INSERT route is gone
+        // (the operator holds no INSERT), so this is the only reachable path.
+        await expect(operator.$queryRawUnsafe(
+            `SELECT public.azm_authority_activate($1,'second','second','EXT-EVIDENCE-0002',$2)`,
+            sessionOperator, 'c'.repeat(64)
+        )).rejects.toThrow(/ALREADY_ACTIVATED|already exists|23505/i);
         await expect(operator.$executeRawUnsafe(
             `INSERT INTO "FiatLiquidityAuthorityActivation" ("id","activatedBy","approvedBy","evidenceReference","evidenceDigest")
              VALUES (2,'second','second','EXT-EVIDENCE-0002','${'c'.repeat(64)}')`
-        )).rejects.toThrow(/check constraint|singleton|violates/i);
+        )).rejects.toThrow(/permission denied|insufficient_privilege|42501/i);
 
         const rows = await admin.$queryRawUnsafe('SELECT count(*)::int AS n FROM "FiatLiquidityAuthorityActivation"');
         expect(rows[0].n).toBe(1);
