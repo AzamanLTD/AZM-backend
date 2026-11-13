@@ -335,4 +335,70 @@ run('WP-H function-owner privilege normalisation (real PostgreSQL)', () => {
         await admin.$executeRawUnsafe(`ALTER TABLE "AttackerOwned" OWNER TO ${el(ROLE.migrator)}`);
         await admin.$executeRawUnsafe(`DROP TABLE "AttackerOwned"`);
     }, 60000);
+    test('a stray owned relation refuses the install WITHOUT replacing the callable function', async () => {
+        // Start from a working boundary. Earlier tests in this file deliberately
+        // leave the boundary broken, so it is restored here first: the point of
+        // THIS test is what the installer does to a callable function.
+        const { installAuthorityActivationFunction: restoreFn } = require('../infra/install-authority-activation-function');
+        const strays = await admin.$queryRawUnsafe(
+            `SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE c.relowner = (SELECT oid FROM pg_roles WHERE rolname = $1)
+                AND c.relkind = 'r' AND n.nspname = 'public'`, ROLE.fnOwner);
+        for (const row of strays) {
+            await admin.$executeRawUnsafe(`ALTER TABLE public."${row.relname}" OWNER TO ${q(ROLE.owner)}`);
+        }
+        const restored = await restoreFn(admin, {
+            tableOwner: ROLE.owner, functionOwner: ROLE.fnOwner, runtime: ROLE.runtime, operator: ROLE.operator,
+            roleScoped: true, log: () => {},
+        });
+        expect(restored.ok).toBe(true);
+
+        const before = await admin.$queryRawUnsafe(
+            `SELECT p.prosrc AS body, pg_get_userbyid(p.proowner) AS owner
+               FROM pg_proc p WHERE p.oid = 'public.azm_authority_activate(text,text,text,text,text)'::regprocedure`);
+        expect(before.length).toBe(1);
+        const [opBefore] = await admin.$queryRawUnsafe(
+            `SELECT has_function_privilege($1, 'public.azm_authority_activate(text,text,text,text,text)', 'EXECUTE') AS x`, ROLE.operator);
+        expect(opBefore.x).toBe(true);
+
+        // The poison: the function owner owns something else entirely.
+        const stray = `StrayOwned_${RUN}`;
+        await admin.$executeRawUnsafe(`CREATE TABLE public."${stray}" (id integer)`);
+        await admin.$executeRawUnsafe(`ALTER TABLE public."${stray}" OWNER TO ${el(ROLE.fnOwner)}`);
+
+        const { installAuthorityActivationFunction } = require('../infra/install-authority-activation-function');
+        const report = await installAuthorityActivationFunction(admin, {
+            tableOwner: ROLE.owner, functionOwner: ROLE.fnOwner, runtime: ROLE.runtime, operator: ROLE.operator,
+            roleScoped: true, log: () => {},
+        });
+
+        // 1. the installer refuses, naming the exact object
+        expect(report.ok).toBe(false);
+        expect(report.status).toBe('REFUSED_UNEXPECTED_OWNERSHIP');
+        const diagnostic = [...report.problems, ...report.skipped].join(' | ');
+        expect(diagnostic).toContain(stray);
+
+        // 2. the existing function was NOT replaced (same body, same owner)
+        const after = await admin.$queryRawUnsafe(
+            `SELECT p.prosrc AS body, pg_get_userbyid(p.proowner) AS owner
+               FROM pg_proc p WHERE p.oid = 'public.azm_authority_activate(text,text,text,text,text)'::regprocedure`);
+        expect(after[0].body).toBe(before[0].body);
+        expect(after[0].owner).toBe(before[0].owner);
+
+        // 3. nothing is callable: operator and PUBLIC both lost EXECUTE
+        const [opAfter] = await admin.$queryRawUnsafe(
+            `SELECT has_function_privilege($1, 'public.azm_authority_activate(text,text,text,text,text)', 'EXECUTE') AS x`, ROLE.operator);
+        expect(opAfter.x).toBe(false);
+        const [pubAfter] = await admin.$queryRawUnsafe(
+            `SELECT has_function_privilege('public', 'public.azm_authority_activate(text,text,text,text,text)', 'EXECUTE') AS x`);
+        expect(pubAfter.x).toBe(false);
+
+        // 4. the stray relation was NOT reassigned
+        const [owner] = await admin.$queryRawUnsafe(
+            `SELECT pg_get_userbyid(c.relowner) AS owner FROM pg_class c WHERE c.oid = to_regclass($1)`, `public."${stray}"`);
+        expect(owner.owner).toBe(ROLE.fnOwner);
+
+        await admin.$executeRawUnsafe(`DROP TABLE public."${stray}"`);
+    });
+
 });

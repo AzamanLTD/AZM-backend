@@ -31,16 +31,51 @@ const DEFAULTS = {
 const quoteIdent = (name) => '"' + String(name).replace(/"/g, '""') + '"';
 
 const { functionSql } = require("./lib/authority-function-sql");
+const { resolveAuthorityRoles, assertDistinctRoles } = require("./lib/authority-roles");
 const {
     normaliseFunctionOwner,
     verifyFunctionOwner,
 } = require("./lib/authority-role-normalisation");
 
 async function installAuthorityActivationFunction(prisma, options = {}) {
-    const { tableOwner, functionOwner, runtime, operator, migrator } = { ...DEFAULTS, ...options };
     const log = options.log || (() => {});
-    const roleScoped = options.roleScoped === true;
-    const report = { applied: [], problems: [], skipped: [], functionOwner, operator };
+    // ONE resolver for every entry point (option > environment > canonical).
+    const roles = resolveAuthorityRoles({
+        owner: options.tableOwner || options.owner,
+        runtime: options.runtime,
+        operator: options.operator,
+        functionOwner: options.functionOwner,
+    });
+    const { owner: tableOwner, runtime, operator, functionOwner } = roles;
+    const roleScoped = options.roleScoped !== undefined
+        ? options.roleScoped === true
+        : Boolean(options.tableOwner || options.owner || options.operator || options.runtime || options.functionOwner);
+    const report = {
+        applied: [], problems: [], skipped: [], roles, functionOwner, operator,
+        status: 'PROVISIONED', provisioned: true,
+    };
+
+    // BARE MODE RETURNS BEFORE ANY SIDE EFFECT: no role, no function, no grant,
+    // no ownership change. A restore pass is not an authority installation and
+    // must not be able to look like one.
+    if (!roleScoped) {
+        return {
+            ...report,
+            ok: true,
+            status: 'SKIPPED_NOT_PROVISIONED',
+            provisioned: false,
+            skipped: ['bare overlay/restore invocation: no authority role, function or grant was created or altered'],
+        };
+    }
+
+    try {
+        assertDistinctRoles(roles);
+    } catch (err) {
+        report.problems.push(err.message);
+        report.ok = false;
+        report.status = 'REFUSED_ROLE_COLLISION';
+        return report;
+    }
 
     const roleExists = async (name) => {
         const [row] = await prisma.$queryRawUnsafe('SELECT 1 AS e FROM pg_roles WHERE rolname = $1', name);
@@ -82,7 +117,11 @@ async function installAuthorityActivationFunction(prisma, options = {}) {
     report.normalisation = {
         revokedMemberships: normalised.revokedMemberships,
         revokedGrants: normalised.revokedGrants,
+        // The whole audit result, not just the owned list: the refusals below
+        // read `.unexpected` from it, and a flattened array made that check a
+        // silent no-op.
         ownedObjects: normalised.ownership.owned,
+        unexpectedOwnership: normalised.ownership.unexpected,
     };
     if (!(await roleExists(functionOwner))) report.problems.push('function owner role is missing');
 
@@ -90,7 +129,7 @@ async function installAuthorityActivationFunction(prisma, options = {}) {
     // a fresh SECURITY DEFINER function: installing first and reporting after
     // leaves a callable path behind a failed boundary. Nothing is reassigned —
     // stray objects may belong to a different system boundary.
-    const unexpectedOwnership = (report.normalisation && report.normalisation.ownedObjects && report.normalisation.ownedObjects.unexpected) || [];
+    const unexpectedOwnership = normalised.ownership.unexpected || [];
     if (unexpectedOwnership.length > 0 || !(await roleExists(functionOwner))) {
         let revoked = 0;
         try {
@@ -102,7 +141,11 @@ async function installAuthorityActivationFunction(prisma, options = {}) {
                 revoked = 1;
             }
         } catch (_) { /* the function may not exist; the refusal below still holds */ }
-        report.skipped.push('activation function NOT installed or replaced: the function owner failed its audit');
+        report.status = unexpectedOwnership.length > 0 ? 'REFUSED_UNEXPECTED_OWNERSHIP' : 'REFUSED_ROLE_MISSING';
+        report.skipped.push(
+            unexpectedOwnership.length > 0
+                ? `activation function NOT installed or replaced: ${functionOwner} owns unexpected object(s) ${unexpectedOwnership.map((o) => (typeof o === 'string' ? o : o.object || JSON.stringify(o))).join(', ')}`
+                : 'activation function NOT installed or replaced: the function owner role is missing');
         if (revoked) report.applied.push('revoked EXECUTE on the existing activation function from PUBLIC and the operator');
         report.ok = false;
         return report;
