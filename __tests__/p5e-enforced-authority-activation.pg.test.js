@@ -31,7 +31,14 @@ const {
     splitSqlStatements,
 } = require('../infra/install-authority-activation-roles');
 
-const ADMIN_URL = process.env.TEST_DATABASE_URL;
+// ISOLATION: this suite mutates global activation state (drops and recreates the
+// protected record, its triggers and the legacy latch). It therefore runs in a
+// database of its own, created and dropped by the suite, and never touches the
+// shared test database.
+const SHARED_URL = process.env.TEST_DATABASE_URL;
+const { createDisposableDatabase } = require('./helpers/disposableDatabase');
+let ADMIN_URL = SHARED_URL;
+let disposableDb = null;
 const IS_CI = Boolean(process.env.CI || process.env.GITHUB_ACTIONS);
 const run = ADMIN_URL ? describe : describe.skip;
 
@@ -92,6 +99,8 @@ run('WP-E — database-enforced, append-only authority activation', () => {
     let activationRecord = null;
 
     beforeAll(async () => {
+        disposableDb = await createDisposableDatabase('p5e');
+        ADMIN_URL = disposableDb.url;
         admin = new PrismaClient({ datasources: { db: { url: ADMIN_URL } } });
 
         // ── provisioning preconditions: fail loudly, never pass vacuously ────
@@ -255,6 +264,10 @@ run('WP-E — database-enforced, append-only authority activation', () => {
         expect(membership.owner_member).toBe(false);
         expect(membership.operator_member).toBe(false);
     });
+
+    afterAll(async () => {
+        if (disposableDb) await disposableDb.drop();
+    }, 120000);
 
     // ── 11. application code reports INACTIVE before activation ─────────────
     test('11. the gate reports inactive while no activation record exists', async () => {
