@@ -187,6 +187,48 @@ describeOrSkip('WP-I matrix cases 2-9 — callback authentication and evidence i
         expect((await depositOf(reference)).status).toBe('COMPLETED');
     });
 
+    // ── 17. Provider timeout, then settlement, then reconciliation ──────────
+    test('17: a settled deposit whose acknowledgement was lost converges after retries and the reconciliation sweep', async () => {
+        const fiatLiquidity = require('../src/services/fiatLiquidityService');
+        // Liquidity authority ON for this case only: the point is a RECEIPT and
+        // its single AVAILABLE transition surviving retries plus a sweep.
+        // beforeEach resets the flag to false for every other case.
+        await prisma.globalSettings.update({
+            where: { id: 1 }, data: { fiatLiquidityAuthorityEnabled: true },
+        });
+        const { reference } = await newDeposit(100);
+
+        // The provider's FIRST attempt never reached us (its request timed out),
+        // so the settlement only lands on the retry. From our side that is one
+        // delivery — what matters is that the retries and the later sweep cannot
+        // manufacture a second receipt or a second AVAILABLE transition.
+        const first = await deliver(p01(reference));
+        expect(first.statusCode).toBe(200);
+        expect((await depositOf(reference)).status).toBe('COMPLETED');
+        expect(await eventCount()).toBe(1);
+        expect(await receiptCount()).toBe(1);
+        const settledAvailable = await availableGhs();
+        expect(settledAvailable).toBe('100.00');
+
+        const retry1 = await deliver(p01(reference));
+        const retry2 = await deliver(p01(reference));
+        expect(retry1.statusCode).toBe(200);
+        expect(retry2.statusCode).toBe(200);
+
+        // The reconciliation sweep then runs over everything, including this
+        // receipt (horizon 0 marks it stale, so the repair logic must decide).
+        const sweep = await fiatLiquidity.reconcile(prisma, { horizonMinutes: 0 });
+
+        const flagged = (sweep.exceptions || []).filter(
+            (ex) => ex.reference === reference || ex.entityId === reference
+        );
+        expect(flagged).toEqual([]);
+        expect(await receiptCount()).toBe(1);
+        expect(await availableGhs()).toBe(settledAvailable);
+        expect((await depositOf(reference)).status).toBe('COMPLETED');
+        expect(await eventCount()).toBe(1);
+    });
+
     // ── 8. Byte-different, economically identical ───────────────────────────
     test('8: a byte-different but economically identical callback converges on the same single effect', async () => {
         const { reference, user } = await newDeposit(100);
