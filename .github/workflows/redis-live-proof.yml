@@ -1,0 +1,85 @@
+# Live Redis proof — runs the real-server suites against a HOSTED endpoint.
+#
+# Why this exists: the sandbox this work is developed in can only reach TCP 443,
+# and Redis listens on 6379, so a live round-trip cannot be dialled from there. A
+# GitHub runner has full egress. The suites below skip themselves when no
+# endpoint is provided (see __tests__/redis-live-roundtrip.test.js), so this
+# workflow is the only place the hosted path is actually exercised.
+#
+# It is manual-only on purpose: it must never turn the normal CI lanes red just
+# because a secret is absent, and it must never look green when it proved
+# nothing.
+name: Redis live proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'What endpoint this run targets (recorded in the summary)'
+        required: false
+        default: 'hosted Redis'
+
+concurrency:
+  group: redis-live-proof
+  cancel-in-progress: false
+
+jobs:
+  live-redis:
+    name: live-redis
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Refuse to run without an endpoint
+        env:
+          REDIS_URL_LIVE: ${{ secrets.REDIS_URL_LIVE }}
+        run: |
+          if [ -z "$REDIS_URL_LIVE" ]; then
+            echo "::error::No REDIS_URL_LIVE secret is configured, so no live Redis endpoint exists to prove."
+            {
+              echo "## Redis live proof — NOT RUN"
+              echo ""
+              echo "No \`REDIS_URL_LIVE\` secret is configured on this repository."
+              echo "Nothing was proven. Add the secret (rediss://default:<password>@<host>:6379) and re-run."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Endpoint is configured. Running the live suites."
+
+      - name: Live round-trip, OTP durability, unlock atomicity
+        env:
+          REDIS_URL_LIVE: ${{ secrets.REDIS_URL_LIVE }}
+        run: |
+          export REDIS_URL="$REDIS_URL_LIVE"
+          npx jest --runInBand --forceExit \
+            __tests__/redis-live-roundtrip.test.js \
+            __tests__/sms-otp-real-redis.integration.test.js \
+            __tests__/app-unlock-redis.integration.test.js
+
+      - name: Record the outcome
+        if: always()
+        env:
+          REDIS_URL_LIVE: ${{ secrets.REDIS_URL_LIVE }}
+        run: |
+          {
+            echo "## Redis live proof"
+            echo ""
+            echo "- target: ${{ github.event.inputs.target }}"
+            echo "- endpoint configured: $([ -n "$REDIS_URL_LIVE" ] && echo yes || echo no)"
+            echo "- commit: ${{ github.sha }}"
+            echo "- result: ${{ job.status }}"
+            echo ""
+            echo "The endpoint and password are never printed."
+          } >> "$GITHUB_STEP_SUMMARY"
