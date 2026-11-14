@@ -72,10 +72,11 @@ jobs:
           REDIS_URL_LIVE: ${{ secrets.REDIS_URL_LIVE }}
         run: |
           export REDIS_URL="$REDIS_URL_LIVE"
-          npx jest --runInBand --forceExit \
-            __tests__/redis-live-roundtrip.test.js \
-            __tests__/sms-otp-real-redis.integration.test.js \
-            __tests__/app-unlock-redis.integration.test.js
+          # jest.live-redis.config.js, not the repo default: the default runs a
+          # global setup that connects to PostgreSQL. These suites need no
+          # database, and requiring one made the first run fail with
+          # PrismaClientInitializationError before any Redis command was sent.
+          npx jest -c jest.live-redis.config.js --runInBand --forceExit
 
       - name: Record the outcome
         if: always()
