@@ -476,6 +476,7 @@ jobs:
             "__tests__/app-unlock-durable-state.test.js"
             "__tests__/app-unlock-claim-installer-wiring.test.js"
             "__tests__/pos-settlement-containment.test.js"
+            "__tests__/wp-i-provider-trust-boundary.test.js"
           )
           npx jest --runInBand --forceExit "${SUITES[@]}"
 

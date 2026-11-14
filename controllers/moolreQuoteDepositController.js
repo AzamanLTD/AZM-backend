@@ -358,7 +358,14 @@ exports.webhook = async (req, res) => {
     // comparison.
 
     try {
-        settledGhs = fiatLiquidity.toExactGhsDecimal(data?.amount, { field: 'amount' });
+        // WP-I §9: `amount` is the payer's GROSS figure; `value` is what the wallet
+        // actually received after fees. Crediting gross overstates treasury
+        // evidence by the fee. Net is authoritative; gross is retained only as
+        // reconciliation context.
+        if (data?.value === undefined || data?.value === null || String(data.value).trim() === '') {
+            return res.status(400).json({ success: false, message: 'Callback carries no net settled value — gross amount alone cannot evidence funding.' });
+        }
+        settledGhs = fiatLiquidity.toExactGhsDecimal(data.value, { field: 'value' });
     } catch (e) {
         return res.status(400).json({ success: false, message: 'Invalid settlement amount — must be a positive decimal exact to the pesewa (2 decimal places).' });
     }

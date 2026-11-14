@@ -7579,3 +7579,29 @@ model SavedBankBeneficiary {
   @@unique([userId, accountNumberHmac])
   @@index([userId, status])
 }
+
+/// WP-I — independently fetched provider settlement witness.
+/// The ONLY authority that may make a treasury opening AVAILABLE. Written by
+/// the reconciliation process under its own database identity; the API runtime
+/// has no write path to this table. Immutable by convention (no update path is
+/// exposed) and single-use per treasury opening.
+model ProviderSettlementWitness {
+  id               String   @id @default(uuid())
+  openingDedupKey  String   @unique // single-use binding to exactly one opening
+  provider         String
+  fundingType      String // COLLECTION | BANK_VIRTUAL_ACCOUNT | PAYMENT_ID | WALLET_INFLOW
+  witnessKind      String // which provider lookup produced this witness
+  walletAccount    String
+  currency         String // GHS only
+  netPesewas       BigInt // NET credited value — never the payer gross
+  grossPesewas     BigInt?
+  providerState    String // provider-reported settled state
+  endpoint         String
+  requestParams    Json
+  rawResponseDigest String
+  rawResponse      String
+  fetchedAt        DateTime
+  createdAt        DateTime @default(now())
+
+  @@index([provider, openingDedupKey])
+}
