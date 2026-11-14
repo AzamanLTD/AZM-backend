@@ -110,6 +110,28 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
     let prisma;
     const { seedUser } = require('./helpers/factories');
     const fiatLiquidity = require('../src/services/fiatLiquidityService');
+// ── WP-I: treasury funding now requires an independently fetched witness ────
+const witnesses = require('../src/services/providerSettlementWitnessService');
+
+async function recordWitness(openingDedupKey, amountGhs, ref) {
+    const value = Number(amountGhs).toFixed(2);
+    const raw = JSON.stringify({ status: 1, data: { state: 'SETTLED', value, accountnumber: '1000000001' } });
+    process.env.AZM_RECONCILER_MODE = '1';
+    process.env.AZM_RECONCILER_PROVIDER_KEY = 'test-reconciler-key';
+    try {
+        return await inTx((tx) => witnesses.recordProviderSettlementWitness(tx, {
+            openingDedupKey, provider: 'MOOLRE', fundingType: 'COLLECTION',
+            endpoint: '/api/v1/payment/status', requestParams: { reference: ref },
+            rawResponse: raw,
+            providerPayload: { state: 'SETTLED', value, accountnumber: '1000000001' },
+            amounts: { netPesewas: BigInt(Math.round(Number(amountGhs) * 100)) },
+            fetchedAt: new Date(), walletAccount: '1000000001',
+        }));
+    } finally {
+        delete process.env.AZM_RECONCILER_MODE;
+    }
+}
+
     const { runDoubleCheck } = require('../utils/securityCheck');
     const moolreQuoteDepositController = require('../controllers/moolreQuoteDepositController');
 
@@ -151,6 +173,9 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
 
     // ── suite-local isolation: liquidity truth is zeroed between tests ─────
     beforeEach(async () => {
+        // WP-I: witnesses are part of the evidence surface and must not leak
+        // between cases (a stale witness would authorise a later opening).
+        await prisma.providerSettlementWitness.deleteMany();
         await prisma.fiatProviderEvent.deleteMany();
         await prisma.fiatLiquidityReceipt.deleteMany();
         await prisma.fiatLiquidityReservation.deleteMany();
@@ -493,6 +518,15 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
                 provider: 'MOOLRE', rail: 'BANK', direction: 'INBOUND', status: 'FUNDED',
                 providerRef: 'MOOLRE-TRS-OK', dedupKey: 'event:moolre-treasury:ok', amountGhs: 500,
             } });
+            // WP-I: the event row alone is application-authored and MUST refuse.
+            await expect(inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+                dedupKey: 'treasury:t1', confirmedBy: 1,
+                providerEventDedupKey: 'event:moolre-treasury:ok',
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_TREASURY_FUNDING_EVIDENCE_UNAVAILABLE' });
+            expect(dec((await state()).availableGhs)).toBe(0);
+
+            // ...and with an independently fetched witness it unlocks, exactly once.
+            await recordWitness('treasury:t1', 500, 'MOOLRE-TRS-OK');
             const { receipt: confirmed } = await inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
                 dedupKey: 'treasury:t1', confirmedBy: 1,
                 providerEventDedupKey: 'event:moolre-treasury:ok',
@@ -528,6 +562,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
                 provider: 'MOOLRE', rail: 'BANK', direction: 'INBOUND', status: 'SETTLED',
                 providerRef: 'MOOLRE-DUP', dedupKey: 'event:moolre-treasury:dup', amountGhs: 100,
             } });
+            await recordWitness(a.receipt.dedupKey, 100, 'MOOLRE-DUP');
             await inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
                 dedupKey: a.receipt.dedupKey, providerEventDedupKey: 'event:moolre-treasury:dup',
             }));
@@ -543,6 +578,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
                 provider: 'MOOLRE', rail: 'BANK', direction: 'INBOUND', status: 'SETTLED',
                 providerRef: 'MOOLRE-DUP-2', dedupKey: 'event:moolre-treasury:dup-2', amountGhs: 100,
             } });
+            await recordWitness(b.receipt.dedupKey, 100, 'MOOLRE-DUP-2');
             await inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
                 dedupKey: b.receipt.dedupKey, providerEventDedupKey: 'event:moolre-treasury:dup-2',
             }));

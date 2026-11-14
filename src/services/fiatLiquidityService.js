@@ -1092,6 +1092,15 @@ async function confirmTreasuryOpening(tx, {
             + `opening ${dedupKey} amount ${receipt.amountGhs}`
         );
     }
+    // Durable single-use: an observation already bound to another receipt
+    // (or to another economic identity) can never fund a second one.
+    if (observation.relatedReference != null && String(observation.relatedReference) !== String(dedupKey)) {
+        throw new ConflictingEvidenceError(
+            `[fiatLiquidity] observation ${observation.dedupKey} is already bound to ${observation.relatedReference} `
+            + `and cannot also fund ${dedupKey}`
+        );
+    }
+
     // ── WP-I: the validated observation still is not proof of real money ────
     // Every check above reads columns this application's own runtime identity
     // can write. Treasury funding therefore ALSO requires an independently
@@ -1099,11 +1108,11 @@ async function confirmTreasuryOpening(tx, {
     // FUNDING provider (observation.provider) — a treasury receipt carries the
     // internal AZM_TREASURY marker, which no provider would ever witness.
     // No witness → no AVAILABLE. Fail closed.
-    // ACTIVATION: the witness requirement is a release-gate flag, not a silent
-    // behaviour change. Default OFF keeps every existing money path and its
-    // authority suite byte-identical; turning it ON is the owner's activation
-    // decision and is what closes the WP-I forgery in a live environment.
-    if (process.env.AZM_WP_I_WITNESS_REQUIRED === '1') {
+    // WP-I is the default: a treasury opening cannot become AVAILABLE on the
+    // strength of an application-authored FiatProviderEvent alone. Set
+    // AZM_WP_I_WITNESS_REQUIRED=0 only to reproduce pre-WP-I behaviour, which
+    // is exactly the forgery WP-I exists to close.
+    if (process.env.AZM_WP_I_WITNESS_REQUIRED !== '0') {
         const { findWitnessForOpening } = require('./providerSettlementWitnessService');
         const witness = await findWitnessForOpening(tx, {
             openingDedupKey: receipt.dedupKey,
@@ -1117,15 +1126,6 @@ async function confirmTreasuryOpening(tx, {
             );
         }
         linkedWitnessId = witness.id;
-    }
-
-    // Durable single-use: an observation already bound to another receipt
-    // (or to another economic identity) can never fund a second one.
-    if (observation.relatedReference != null && String(observation.relatedReference) !== String(dedupKey)) {
-        throw new ConflictingEvidenceError(
-            `[fiatLiquidity] observation ${observation.dedupKey} is already bound to ${observation.relatedReference} `
-            + `and cannot also fund ${dedupKey}`
-        );
     }
 
     const claim = await tx.fiatLiquidityReceipt.updateMany({
