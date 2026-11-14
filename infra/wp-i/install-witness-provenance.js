@@ -9,10 +9,17 @@
  * unless both role names are supplied, because silently succeeding without a
  * runtime role would leave the forgery open while reporting success.
  *
- * NOT run automatically. This is an activation step for the owner:
+ * WHY THIS IS NOT infra/install-*.js: that directory is the schema-overlay
+ * battery, whose contract is that every installer exits 0 given only
+ * DATABASE_URL (r38-overlay-upgrade-path asserts it). This script needs two
+ * role names and must refuse without them, so living there would either break
+ * that battery or force a dishonest silent skip. It is an activation step, not
+ * an overlay.
+ *
+ * NOT run automatically. Invoke explicitly:
  *   AZM_WITNESS_RUNTIME_ROLE=<app db role> \
  *   AZM_WITNESS_RECONCILER_ROLE=<reconciler db role> \
- *   node infra/install-wp-i-witness-provenance.js
+ *   node infra/wp-i/install-witness-provenance.js
  */
 
 const { PrismaClient } = require('@prisma/client');

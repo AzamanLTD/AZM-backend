@@ -75,10 +75,12 @@ describeDb('WP-I database provenance (real PostgreSQL roles)', () => {
     });
 
     test('the runtime identity CANNOT insert a witness', async () => {
-        await expect(runtime.providerSettlementWitness.create({ data: witnessRow() }))
+        // Scope to THIS opening: other suites legitimately hold witnesses, and a
+        // global count would assert their absence rather than this refusal.
+        const key = `DB-WITNESS-DENIED-${Date.now()}`;
+        await expect(runtime.providerSettlementWitness.create({ data: witnessRow({ openingDedupKey: key }) }))
             .rejects.toThrow(/permission denied/i);
-        const count = await admin.providerSettlementWitness.count();
-        expect(count).toBe(0);
+        expect(await admin.providerSettlementWitness.count({ where: { openingDedupKey: key } })).toBe(0);
     });
 
     test('the reconciler identity CAN insert, and the runtime can read it', async () => {
