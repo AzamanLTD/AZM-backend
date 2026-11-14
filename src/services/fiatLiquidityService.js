@@ -1114,9 +1114,11 @@ async function confirmTreasuryOpening(tx, {
     // is exactly the forgery WP-I exists to close.
     if (process.env.AZM_WP_I_WITNESS_REQUIRED !== '0') {
         const { findWitnessForOpening } = require('./providerSettlementWitnessService');
+        const { ghsToPesewas } = require('./providerSettlementWitnessService');
         const witness = await findWitnessForOpening(tx, {
             openingDedupKey: receipt.dedupKey,
             provider: observation.provider,
+            openingPesewas: ghsToPesewas(receipt.amountGhs.toString()),
         });
         if (!witness) {
             throw new TreasuryFundingEvidenceUnavailableError(

@@ -110,6 +110,10 @@ async function reconcileSettlementProviderRef(prisma, { deposit, providerEvent }
 async function settleMoolreDeposit(prisma, {
     deposit, quoteId, settledGhs, providerEvent, settlementProviderRef,
     payerMsisdn = null, providerData = null, evidenceSource,
+    // WP-I §9: the fee the provider withheld, and whether the provider gave us
+    // a net figure at all. Recorded so the treasury side can tell a net
+    // settlement from a gross-only one.
+    providerFeeGhs = null, netValueUnavailable = false,
 }) {
     if (!quoteId) {
         throw new Error('Deposit is missing its transaction quote.');
@@ -208,6 +212,8 @@ async function settleMoolreDeposit(prisma, {
           settledRoute: quote.selectedRoute || null,
           settledRoutePolicyVersion: quote.routePolicyVersion || null,
           providerData: providerData ?? null,
+          providerFeeGhs: providerFeeGhs ? providerFeeGhs.toFixed(2) : null,
+          netValueUnavailable: netValueUnavailable === true,
           // Honest settlement destination marker (#369): GHS_NATIVE means
           // the customer credit went to the native-GHS wallet; USDC is the
           // legacy conversion credit. The reconciliation sweep keys on it.

@@ -98,6 +98,32 @@ function assertReconcilerContext() {
 }
 
 /** SHA-256 of the exact provider response bytes. */
+/** Providers whose inbound funding this witness layer may authorise. */
+const TRUSTED_FUNDING_PROVIDERS = Object.freeze(['MOOLRE']);
+
+/**
+ * Resolve the AUTHORITATIVE account-to-currency mapping.
+ *
+ * Currency is never inferred from a callback field that may be absent. The
+ * mapping is operator-maintained configuration: pass it explicitly, or provide
+ * it as JSON in WITNESS_ACCOUNT_CURRENCY_MAP. With no mapping an account is
+ * unmapped, and an unmapped account is a refusal, not a guess.
+ */
+function resolveCurrencyMapping(explicit) {
+  if (explicit && typeof explicit === 'object') return explicit;
+  const raw = process.env.WITNESS_ACCOUNT_CURRENCY_MAP;
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (_) {
+    throw new WitnessError(
+      'WITNESS_ACCOUNT_MAPPING_INVALID',
+      '[wp-i] WITNESS_ACCOUNT_CURRENCY_MAP is not valid JSON; refusing to witness without an authoritative mapping'
+    );
+  }
+}
+
 function digestOf(rawBody) {
   const buf = Buffer.isBuffer(rawBody) ? rawBody : Buffer.from(String(rawBody), 'utf8');
   return crypto.createHash('sha256').update(buf).digest('hex');
@@ -216,9 +242,53 @@ async function recordProviderSettlementWitness(tx, input = {}) {
     );
   }
 
-  const netPesewas = amounts?.netPesewas;
-  if (typeof netPesewas !== 'bigint' || netPesewas <= 0n) {
-    throw new WitnessError('WITNESS_NET_AMOUNT_REQUIRED', '[wp-i] witness requires an exact positive net amount in pesewas');
+  if (!TRUSTED_FUNDING_PROVIDERS.includes(String(provider))) {
+    throw new WitnessError(
+      'WITNESS_PROVIDER_UNTRUSTED',
+      `[wp-i] provider ${provider} is not a trusted inbound funding provider`
+    );
+  }
+  if (!endpoint || typeof endpoint !== 'string' || !endpoint.trim()) {
+    throw new WitnessError('WITNESS_ENDPOINT_REQUIRED', '[wp-i] witness must record the provider endpoint actually queried');
+  }
+  if (rawResponse === undefined || rawResponse === null || String(rawResponse).trim() === '') {
+    throw new WitnessError('WITNESS_RAW_RESPONSE_REQUIRED', '[wp-i] witness must retain the exact provider response bytes');
+  }
+
+  // The amounts are DERIVED from the provider payload, never taken on trust
+  // from the caller. A caller-supplied figure must agree with the bytes.
+  const derived = settledAmountFromProviderPayload(providerPayload);
+  const netPesewas = derived.netPesewas;
+  if (amounts?.netPesewas !== undefined && BigInt(amounts.netPesewas) !== netPesewas) {
+    throw new WitnessMismatchError(
+      `[wp-i] supplied net ${amounts.netPesewas} contradicts the provider payload net ${netPesewas}`,
+      { supplied: String(amounts.netPesewas), derived: netPesewas.toString() }
+    );
+  }
+
+  // Currency comes from the authoritative mapping, never from the payload.
+  const currency = currencyForAccount(walletAccount, resolveCurrencyMapping(input.currencyMapping));
+
+  const fetched = fetchedAt instanceof Date ? fetchedAt : new Date(fetchedAt);
+  if (Number.isNaN(fetched.getTime())) {
+    throw new WitnessError('WITNESS_FETCH_TIME_INVALID', '[wp-i] witness requires the real time of the provider fetch');
+  }
+  if (fetched.getTime() > Date.now() + 60_000) {
+    throw new WitnessError('WITNESS_FETCH_TIME_IN_FUTURE', '[wp-i] a witness cannot be dated in the future');
+  }
+  const openingAt = opening.createdAt ?? opening.created_date ?? opening.createdDate ?? null;
+  if (!openingAt) {
+    // Cannot verify the fetch against the opening it claims to evidence.
+    throw new WitnessError(
+      'WITNESS_OPENING_TIME_UNKNOWN',
+      '[wp-i] the treasury opening carries no creation time, so a provider fetch cannot be bound to it'
+    );
+  }
+  if (fetched.getTime() < new Date(openingAt).getTime()) {
+    throw new WitnessMismatchError(
+      '[wp-i] the provider fetch predates the treasury opening it claims to evidence',
+      { fetchedAt: fetched.toISOString(), openingAt: new Date(openingAt).toISOString() }
+    );
   }
   const openingPesewas = ghsToPesewas(opening.amountGhs?.toString?.() ?? opening.amountGhs);
   if (openingPesewas !== netPesewas) {
@@ -235,14 +305,14 @@ async function recordProviderSettlementWitness(tx, input = {}) {
       fundingType,
       witnessKind: requiredWitness,
       walletAccount: String(walletAccount ?? ''),
-      currency: 'GHS',
+      currency,
       netPesewas,
       grossPesewas: amounts?.grossPesewas ?? null,
       providerState: String(providerPayload?.state ?? '').toUpperCase(),
       endpoint: String(endpoint ?? ''),
       requestParams: requestParams ?? {},
       rawResponseDigest: digestOf(rawResponse),
-      fetchedAt: fetchedAt ?? new Date(),
+      fetchedAt: fetched,
       // The exact bytes are retained so a later audit can recompute the digest.
       rawResponse: String(rawResponse ?? ''),
     },
@@ -255,7 +325,7 @@ async function recordProviderSettlementWitness(tx, input = {}) {
  * Find the witness that authorises a treasury opening, and prove it is usable.
  * Returns null when there is no witness — the caller must then refuse.
  */
-async function findWitnessForOpening(tx, { openingDedupKey, provider }) {
+async function findWitnessForOpening(tx, { openingDedupKey, provider, openingPesewas = null }) {
   const witness = await tx.providerSettlementWitness.findUnique({
     where: { openingDedupKey },
   });
@@ -282,6 +352,15 @@ async function findWitnessForOpening(tx, { openingDedupKey, provider }) {
   if (!witness.fetchedAt || !witness.endpoint) {
     throw new WitnessMismatchError('[wp-i] witness is missing its fetch timestamp or endpoint binding');
   }
+  // Defence in depth: the witness amount must still equal the opening it funds,
+  // even if the receipt was touched after the witness was recorded.
+  if (openingPesewas !== undefined && openingPesewas !== null) {
+    if (BigInt(witness.netPesewas) !== BigInt(openingPesewas)) {
+      throw new WitnessMismatchError(
+        `[wp-i] witness net ${witness.netPesewas} no longer equals opening ${openingPesewas} pesewas`
+      );
+    }
+  }
   return witness;
 }
 
@@ -296,6 +375,8 @@ module.exports = {
   digestOf,
   ghsToPesewas,
   currencyForAccount,
+  resolveCurrencyMapping,
+  TRUSTED_FUNDING_PROVIDERS,
   settledAmountFromProviderPayload,
   recordProviderSettlementWitness,
   findWitnessForOpening,

@@ -29,6 +29,8 @@ const OPENING = {
     provider: 'MOOLRE',
     amountGhs: '250.00',
     status: 'RECEIVED',
+    // The real receipt always carries this; a witness is bound to it.
+    createdAt: new Date('2026-11-14T08:00:00Z'),
 };
 
 /** Minimal in-memory tx.client with just the two models this boundary uses. */
@@ -73,6 +75,8 @@ function witnessInput(over = {}) {
         amounts: { netPesewas: 25000n, grossPesewas: 25250n },
         fetchedAt: new Date('2026-11-14T09:00:00Z'),
         walletAccount: '0244000000',
+        // Currency comes from this mapping, never from the payload.
+        currencyMapping: { '0244000000': 'GHS' },
         ...over,
     };
 }
@@ -148,6 +152,44 @@ describe('WP-I provider trust boundary', () => {
                 providerPayload: { state: 'PENDING', value: '250.00' },
             }))).rejects.toMatchObject({ code: 'WITNESS_PROVIDER_STATE_NOT_SETTLED' });
             expect(tx.witnesses).toHaveLength(0);
+        });
+
+        test('13a. an unmapped wallet account refuses to witness at all', async () => {
+            const tx = fakeTx();
+            await expect(recordProviderSettlementWitness(tx, witnessInput({ currencyMapping: {} })))
+                .rejects.toMatchObject({ code: 'WITNESS_ACCOUNT_UNMAPPED' });
+            expect(tx.witnesses).toHaveLength(0);
+        });
+
+        test('13b. the recorded currency is the mapped one, not a constant', async () => {
+            const tx = fakeTx();
+            await expect(recordProviderSettlementWitness(tx, witnessInput({
+                currencyMapping: { '0244000000': 'USD' },
+            }))).rejects.toMatchObject({ code: 'WITNESS_CURRENCY_UNSUPPORTED' });
+
+            const ok = fakeTx();
+            const w = await recordProviderSettlementWitness(ok, witnessInput());
+            expect(w.currency).toBe('GHS');
+        });
+
+        test('13c. an untrusted funding provider cannot witness treasury money', async () => {
+            const tx = fakeTx();
+            await expect(recordProviderSettlementWitness(tx, witnessInput({ provider: 'AZM_TREASURY' })))
+                .rejects.toMatchObject({ code: 'WITNESS_PROVIDER_UNTRUSTED' });
+        });
+
+        test('13d. a witness cannot be dated in the future', async () => {
+            const tx = fakeTx();
+            const future = new Date(Date.now() + 10 * 60_000);
+            await expect(recordProviderSettlementWitness(tx, witnessInput({ fetchedAt: future })))
+                .rejects.toMatchObject({ code: 'WITNESS_FETCH_TIME_IN_FUTURE' });
+        });
+
+        test('13e. a fetch that predates the opening cannot evidence it', async () => {
+            const tx = fakeTx();
+            await expect(recordProviderSettlementWitness(tx, witnessInput({
+                fetchedAt: new Date('2020-01-01T00:00:00Z'),
+            }))).rejects.toBeInstanceOf(WitnessMismatchError);
         });
 
         test('13. currency is resolved from the account mapping, never inferred', () => {
