@@ -18,6 +18,15 @@ on:
         description: 'What endpoint this run targets (recorded in the summary)'
         required: false
         default: 'hosted Redis'
+  # A branch push cannot be dispatched by the API: workflow_dispatch resolves the
+  # workflow from the DEFAULT branch, so a lane that lives only on a feature
+  # branch is unreachable by name. This path filter is the narrowest possible
+  # trigger that works from a branch: it fires only when this file itself
+  # changes, never on ordinary code pushes to the branch, so it can never turn a
+  # PR red because of unrelated work or a paused endpoint.
+  push:
+    paths:
+      - '.github/workflows/redis-live-proof.yml'
 
 concurrency:
   group: redis-live-proof
