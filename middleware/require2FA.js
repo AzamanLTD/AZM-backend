@@ -14,8 +14,13 @@
 // =============================================================================
 
 const bcrypt = require('bcryptjs');
-const speakeasy = require('speakeasy');
 const logger = require('../src/config/logger');
+const {
+    verifyAndClaimTotp,
+    sendTotpFailure,
+    sendTotpUnavailable,
+    TOTP_CODES,
+} = require('../src/services/totpStepClaimService');
 
 function require2FA() {
     return async (req, res, next) => {
@@ -42,14 +47,17 @@ function require2FA() {
                         message: 'Two-factor authentication token required for this operation.',
                     });
                 }
-                const ok = speakeasy.totp.verify({
+                // §WP-F — one shared authority: verifying and claiming the
+                // matched step is a single call, so a code accepted here is
+                // spent for every other path too.
+                const verdict = await verifyAndClaimTotp({
+                    prisma,
+                    userId,
                     secret: user.twoFactorSecret,
-                    encoding: 'base32',
                     token: totpToken,
-                    window: 1,
                 });
-                if (!ok) {
-                    return res.status(401).json({ success: false, message: 'Invalid 2FA token.' });
+                if (!verdict.ok) {
+                    return sendTotpFailure(res, verdict, { invalidStatus: 401, invalidMessage: 'Invalid 2FA token.' });
                 }
             } else {
                 // Password path — require password re-confirmation
@@ -73,6 +81,8 @@ function require2FA() {
 
             next();
         } catch (err) {
+            // A claim-store outage is "not verified", never "verified".
+            if (err && err.code === TOTP_CODES.UNAVAILABLE) return sendTotpUnavailable(res);
             logger.error({ err: err }, '[require2FA] error');
             return res.status(500).json({ success: false, message: 'Authentication verification failed.' });
         }

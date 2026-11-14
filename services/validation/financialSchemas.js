@@ -26,6 +26,20 @@ exports.initiateFiatDepositSchema = z.object({
 // the controller still enforces the phone-presence rule. savedAccountId is the
 // saved-momo account selected as payout destination (r42 WAVE-2 alias compat:
 // the live Flutter app sends it; the controller verifies ownership + isVerified).
+// Native-GHS withdrawal leg (issue #389). GHS-only: NO amount in USDC and no
+// rate anywhere. `quoteId` is present ONLY when the customer explicitly
+// consented to the separate USDC->GHS shortfall quote.
+exports.ghsWithdrawalSchema = z.object({
+  amountGhs:        z.union([z.string(), z.number()]),
+  destination:      z.string().min(9, 'destination must be at least 9 characters').optional(),
+  network:          z.string().optional(),
+  savedAccountId:   z.string().optional(),
+  quoteId:          z.string().optional(),
+}).refine((v) => !!(v.destination || v.savedAccountId), {
+  message: 'destination or savedAccountId is required',
+  path: ['destination'],
+});
+
 exports.fiatWithdrawalSchema = z.object({
   amount:           z.coerce.number().positive('Amount must be positive'),
   payoutMethod:     z.string().optional(),
@@ -115,3 +129,47 @@ exports.createPaymentRequestSchema = z.object({
   requestMode:     z.enum(['DIRECT', 'LINK']),
   recipientUserId: z.union([z.string().min(1).max(64), z.number()]).optional(),
 }).passthrough();
+
+// Saved BANK payout beneficiary (issue #389 section 4). The account number is
+// write-only: 6-20 digits, stored encrypted with a separate HMAC fingerprint.
+exports.bankBeneficiarySchema = z.object({
+  bankCode:      z.string().min(2).max(16),
+  bankName:      z.string().min(2).max(80),
+  // Account numbers are 10-16 digits — the SAME range the saved-beneficiary
+  // domain service enforces (ACCOUNT_NUMBER_MIN_DIGITS / MAX_DIGITS). This layer
+  // used to advertise 6-20, so a client could pass HTTP validation and be refused
+  // by the service with a different rule. Leading zeroes are significant and are
+  // preserved verbatim: nothing here trims or coerces the value.
+  accountNumber: z.string()
+    .trim()
+    .transform((v) => v.replace(/[\s-]/g, ''))
+    .pipe(z.string().regex(/^[0-9]{10,16}$/, 'Account number must be 10-16 digits')),
+  accountName:   z.string().max(120).optional(),
+  nickname:      z.string().max(40).optional(),
+  isPrimary:     z.boolean().optional(),
+});
+
+// Bank payout request (issue #389): explicit typed BANK destination. The
+// amount is GHS-denominated and exact to the pesewa.
+// §P0-2: a BANK shortfall quote is requested for a SAVED, provider-verified
+// beneficiary. The client names the beneficiary, never a fingerprint, an account
+// number or a snapshot: those are server-derived from the persisted record.
+exports.bankWithdrawalQuoteSchema = z.object({
+  amountGhs:     z.union([z.string(), z.number()]),
+  beneficiaryId: z.string().min(4).max(64),
+});
+
+exports.bankWithdrawalSchema = z.object({
+  amountGhs:      z.union([z.string(), z.number()]),
+  beneficiaryId:  z.string().min(4).max(64),
+  quoteId:        z.string().optional(),
+  idempotencyKey: z.string().optional(),
+});
+
+// §P1C the only mutable fields. A payee's destination is immutable, so an update
+// can never silently redirect a verified account; unknown keys are refused so a
+// client cannot even ask.
+exports.bankBeneficiaryUpdateSchema = z.object({
+  nickname:  z.string().max(40).nullable().optional(),
+  isPrimary: z.boolean().optional(),
+}).strict();

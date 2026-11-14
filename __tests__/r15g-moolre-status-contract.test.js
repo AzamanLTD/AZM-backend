@@ -131,7 +131,10 @@ describe('r15 follow-up P0: Moolre disbursement transfer-status contract (axios 
         const res = await service.getTransferStatus('R15G-REF-1');
         expect(res.status).toBe('SUCCESSFUL');
         expect(res.externalId).toBe('R15G-REF-1');
-        expect(res.amountGhs).toBe(5);
+        // §r42.5: the provider-echoed amount is normalised to an exact 2-dp
+        // decimal STRING, not a JS number. Consumers wrap it in Decimal.
+        expect(res.amountGhs).toBe('5.00');
+        expect(typeof res.amountGhs).toBe('string');
         expect(res.source).toBe('LIVE');
         expect(axiosSpy.mock.calls[0][1].id).toBe('R15G-REF-1');
     });

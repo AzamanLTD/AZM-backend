@@ -85,7 +85,9 @@ const _debitUserBalance = async (tx, userId, amount) => {
 
 const ledger = require('./ledgerService'); // §P.4 authoritative ledger
 const restrictedObligations = require('./restrictedObligationService'); // §P.4 persisted restricted obligations
-const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D GHS liquidity authority
+const fiatLiquidity = require('../src/services/fiatLiquidityService');
+const fiatLiquidityActivation = require('../src/services/fiatLiquidityActivationService');
+const { recordReconciliationException } = require('./reconciliationExceptionService'); // §P.5-D GHS liquidity authority
 // r19: Smart Route settlement convergence — a LEAF module (no service
 // cycles). Converges the SmartRouteRun projection onto the canonical
 // fiat outcome INSIDE the settlement/reversal transaction.
@@ -99,7 +101,12 @@ const processFiatWithdrawal = async (prisma, userId, amountIn, opts = {}) => {
     // (8dp USDC, 2dp pesewas GHS, HALF_UP).
     const amount = ledger.toExactDecimal(amountIn, 'amount');
     await runDoubleCheck(prisma, userId);
-    const liquidityAuthorityOn = await fiatLiquidity.isAuthorityEnabled(prisma);
+    // Outer read for early, user-facing validation only. The AUTHORITATIVE
+    // regime is re-read inside the transaction under the activation lock (see
+    // below): this value can be stale by the time we commit.
+    // §P.5-D: NO pre-transaction regime read. The effective mode is resolved
+    // inside the transaction under the activation lock, so a stale USDC answer
+    // can never decide a GHS-era branch (see the legacy capacity preflight).
     const referrer = await _resolveReferrer(prisma, userId);
 
     const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
@@ -158,19 +165,31 @@ const processFiatWithdrawal = async (prisma, userId, amountIn, opts = {}) => {
     // which fails closed (FIAT_POOL_INSUFFICIENT, identical user-facing
     // message) and rolls back the user debit when the exact payoutGhs
     // cannot be claimed from FiatLiquidityState.availableGhs.
-    if (!liquidityAuthorityOn) {
-        const fiatPool = await prisma.systemFiatPool.findUnique({ where: { id: 1 } });
-        if (!fiatPool || new Prisma.Decimal(fiatPool.balance).lessThan(amount)) {
-            const err = new Error(
-                'MoMo payouts are temporarily at capacity. Your USDC has not been deducted. ' +
-                'Please try again in a few minutes or contact support.'
-            );
-            err.code = 'FIAT_POOL_INSUFFICIENT';
-            throw err;
-        }
-    }
-
     const result = await prisma.$transaction(async (tx) => {
+        // §P.5-D MUTUAL EXCLUSION WITH ACTIVATION. Activation takes this same
+        // advisory lock for its preflight-then-latch sequence, so the two paths
+        // cannot interleave: either activation sees this row (and refuses), or
+        // this withdrawal observes the activated regime and reserves GHS.
+        await fiatLiquidityActivation.lockRegime(tx);
+        const liquidityAuthorityOn = (await fiatLiquidityActivation.readMode(tx)).active;
+
+        // §P.5-D: the LEGACY capacity preflight lives here, not before the
+        // transaction. Read outside the lock it could compare a GHS projection
+        // against a USDC amount if activation committed in between. Under the
+        // authority the pool is not a USDC scalar at all, so the check is
+        // skipped and the atomic reserveForPayout claim is the authority.
+        if (!liquidityAuthorityOn) {
+            const fiatPool = await tx.systemFiatPool.findUnique({ where: { id: 1 } });
+            if (!fiatPool || new Prisma.Decimal(fiatPool.balance).lessThan(amount)) {
+                const err = new Error(
+                    'MoMo payouts are temporarily at capacity. Your USDC has not been deducted. ' +
+                    'Please try again in a few minutes or contact support.'
+                );
+                err.code = 'FIAT_POOL_INSUFFICIENT';
+                throw err;
+            }
+        }
+
         const liveUser = await tx.user.findUnique({ where: { id: userId } });
         if (!liveUser) throw new Error('User not found.');
 
@@ -374,6 +393,14 @@ const processFiatWithdrawal = async (prisma, userId, amountIn, opts = {}) => {
             withdrawalRecord,
             profitFees,
             fiatPool: updatedFiatPool,
+            fiatPoolUnit: liquidityAuthorityOn ? 'GHS' : 'USDC',
+            // Same-unit floor: USDC threshold converted at the rate THIS
+            // transaction priced the payout with.
+            fiatPoolThreshold: liquidityAuthorityOn
+                ? new Prisma.Decimal(FIAT_POOL_ALERT_THRESH)
+                    .times(new Prisma.Decimal(String(retailRate)))
+                    .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP)
+                : new Prisma.Decimal(FIAT_POOL_ALERT_THRESH),
             masterCrypto,
             newUserBalance: updatedUser.availableBalance,
             azmFeeDiscount
@@ -397,13 +424,20 @@ const processFiatWithdrawal = async (prisma, userId, amountIn, opts = {}) => {
             : { referrerId: null, referrerUsername: null, referrerShare: new Prisma.Decimal(0), systemShare: exitFee },
         newBalance: result.newUserBalance,
         systemFiatPool: result.fiatPool.balance,
+        systemFiatPoolUnit: result.fiatPoolUnit,
         systemProfitFees: result.profitFees.balance,
         systemMasterCrypto: result.masterCrypto.balance,
         arbitrageCapture: amount,
         transaction: result.txRecord,
         withdrawalRecord: result.withdrawalRecord,
-        fiatPoolLow: result.fiatPool.balance < FIAT_POOL_ALERT_THRESH,
+        // §P.5-D UNIT CONTRACT: the alert threshold is a USDC number. Comparing a
+        // GHS projection against it (600 GHS vs a 5000 "unit" floor) reports a
+        // healthy pool while it is 8x short. The threshold is converted INTO the
+        // pool's unit and both the threshold and its unit are returned.
+        fiatPoolLow: result.fiatPool.balance < result.fiatPoolThreshold,
         fiatPoolBalance: result.fiatPool.balance,
+        fiatPoolThreshold: result.fiatPoolThreshold,
+        fiatPoolThresholdUnit: result.fiatPoolUnit,
         azmFeeDiscount: result.azmFeeDiscount
     };
 };
@@ -553,6 +587,13 @@ const completeFiatWithdrawal = async (prisma, reference, { providerTxId = null }
         // (IN_TRANSIT → PAID_OUT; contradictory or undelivered states
         // quarantine — never a throw on the mounted settle path, never a
         // rewrite of terminal history). Legacy withdrawals skip.
+        // A crash between the provider's answer and the dispatch lifecycle
+        // write leaves the reservation RESERVED while the money is with the
+        // provider. Repair that from the durable dispatch observation BEFORE
+        // settling, so the provider's own SUCCESS is not mistaken for a
+        // contradiction and quarantined. Without dispatch evidence nothing is
+        // repaired and the contradiction guard keeps its full meaning.
+        await fiatLiquidity.repairInTransitFromDispatchEvidence(tx, { reference, providerTxId });
         await fiatLiquidity.settleIfRecorded(tx, {
             reference,
             outcome: 'SUCCESSFUL',
@@ -713,11 +754,34 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
                 reason: opts.reason || 'reversal',
             });
         if (liquidityRelease.skipped) {
-            await _ensureFiatPoolSingleton(tx);
-            await tx.systemFiatPool.update({
-                where: { id: 1 },
-                data: { balance: { increment: amountUsdc } }
-            });
+            // §P.5-D LATCHED REGIME. An unreserved legacy row has no GHS
+            // reservation to release, and after activation SystemFiatPool is a
+            // GHS projection of availableGhs — so the legacy USDC re-credit
+            // would inject USDC into a GHS figure. The customer's USDC refund
+            // (master-crypto restore above) is unaffected; the pool is left
+            // alone and the gap is parked as durable reconciliation evidence.
+            const reversalMode = await fiatLiquidityActivation.readMode(tx);
+            if (reversalMode.active) {
+                await recordReconciliationException(tx, {
+                    entityType: 'TRANSACTION',
+                    entityId: String(reference),
+                    reference: String(reference),
+                    reason: 'LEGACY_REVERSAL_UNDER_AUTHORITY_REGIME',
+                    details: {
+                        phase: 'REVERSAL',
+                        amountUsdc: String(amountUsdc),
+                        projectionUnit: reversalMode.authorityUnit,
+                        message: 'Legacy USDC pool re-credit suppressed: SystemFiatPool is the GHS projection after '
+                            + 'activation. The customer refund is unaffected; no GHS was reserved for this row.',
+                    },
+                });
+            } else {
+                await _ensureFiatPoolSingleton(tx);
+                await tx.systemFiatPool.update({
+                    where: { id: 1 },
+                    data: { balance: { increment: amountUsdc } }
+                });
+            }
         }
 
         // P0: restore the AZM fee-discount spend INSIDE this same reversal
@@ -781,7 +845,12 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
             tx.systemMasterCrypto.findUnique({ where: { id: 1 } }),
             tx.user.findUnique({ where: { id: userId }, select: { availableBalance: true } })
         ]);
-        return { alreadyReversed: false, profitFees, fiatPool: updatedFiatPool, masterCrypto, user, azmFeeDiscount };
+        const reversalMode = await fiatLiquidityActivation.readMode(tx);
+        return {
+            alreadyReversed: false, profitFees, fiatPool: updatedFiatPool, masterCrypto, user, azmFeeDiscount,
+            fiatPoolUnit: reversalMode.active ? 'GHS' : 'USDC',
+            fiatPoolRegime: reversalMode.active ? 'GHS_AUTHORITY' : 'LEGACY_USDC_POOL',
+        };
     };
 
     // r16 P0-C: run inside the caller's transaction when coordinated claims
@@ -797,6 +866,8 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
         newUserBalance: result.user.availableBalance,
         systemProfitFees: result.profitFees.balance,
         systemFiatPool: result.fiatPool.balance,
+        systemFiatPoolUnit: result.fiatPoolUnit,
+        systemFiatPoolRegime: result.fiatPoolRegime,
         systemMasterCrypto: result.masterCrypto.balance,
         unwoundCapture: amountUsdc,
         azmFeeDiscount: result.azmFeeDiscount,
@@ -808,11 +879,19 @@ const liquidateProfits = async (prisma, amountIn, adminId, auditContext = {}) =>
     // r39/P1 — EXACT LIQUIDATION CORE: the admin-requested amount passes the
     // canonical exact parser; the GHS treasury opening prices at 2dp pesewas.
     const amount = ledger.toExactDecimal(amountIn, 'amount');
-    const liquidityAuthorityOn = await fiatLiquidity.isAuthorityEnabled(prisma);
-    let treasuryRate = null;
-    let treasuryRateSource = null;
-    let treasuryRateAsOf = null;
-    if (liquidityAuthorityOn) {
+    // §P.5-D P0: the regime is NOT read here. A pre-transaction read could be
+    // false while activation commits before the legacy branch runs, and the
+    // legacy branch writes a USDC amount straight into the GHS projection.
+    // The mode is resolved INSIDE the transaction, after the same advisory lock
+    // activation takes, and that transaction-local answer drives every branch.
+    const result = await prisma.$transaction(async (tx) => {
+        await fiatLiquidityActivation.lockRegime(tx);
+        const liquidationMode = await fiatLiquidityActivation.readMode(tx);
+        const liquidityAuthorityOn = liquidationMode.active;
+        let treasuryRate = null;
+        let treasuryRateSource = null;
+        let treasuryRateAsOf = null;
+        if (liquidityAuthorityOn) {
         // §P.5-D / NO-SYNTHETIC-GHS: liquidateProfits is an INTERNAL USDC
         // profit-account operation. It is NOT evidence that GHS cash entered
         // custody — no bank transfer, no MoMo collection happened. With the
@@ -822,7 +901,7 @@ const liquidateProfits = async (prisma, amountIn, adminId, auditContext = {}) =>
         // here: only fiatLiquidity.confirmTreasuryOpening with a durable
         // external GHS funding observation (bank/MoMo transfer evidence)
         // can unlock it — a separate, explicitly human-attested step.
-        const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
+        const settings = await tx.globalSettings.findUnique({ where: { id: 1 } });
         treasuryRate = Number(settings?.liveRetailRate);
         if (!(treasuryRate > 0)) {
             const err = new Error('Treasury liquidation requires a canonical retail rate (liveRetailRate unavailable).');
@@ -832,7 +911,6 @@ const liquidateProfits = async (prisma, amountIn, adminId, auditContext = {}) =>
         treasuryRateSource = settings?.liveRateSource || null;
         treasuryRateAsOf = settings?.lastExternalSync || settings?.lastRateSync || new Date();
     }
-    const result = await prisma.$transaction(async (tx) => {
         await _ensureProfitFeesSingleton(tx);
         if (!liquidityAuthorityOn) await _ensureFiatPoolSingleton(tx);
 
@@ -894,9 +972,11 @@ const liquidateProfits = async (prisma, amountIn, adminId, auditContext = {}) =>
             tx.systemProfitFees.findUnique({ where: { id: 1 } }),
             tx.systemFiatPool.findUnique({ where: { id: 1 } })
         ]);
-        return { profitLog, updatedProfitFees, updatedFiatPool };
+        return { profitLog, updatedProfitFees, updatedFiatPool, authorityMode: liquidityAuthorityOn };
     });
-    if (liquidityAuthorityOn) {
+    // The regime used for the post-commit response is the TRANSACTION-LOCAL one,
+    // never a value read before the lock.
+    if (result.authorityMode) {
         // NO-SYNTHETIC-GHS: the response explicitly does NOT report spendable
         // GHS creation — an internal USDC liquidation created a NON-AVAILABLE
         // treasury opening only (requires external GHS funding evidence to
@@ -905,13 +985,28 @@ const liquidateProfits = async (prisma, amountIn, adminId, auditContext = {}) =>
             amountLiquidated: amount,
             newProfitFees: result.updatedProfitFees.balance,
             newFiatPool: result.updatedFiatPool.balance,
+            // The pool is the GHS projection here: it did NOT grow by the
+            // liquidated USDC amount, and no spendable GHS was created.
+            newFiatPoolUnit: 'GHS',
+            newFiatPoolRegime: 'GHS_AUTHORITY',
+            fiatPoolCredited: false,
             profitLog: result.profitLog,
             treasuryOpeningRecorded: true,
             ghsAvailableCreated: '0.00',
             ghsAvailabilityNote: 'Internal USDC liquidation records a non-available treasury opening only; confirming it requires an external GHS funding event (confirmTreasuryOpening).'
         };
     }
-    return { amountLiquidated: amount, newProfitFees: result.updatedProfitFees.balance, newFiatPool: result.updatedFiatPool.balance, profitLog: result.profitLog };
+    return {
+        amountLiquidated: amount,
+        newProfitFees: result.updatedProfitFees.balance,
+        newFiatPool: result.updatedFiatPool.balance,
+        newFiatPoolUnit: 'USDC',
+        newFiatPoolRegime: 'LEGACY_USDC_POOL',
+        fiatPoolCredited: true,
+        profitLog: result.profitLog,
+        treasuryOpeningRecorded: false,
+        ghsAvailableCreated: '0.00'
+    };
 };
 
 const processCryptoDeposit = async (prisma, { userId, amountUsdc, txHash, address }) => {

@@ -89,6 +89,9 @@ async function cleanupAll() {
     await prisma.businessProfile.deleteMany();
     await prisma.transactionHistory.deleteMany();
     await prisma.notification.deleteMany();
+    // Withdrawal rows carry a Withdrawal_userId_fkey, so a user cannot be
+    // deleted while a later suite left one behind for the same fixture user.
+    await prisma.withdrawal.deleteMany({ where: { user: { username: { startsWith: 'user_' } } } });
     await prisma.user.deleteMany({ where: { username: { startsWith: 'user_' } } });
 }
 

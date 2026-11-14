@@ -12,6 +12,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const { requireKyc } = require('../middleware/requireKyc');
 const router = require('express').Router();
 const { protect }       = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
@@ -106,7 +107,7 @@ router.get('/invoices/:invoiceId',         protect,                invoiceCtrl.g
 router.post('/invoices/:invoiceId/send',   protect, protectActive, invoiceCtrl.sendInvoice);
 router.post('/invoices/:invoiceId/email',  protect, protectActive, invoiceCtrl.emailInvoice);
 router.post('/invoices/:invoiceId/void',   protect, protectActive, invoiceCtrl.voidInvoice);
-router.post('/invoices/:invoiceId/pay',    protect, protectActive, invoiceCtrl.payInvoice);
+router.post('/invoices/:invoiceId/pay',    protect, protectActive, requireKyc('pay'), invoiceCtrl.payInvoice);
 
 // ── REVIEW ROUTES ─────────────────────────────────────────────────────────────
 router.post('/reviews',                    protect, protectActive, invoiceCtrl.createReview);

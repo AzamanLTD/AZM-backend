@@ -139,6 +139,17 @@ describeOrSkip('r19 P0: Smart Route immutable execution snapshot', () => {
         expect(Number(refreshedRoute.amountUsdc)).toBe(99);
     });
 
+    beforeEach(async () => {
+        // Universal USDC transaction gate: route executions demand a FRESH
+        // external rate observation (a truncated GlobalSettings row has a
+        // null lastExternalSync → untrusted cache → fail closed).
+        await prisma.globalSettings.upsert({
+            where: { id: 1 },
+            update: { liveRetailRate: 15, liveUsdToGhs: 15, lastExternalSync: new Date(), lastRateSync: new Date(), liveRateSource: 'KOTANI_PAY' },
+            create: { id: 1, liveRetailRate: 15, liveUsdToGhs: 15, lastExternalSync: new Date(), lastRateSync: new Date(), liveRateSource: 'KOTANI_PAY' },
+        });
+    });
+
     test('2: savings — claim → edit amount+goal → execute deposits to the CLAIMED goal at the freshness-gated retail rate; run records economics', async () => {
         const svc = makeSvc();
         const user = await seedUser(prisma, { availableBalance: 500 });

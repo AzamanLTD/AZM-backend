@@ -520,7 +520,9 @@ class SusuService {
             }
 
             const settings = await tx.globalSettings.findFirst();
-            const profitPct = new Prisma.Decimal(settings?.susuProfitPct || 0.03);
+            // An Admin-configured 0 means "charge no Susu fee" and must not fall
+            // through to the 3% default; only an ABSENT setting defaults.
+            const profitPct = new Prisma.Decimal(settings?.susuProfitPct ?? 0.03);
             const feeUsdc = totalCollected.mul(profitPct).toDecimalPlaces(2, Prisma.Decimal.ROUND_DOWN);
             const netPayout = totalCollected.minus(feeUsdc);
 

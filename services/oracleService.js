@@ -1,6 +1,10 @@
 // services/oracleService.js
 const logger = require('../src/config/logger');
 const axios = require('axios');
+const {
+    saveValidatedRateSnapshot,
+    FX_SAVED_RATE_PAIR,
+} = require('../src/services/fxRateSnapshotService');
 
 const KOTANI_DEFAULT_BASE_URL = 'https://sandbox-api.kotanipay.io/api/v3';
 
@@ -567,6 +571,46 @@ class OracleService {
             });
 
             logger.info(`📈 Oracle Sync: 1 USDC ≈ ${usdcToGhsRate} GHS | source=KOTANI_PAY`);
+
+            // FX-balance workstream — persist the LAST SUCCESSFULLY VALIDATED
+            // observation as the display-only saved-rate snapshot. This call
+            // sits AFTER the canonical GlobalSettings write and is strictly
+            // failure-isolated: the canonical current rate + freshness
+            // timestamps above remain the 271B/271C authority, and a snapshot
+            // persistence problem must never turn a successful oracle sync
+            // into a failure (or leave the upsert half-described). The
+            // snapshot is a separate display concept and is never transaction
+            // authorization.
+            try {
+                // Provenance is the SAME literal the canonical write
+                // stamps (liveRateSource: 'KOTANI_PAY'). Post-#353 this
+                // sync path is Kotani-only: no FALLBACK_FX observation can
+                // reach it, so the snapshot provenance is identical to the
+                // canonical one by construction — never a separate or
+                // client-supplied value.
+                const result = await saveValidatedRateSnapshot({
+                    prisma: this.prisma,
+                    pair: FX_SAVED_RATE_PAIR,
+                    rate: usdcToGhsRate,
+                    source: 'KOTANI_PAY',
+                    observedAt: observationTimestamp,
+                    validation: {
+                        validationStatus: 'CANONICAL',
+                        oracleWrite: 'SUCCESS_ONLY_EXTERNAL',
+                        freshnessField: 'lastExternalSync',
+                    },
+                });
+                if (!result.saved) {
+                    logger.warn(
+                        `[Oracle] Saved-rate snapshot not updated: ${result.reason}`
+                    );
+                }
+            } catch (snapshotErr) {
+                logger.error(
+                    { err: snapshotErr },
+                    '[Oracle] Saved-rate snapshot persistence failed (non-fatal) — canonical rate write is unaffected.'
+                );
+            }
 
             if (this.rateAlertService && usdcToGhsRate) {
                 setImmediate(() => {

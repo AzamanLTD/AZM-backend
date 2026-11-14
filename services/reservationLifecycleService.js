@@ -48,7 +48,7 @@ const expireDraftEscrow = async (tx, escrow) => {
 };
 
 
-const runConvergent = async (prisma, reservationId, targetStatus, work) => {
+const runConvergent = async (prisma, reservationId, targetStatus, work, { onConverge = null } = {}) => {
     try {
         return await prisma.$transaction(work);
     } catch (err) {
@@ -57,7 +57,13 @@ const runConvergent = async (prisma, reservationId, targetStatus, work) => {
         // reservation fact after rollback; different terminal facts conflict.
         if (['ESCROW_ALREADY_FINALIZED', 'ESCROW_STATE_CONFLICT', 'RESERVATION_STATE_CONFLICT'].includes(err.code)) {
             const current = await prisma.reservation.findUnique({ where: { id: reservationId } });
-            if (current?.status === targetStatus) return current;
+            if (current?.status === targetStatus) {
+                // r29: convergence is right for an idempotent retry and wrong
+                // for a one-use credential. The caller decides which it is;
+                // the default (null) keeps every existing path unchanged.
+                if (onConverge) return onConverge(current);
+                return current;
+            }
         }
         throw err;
     }
@@ -125,13 +131,26 @@ const cancelReservation = async (prisma, { reservationId, customerId }) =>
         });
     });
 
-const checkInReservation = async (prisma, { reservationId, businessUserId }) =>
-    runConvergent(prisma, reservationId, 'CHECKED_IN', async (tx) => {
+const checkInReservation = async (prisma, { reservationId, businessUserId, requireFreshClaim = false }) => {
+    // A QR token is a ONE-USE credential; a staff retry on the same reservation
+    // is not. `requireFreshClaim` keeps the convergent default for the manual
+    // path and makes the token path refuse any use that did not itself perform
+    // the transition. PostgreSQL arbitrates the race inside claimReservation's
+    // conditional UPDATE, so exactly one caller can claim.
+    const refuseIfConverged = requireFreshClaim
+        ? () => { throw fail('RESERVATION_ALREADY_CHECKED_IN', 'This reservation has already been checked in.'); }
+        : null;
+    return runConvergent(prisma, reservationId, 'CHECKED_IN', async (tx) => {
         const reservation = await loadAggregate(tx, reservationId);
         if (!reservation || reservation.businessProfile?.userId !== businessUserId) {
             throw fail('RESERVATION_NOT_FOUND', 'Reservation not found.');
         }
-        if (reservation.status === 'CHECKED_IN') return reservation;
+        if (reservation.status === 'CHECKED_IN') {
+            if (requireFreshClaim) {
+                throw fail('RESERVATION_ALREADY_CHECKED_IN', 'This reservation has already been checked in.');
+            }
+            return reservation;
+        }
         if (reservation.status !== 'CONFIRMED') {
             throw fail('RESERVATION_NOT_CHECKIN_READY', `Reservation is ${reservation.status}, cannot check in.`);
         }
@@ -153,7 +172,8 @@ const checkInReservation = async (prisma, { reservationId, businessUserId }) =>
             from: ['CONFIRMED'],
             data: { status: 'CHECKED_IN', checkedInAt: new Date() },
         });
-    });
+    }, { onConverge: refuseIfConverged });
+};
 
 const markNoShowReservation = async (prisma, { reservationId, businessUserId = null, worker = false }) =>
     runConvergent(prisma, reservationId, 'NO_SHOW', async (tx) => {

@@ -45,6 +45,32 @@ const request = require('supertest');
 const url = process.env.TEST_DATABASE_URL;
 const run = url ? describe : describe.skip;
 
+/**
+ * Flip a character INSIDE the envelope's ciphertext segment.
+ *
+ * Why not replace the trailing characters: the envelope's last segment is
+ * base64url, and the final character carries unused bits that the decoder
+ * discards. Replacing the last two characters therefore decodes to the SAME
+ * bytes whenever the new penultimate character happens to equal the old one
+ * (the alphabet is 64 wide), the AEAD verifies, the raw token comes back
+ * identical and the request legitimately returns 200. Measured on 2000 random
+ * envelopes, `${envelope.slice(0, -2)}XX` was a no-op 12 times, which is how
+ * this security assertion failed in CI on 2026-11-04 while passing locally.
+ * An interior character is always significant, so the tamper always breaks
+ * authentication instead of sometimes reproducing a valid link.
+ */
+const ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_';
+function tamperEnvelope(envelope) {
+    const parts = String(envelope).split('.');
+    const ctIndex = parts.length - 1;
+    const ct = parts[ctIndex];
+    const at = Math.floor(ct.length / 2);
+    const original = ct[at];
+    const replacement = ALPHABET[(ALPHABET.indexOf(original) + 17) % ALPHABET.length];
+    parts[ctIndex] = ct.slice(0, at) + replacement + ct.slice(at + 1);
+    return parts.join('.');
+}
+
 run('payment-requests — authority (PostgreSQL)', () => {
     let prisma;
     let app;
@@ -318,10 +344,34 @@ run('payment-requests — authority (PostgreSQL)', () => {
         const ok = await request(app).get(`/api/payment-requests/public/${urlToken}`);
         expect(ok.status).toBe(200);
         expect(ok.body.data.request.amount).toBe('12.50');
-        const tampered = `${urlToken.slice(0, -2)}XX`;
+        const tampered = tamperEnvelope(urlToken);
+        // The tamper must actually change the envelope: the AEAD must fail, not
+        // resolve to the same raw token through base64url padding bits.
+        expect(tampered).not.toBe(urlToken);
+        expect(unwrapShareToken(tampered)).toBeNull();
         const wrong = await request(app).get(`/api/payment-requests/public/${tampered}`);
         expect(wrong.status).toBe(404);
         expect(wrong.body.code).toBe('PAYMENT_REQUEST_NOT_FOUND');
+    });
+
+    // ── PR7b: tamper determinism (the flake that broke CI) ──────────────────
+    test('PR7b: an interior tamper always fails AEAD auth, never resolving to the original token', async () => {
+        const { wrapShareToken, unwrapShareToken } = require('../services/crypto/shareToken');
+        const { randomBytes } = require('crypto');
+        let resolvedToOriginal = 0;
+        let resolvedAtAll = 0;
+        for (let i = 0; i < 300; i += 1) {
+            const raw = randomBytes(32).toString('base64url');
+            const envelope = wrapShareToken(raw);
+            expect(unwrapShareToken(envelope)).toBe(raw);
+            const tampered = tamperEnvelope(envelope);
+            expect(tampered).not.toBe(envelope);
+            const out = unwrapShareToken(tampered);
+            if (out === raw) resolvedToOriginal += 1;
+            if (out !== null) resolvedAtAll += 1;
+        }
+        expect(resolvedToOriginal).toBe(0);
+        expect(resolvedAtAll).toBe(0);
     });
 
     // ── PR8: authorization isolation ────────────────────────────────────────

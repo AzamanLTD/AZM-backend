@@ -75,13 +75,23 @@ run('r36/P0 — conversation money state machine', () => {
         return conv;
     };
 
-    beforeAll(() => {
+    beforeAll(async () => {
         process.env.DATABASE_URL = url;
         db = new PrismaClient();
         app = express();
         app.use(express.json());
         app.set('prisma', db);
         app.use('/api/conversations', conversationRoutes);
+        // Universal USDC transaction gate: accept-money authorizations
+        // demand a FRESH canonical USDC/GHS rate observation. A fresh
+        // CI database carries a GlobalSettings row with a null/stale
+        // lastExternalSync → the gate correctly fails closed with 503.
+        // Seed the execution contract the same way as the r19 snapshots.
+        await db.globalSettings.upsert({
+            where: { id: 1 },
+            update: { liveRetailRate: 15, liveUsdToGhs: 15, lastExternalSync: new Date(), lastRateSync: new Date(), liveRateSource: 'KOTANI_PAY' },
+            create: { id: 1, liveRetailRate: 15, liveUsdToGhs: 15, lastExternalSync: new Date(), lastRateSync: new Date(), liveRateSource: 'KOTANI_PAY' },
+        });
     });
     afterAll(async () => { await db.$disconnect(); });
     afterEach(async () => {
