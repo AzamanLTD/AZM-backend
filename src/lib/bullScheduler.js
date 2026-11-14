@@ -147,7 +147,7 @@ class BullScheduler {
                 // still recovers automatically (next attempt is at most 10s
                 // away); a dead Redis costs at most ~6 attempts/min, not ~600.
                 retryStrategy: (times) => Math.min(RETRY_FLOOR_MS * Math.pow(2, Math.min(times - 1, 5)), RETRY_CAP_MS),
-                ...(isTLS ? { tls: { rejectUnauthorized: false } } : {}),
+                ...(isTLS ? { tls: {} } : {}),
             });
 
             this._installBreakerHooks(this.redisConnection);
@@ -285,7 +285,7 @@ class BullScheduler {
                 maxRetriesPerRequest: 1,
                 retryStrategy: () => 60_000, // probe owns its retries; never auto-loop
                 enableReadyCheck: true,
-                ...(isTLS ? { tls: { rejectUnauthorized: false } } : {}),
+                ...(isTLS ? { tls: {} } : {}),
             });
             probe.on('error', () => {}); // silence — failure is the normal path
             await _withTimeout(probe.connect().then(() => probe.ping()), BOOT_PING_TIMEOUT_MS, 'Redis probe');
@@ -314,7 +314,7 @@ class BullScheduler {
                 enableReadyCheck: true,
                 lazyConnect: false,
                 retryStrategy: (times) => Math.min(RETRY_FLOOR_MS * Math.pow(2, Math.min(times - 1, 5)), RETRY_CAP_MS),
-                ...(isTLS ? { tls: { rejectUnauthorized: false } } : {}),
+                ...(isTLS ? { tls: {} } : {}),
             });
             await _withTimeout(conn.ping(), BOOT_PING_TIMEOUT_MS, 'Redis restore PING');
             conn.disconnect();
@@ -328,7 +328,7 @@ class BullScheduler {
                 enableReadyCheck: true,
                 lazyConnect: false,
                 retryStrategy: (times) => Math.min(RETRY_FLOOR_MS * Math.pow(2, Math.min(times - 1, 5)), RETRY_CAP_MS),
-                ...(isTLS ? { tls: { rejectUnauthorized: false } } : {}),
+                ...(isTLS ? { tls: {} } : {}),
             });
             this._installBreakerHooks(this.redisConnection);
             this.Queue = Queue;

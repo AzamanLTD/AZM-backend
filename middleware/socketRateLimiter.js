@@ -3,22 +3,10 @@
 // AZAMAN — PER-SOCKET-EVENT RATE LIMITING
 // =============================================================================
 
-const logger = require('../src/config/logger');
-const Redis = require('ioredis');
+const { getRedis } = require('../src/lib/redisConnection');
 
-let _redisClient = null;
-const _getRedis = () => {
-    if (!process.env.REDIS_URL) return null;
-    if (!_redisClient) {
-        _redisClient = new Redis(process.env.REDIS_URL, {
-            maxRetriesPerRequest: 3,
-            enableReadyCheck: false,
-            lazyConnect: true,
-        });
-        _redisClient.on('error', (err) => logger.error({ err: err }, '[socketRateLimiter] redis error'));
-    }
-    return _redisClient;
-};
+// Shared default connection — a socket storm must not open its own client.
+const _getRedis = () => getRedis('default');
 
 // In-memory fallback store: eventKey -> { count, windowStart }
 const _memStore = new Map();
