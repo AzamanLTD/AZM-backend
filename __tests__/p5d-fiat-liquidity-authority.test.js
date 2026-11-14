@@ -126,6 +126,9 @@ async function recordWitness(openingDedupKey, amountGhs, ref) {
             providerPayload: { state: 'SETTLED', value, accountnumber: '1000000001' },
             amounts: { netPesewas: BigInt(Math.round(Number(amountGhs) * 100)) },
             fetchedAt: new Date(), walletAccount: '1000000001',
+            // Currency comes from the authoritative account mapping (WP-I), not
+            // from the payload and not from a constant.
+            currencyMapping: { '1000000001': 'GHS' },
         }));
     } finally {
         delete process.env.AZM_RECONCILER_MODE;
