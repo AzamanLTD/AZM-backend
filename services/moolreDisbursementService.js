@@ -56,6 +56,7 @@
 const logger = require('../src/config/logger');
 const axios          = require('axios');
 const { randomUUID } = require('crypto');
+const { Prisma }     = require('@prisma/client');
 
 // ── Confirmed constants ───────────────────────────────────────────────────────
 const PROVIDER_NAME          = 'MOOLRE_DISBURSEMENT';
@@ -200,7 +201,10 @@ class MoolreDisbursementService {
      *
      * @param {{
      *   referenceId: string,                 // idempotency key (reused as txHash)
-     *   amountGhs:   number,
+     *   amountGhs:   string | number,        // decimal string authoritative; a
+     *                                        // number is accepted for legacy
+     *                                        // callers and read as an exact
+     *                                        // GHS figure, then settled to 2dp
      *   recipientPhone: string,              // E.164 or local (MSISDN)
      *   externalId?: string,                 // your own audit reference
      *   payerMessage?: string,
@@ -213,11 +217,18 @@ class MoolreDisbursementService {
      *   referenceId: string,
      *   externalId: string,
      *   status: 'PENDING'|'SUCCESSFUL'|'FAILED',
-     *   amountGhs: number,
+     *   amountGhs: string,        // AUTHORITATIVE: exact GHS at 2dp, e.g. '268.40'
+     *   amountGhsValue: number,   // presentation projection of amountGhs
      *   recipientPhone: string,
      *   message: string,
      *   source: 'LIVE'|'MOCK'
      * }>}
+     *
+     * `amountGhs` is a STRING, never a number: it is the exact 2-dp figure that
+     * is sent to Moolre, recorded in the mock ledger and compared against a
+     * provider echo. `amountGhsValue` is the explicitly named numeric
+     * projection for display only; it is not authoritative and must never be
+     * used as the amount of record (docs/MONEY_CONTRACT.md §6, §10).
      */
     async initiateTransfer(payload) {
         const {
@@ -234,7 +245,18 @@ class MoolreDisbursementService {
         if (!referenceId || typeof referenceId !== 'string') {
             throw this._outcomeError('referenceId is required for idempotency.', PROVIDER_OUTCOMES.NOT_DISPATCHED, { stage: 'VALIDATE' });
         }
-        if (!amountGhs || Number(amountGhs) <= 0) {
+        // §r42.5 — the amount is validated and carried as an EXACT decimal.
+        // A JS number never becomes the authoritative figure on this path: the
+        // provider body, the mock ledger and every return value carry the
+        // 2-dp decimal STRING, with an explicitly-named numeric projection
+        // (`amountGhsValue`) for display consumers only.
+        let amountGhsExact;
+        try {
+            amountGhsExact = new Prisma.Decimal(String(amountGhs));
+        } catch (_) {
+            throw this._outcomeError('amountGhs must be a positive decimal.', PROVIDER_OUTCOMES.NOT_DISPATCHED, { stage: 'VALIDATE' });
+        }
+        if (!amountGhsExact.isFinite() || amountGhsExact.lessThanOrEqualTo(0)) {
             throw this._outcomeError('amountGhs must be positive.', PROVIDER_OUTCOMES.NOT_DISPATCHED, { stage: 'VALIDATE' });
         }
         if (!recipientPhone) {
@@ -242,13 +264,14 @@ class MoolreDisbursementService {
         }
 
         const finalExternalId   = externalId   || `AZAMAN_${referenceId}`;
+        const amountGhsValue    = amountGhsExact.toFixed(2);
         const finalNote         = (payeeNote || payerMessage || 'Azaman MoMo payout').slice(0, 160);
         const channel           = NETWORK_TO_CHANNEL[(network || 'MTN').toUpperCase()] || NETWORK_TO_CHANNEL.MTN;
 
         if (this.providerMode === 'MOCK') {
             return this._mockInitiateTransfer({
                 referenceId,
-                amountGhs:      Number(amountGhs),
+                amountGhs:      amountGhsValue,
                 recipientPhone,
                 externalId:     finalExternalId,
                 note:           finalNote,
@@ -266,7 +289,14 @@ class MoolreDisbursementService {
 
         const body = {
             [BODY_KEYS.currency]:      SUPPORTED_CURRENCY,
-            [BODY_KEYS.amount]:        String(Number(amountGhs)),   // Moolre requires amount as string
+            // §r42.2 Moolre requires the amount as a string, and the old
+            // String(Number(...)) round-trip put an IEEE double in front of the
+            // outbound GHS figure. The Decimal string is already exact (2dp
+            // from the caller) and is the same value the old path formatted.
+            // §r42.5 — the SAME 2-dp string that is returned and recorded, so
+            // the amount we send, the amount we store and the amount we report
+            // can never diverge by a scale digit.
+            [BODY_KEYS.amount]:        amountGhsValue,
             [BODY_KEYS.recipient]:     this._sanitizeMsisdn(recipientPhone),
             [BODY_KEYS.reference]:     referenceId,         // strict idempotency key
             [BODY_KEYS.channel]:       channel,
@@ -319,7 +349,8 @@ class MoolreDisbursementService {
                 referenceId,
                 externalId:     finalExternalId,
                 status:         normalized,
-                amountGhs:      Number(amountGhs),
+                amountGhs:      amountGhsValue,
+                amountGhsValue: Number(amountGhsValue),
                 recipientPhone: this._sanitizeMsisdn(recipientPhone),
                 message:        message || 'Moolre accepted disbursement.',
                 providerTxId:   (data && (data.transactionid || data.txid || data.id)) || null,
@@ -429,7 +460,9 @@ class MoolreDisbursementService {
                 referenceId,
                 externalId:  (data && data.externalref) || null,
                 status:      this._normalizeStatus(rawStatus),
-                amountGhs:   data && data.amount ? Number(data.amount) : null,
+                amountGhs:   data && data.amount != null
+                    ? new Prisma.Decimal(String(data.amount)).toFixed(2)
+                    : null,
                 reason:      (data && data.reason) || message || null,
                 source:      'LIVE'
             };

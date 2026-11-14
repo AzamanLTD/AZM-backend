@@ -8,6 +8,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const { requireKyc } = require('../middleware/requireKyc');
 const express             = require('express');
 const router              = express.Router();
 const tradeController     = require('../controllers/tradeController');
@@ -46,10 +47,12 @@ router.get('/:id',     protect, getTradeDetails);
 // controller's explicit pre-economics guards mark the claim releasable
 // (res.locals.financialClaimRelease), and those provably run before the
 // economic transaction.
-router.post('/initiate', protectActive, require2FA(), idempotency(), initiateTrade);
+router.post('/initiate', protectActive, requireKyc('trade'), require2FA(),
+    idempotency(), initiateTrade);
 
 // ── Vendor approval actions ──────────────────────────────────────────────────
-router.post('/accept',  protectActive, idempotency(), acceptTrade);
+router.post('/accept',  protectActive,
+    idempotency(), acceptTrade);
 router.post('/decline', protectActive, declineTrade);
 
 // ── Time extension ───────────────────────────────────────────────────────────

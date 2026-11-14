@@ -11,6 +11,13 @@
 const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client');
 const ledger = require('../services/ledgerService');
+const {
+    verifyAndClaimTotp,
+    sendTotpFailure,
+    sendTotpUnavailable,
+    TOTP_CODES,
+} = require('../src/services/totpStepClaimService');
+
 const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 const express = require('express');
 const router = express.Router();
@@ -579,15 +586,15 @@ router.post('/2fa/verify', async (req, res) => {
             return res.status(400).json({ success: false, message: '2FA is already enabled.' });
         }
 
-        const verified = speakeasy.totp.verify({
+        const verdict = await verifyAndClaimTotp({
+            prisma,
+            userId,
             secret: user.twoFactorSecret,
-            encoding: 'base32',
             token,
-            window: 1,
         });
 
-        if (!verified) {
-            return res.status(400).json({ success: false, message: 'Invalid token. Please try again.' });
+        if (!verdict.ok) {
+            return sendTotpFailure(res, verdict, { invalidStatus: 400, invalidMessage: 'Invalid token. Please try again.' });
         }
 
         await prisma.user.update({
@@ -597,6 +604,7 @@ router.post('/2fa/verify', async (req, res) => {
 
         res.json({ success: true, message: '2FA enabled successfully.' });
     } catch (err) {
+        if (err && err.code === TOTP_CODES.UNAVAILABLE) return sendTotpUnavailable(res);
         logger.error('[AdminRoutes] 2FA verify error:', err);
         res.status(500).json({ success: false, message: err.message });
     }
@@ -622,15 +630,15 @@ router.post('/2fa/disable', async (req, res) => {
             return res.status(400).json({ success: false, message: '2FA is not enabled.' });
         }
 
-        const verified = speakeasy.totp.verify({
+        const verdict = await verifyAndClaimTotp({
+            prisma,
+            userId,
             secret: user.twoFactorSecret,
-            encoding: 'base32',
             token,
-            window: 1,
         });
 
-        if (!verified) {
-            return res.status(400).json({ success: false, message: 'Invalid token.' });
+        if (!verdict.ok) {
+            return sendTotpFailure(res, verdict, { invalidStatus: 400, invalidMessage: 'Invalid token.' });
         }
 
         await prisma.user.update({
@@ -640,6 +648,7 @@ router.post('/2fa/disable', async (req, res) => {
 
         res.json({ success: true, message: '2FA disabled.' });
     } catch (err) {
+        if (err && err.code === TOTP_CODES.UNAVAILABLE) return sendTotpUnavailable(res);
         logger.error('[AdminRoutes] 2FA disable error:', err);
         res.status(500).json({ success: false, message: err.message });
     }

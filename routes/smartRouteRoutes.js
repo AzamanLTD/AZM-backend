@@ -13,6 +13,6 @@ router.patch('/:id',       protectActive, ctrl.update);
 router.post('/:id/pause',  protectActive, ctrl.pause);
 router.post('/:id/resume', protectActive, ctrl.resume);
 router.delete('/:id',      protectActive, ctrl.cancel);
-router.post('/:id/run-now',protectActive, ctrl.runNow);
+router.post('/:id/run-now', protectActive, ctrl.runNow);
 
 module.exports = router;

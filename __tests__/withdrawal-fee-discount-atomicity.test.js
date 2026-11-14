@@ -61,16 +61,44 @@ describeOrSkip('AZM fee-discount withdrawal atomicity (real PostgreSQL)', () => 
     afterAll(async () => { if (prisma) await prisma.$disconnect(); });
 
     beforeEach(async () => {
+        // The fixture must declare the fee path it asserts. With
+        // `fiatLiquidityAuthorityEnabled` true, processFiatWithdrawal claims GHS
+        // liquidity and then mirror-writes it into SystemFiatPool through
+        // syncPoolProjection (src/services/fiatLiquidityService.js:566), which
+        // assigns `balance = FiatLiquidityState.availableGhs` — a GHS figure read
+        // back as USDC. A suite leaving the flag true (p5d and the other P5
+        // authority suites set it) therefore changes what THIS suite reads:
+        // measured 99350, which is 50 USDC x 13.0 GHS, not a fee defect.
+        // Pinning it false makes this suite independent of whoever ran before it.
         await prisma.globalSettings.upsert({
             where: { id: 1 },
-            update: { liveRetailRate: 13.0, liveRateSource: 'KOTANI_PAY' },
-            create: { id: 1, liveRetailRate: 13.0, liveRateSource: 'KOTANI_PAY' }
+            update: { liveRetailRate: 13.0, liveRateSource: 'KOTANI_PAY', fiatLiquidityAuthorityEnabled: false },
+            create: { id: 1, liveRetailRate: 13.0, liveRateSource: 'KOTANI_PAY', fiatLiquidityAuthorityEnabled: false }
         });
         await prisma.systemFiatPool.upsert({
             where: { id: 1 },
             update: { balance: 100_000.0 },
             create: { id: 1, balance: 100_000.0 }
         });
+        // §P.5-D FIXTURE ISOLATION. Every assertion below is USDC arithmetic on
+        // SystemFiatPool. Under the latched regime that row is a GHS projection
+        // and the same withdrawal reserves GHS instead, which turned
+        // `100_000 - 50` into a number from a different unit when an earlier
+        // suite had activated. Pin both components (Boolean AND latch) and prove
+        // it through the production reader before the suite runs.
+        await prisma.globalSettings.upsert({
+            where: { id: 1 },
+            update: { fiatLiquidityAuthorityEnabled: false },
+            create: { id: 1, liveRetailRate: 13.0, liveRateSource: 'KOTANI_PAY', fiatLiquidityAuthorityEnabled: false }
+        });
+        await prisma.fiatLiquidityState.upsert({
+            where: { id: 1 },
+            update: { authorityActivatedAt: null },
+            create: { id: 1, availableGhs: 0, reservedGhs: 0, inTransitGhs: 0, paidOutGhs: 0, updatedAt: new Date() }
+        });
+        const mode = await require('../src/services/fiatLiquidityActivationService').readMode(prisma);
+        expect(mode.active).toBe(false);
+        expect(mode.authorityUnit).toBe('USDC');
         // Fresh-install posture: processFiatWithdrawal DEFERS the principal
         // into SystemMasterCrypto, and test A asserts the master balance
         // against the seeded withdrawal. A prior suite's residue (e.g. the
@@ -123,6 +151,13 @@ describeOrSkip('AZM fee-discount withdrawal atomicity (real PostgreSQL)', () => 
     // ── A. atomic creation ──────────────────────────────────────────────────
     test('A. AZM debit commits atomically with the fiat reservation', async () => {
         const user = await seedWithdrawalUser();
+        // The persisted posture is asserted, not inherited: this is the state the
+        // withdrawal below actually reads, so the absolute pool expectation can
+        // only hold on the fee path this suite intends to exercise.
+        const posture = await prisma.globalSettings.findUnique({ where: { id: 1 } });
+        expect(posture.fiatLiquidityAuthorityEnabled).toBe(false);
+        expect(Number(posture.liveRetailRate)).toBeCloseTo(13.0, 6);
+
         const { data, reference, tier } = await createWithdrawalWithDiscount(user);
 
         expect(data.azmFeeDiscount).toMatchObject({

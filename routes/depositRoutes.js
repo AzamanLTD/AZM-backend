@@ -15,6 +15,7 @@
 // =============================================================================
 
 const express = require('express');
+const { requireKyc } = require('../middleware/requireKyc');
 const router = express.Router();
 const depositController = require('../controllers/depositController');
 const quoteFiatDepositController = require('../controllers/quoteFiatDepositController');
@@ -27,13 +28,13 @@ const {
   initiateMoolreFiatDepositSchema,
 } = require('../services/validation/financialSchemas');
 
-router.post('/fiat/initiate', protectActive, idempotency(), validate(initiateFiatDepositSchema), quoteFiatDepositController.initiate);
+router.post('/fiat/initiate', protectActive, requireKyc('deposit'), idempotency(), validate(initiateFiatDepositSchema), quoteFiatDepositController.initiate);
 router.post('/fiat/webhook', quoteFiatDepositController.webhook);
 router.post('/webhook/tatum', depositController.tatumCryptoWebhook);
 
 // All Moolre initiation/OTP/webhook mutations use the quote-backed controllers.
 // Do not route financial settlement through the legacy depositController copies.
-router.post('/fiat/initiate/moolre', protectActive, idempotency(), validate(initiateMoolreFiatDepositSchema), quoteMoolreDepositController.initiate);
+router.post('/fiat/initiate/moolre', protectActive, requireKyc('deposit'), idempotency(), validate(initiateMoolreFiatDepositSchema), quoteMoolreDepositController.initiate);
 router.post('/fiat/initiate/moolre/otp', protectActive, quoteFiatDepositController.confirmMoolreOtp);
 router.post('/fiat/webhook/moolre', quoteMoolreDepositController.webhook);
 router.post('/validate-name', protectActive, depositController.validateMomoName);

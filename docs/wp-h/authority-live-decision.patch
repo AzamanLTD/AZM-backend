@@ -1,0 +1,114 @@
+diff --git a/__tests__/p5e-enforced-authority-activation.pg.test.js b/__tests__/p5e-enforced-authority-activation.pg.test.js
+index 0ad9e85..fb0c5cf 100644
+--- a/__tests__/p5e-enforced-authority-activation.pg.test.js
++++ b/__tests__/p5e-enforced-authority-activation.pg.test.js
+@@ -177,6 +177,31 @@ run('WP-E — database-enforced, append-only authority activation', () => {
+         expect(await enforcement.readActivationRecord(runtime)).toBeNull();
+     });
+ 
++    // ── 1b. §WP-H: the LIVE MODE decision ignores the writable legacy state ──
++    test('1b. the writable flag and the legacy latch cannot activate the live mode', async () => {
++        // Both legacy fields are writable by the ordinary runtime credential, so
++        // neither may be evidence of activation. Drive them to their strongest
++        // "activated" values and prove the mode the money paths read stays USDC.
++        // The runtime role must be able to read its own settings rows; the p5e
++        // harness grants only the activation table, so grant the legacy tables
++        // here (they are the ones whose values must NOT decide the regime).
++        await admin.$executeRawUnsafe(`GRANT SELECT ON "GlobalSettings", "FiatLiquidityState", "SystemFiatPool", "FiatLiquidityAuthorityActivation" TO ${q(ROLE.runtime)}`).catch(() => {});
++        await admin.$executeRawUnsafe('UPDATE "GlobalSettings" SET "fiatLiquidityAuthorityEnabled" = true WHERE "id" = 1');
++        await admin.$executeRawUnsafe('UPDATE "FiatLiquidityState" SET "authorityActivatedAt" = NOW() WHERE "id" = 1');
++        const modal = require('../src/services/fiatLiquidityActivationService');
++        const mode = await modal.readMode(runtime);
++        expect(mode.flagged).toBe(true);
++        expect(mode.latched).toBe(true);
++        expect(mode.active).toBe(false);
++        expect(mode.authorityUnit).toBe('USDC');
++        expect(mode.enforcement.established).toBe(true);
++        expect(await modal.isAuthorityModeActive(runtime)).toBe(false);
++        // and the balance/Pool reader must label the number with the SAME unit
++        const withPool = await modal.readModeAndPool(runtime);
++        expect(withPool.active).toBe(false);
++        expect(withPool.currency).toBe('USDC');
++    });
++
+     // ── 2-5. no DML, in any form ────────────────────────────────────────────
+     test('2. the runtime role cannot INSERT', async () => {
+         await expect(runtime.$executeRawUnsafe(
+@@ -298,6 +323,25 @@ run('WP-E — database-enforced, append-only authority activation', () => {
+     });
+ 
+     // ── 10. one activation only: it cannot be replaced ──────────────────────
++    // ── 8b. §WP-H: the live mode now reads ACTIVE from the protected record ──
++    test('8b. the live mode reads active from the protected record, not the flag', async () => {
++        const modal = require('../src/services/fiatLiquidityActivationService');
++        await admin.$executeRawUnsafe(`GRANT SELECT ON "GlobalSettings", "FiatLiquidityState", "SystemFiatPool", "FiatLiquidityAuthorityActivation" TO ${q(ROLE.runtime)}`).catch(() => {});
++        const mode = await modal.readMode(runtime);
++        expect(mode.active).toBe(true);
++        expect(mode.authorityUnit).toBe('GHS');
++        expect(mode.enforcement.reason).toBe('ACTIVE');
++
++        // Clearing BOTH writable legacy fields must not deactivate the regime.
++        await admin.$executeRawUnsafe('UPDATE "GlobalSettings" SET "fiatLiquidityAuthorityEnabled" = false WHERE "id" = 1');
++        await admin.$executeRawUnsafe('UPDATE "FiatLiquidityState" SET "authorityActivatedAt" = NULL WHERE "id" = 1');
++        const after = await modal.readMode(runtime);
++        expect(after.flagged).toBe(false);
++        expect(after.latched).toBe(false);
++        expect(after.active).toBe(true);
++        expect(await modal.isAuthorityModeActive(runtime)).toBe(true);
++    });
++
+     test('10. a second activation cannot replace the first', async () => {
+         await expect(operator.$executeRawUnsafe(
+             `INSERT INTO "FiatLiquidityAuthorityActivation" ("id","activatedBy","approvedBy","evidenceReference","evidenceDigest")
+diff --git a/src/services/fiatLiquidityActivationService.js b/src/services/fiatLiquidityActivationService.js
+index ab5320d..59c7ea3 100644
+--- a/src/services/fiatLiquidityActivationService.js
++++ b/src/services/fiatLiquidityActivationService.js
+@@ -99,13 +99,30 @@ async function readMode(db) {
+     const flagged = settings?.fiatLiquidityAuthorityEnabled === true;
+     const activatedAt = state?.authorityActivatedAt || null;
+     const latched = activatedAt != null;
++
++    // §WP-H — THE LIVE DECISION COMES FROM THE PROTECTED RECORD, NEVER FROM
++    // THE APPLICATION-WRITABLE FLAG OR LATCH. `flagged`/`latched` remain in the
++    // payload as diagnostics only: the runtime credential can write both, so
++    // neither can be evidence that the regime is active. Activation is real
++    // only when the append-only activation row exists AND the database-role
++    // enforcement that protects it is genuinely established (owner is NOLOGIN,
++    // runtime cannot write or alter it, triggers enabled). Anything else —
++    // missing table, wrong owner, excessive runtime privileges, unreadable
++    // record — leaves the regime unavailable.
++    const enforcement = await require('./authorityActivationEnforcement').readEnforcedAuthority(db);
++    const active = enforcement.enforcedActive === true;
+     return {
+-        active: flagged || latched,
++        active,
+         flagged,
+         latched,
+-        activatedAt,
++        activatedAt: enforcement.activation ? (enforcement.activation.activatedAt || activatedAt) : activatedAt,
++        enforcement: {
++            established: enforcement.enforcementEstablished === true,
++            reason: enforcement.reason,
++            problems: enforcement.problems || [],
++        },
+         // The unit SystemFiatPool.balance is expressed in RIGHT NOW.
+-        authorityUnit: (flagged || latched) ? 'GHS' : 'USDC',
++        authorityUnit: active ? 'GHS' : 'USDC',
+     };
+ }
+ 
+@@ -140,7 +157,12 @@ async function readModeAndPool(db) {
+     const flagged = row.flagged === true;
+     const activatedAt = row.activatedAt || null;
+     const latched = activatedAt != null;
+-    const active = flagged || latched;
++    // §WP-H: the unit of the number published below is decided by the
++    // PROTECTED record, not by the writable flag/latch. The enforcement read is
++    // a separate round trip; it changes only through a privileged DBA action,
++    // so it cannot move between this statement and the balance it labels.
++    const enforcement = await require('./authorityActivationEnforcement').readEnforcedAuthority(db);
++    const active = enforcement.enforcedActive === true;
+     const balance = active
+         ? new Prisma.Decimal(row.availableGhs ?? 0)
+         : new Prisma.Decimal(row.projectionBalance ?? 0);

@@ -47,6 +47,7 @@ const { seedUser } = require('./helpers/factories');
 const url = process.env.TEST_DATABASE_URL;
 const run = url ? describe : describe.skip;
 
+
 run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
     let prisma;
 
@@ -863,6 +864,7 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
         });
 
         try {
+            const testStart = new Date();
             await prisma.systemHotWallet.upsert({ where: { id: 1 }, update: { balance: 1000 }, create: { id: 1, balance: 1000 } });
             const seeded = await seedUser(prisma, { availableBalance: 500 });
             const userId = seeded.id;
@@ -888,12 +890,34 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
             const u1 = await prisma.user.findUnique({ where: { id: userId }, select: { availableBalance: true } });
             expect(Number(u1.availableBalance)).toBeCloseTo(450, 6);
             expect(await prisma.transactionHistory.count({ where: { userId, type: 'WITHDRAWAL_CRYPTO' } })).toBe(1);
-            expect(await prisma.custodyExecution.count({ where: { userId, kind: 'CUSTOMER_WITHDRAWAL' } })).toBe(1);
+
+            // Ownership scoping, not userId scoping. `CustodyExecution.userId` is a
+            // bare Int with no relation, so a sibling suite's
+            // `TRUNCATE "User" RESTART IDENTITY CASCADE` cannot reach it: after the
+            // reset a freshly seeded user reuses a low id and inherits that suite's
+            // executions (measured: user 26 arrived with 2 CUSTOMER_WITHDRAWAL rows
+            // both still SIGNING). Count what THIS request created — the withdrawal
+            // it wrote, plus everything since this test began — so the one-execution
+            // invariant is asserted on owned rows only.
+            const withdrawalRow = await prisma.transactionHistory.findFirst({
+                where: { userId, type: 'WITHDRAWAL_CRYPTO' },
+                select: { id: true },
+            });
+            expect(withdrawalRow).toBeTruthy();
+            const ownedExecutions = () => prisma.custodyExecution.findMany({
+                where: { userId, kind: 'CUSTOMER_WITHDRAWAL', refId: withdrawalRow.id },
+            });
+            const executionsThisRun = () => prisma.custodyExecution.count({
+                where: { userId, kind: 'CUSTOMER_WITHDRAWAL', createdAt: { gte: testStart } },
+            });
+            expect(await ownedExecutions()).toHaveLength(1);
+            expect(await executionsThisRun()).toBe(1);
 
             // The provider was contacted EXACTLY once — the KMS submission is
             // a durable post-response phase fact, never a per-retry side effect.
             expect(submitted.length).toBe(1);
-            const execution = await prisma.custodyExecution.findFirst({ where: { userId, kind: 'CUSTOMER_WITHDRAWAL' } });
+            const execution = (await ownedExecutions())[0];
+            expect(execution).toBeTruthy();
             expect(execution.status).toBe('SIGNING'); // pending KMS signature
 
             // Same-key retry: byte-identical replay, zero second mutation,
@@ -904,7 +928,8 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
             const u2 = await prisma.user.findUnique({ where: { id: userId }, select: { availableBalance: true } });
             expect(Number(u2.availableBalance)).toBeCloseTo(450, 6);
             expect(submitted.length).toBe(1);
-            expect(await prisma.custodyExecution.count({ where: { userId, kind: 'CUSTOMER_WITHDRAWAL' } })).toBe(1);
+            expect(await ownedExecutions()).toHaveLength(1);
+            expect(await executionsThisRun()).toBe(1);
             expect(await prisma.transactionHistory.count({ where: { userId, type: 'WITHDRAWAL_CRYPTO' } })).toBe(1);
         } finally {
             custody.__setProviderForTests(null);

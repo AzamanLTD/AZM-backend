@@ -1,5 +1,6 @@
 // routes/susuRoutes.js
 const logger = require('../src/config/logger');
+const { requireKyc } = require('../middleware/requireKyc');
 const express = require('express');
 const router = express.Router();
 const ctrl = require('../controllers/susuController');
@@ -9,7 +10,7 @@ const { protectActive } = require('../middleware/banGuardMiddleware');
 const { idempotency } = require('../middleware/idempotency');
 
 // ── Legacy GroupChat-bound flow (kept as-is) ──────────────────────────────
-router.post('/groups',                    protectActive, idempotency(), ctrl.createSusu);
+router.post('/groups',                    protectActive, requireKyc('susu'), idempotency(), ctrl.createSusu);
 router.get('/groups/:id',                 protect,       ctrl.getDetail);
 router.get('/groups/:id/transparency',    protect,       ctrl.getTransparencyReport);
 router.post('/groups/:id/contract',       protectActive, idempotency(), ctrl.acceptContract);

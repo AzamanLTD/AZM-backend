@@ -28,6 +28,7 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
         }]);
         const prisma = {
             globalSettings: { findUnique: jest.fn().mockResolvedValue(settings) },
+            fiatLiquidityState: { findUnique: jest.fn().mockResolvedValue(null) },
             systemFiatPool: { findUnique: jest.fn().mockResolvedValue({ balance: 1000 }) },
         // §P.5-D per-row regime: no reservation row → this is a LEGACY
         // withdrawal; the legacy SystemFiatPool policy applies.
@@ -64,6 +65,7 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
         const initiateTransfer = jest.fn();
         const prisma = {
             globalSettings: { findUnique: jest.fn().mockResolvedValue(settings) },
+            fiatLiquidityState: { findUnique: jest.fn().mockResolvedValue(null) },
             systemFiatPool: { findUnique: jest.fn().mockResolvedValue({ balance: 1000 }) },
         // §P.5-D per-row regime: no reservation row → this is a LEGACY
         // withdrawal; the legacy SystemFiatPool policy applies.
@@ -95,6 +97,7 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
         const initiateTransfer = jest.fn();
         const prisma = {
             globalSettings: { findUnique: jest.fn().mockResolvedValue(settings) },
+            fiatLiquidityState: { findUnique: jest.fn().mockResolvedValue(null) },
             systemFiatPool: { findUnique: jest.fn().mockResolvedValue({ balance: 1000 }) },
         // §P.5-D per-row regime: no reservation row → this is a LEGACY
         // withdrawal; the legacy SystemFiatPool policy applies.
@@ -146,6 +149,7 @@ describe('PayoutBatchWorker provider outcome classification', () => {
 
     const buildPrisma = ({ withdrawal, update, updateMany }) => ({
         globalSettings: { findUnique: jest.fn().mockResolvedValue({ ...settings, liveRetailRate: 13 }) },
+        fiatLiquidityState: { findUnique: jest.fn().mockResolvedValue(null) },
         systemFiatPool: { findUnique: jest.fn().mockResolvedValue({ balance: 1000 }) },
         // §P.5-D per-row regime: no reservation row → this is a LEGACY
         // withdrawal; the legacy SystemFiatPool policy applies.

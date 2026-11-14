@@ -133,6 +133,7 @@ const STATEMENTS = [
     "inTransitGhs" DECIMAL(20,2) NOT NULL DEFAULT 0,
     "paidOutGhs" DECIMAL(20,2) NOT NULL DEFAULT 0,
     "reconciliationHeldGhs" DECIMAL(20,2) NOT NULL DEFAULT 0,
+    "authorityActivatedAt" TIMESTAMP(3),
     "updatedAt" TIMESTAMP(3) NOT NULL,
     CONSTRAINT "FiatLiquidityState_pkey" PRIMARY KEY ("id")
   );`,
@@ -143,6 +144,14 @@ const STATEMENTS = [
   // Existing deployments (pre-blocker-5 DBs) gain the new bucket column.
   `ALTER TABLE "FiatLiquidityState"
      ADD COLUMN IF NOT EXISTS "reconciliationHeldGhs" DECIMAL(20,2) NOT NULL DEFAULT 0;`,
+
+  // §P.5-D one-way latch. Nullable and additive: NULL means "never activated".
+  // This installer must produce the CURRENT table shape, because a first
+  // install (and any re-provision after a dropped table) is exactly where a
+  // magazine-only column silently disappears — and a missing latch column makes
+  // every later reader fail closed with "the regime could not be read".
+  `ALTER TABLE "FiatLiquidityState"
+     ADD COLUMN IF NOT EXISTS "authorityActivatedAt" TIMESTAMP(3);`,
 
   // Singleton zero-state row (deterministic id=1). No financial data.
   `INSERT INTO "FiatLiquidityState" ("id", "availableGhs", "reservedGhs", "inTransitGhs", "paidOutGhs", "reconciliationHeldGhs", "updatedAt")
