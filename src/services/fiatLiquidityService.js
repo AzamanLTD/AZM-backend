@@ -1000,7 +1000,6 @@ async function confirmReconciliationMatch(tx, {
                 reconciliationMatch: {
                     matchedTransactionId: String(matchedTransactionId),
                     providerEventDedupKey,
-                    providerSettlementWitnessId: linkedWitnessId,
                 },
             },
         },
