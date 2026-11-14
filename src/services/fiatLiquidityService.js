@@ -1000,6 +1000,7 @@ async function confirmReconciliationMatch(tx, {
                 reconciliationMatch: {
                     matchedTransactionId: String(matchedTransactionId),
                     providerEventDedupKey,
+                    providerSettlementWitnessId: linkedWitnessId,
                 },
             },
         },
@@ -1029,6 +1030,7 @@ async function confirmTreasuryOpening(tx, {
     dedupKey, confirmedBy = null, providerEventDedupKey = null,
 }) {
     await ensureStateRow(tx);
+    let linkedWitnessId = null;
     const receipt = await tx.fiatLiquidityReceipt.findUnique({ where: { dedupKey } });
     if (!receipt) throw new InvalidEvidenceError(`[fiatLiquidity] unknown receipt identity ${dedupKey}`);
     if (receipt.status === 'AVAILABLE') return { receipt, replay: true };
@@ -1036,6 +1038,29 @@ async function confirmTreasuryOpening(tx, {
         throw new ConflictingEvidenceError(
             `[fiatLiquidity] receipt ${dedupKey} in state ${receipt.status} cannot be confirmed (RECEIVED treasury opening only)`
         );
+    }
+
+    // ── WP-I: the OBSERVATION alone is not evidence of real money ────────────
+    // A FiatProviderEvent is a row this application's own credential can
+    // insert. Treasury funding therefore requires an INDEPENDENTLY FETCHED
+    // provider settlement witness, written by the reconciliation process under
+    // a different database identity, and matching this opening exactly on
+    // provider, currency, exact net pesewas and a provider-reported settled
+    // state. No witness → no AVAILABLE. Fail closed.
+    {
+        const { findWitnessForOpening } = require('./providerSettlementWitnessService');
+        const witness = await findWitnessForOpening(tx, {
+            openingDedupKey: receipt.dedupKey,
+            provider: receipt.provider,
+        });
+        if (!witness) {
+            throw new TreasuryFundingEvidenceUnavailableError(
+                '[wp-i] treasury funding requires an independently fetched provider settlement witness for this '
+                + 'opening. A provider event row is application-authored evidence and cannot unlock spendable GHS.',
+                { dedupKey, receiptAmountGhs: receipt.amountGhs?.toString() ?? null },
+            );
+        }
+        linkedWitnessId = witness.id;
     }
 
     // The caller may only POINT AT an observation. It may never describe one:
