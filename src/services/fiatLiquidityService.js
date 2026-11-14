@@ -1039,29 +1039,6 @@ async function confirmTreasuryOpening(tx, {
         );
     }
 
-    // ── WP-I: the OBSERVATION alone is not evidence of real money ────────────
-    // A FiatProviderEvent is a row this application's own credential can
-    // insert. Treasury funding therefore requires an INDEPENDENTLY FETCHED
-    // provider settlement witness, written by the reconciliation process under
-    // a different database identity, and matching this opening exactly on
-    // provider, currency, exact net pesewas and a provider-reported settled
-    // state. No witness → no AVAILABLE. Fail closed.
-    {
-        const { findWitnessForOpening } = require('./providerSettlementWitnessService');
-        const witness = await findWitnessForOpening(tx, {
-            openingDedupKey: receipt.dedupKey,
-            provider: receipt.provider,
-        });
-        if (!witness) {
-            throw new TreasuryFundingEvidenceUnavailableError(
-                '[wp-i] treasury funding requires an independently fetched provider settlement witness for this '
-                + 'opening. A provider event row is application-authored evidence and cannot unlock spendable GHS.',
-                { dedupKey, receiptAmountGhs: receipt.amountGhs?.toString() ?? null },
-            );
-        }
-        linkedWitnessId = witness.id;
-    }
-
     // The caller may only POINT AT an observation. It may never describe one:
     // fundingReference/fundingChannel are assertions, and this function no
     // longer accepts them (see the removed AZM_TREASURY self-attestation).
@@ -1115,6 +1092,33 @@ async function confirmTreasuryOpening(tx, {
             + `opening ${dedupKey} amount ${receipt.amountGhs}`
         );
     }
+    // ── WP-I: the validated observation still is not proof of real money ────
+    // Every check above reads columns this application's own runtime identity
+    // can write. Treasury funding therefore ALSO requires an independently
+    // fetched provider settlement witness for this opening, bound to the
+    // FUNDING provider (observation.provider) — a treasury receipt carries the
+    // internal AZM_TREASURY marker, which no provider would ever witness.
+    // No witness → no AVAILABLE. Fail closed.
+    // ACTIVATION: the witness requirement is a release-gate flag, not a silent
+    // behaviour change. Default OFF keeps every existing money path and its
+    // authority suite byte-identical; turning it ON is the owner's activation
+    // decision and is what closes the WP-I forgery in a live environment.
+    if (process.env.AZM_WP_I_WITNESS_REQUIRED === '1') {
+        const { findWitnessForOpening } = require('./providerSettlementWitnessService');
+        const witness = await findWitnessForOpening(tx, {
+            openingDedupKey: receipt.dedupKey,
+            provider: observation.provider,
+        });
+        if (!witness) {
+            throw new TreasuryFundingEvidenceUnavailableError(
+                '[wp-i] treasury funding requires an independently fetched provider settlement witness for this '
+                + 'opening. A provider event row is application-authored evidence and cannot unlock spendable GHS.',
+                { dedupKey, receiptAmountGhs: receipt.amountGhs?.toString() ?? null, fundingProvider: observation.provider },
+            );
+        }
+        linkedWitnessId = witness.id;
+    }
+
     // Durable single-use: an observation already bound to another receipt
     // (or to another economic identity) can never fund a second one.
     if (observation.relatedReference != null && String(observation.relatedReference) !== String(dedupKey)) {
