@@ -175,6 +175,73 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
         expect(await prisma.providerSettlementWitness.count()).toBe(0);
     });
 
+    // ── Case 19: funding type the status endpoint cannot witness ────────────
+    test('19: a funding type with no supported witness is refused', async () => {
+        await seedOpening(OPENING_A);
+        stubProvider({});
+        const witnesses = require('../src/services/providerSettlementWitnessService');
+
+        await expect(prisma.$transaction((tx) => witnesses.recordProviderSettlementWitness(tx, {
+            openingDedupKey: OPENING_A,
+            provider: 'MOOLRE',
+            // A bank deposit cannot be evidenced by the collection status
+            // endpoint; the type must be refused rather than coerced.
+            fundingType: 'BANK_DEPOSIT_QUERIED_AS_TYPE_1',
+            endpoint: 'https://api.moolre.com/open/transact/status',
+            requestParams: { id: PROVIDER_REF },
+            rawResponse: JSON.stringify({ status: 1, data: { state: 'SETTLED', value: '99.00' } }),
+            providerPayload: { state: 'SETTLED', value: '99.00' },
+            fetchedAt: new Date(),
+            walletAccount: 'WALLET-AZM-1',
+            currencyMapping: { 'WALLET-AZM-1': 'GHS' },
+        }))).rejects.toMatchObject({ code: 'WITNESS_FUNDING_TYPE_UNSUPPORTED' });
+
+        expect(await prisma.providerSettlementWitness.count()).toBe(0);
+        const opening = await prisma.fiatLiquidityReceipt.findUnique({ where: { dedupKey: OPENING_A } });
+        expect(opening.status).toBe('RECEIVED');
+    });
+
+    // ── Case 20: currency cannot be proven from the account mapping ─────────
+    test('20: an account absent from the currency mapping is refused, never defaulted to GHS', async () => {
+        await prisma.fiatLiquidityReceipt.create({
+            data: {
+                provider: 'MOOLRE', dedupKey: OPENING_A, amountGhs: 99, status: 'RECEIVED',
+                providerRef: PROVIDER_REF,
+                evidence: { walletAccount: 'WALLET-UNMAPPED', fundingReference: PROVIDER_REF },
+            },
+        });
+        stubProvider({});
+        const witnesses = require('../src/services/providerSettlementWitnessService');
+
+        const results = await reconciler.reconcileTreasuryOpenings({ openingDedupKeys: [OPENING_A] });
+
+        expect(results[0].witnessed).toBe(false);
+        expect(results[0].reason).toMatch(/WITNESS_ACCOUNT_UNMAPPED|currency/i);
+        expect(await prisma.providerSettlementWitness.count()).toBe(0);
+    });
+
+    // ── Case 25: a witness written without a provider call is detected ──────
+    test('25: a witness whose retained bytes no longer match its digest is refused at promotion', async () => {
+        await seedOpening(OPENING_A);
+        stubProvider({});
+        const witnesses = require('../src/services/providerSettlementWitnessService');
+
+        const [result] = await reconciler.reconcileTreasuryOpenings({ openingDedupKeys: [OPENING_A] });
+        expect(result.witnessed).toBe(true);
+
+        // Simulate a compromised writer: the row exists and looks legitimate,
+        // but its stored bytes were swapped after the fact. The digest is the
+        // detection: the witness stops being usable evidence.
+        await prisma.providerSettlementWitness.update({
+            where: { openingDedupKey: OPENING_A },
+            data: { rawResponse: JSON.stringify({ status: 1, data: { state: 'SETTLED', value: '999999.00' } }) },
+        });
+
+        await expect(prisma.$transaction((tx) => witnesses.findWitnessForOpening(tx, {
+            openingDedupKey: OPENING_A, provider: 'MOOLRE', openingPesewas: 9900n,
+        }))).rejects.toMatchObject({ code: 'WITNESS_MISMATCH' });
+    });
+
     // ── Case 26: one observation cannot fund two openings ────────────────────
     test('one provider observation cannot be used to witness a second opening', async () => {
         await seedOpening(OPENING_A);
