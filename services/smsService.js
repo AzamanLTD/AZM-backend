@@ -259,7 +259,7 @@ class SMSService {
         };
         const otpKey = `otp:${phoneNumber}`;
         if (durable) {
-            await this._redisClient.set(otpKey, JSON.stringify(record), 'EX', expiryMinutes * 60);
+            await this._storeSet(otpKey, JSON.stringify(record), 'EX', expiryMinutes * 60);
         } else {
             this.otpStore.set(phoneNumber, { ...record });
         }
@@ -307,9 +307,60 @@ class SMSService {
         return false; // development/test: in-process Map is acceptable
     }
 
+    /**
+     * A Redis client that exists but cannot be REACHED is a store outage, not a
+     * wrong code. Without this mapping a mid-flight connection drop surfaced as
+     * a generic error (a 500 at the edge), so a caller could not tell "the code
+     * is wrong" from "the store is down" — and nothing recorded that the store
+     * had failed. Every store call now fails closed on a typed refusal, and the
+     * in-process Map is never consulted as a fallback.
+     */
+    _isStoreTransportError(err) {
+        const code = String(err?.code || '');
+        const TRANSPORT_CODES = [
+            'MaxRetriesPerRequestError', 'NR_CLOSED', 'CONNECTION_BROKEN',
+            'ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'ENOTFOUND', 'EPIPE', 'ENETUNREACH',
+        ];
+        if (TRANSPORT_CODES.includes(code)) return true;
+        return /max retries per request|connection is closed|stream isn't writeable|socket closed/i
+            .test(String(err?.message || ''));
+    }
+
+    async _storeCall(label, fn) {
+        try {
+            return await fn();
+        } catch (err) {
+            if (!this._isStoreTransportError(err)) throw err;
+            logger.error({ err, label }, '[SMSService] OTP store transport failure');
+            const refusal = new Error(
+                'The verification store is unreachable right now. No code was accepted or issued.'
+            );
+            refusal.code = 'OTP_STORE_UNAVAILABLE';
+            refusal.cause = err;
+            throw refusal;
+        }
+    }
+
+    _storeSet(...args) {
+        return this._storeCall('set', () => this._redisClient.set(...args));
+    }
+
+    _storeEval(...args) {
+        return this._storeCall('eval', () => this._redisClient.eval(...args));
+    }
+
+    /** Cleanup must never mask the error that triggered it. */
+    async _storeDelQuietly(key, label) {
+        try {
+            await this._redisClient.del(key);
+        } catch (err) {
+            logger.error({ err, label }, '[SMSService] OTP store cleanup failed (ignored)');
+        }
+    }
+
     async _deleteOtp(phoneNumber) {
         const key = `otp:${phoneNumber}`;
-        if (this._redisClient) await this._redisClient.del(key);
+        if (this._redisClient) await this._storeDelQuietly(key, 'delete-otp');
         else this.otpStore.delete(phoneNumber);
     }
 
@@ -327,7 +378,7 @@ class SMSService {
         const windowKey = `otp:rl:w:${phoneNumber}`;
 
         if (this._redisClient) {
-            const [ok, why, detail] = await this._redisClient.eval(
+            const [ok, why, detail] = await this._storeEval(
                 OTP_RESERVE_LUA, 2, intervalKey, windowKey,
                 String(this._sendMinIntervalMs), String(this._sendWindowMs),
                 String(this._sendMaxPerWindow), String(now)
@@ -434,7 +485,7 @@ class SMSService {
         // synchronous Map path). Two concurrent correct requests can therefore
         // never both succeed: the second finds the key already consumed.
         if (durable) {
-            const [ok, why, detail] = await this._redisClient.eval(
+            const [ok, why, detail] = await this._storeEval(
                 OTP_VERIFY_LUA, 1, otpKey, digest, String(nowMs)
             );
             return this._verifyOutcome(why, Number(detail));
@@ -688,7 +739,7 @@ class SMSService {
         };
 
         if (durability) {
-            await this._redisClient.set(key, JSON.stringify(record), 'PX', ttlSeconds * 1000);
+            await this._storeSet(key, JSON.stringify(record), 'PX', ttlSeconds * 1000);
         } else {
             this.otpStore.set(key, record);
         }
@@ -718,7 +769,7 @@ class SMSService {
 
     async _deleteUnlockChallenge(userId, challengeId) {
         const key = this._unlockKey(userId, challengeId);
-        if (this._redisClient) await this._redisClient.del(key);
+        if (this._redisClient) await this._storeDelQuietly(key, 'delete-unlock-challenge');
         else this.otpStore.delete(key);
     }
 
@@ -737,7 +788,7 @@ class SMSService {
         const digest = this._hashCode(`${purpose}:${userId}:${challengeId}`, String(code));
 
         if (durable) {
-            const [ok, outcome, left] = await this._redisClient.eval(
+            const [ok, outcome, left] = await this._storeEval(
                 OTP_VERIFY_LUA, 1, key, digest, String(Date.now()),
             );
             return {
