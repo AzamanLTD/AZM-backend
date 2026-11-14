@@ -335,6 +335,19 @@ exports.webhook = async (req, res) => {
     const expectedSecret = process.env.MOOLRE_WEBHOOK_SECRET;
     if (!expectedSecret) return res.status(503).json({ success: false, message: 'Webhook endpoint not configured.' });
 
+    // ── WP-I matrix case 4: a body that ASSERTS a secret must assert the right
+    // one. Moolre's documented callback contract carries a `secret` field in the
+    // body; previously a caller holding the static header could send a body with
+    // a DIFFERENT secret and still be authenticated, so the payload's own claim
+    // was never checked against the shared secret. Evaluated before any header
+    // credential, so a mismatching body secret is refused even when a header
+    // would otherwise authenticate. Absent body secret = unchanged behaviour.
+    const assertedBodySecret = req.body?.secret;
+    if (assertedBodySecret !== undefined && assertedBodySecret !== null
+        && !safeEqual(String(assertedBodySecret), expectedSecret)) {
+        return res.status(401).json({ success: false, message: 'Unauthorized.' });
+    }
+
     const rawBody = req.rawBody || JSON.stringify(req.body);
     const signature = req.headers['x-moolre-signature'];
     let authenticated = signature && safeEqual(

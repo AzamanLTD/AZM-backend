@@ -494,6 +494,7 @@ jobs:
             "__tests__/pos-settlement-containment.test.js"
             "__tests__/wp-i-provider-trust-boundary.test.js"
             "__tests__/wp-i-witness-db-provenance.test.js"
+            "__tests__/wp-i-callback-authentication.test.js"
             "__tests__/wp-i-treasury-promotion-race.test.js"
           )
           npx jest --runInBand --forceExit "${SUITES[@]}"
