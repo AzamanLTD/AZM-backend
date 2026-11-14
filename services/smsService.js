@@ -134,18 +134,15 @@ class SMSService {
         this._redisClient = null;
         if (process.env.REDIS_URL) {
             try {
-                const Redis = require('ioredis');
-                const isTLS = process.env.REDIS_URL.startsWith('rediss://');
-                this._redisClient = new Redis(process.env.REDIS_URL, {
-                    maxRetriesPerRequest: 2,
-                    enableReadyCheck: false,
-                    lazyConnect: true,
-                    ...(isTLS ? { tls: {} } : {}),
-                });
-                this._redisClient.on('error', (e) => {
-                    logger.error({ err: e }, '[SMSService] Redis error (OTP store)');
-                });
-                logger.info('[SMSService] OTP store: Redis' + (isTLS ? ' (TLS/Upstash)' : ''));
+                // Shared OTP connection (src/lib/redisConnection.js): one client
+                // for this profile, bounded backoff, TLS verification intact.
+                // OTP codes must never be stored in two places per instance.
+                const { getRedis } = require('../src/lib/redisConnection');
+                this._redisClient = getRedis('otp');
+                if (!this._redisClient) {
+                    throw new Error('REDIS_URL is set but the shared Redis client could not be created');
+                }
+                logger.info('[SMSService] OTP store: Redis (shared otp profile)');
             } catch (e) {
                 if (this.isProduction) {
                     // Fail closed: an in-process Map cannot serve multiple
