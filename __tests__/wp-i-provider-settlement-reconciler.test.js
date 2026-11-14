@@ -175,6 +175,66 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
         expect(await prisma.providerSettlementWitness.count()).toBe(0);
     });
 
+    // ── Case 11: an OUTBOUND observation cannot fund the treasury ───────────
+    test('11: an OUTBOUND provider observation cannot fund a treasury opening, while the INBOUND one can', async () => {
+        const fiatLiquidity = require('../src/services/fiatLiquidityService');
+        const witnesses = require('../src/services/providerSettlementWitnessService');
+
+        await prisma.fiatLiquidityState.deleteMany({ where: { id: 1 } });
+        await prisma.fiatLiquidityState.create({
+            data: { id: 1, availableGhs: 0, reservedGhs: 0, inTransitGhs: 0, paidOutGhs: 0, reconciliationHeldGhs: 0 },
+        });
+
+        // A treasury opening funded by a real, independently fetched witness.
+        await prisma.$transaction((tx) => fiatLiquidity.recordReceipt(tx, {
+            provider: 'AZM_TREASURY', rail: 'INTERNAL', dedupKey: 'treasury:dir-a',
+            amountGhs: 100, treasury: true, evidence: { kind: 'AUDITED_TREASURY_OPENING' },
+        }));
+        const raw = JSON.stringify({ status: 1, data: { state: 'SETTLED', value: '100.00', accountnumber: 'WALLET-AZM-1' } });
+        await prisma.$transaction((tx) => witnesses.recordProviderSettlementWitness(tx, {
+            openingDedupKey: 'treasury:dir-a',
+            provider: 'MOOLRE',
+            fundingType: 'COLLECTION',
+            endpoint: 'https://api.moolre.com/open/transact/status',
+            requestParams: { reference: 'REF-DIR' },
+            rawResponse: raw,
+            providerPayload: { state: 'SETTLED', value: '100.00' },
+            fetchedAt: new Date(),
+            walletAccount: 'WALLET-AZM-1',
+            currencyMapping: { 'WALLET-AZM-1': 'GHS' },
+        }));
+
+        // The matching settlement at the provider is OUTBOUND — money leaving,
+        // not money arriving. It must not open the treasury.
+        await prisma.fiatProviderEvent.create({
+            data: {
+                provider: 'MOOLRE', rail: 'BANK', direction: 'OUTBOUND', status: 'SETTLED',
+                providerRef: 'REF-DIR', dedupKey: 'event:dir-out', amountGhs: 100,
+            },
+        });
+
+        await expect(prisma.$transaction((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+            dedupKey: 'treasury:dir-a', providerEventDedupKey: 'event:dir-out',
+        }))).rejects.toThrow(/OUTBOUND/i);
+
+        const stateAfterOutbound = await prisma.fiatLiquidityState.findUnique({ where: { id: 1 } });
+        expect(String(stateAfterOutbound.availableGhs)).toBe('0');
+
+        // Positive control: the SAME opening with the correct INBOUND
+        // observation does fund, so the refusal above was about direction.
+        await prisma.fiatProviderEvent.create({
+            data: {
+                provider: 'MOOLRE', rail: 'BANK', direction: 'INBOUND', status: 'SETTLED',
+                providerRef: 'REF-DIR-IN', dedupKey: 'event:dir-in', amountGhs: 100,
+            },
+        });
+        await prisma.$transaction((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+            dedupKey: 'treasury:dir-a', providerEventDedupKey: 'event:dir-in',
+        }));
+        const stateAfterInbound = await prisma.fiatLiquidityState.findUnique({ where: { id: 1 } });
+        expect(String(stateAfterInbound.availableGhs)).toBe('100');
+    });
+
     // ── Case 19: funding type the status endpoint cannot witness ────────────
     test('19: a funding type with no supported witness is refused', async () => {
         await seedOpening(OPENING_A);
