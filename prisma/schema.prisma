@@ -7588,6 +7588,11 @@ model SavedBankBeneficiary {
 model ProviderSettlementWitness {
   id               String   @id @default(uuid())
   openingDedupKey  String   @unique // single-use binding to exactly one opening
+  // Single-use binding on the OBSERVATION itself: the digest identity of the
+  // provider lookup (provider|fundingType|endpoint|requested reference). It is
+  // unique so one provider settlement can never fund two treasury openings;
+  // null only for witnesses written before this binding existed.
+  observationKey   String?  @unique
   provider         String
   fundingType      String // COLLECTION | BANK_VIRTUAL_ACCOUNT | PAYMENT_ID | WALLET_INFLOW
   witnessKind      String // which provider lookup produced this witness

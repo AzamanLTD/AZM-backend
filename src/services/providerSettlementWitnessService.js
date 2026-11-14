@@ -298,9 +298,40 @@ async function recordProviderSettlementWitness(tx, input = {}) {
     );
   }
 
-  const witness = await tx.providerSettlementWitness.create({
+  // Single-use binding on the provider observation (WP-I matrix case 26): one
+  // settlement can fund exactly ONE treasury opening. Identity is derived from
+  // what was actually queried, not from anything the caller may vary, and the
+  // unique index is the real guard under concurrency — the pre-check exists so
+  // the common path fails with a typed reason instead of a raw constraint error.
+  // The identity must identify the OBSERVATION, not merely the call shape. A
+  // witness recorded without requestParams.id still describes one specific
+  // payment, so fall back to the reference the provider reported and finally to
+  // the response bytes themselves — two different payments can never collide,
+  // and the same payment always does.
+  const observedReference = requestParams?.id
+    ?? requestParams?.reference
+    ?? providerPayload?.externalref
+    ?? providerPayload?.reference
+    ?? providerPayload?.transactionid
+    ?? digestOf(rawResponse);
+  const observationKey = crypto
+    .createHash('sha256')
+    .update([String(provider), fundingType, String(endpoint), String(observedReference)].join('|'))
+    .digest('hex');
+  const alreadyUsed = await tx.providerSettlementWitness.findUnique({ where: { observationKey } });
+  if (alreadyUsed) {
+    throw new WitnessError(
+      'WITNESS_OBSERVATION_ALREADY_USED',
+      `[wp-i] this provider settlement already vouches for opening ${alreadyUsed.openingDedupKey}; one observation cannot fund a second opening`
+    );
+  }
+
+  let witness;
+  try {
+    witness = await tx.providerSettlementWitness.create({
     data: {
       openingDedupKey,
+      observationKey,
       provider: String(provider),
       fundingType,
       witnessKind: requiredWitness,
@@ -316,7 +347,17 @@ async function recordProviderSettlementWitness(tx, input = {}) {
       // The exact bytes are retained so a later audit can recompute the digest.
       rawResponse: String(rawResponse ?? ''),
     },
-  });
+    });
+  } catch (err) {
+    // Concurrent writers both pass the pre-check; the unique index settles it.
+    if (err && err.code === 'P2002') {
+      throw new WitnessError(
+        'WITNESS_OBSERVATION_ALREADY_USED',
+        '[wp-i] this provider settlement is already bound to another opening'
+      );
+    }
+    throw err;
+  }
 
   return witness;
 }
