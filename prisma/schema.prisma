@@ -3670,7 +3670,12 @@ model BusinessOrder {
   orderRef          String              @unique
   title             String              @db.VarChar(200)
   description       String?             @db.VarChar(500)
-  amountUsdc        Decimal             @db.Decimal(20, 8)
+  amountUsdc        Decimal?            @db.Decimal(20, 8) // nullable: a native-GHS order carries no USDC amount at all
+  /// 'GHS' | 'USDC' | NULL. NULL means a legacy row whose meaning is USDC by history.
+  /// Never infer currency from which column is populated: the DB CHECK enforces the pairing.
+  currency          String?             @db.VarChar(8) // 8, not 3: the asset is "USDC" (4 chars), not ISO "USD"
+  /// Exact native GHS, 2dp pesewas. NOT a valuation: this is the amount the merchant charged.
+  amountGhs         Decimal?            @db.Decimal(20, 2)
   customerNotes     String?             @db.VarChar(500)
   deliveryNotes     String?             @db.VarChar(500)
   deliveredAt       DateTime?
