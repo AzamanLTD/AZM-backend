@@ -232,13 +232,15 @@ class BullScheduler {
             logger.error(`[BullScheduler] Circuit breaker OPEN (${reason}: ${detail}) — switching ALL jobs to in-process fallback`);
             await this._shutdownBull();
             this.useBull = false;
+            // NO local fallback here. A tripped breaker means Redis stopped
+            // answering; in a multi-replica deployment every replica would trip at
+            // roughly the same moment and then each run the same financial job.
+            // Jobs stay registered and resume when the probe restores Bull.
             this.mode = 'unavailable_no_scheduling';
-            for (const [name, job] of this.jobs) {
-                if (!this.fallbacks.has(name)) {
-                    this._registerFallback(name, job.cronExpr, job.handler, job.opts);
-                }
-            }
-            logger.info(`[BullScheduler] Fallback active for ${this.fallbacks.size}/${this.jobs.size} jobs — distributed scheduling disabled until Redis recovers`);
+            logger.info(
+                `[BullScheduler] ${this.jobs.size} job(s) NOT scheduled while Redis is unavailable — `
+                + 'distributed scheduling disabled until Redis recovers (no local fallback)'
+            );
         } finally {
             this._transitioning = false;
         }
@@ -401,6 +403,20 @@ class BullScheduler {
         }
 
         if (!this.useBull && !this.fallbacks.has(name)) {
+            // ENFORCEMENT POINT. Local scheduling is only legal in the explicit
+            // single-instance mode. In 'disabled_no_scheduling' or
+            // 'unavailable_no_scheduling' the job stays registered but is never
+            // scheduled here: a replica that merely lost Redis must not become an
+            // independent scheduler and run the same financial job again.
+            if (this.mode !== 'single_instance_fallback') {
+                this._refusedLocalScheduling = (this._refusedLocalScheduling || 0) + 1;
+                logger.error(
+                    { job: name, mode: this.mode },
+                    `[BullScheduler] NOT scheduling "${name}" locally: mode=${this.mode}. `
+                    + 'Set REDIS_URL (distributed) or SCHEDULER_SINGLE_INSTANCE=true (explicit single instance).'
+                );
+                return;
+            }
             try {
                 this._registerFallback(name, cronExpr, handler, opts);
             } catch (err) {
