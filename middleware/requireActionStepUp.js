@@ -73,4 +73,16 @@ async function consumeStepUp(tx, req) {
     });
 }
 
-module.exports = { requireActionStepUp, consumeStepUp, actionForRequest, GRANT_HEADER };
+// Enforcement is a deliberate, single-source switch. Default OFF keeps today's
+// behaviour exactly: require2FA() governs the route and nothing changes for
+// clients that have not shipped the challenge flow yet. Turning it ON swaps the
+// proof mechanism for that route rather than stacking two of them.
+function isStepUpEnforced() {
+    return String(process.env.STEP_UP_ENFORCEMENT || '').toLowerCase() === 'on';
+}
+
+function whenStepUpEnforced(middleware) {
+    return (req, res, next) => (isStepUpEnforced() ? middleware(req, res, next) : next());
+}
+
+module.exports = { requireActionStepUp, consumeStepUp, actionForRequest, isStepUpEnforced, whenStepUpEnforced, GRANT_HEADER };
