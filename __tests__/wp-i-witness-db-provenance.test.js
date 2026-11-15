@@ -134,7 +134,7 @@ describeDb('WP-I database provenance (real PostgreSQL roles)', () => {
         const { assertReconcilerContext, WitnessWriterNotPermittedError } =
             require('../src/services/providerSettlementWitnessService');
         const savedMode = process.env.AZM_RECONCILER_MODE;
-        const savedKey = process.env.AZM_RECONCILER_PROVIDER_KEY;
+        const savedKey = process.env.AZM_RECONCILER_PROVIDER_USER;
         delete process.env.AZM_RECONCILER_MODE;
         delete process.env.AZM_RECONCILER_PROVIDER_USER;
         delete process.env.AZM_RECONCILER_PROVIDER_PUBKEY;
@@ -142,7 +142,7 @@ describeDb('WP-I database provenance (real PostgreSQL roles)', () => {
             expect(() => assertReconcilerContext()).toThrow(WitnessWriterNotPermittedError);
         } finally {
             if (savedMode !== undefined) process.env.AZM_RECONCILER_MODE = savedMode;
-            if (savedKey !== undefined) process.env.AZM_RECONCILER_PROVIDER_KEY = savedKey;
+            if (savedKey !== undefined) { process.env.AZM_RECONCILER_PROVIDER_USER = savedKey; process.env.AZM_RECONCILER_PROVIDER_PUBKEY = savedKey; }
         }
     });
 });

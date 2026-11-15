@@ -11,7 +11,7 @@ A second credential *inside* the API process would be theatre: a compromised API
 process reads it from memory. What limits the blast radius is a separate
 component with:
 
-- its own provider credential (`AZM_RECONCILER_PROVIDER_KEY`),
+- its own provider credential (`AZM_RECONCILER_PROVIDER_USER + AZM_RECONCILER_PROVIDER_PUBKEY`),
 - its own database login (`WITNESS_DATABASE_URL`) that can **append** a witness
   and nothing else,
 - its own egress identity, so provider-side allowlists can name it.
@@ -24,7 +24,7 @@ that takes user requests.
 | Variable | Meaning |
 | --- | --- |
 | `AZM_RECONCILER_MODE` | Enables the writer guard. Anything non-empty. |
-| `AZM_RECONCILER_PROVIDER_KEY` | Provider API credential (`X-API-KEY`). |
+| `AZM_RECONCILER_PROVIDER_USER + AZM_RECONCILER_PROVIDER_PUBKEY` | Provider API credential (`X-API-KEY`). |
 | `WITNESS_DATABASE_URL` | Reconciler DB login — INSERT on `ProviderSettlementWitness` only. |
 | `WITNESS_ACCOUNT_CURRENCY_MAP` | Authoritative account → currency JSON, e.g. `{"1000000001":"GHS"}`. |
 

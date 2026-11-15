@@ -15,7 +15,7 @@
  *
  * Required environment (all distinct from the API process):
  *   AZM_RECONCILER_MODE=1                 enables the writer guard
- *   AZM_RECONCILER_PROVIDER_KEY           provider API credential
+ *   AZM_RECONCILER_PROVIDER_USER + AZM_RECONCILER_PROVIDER_PUBKEY           provider API credential
  *   WITNESS_DATABASE_URL                  reconciler DB login (INSERT only)
  *   WITNESS_ACCOUNT_CURRENCY_MAP          authoritative account -> currency JSON
  */

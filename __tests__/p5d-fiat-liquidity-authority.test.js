@@ -117,7 +117,8 @@ async function recordWitness(openingDedupKey, amountGhs, ref) {
     const value = Number(amountGhs).toFixed(2);
     const raw = JSON.stringify({ status: 1, data: { state: 'SETTLED', value, accountnumber: '1000000001' } });
     process.env.AZM_RECONCILER_MODE = '1';
-    process.env.AZM_RECONCILER_PROVIDER_KEY = 'test-reconciler-key';
+    process.env.AZM_RECONCILER_PROVIDER_USER = 'reconciler-user';
+        process.env.AZM_RECONCILER_PROVIDER_PUBKEY = 'test-reconciler-key';
     try {
         return await inTx((tx) => witnesses.recordProviderSettlementWitness(tx, {
             openingDedupKey, provider: 'MOOLRE', fundingType: 'COLLECTION',
