@@ -904,54 +904,63 @@ class PayoutBatchWorker {
     // reconciliation worker, so an existing authority always keeps it.
     // Returns true when the flag landed.
     async _claimForManualReview(withdrawal, reason, metadata = {}, claimableStatuses, phase = 'PRE_DISPATCH') {
+        // §WP-H D2 — EVIDENCE AND STATUS ARE ONE DECISION.
+        // The exception row and the status CAS used to be two independent
+        // operations: evidence could commit against a row another worker then
+        // dispatched, and a losing CAS left the evidence behind pointing at a
+        // park that never happened. They now run in ONE transaction under the
+        // shared authority lock, so a losing CAS rolls its evidence back and a
+        // parking decision cannot race an activation. No provider I/O here.
+        let claimed = false;
         try {
-            await recordReconciliationException(this.prisma, {
-                entityType: 'WITHDRAWAL',
-                entityId: String(withdrawal.id),
-                reference: metadata.referenceId || null,
-                reason,
-                details: { ...metadata, phase, claimedFrom: claimableStatuses },
+            claimed = await this.prisma.$transaction(async (tx) => {
+                await authorityState.lockAuthorityShared(tx);
+                await recordReconciliationException(tx, {
+                    entityType: 'WITHDRAWAL',
+                    entityId: String(withdrawal.id),
+                    reference: metadata.referenceId || null,
+                    reason,
+                    details: { ...metadata, phase, claimedFrom: claimableStatuses },
+                });
+                const claim = await tx.withdrawal.updateMany({
+                    where: { id: withdrawal.id, status: { in: claimableStatuses } },
+                    data: { status: 'NEEDS_MANUAL_REVIEW' }
+                });
+                // A stale scan must never overwrite PROCESSING or a terminal
+                // state: count 0 rolls the evidence write back with it.
+                return claim.count === 1;
             });
         } catch (evidenceErr) {
             logger.error({ err: evidenceErr, reason, withdrawalId: withdrawal.id },
-                '[payoutBatchWorker] parking evidence write failed — NOT parking; the existing status authority keeps the row');
+                '[payoutBatchWorker] parking evidence/claim transaction failed — NOT parking; the existing status authority keeps the row');
             return false;
         }
 
-        try {
-            const claim = await this.prisma.withdrawal.updateMany({
-                where: { id: withdrawal.id, status: { in: claimableStatuses } },
-                data: { status: 'NEEDS_MANUAL_REVIEW' }
-            });
-            if (claim.count === 0) {
-                const current = await this.prisma.withdrawal.findUnique({
-                    where: { id: withdrawal.id },
-                    select: { status: true }
-                }).catch(() => null);
-                logger.info(
-                    `[PayoutBatchWorker] skip flag #${withdrawal.id} (${reason}) — row is ` +
-                    `${current ? current.status : 'GONE'}, not ${claimableStatuses.join('/')} ` +
-                    `(a concurrent worker or terminal state owns it — stale scan does nothing)`
-                );
-                return false;
-            }
-
-            if (this.notificationService) {
-                await this.notificationService.sendNotification({
-                    userId: withdrawal.userId,
-                    title: 'Withdrawal Under Review',
-                    message: 'Your withdrawal is being reviewed by our team. This usually takes less than 24 hours.',
-                    type: 'WITHDRAWAL_REVIEW',
-                    category: 'GENERAL'
-                }).catch(() => {});
-            }
-
-            logger.info(`[PayoutBatchWorker] flagged withdrawal #${withdrawal.id} → NEEDS_MANUAL_REVIEW (${reason})`);
-            return true;
-        } catch (err) {
-            logger.error(`[PayoutBatchWorker] failed to flag withdrawal #${withdrawal.id}:`, err.message);
+        if (!claimed) {
+            const current = await this.prisma.withdrawal.findUnique({
+                where: { id: withdrawal.id },
+                select: { status: true }
+            }).catch(() => null);
+            logger.info(
+                `[payoutBatchWorker] skip flag #${withdrawal.id} (${reason}) — row is ` +
+                `${current ? current.status : 'GONE'}, not ${claimableStatuses.join('/')} ` +
+                `(a concurrent worker or terminal state owns it — stale scan does nothing)`
+            );
             return false;
         }
+
+        if (this.notificationService) {
+            await this.notificationService.sendNotification({
+                userId: withdrawal.userId,
+                title: 'Withdrawal Under Review',
+                message: 'Your withdrawal is being reviewed by our team. This usually takes less than 24 hours.',
+                type: 'WITHDRAWAL_REVIEW',
+                category: 'GENERAL'
+            }).catch(() => {});
+        }
+
+        logger.info(`[payoutBatchWorker] flagged withdrawal #${withdrawal.id} → NEEDS_MANUAL_REVIEW (${reason})`);
+        return true;
     }
 
     // PRE-DISPATCH eligibility parking — PENDING/APPROVED only. The row was
