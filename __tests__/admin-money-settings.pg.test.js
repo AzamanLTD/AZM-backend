@@ -110,7 +110,11 @@ describeDb('money settings (real Postgres)', () => {
         expect(byKey['fxSpread.CONVERT_GHS_TO_USDC'].value).toBeNull();
         expect(byKey['fxSpread.CONVERT_GHS_TO_USDC'].source).toBe('unset');
 
-        expect(byKey.balanceHeadlineMode.value).toBe('COMBINED_ESTIMATE');
+        // GHS-first: PR #369 supersedes the combined formula, so the reported
+        // owner decision must match the contract the backend actually implements.
+        expect(byKey.balanceHeadlineMode.value).toBe('NATIVE_ONLY');
+        // and the supersession must be disclosed rather than silently dropped
+        expect(contract.SUPERSEDED_HEADLINE_MODES.COMBINED_ESTIMATE).toMatch(/PR #369/);
         expect(byKey.balanceHeadlineMode.ownerResolved).toBe(true);
         expect(snap.ownerResolved.editableThroughThisApi).toBe(false);
     });
@@ -205,7 +209,7 @@ describeDb('money settings (real Postgres)', () => {
         expect(await prisma.adminMoneySettingRevision.count()).toBe(0);
         const snap = await service.getSnapshot(prisma);
         const headline = snap.settings.find((s) => s.key === 'balanceHeadlineMode');
-        expect(headline.value).toBe('COMBINED_ESTIMATE');
+        expect(headline.value).toBe('NATIVE_ONLY');
     });
 
     test('a change with no reason is refused (both field names checked)', async () => {

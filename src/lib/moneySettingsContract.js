@@ -78,7 +78,27 @@ const HEADLINE_MODES = Object.freeze(['COMBINED_ESTIMATE', 'NATIVE_ONLY']);
  * exposed through this API.
  */
 const OWNER_RESOLVED_KEY = 'balanceHeadlineMode';
-const OWNER_RESOLVED_VALUE = 'COMBINED_ESTIMATE';
+
+/**
+ * The owner-resolved value is NATIVE_ONLY, not COMBINED_ESTIMATE.
+ *
+ * The work packet recorded COMBINED_ESTIMATE as the then-current owner decision.
+ * The backend has since landed the GHS-first valuation contract (PR #369,
+ * "Native-GHS valuation contract — GHS-first"), which states plainly that the
+ * headline is the authoritative native-GHS balance ONLY and that the earlier
+ * combined formula is *superseded*. PR #369 also pins a regression: native GHS
+ * 100 with USDC 500 at rate 10 must render a 100 GHS headline, never a combined
+ * figure, and a missing FX rate must never blank the GHS headline.
+ *
+ * Reporting COMBINED_ESTIMATE here would tell the Admin Portal that a formula
+ * the backend no longer implements is in force. The key, its history and its
+ * owner-resolved protection are unchanged; only the value being reported is
+ * corrected to match the code.
+ */
+const OWNER_RESOLVED_VALUE = 'NATIVE_ONLY';
+const SUPERSEDED_HEADLINE_MODES = Object.freeze({
+    COMBINED_ESTIMATE: 'Superseded by the GHS-first valuation contract (backend PR #369): the headline is the native GHS balance only, and the USDC figure is an estimate displayed beneath it, never folded into the headline.',
+});
 
 const SETTING_KINDS = Object.freeze({
     'quoteTtl.payment_topup': 'int',
@@ -310,6 +330,7 @@ module.exports = {
     STEP_UP_THRESHOLD,
     HEADLINE_MODES,
     OWNER_RESOLVED_KEY,
+    SUPERSEDED_HEADLINE_MODES,
     OWNER_RESOLVED_VALUE,
     SETTING_KINDS,
     BOUNDS,

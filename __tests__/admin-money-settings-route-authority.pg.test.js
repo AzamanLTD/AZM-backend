@@ -132,6 +132,6 @@ describeOrSkip('money settings route authority (real PostgreSQL)', () => {
         expect(await revisions()).toBe(0);
         const snapshot = await request(app).get(URL_BASE).set('Authorization', bearer(finance));
         const headline = snapshot.body.settings.find((s) => s.key === 'balanceHeadlineMode');
-        expect(headline.value).toBe('COMBINED_ESTIMATE');
+        expect(headline.value).toBe('NATIVE_ONLY');
     });
 });
