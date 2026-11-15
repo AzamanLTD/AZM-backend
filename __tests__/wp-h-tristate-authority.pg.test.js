@@ -147,7 +147,7 @@ afterAll(async () => {
     if (!adminPg) return;
     try {
         await adminPg.$executeRawUnsafe(`DROP DATABASE IF EXISTS ${q(DB)} WITH (FORCE)`);
-        for (const r of [ROLE.runtime, ROLE.operator, ROLE.migrator, ROLE.owner]) {
+        for (const r of [ROLE.runtime, ROLE.operator, ROLE.migrator, ROLE.fnOwner, ROLE.owner]) {
             await adminPg.$executeRawUnsafe(`DROP ROLE IF EXISTS ${q(r)}`);
         }
     } catch (_) { /* best effort */ }
@@ -460,4 +460,82 @@ describe('WP-H tri-state authority (real PostgreSQL logins)', () => {
             else process.env.AUTHORITY_ENFORCEMENT_MODE = prev;
         }
     }, 60000);
+    // ── B: the runtime AТTESTATION must refuse a mutated boundary ───────────
+    // Each case mutates ONE property of an otherwise sound boundary, proves the
+    // state becomes UNKNOWN, then restores it and proves the boundary is whole
+    // again. A check that passed any of these would be a check that proves
+    // nothing.
+    const FN_SIG = 'public.azm_authority_activate(text,text,text,text,text)';
+
+    async function attack(sql, undo, label) {
+        await admin.$executeRawUnsafe(sql);
+        try {
+            const resolved = await A.resolveAuthorityState(runtime);
+            expect({ label, state: resolved.state }).toEqual({ label, state: A.AUTHORITY_STATE.UNKNOWN });
+            expect(resolved.unit).toBeNull();
+            expect(resolved.active).toBeNull();
+        } finally {
+            await admin.$executeRawUnsafe(undo);
+        }
+        // The legitimate boundary must be whole again.
+        const restored = await A.resolveAuthorityState(runtime);
+        expect({ label, unexpected: restored.state === A.AUTHORITY_STATE.UNKNOWN }).toEqual({ label, unexpected: false });
+    }
+
+    t('a LOGIN function owner refuses', async () => {
+        await attack(
+            `ALTER ROLE ${q(ROLE.fnOwner)} LOGIN`,
+            `ALTER ROLE ${q(ROLE.fnOwner)} NOLOGIN`,
+            'LOGIN function owner');
+    });
+
+    t('a function owner that can create roles refuses', async () => {
+        await attack(
+            `ALTER ROLE ${q(ROLE.fnOwner)} CREATEROLE`,
+            `ALTER ROLE ${q(ROLE.fnOwner)} NOCREATEROLE`,
+            'CREATEROLE function owner');
+    });
+
+    t('SECURITY INVOKER substitution refuses', async () => {
+        await attack(
+            `ALTER FUNCTION ${FN_SIG} SECURITY INVOKER`,
+            `ALTER FUNCTION ${FN_SIG} SECURITY DEFINER`,
+            'security invoker');
+    });
+
+    t('a tampered search_path refuses', async () => {
+        await attack(
+            `ALTER FUNCTION ${FN_SIG} SET search_path = public`,
+            `ALTER FUNCTION ${FN_SIG} SET search_path = pg_catalog`,
+            'search_path drift');
+    });
+
+    t('PUBLIC EXECUTE on the activation function refuses', async () => {
+        await attack(
+            `GRANT EXECUTE ON FUNCTION ${FN_SIG} TO PUBLIC`,
+            `REVOKE EXECUTE ON FUNCTION ${FN_SIG} FROM PUBLIC`,
+            'PUBLIC execute');
+    });
+
+    t('runtime EXECUTE on the activation function refuses', async () => {
+        await attack(
+            `GRANT EXECUTE ON FUNCTION ${FN_SIG} TO ${q(ROLE.runtime)}`,
+            `REVOKE EXECUTE ON FUNCTION ${FN_SIG} FROM ${q(ROLE.runtime)}`,
+            'runtime execute');
+    });
+
+    t('a direct operator INSERT on the protected record refuses', async () => {
+        await attack(
+            `GRANT INSERT ON "FiatLiquidityAuthorityActivation" TO ${q(ROLE.operator)}`,
+            `REVOKE INSERT ON "FiatLiquidityAuthorityActivation" FROM ${q(ROLE.operator)}`,
+            'operator direct insert');
+    });
+
+    t('a function owner that can rewrite the protected record refuses', async () => {
+        await attack(
+            `GRANT UPDATE ON "FiatLiquidityAuthorityActivation" TO ${q(ROLE.fnOwner)}`,
+            `REVOKE UPDATE ON "FiatLiquidityAuthorityActivation" FROM ${q(ROLE.fnOwner)}`,
+            'function owner update');
+    });
+
 });
