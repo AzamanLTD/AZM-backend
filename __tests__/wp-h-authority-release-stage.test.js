@@ -68,6 +68,52 @@ describe('WP-H release-chain authority verification', () => {
         expect(r.ok).toBe(false);
     });
 
+    test('the CI shape: table present, nothing installed, runtime unsplit -> NOT_PROVISIONED and passes', async () => {
+        // Exactly what a schema-pushed database looks like: the table exists because
+        // the schema creates it, but no guard triggers, no activation function, and
+        // the runtime still owns it. This must NOT block a release.
+        inspectAs([
+            enforcement.PROBLEM.RUNTIME_IS_SUPERUSER,
+            enforcement.PROBLEM.RUNTIME_OWNS_TABLE,
+            enforcement.PROBLEM.RUNTIME_CAN_SET_ROLE_TO_OWNER,
+            enforcement.PROBLEM.RUNTIME_CAN_INSERT,
+            enforcement.PROBLEM.RUNTIME_CAN_UPDATE,
+            enforcement.PROBLEM.RUNTIME_CAN_DELETE,
+            enforcement.PROBLEM.RUNTIME_CAN_TRUNCATE,
+            enforcement.PROBLEM.RUNTIME_CAN_CREATE_TRIGGER,
+            enforcement.PROBLEM.TRIGGER_FUNCTION_MISSING,
+            enforcement.PROBLEM.ACTIVATION_FUNCTION_MISSING,
+        ]);
+        const log = jest.fn();
+        const r = await verifyAuthorityBoundary({}, { log });
+        expect(r.verdict).toBe('NOT_PROVISIONED');
+        expect(r.ok).toBe(true);
+        expect(log.mock.calls.flat().join(' ')).toMatch(/UNENFORCED/);
+    });
+
+    test('once the split is done, the SAME missing objects are DRIFT, not "not provisioned"', async () => {
+        // runtime is a dedicated non-owner role, so the boundary SHOULD be installed;
+        // a missing guard trigger is now real drift and must stop the release.
+        inspectAs([
+            enforcement.PROBLEM.TRIGGER_FUNCTION_MISSING,
+            enforcement.PROBLEM.ACTIVATION_FUNCTION_MISSING,
+        ]);
+        const r = await verifyAuthorityBoundary({}, {});
+        expect(r.verdict).toBe('DRIFT');
+        expect(r.ok).toBe(false);
+    });
+
+    test('never-provisioned fails under --strict', async () => {
+        inspectAs([
+            enforcement.PROBLEM.RUNTIME_IS_SUPERUSER,
+            enforcement.PROBLEM.TRIGGER_FUNCTION_MISSING,
+            enforcement.PROBLEM.ACTIVATION_FUNCTION_MISSING,
+        ]);
+        const r = await verifyAuthorityBoundary({}, { strict: true });
+        expect(r.verdict).toBe('NOT_PROVISIONED_STRICT');
+        expect(r.ok).toBe(false);
+    });
+
     test('a sound boundary passes', async () => {
         inspectAs([]);
         const r = await verifyAuthorityBoundary({}, {});

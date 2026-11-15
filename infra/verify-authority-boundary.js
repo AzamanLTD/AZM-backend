@@ -23,6 +23,17 @@ const { inspectEnforcement, PROBLEM } = require('../src/services/authorityActiva
 // distinct from "present and wrong", which is drift and must stop the release.
 const ABSENT_PROBLEMS = new Set([PROBLEM.TABLE_MISSING]);
 
+// The protected TABLE comes from the schema, not from the role installer, so a
+// database can easily have the table and NOTHING else. That is not drift: it is a
+// database where the boundary was never installed.
+const NEVER_INSTALLED = [PROBLEM.TRIGGER_FUNCTION_MISSING, PROBLEM.ACTIVATION_FUNCTION_MISSING];
+
+// The connection split is the prerequisite for all of this. While the runtime is
+// a superuser or the table owner, enforcement is impossible by construction, so
+// "not provisioned" is the honest verdict and the deploy must not be blocked.
+// Once the split lands these two go false and every missing object becomes drift.
+const UNSPLIT = [PROBLEM.RUNTIME_IS_SUPERUSER, PROBLEM.RUNTIME_OWNS_TABLE];
+
 async function verifyAuthorityBoundary(prisma, { strict = false, log = () => {} } = {}) {
     const result = await inspectEnforcement(prisma);
     const problems = Array.isArray(result.problems) ? result.problems : [];
@@ -31,11 +42,14 @@ async function verifyAuthorityBoundary(prisma, { strict = false, log = () => {} 
     // to certify it. The release stays green only on a positively absent boundary.
     const probeFailed = problems.includes(PROBLEM.ENFORCEMENT_PROBE_FAILED);
     const absent = problems.length > 0 && problems.every((p) => ABSENT_PROBLEMS.has(p));
+    const neverInstalled = NEVER_INSTALLED.every((p) => problems.includes(p));
+    const unsplit = UNSPLIT.some((p) => problems.includes(p));
 
     let verdict;
     if (probeFailed) verdict = 'UNVERIFIABLE';
     else if (absent) verdict = strict ? 'ABSENT_STRICT' : 'ABSENT';
     else if (problems.length === 0) verdict = 'SOUND';
+    else if (neverInstalled && unsplit) verdict = strict ? 'NOT_PROVISIONED_STRICT' : 'NOT_PROVISIONED';
     else verdict = 'DRIFT';
 
     if (verdict === 'ABSENT') {
@@ -44,7 +58,16 @@ async function verifyAuthorityBoundary(prisma, { strict = false, log = () => {} 
         log('  node infra/install-authority-activation-function.js --role-scoped');
         log('Nothing was created by this stage.');
     }
+    if (verdict === 'NOT_PROVISIONED') {
+        log('authority boundary EXISTS but was never provisioned: no guard triggers, no');
+        log('activation function, and the runtime identity still owns the table.');
+        log('Enforcement cannot be attested from this connection. This deploy proceeds');
+        log('UNENFORCED. Provisioning is a DBA action:');
+        log('  node infra/install-authority-activation-roles.js --owner=... --runtime=... --operator=...');
+        log('  node infra/install-authority-activation-function.js --role-scoped');
+    }
     if (verdict === 'ABSENT_STRICT') log('authority boundary is ABSENT and --strict was requested.');
+    if (verdict === 'NOT_PROVISIONED_STRICT') log('authority boundary was never provisioned and --strict was requested.');
     if (verdict === 'SOUND') log('authority boundary is provisioned and sound.');
     if (verdict === 'DRIFT' || verdict === 'UNVERIFIABLE') {
         log(`authority boundary is ${verdict === 'DRIFT' ? 'DRIFTED' : 'UNVERIFIABLE'}: ${problems.join(', ')}`);
@@ -53,7 +76,7 @@ async function verifyAuthorityBoundary(prisma, { strict = false, log = () => {} 
     return {
         verdict,
         problems,
-        ok: verdict === 'SOUND' || verdict === 'ABSENT',
+        ok: verdict === 'SOUND' || verdict === 'ABSENT' || verdict === 'NOT_PROVISIONED',
         diagnostics: result.diagnostics || null,
     };
 }
