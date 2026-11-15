@@ -268,6 +268,12 @@ jobs:
         # TOTP fails closed (503). Idempotent; mirrors the release chain.
         run: node infra/install-app-unlock-totp-claim.js
 
+      # §WP-H: verifies the authority boundary and provisions NOTHING.
+      # Absent boundary exits 0 (un-split DB cannot be enforced);
+      # drift or an unreadable probe exits 1 and stops the lane.
+      - name: Verify authority boundary (creates nothing)
+        run: node infra/verify-authority-boundary.js
+
       - name: Install inventory restock authority
         run: node infra/install-inventory-restock-overlay.js
 

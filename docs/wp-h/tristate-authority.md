@@ -108,3 +108,58 @@ disposable database and roles.
 | `src/services/fiatLiquidityActivationService.js` | 10 |
 | `src/services/fiatLiquidityService.js` | 1 |
 | `workers/payoutBatchWorker.js` | 1 |
+
+## The five-role boundary (as installed)
+
+| Role | Login | Purpose | Holds |
+|---|---|---|---|
+| table owner | `NOLOGIN` | owns `FiatLiquidityAuthorityActivation` and the immutability trigger function | all on its own objects |
+| function owner | `NOLOGIN` | owns the `SECURITY DEFINER` activation function | exactly the column privileges the body needs |
+| runtime | `LOGIN` | the application connection | `SELECT` on the protected record, nothing else |
+| operator | `LOGIN` | the sanctioned activation caller | `EXECUTE` on the activation function, **no** direct DML on the record |
+| migrator | `LOGIN` | schema provisioning | DDL only, never runtime |
+
+The table/trigger owner and the activation-function owner are **distinct trusted roles**. If one
+role holds both, a compromise of the definer body is a compromise of the record's owner.
+
+## One resolver, one answer
+
+`infra/lib/authority-roles.js` is the only place a role identity is decided. Precedence, highest
+first: **explicit option → environment (`AUTHORITY_OWNER_ROLE`, `AUTHORITY_RUNTIME_ROLE`,
+`AUTHORITY_OPERATOR_ROLE`, `AUTHORITY_FN_OWNER_ROLE`) → canonical default**, with the function
+owner DERIVED from the resolved owner (`<owner>_fn`) rather than defaulted separately. Every
+entry point uses it: both installers, every programmatic call, and the CLIs. Colliding identities
+are refused before any DDL.
+
+## Restore is not provisioning
+
+A bare overlay run (the `npm run release` chain, a CI schema restore) names no roles and
+therefore returns `SKIPPED_NOT_PROVISIONED` with `provisioned: false` **before** creating or
+altering any role, function, grant or ownership. This is deliberate: a restore that silently
+provisioned an authority boundary would make a schema pipeline the owner of a security decision.
+It also means the release chain no longer provisions the authority roles, so production must run
+the explicit command below.
+
+## DBA provisioning command
+
+```
+node infra/install-authority-activation-roles.js \
+  --owner azm_authority_owner \
+  --runtime azm_app_runtime \
+  --operator azm_authority_operator \
+  --function-owner azm_authority_fn_owner
+```
+
+Every role must be named explicitly. A named install fails non-zero on any missing prerequisite,
+role collision, mismatched identity, absent grant, unsafe role attribute or unexpected ownership.
+It never reassigns an unexplained object, and it refuses to create or replace the activation
+function under a role that failed its ownership audit (any pre-existing copy has `EXECUTE`
+revoked from PUBLIC and the operator).
+
+## Release / runtime connection split
+
+`render.yaml` currently runs the release chain and the application with the **same** single
+`DATABASE_URL`, so in production one role is migration authority *and* runtime *and* table owner.
+Until that is split (`MIGRATION_DATABASE_URL` for release, a `SELECT`/DML-only runtime role, and
+the operator credential held outside Render), the runtime attestation cannot pass in production
+and the gate must stay closed. Do not enable `AUTHORITY_ENFORCEMENT_MODE` before the split.
