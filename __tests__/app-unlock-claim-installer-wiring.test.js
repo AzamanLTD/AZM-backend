@@ -100,6 +100,11 @@ describe('WP-D packaging — the claim table is installed by the real release pa
             'infra/install-e2ee-server-blind-overlay.js',
             'infra/install-phase3-overlay.js',
             'infra/install-payout-reconciliation-infra.js',
+            // WP-I: the settlement witness table must exist before the liquidity
+            // overlay backfills FiatLiquidityReceipt.walletAccount from it. A
+            // clean production release never runs Prisma migrations, so the
+            // table has to come from this chain.
+            'infra/install-wp-i-settlement-witness.js',
             'infra/install-fiat-liquidity-overlay.js',
             'infra/install-model-b-settlement-overlay.js',
             'infra/install-ghs-wallet-overlay.js',
