@@ -35,9 +35,13 @@ jest.mock('../src/services/fiatLiquidityService', () => ({
 }));
 jest.mock('../src/services/fiatLiquidityActivationService', () => ({
     isAuthorityModeActive: jest.fn().mockResolvedValue(false),
+    // The claim path re-reads the regime inside its transaction with the
+    // canonical reader; a mock without it makes the worker throw.
+    readMode: jest.fn().mockResolvedValue({ active: false, latched: false, flagged: false }),
 }));
 
 const PayoutBatchWorker = require('../workers/payoutBatchWorker');
+const { withTransactions } = require('./helpers/mockTransaction');
 const fiatLiquidity = require('../src/services/fiatLiquidityService');
 
 describe('payoutBatchWorker legacy fiat dispatch — exact 2-dp GHS', () => {
@@ -58,6 +62,8 @@ describe('payoutBatchWorker legacy fiat dispatch — exact 2-dp GHS', () => {
             systemFiatPool: { findUnique: jest.fn().mockResolvedValue({ balance: pool }) },
             fiatLiquidityReservation: { findUnique: jest.fn().mockResolvedValue(reservation) },
             withdrawal: {
+                // The claim re-reads the row INSIDE the claim transaction.
+                findUnique: jest.fn(async (args) => ({ id: args && args.where ? args.where.id : 91, status: 'PENDING' })),
                 findMany: jest.fn().mockResolvedValue([{
                     id: 91, userId: 7, amount: usdcAmount, destination: '0240000000', network: 'MTN',
                     payoutMethod: 'MTN_MOMO', createdAt: new Date('2026-08-30T10:00:00.000Z'),
@@ -75,7 +81,7 @@ describe('payoutBatchWorker legacy fiat dispatch — exact 2-dp GHS', () => {
             $queryRawUnsafe: jest.fn().mockResolvedValue([]),
             $executeRawUnsafe: jest.fn().mockResolvedValue(1),
         };
-        const worker = new PayoutBatchWorker(prisma, null, { initiateTransfer }, null);
+        const worker = new PayoutBatchWorker(withTransactions(prisma), null, { initiateTransfer }, null);
         return { worker, initiateTransfer };
     };
 
@@ -134,6 +140,8 @@ describe('payoutBatchWorker legacy fiat dispatch — exact 2-dp GHS', () => {
                 systemFiatPool: { findUnique: jest.fn().mockResolvedValue({ balance: pool }) },
                 fiatLiquidityReservation: { findUnique: jest.fn().mockResolvedValue(null) },
                 withdrawal: {
+                // The claim re-reads the row INSIDE the claim transaction.
+                findUnique: jest.fn(async (args) => ({ id: args && args.where ? args.where.id : 91, status: 'PENDING' })),
                     findMany: jest.fn().mockResolvedValue([{
                         id: 77, userId: 7, amount: usdcAmount, destination: '0240000000', network: 'MTN',
                         payoutMethod: 'MTN_MOMO', createdAt: new Date('2026-08-30T10:00:00.000Z'),
@@ -151,7 +159,7 @@ describe('payoutBatchWorker legacy fiat dispatch — exact 2-dp GHS', () => {
                 $queryRawUnsafe: jest.fn().mockResolvedValue([]),
                 $executeRawUnsafe: jest.fn().mockResolvedValue(1),
             };
-            const worker = new PayoutBatchWorker(prisma, null, { initiateTransfer }, null);
+            const worker = new PayoutBatchWorker(withTransactions(prisma), null, { initiateTransfer }, null);
             const result = await worker._processBatch(settings, { isManualTrigger: true });
             return { result, initiateTransfer };
         };
