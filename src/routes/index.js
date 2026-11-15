@@ -53,6 +53,8 @@ function mountRoutes(app, {
     app.use('/api/bank-beneficiaries', financialLimiter, require('../../routes/bankBeneficiaryRoutes'));
     app.use('/api/admin/chat', generalLimiter, require('../../routes/adminChatRoutes'));
     app.use('/api/security', generalLimiter, require('../../routes/securityRoutes'));
+    // §WP-H G: action-bound step-up capability (challenge + grant issuance).
+    app.use('/api/step-up', financialLimiter, require('../../routes/stepUpRoutes'));
     app.use('/api/users', generalLimiter, require('../../routes/userRoutes'));
     app.use('/api/stories', generalLimiter, require('../../routes/storyRoutes'));
     app.use('/api/stories', generalLimiter, require('../../routes/storyHighlightRoutes'));
