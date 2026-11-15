@@ -115,8 +115,22 @@ beforeAll(async () => {
             ALTER FUNCTION azm_authority_activation_immutable() OWNER TO ${q(ROLE.owner)};
             GRANT USAGE ON SCHEMA public TO ${q(ROLE.runtime)}, ${q(ROLE.operator)}, ${q(ROLE.migrator)};
             GRANT SELECT ON "GlobalSettings", "FiatLiquidityState", "SystemFiatPool" TO ${q(ROLE.runtime)}, ${q(ROLE.operator)};
-            GRANT SELECT ON "FiatLiquidityAuthorityActivation" TO ${q(ROLE.runtime)}, ${q(ROLE.operator)};
-            GRANT INSERT ON "FiatLiquidityAuthorityActivation" TO ${q(ROLE.operator)};`);
+            GRANT SELECT ON "FiatLiquidityAuthorityActivation" TO ${q(ROLE.runtime)}, ${q(ROLE.operator)};`);
+
+        // §WP-H B3: the runtime inspector attests the ACTIVATION FUNCTION as part
+        // of the boundary, so this fixture must provision the real one. It is
+        // owned by its own NOLOGIN role and is EXECUTE-only for the operator;
+        // the operator keeps NO direct INSERT (that IS the bypass).
+        const { installAuthorityActivationFunction } = require('../infra/install-authority-activation-function');
+        await installAuthorityActivationFunction(admin, {
+            tableOwner: ROLE.owner,
+            functionOwner: `${ROLE.owner}_fn`,
+            runtime: ROLE.runtime,
+            operator: ROLE.operator,
+            roleScoped: true,
+            log: () => {},
+        });
+        ROLE.fnOwner = `${ROLE.owner}_fn`;
 
         runtime = new PrismaClient({ datasources: { db: { url: urlFor(ROLE.runtime, DB) } } });
         operator = new PrismaClient({ datasources: { db: { url: urlFor(ROLE.operator, DB) } } });
@@ -216,8 +230,8 @@ describe('WP-H tri-state authority (real PostgreSQL logins)', () => {
         await expectDenied(() => migrator.$executeRawUnsafe('UPDATE "FiatLiquidityAuthorityActivation" SET "activatedBy" = \'m\' WHERE "id" = 1'));
     });
 
-    t('the narrow operator inserts the activation; the state becomes ENFORCED_ACTIVE with unit GHS', async () => {
-        await operator.$executeRawUnsafe(
+    t('provisioning seeds the activation; the state becomes ENFORCED_ACTIVE with unit GHS', async () => {
+        await admin.$executeRawUnsafe(
             `INSERT INTO "FiatLiquidityAuthorityActivation"
                ("id","activatedAt","activatedBy","approvedBy","evidenceReference","evidenceDigest")
              VALUES (1,$1,$2,$3,$4,$5)`,

@@ -88,6 +88,19 @@ const PROBLEM = Object.freeze({
     TRIGGER_MISSING: 'TRIGGER_MISSING',
     TRIGGER_DISABLED: 'TRIGGER_DISABLED',
     ENFORCEMENT_PROBE_FAILED: 'ENFORCEMENT_PROBE_FAILED',
+    // §WP-H B3 — the activation function is its own boundary. An installer
+    // success flag is not a runtime proof.
+    ACTIVATION_FUNCTION_MISSING: 'ACTIVATION_FUNCTION_MISSING',
+    ACTIVATION_FUNCTION_NOT_SECURITY_DEFINER: 'ACTIVATION_FUNCTION_NOT_SECURITY_DEFINER',
+    ACTIVATION_FUNCTION_OWNER_UNSAFE: 'ACTIVATION_FUNCTION_OWNER_UNSAFE',
+    RUNTIME_OWNS_FUNCTION: 'RUNTIME_OWNS_FUNCTION',
+    RUNTIME_CAN_SET_ROLE_TO_FUNCTION_OWNER: 'RUNTIME_CAN_SET_ROLE_TO_FUNCTION_OWNER',
+    RUNTIME_CAN_EXECUTE_ACTIVATION_FUNCTION: 'RUNTIME_CAN_EXECUTE_ACTIVATION_FUNCTION',
+    ACTIVATION_FUNCTION_SEARCH_PATH_UNPINNED: 'ACTIVATION_FUNCTION_SEARCH_PATH_UNPINNED',
+    PUBLIC_CAN_EXECUTE_ACTIVATION_FUNCTION: 'PUBLIC_CAN_EXECUTE_ACTIVATION_FUNCTION',
+    ACTIVATION_FUNCTION_EXECUTE_NOT_PINNED: 'ACTIVATION_FUNCTION_EXECUTE_NOT_PINNED',
+    NON_OWNER_CAN_WRITE_ACTIVATION_RECORD: 'NON_OWNER_CAN_WRITE_ACTIVATION_RECORD',
+    ACTIVATION_FUNCTION_OWNER_HAS_WIDE_PRIVILEGES: 'ACTIVATION_FUNCTION_OWNER_HAS_WIDE_PRIVILEGES',
 });
 
 /**
@@ -112,6 +125,146 @@ class AuthorityEnforcementUnavailable extends Error {
  * record. Read-only: no DDL, no writes, nothing that a runtime role could not
  * safely do on every request.
  */
+
+const ACTIVATION_FUNCTION_REGPROCEDURE = 'public.azm_authority_activate(text,text,text,text,text)';
+
+/**
+ * §WP-H B3 — ATTEST THE ACTIVATION FUNCTION ITSELF, from the catalog.
+ *
+ * Deliberately PROPERTY-based, not name-based: a role whose name looks right
+ * proves nothing, and a name that differs proves nothing either. What is
+ * attested is what PostgreSQL will actually enforce: who owns the function,
+ * whether that owner can log in / create roles / inherit, whether the definer
+ * search_path is pinned, who holds EXECUTE, and whether anybody other than the
+ * table owner can write the protected record.
+ *
+ * Every probe reads catalogs (pg_proc / pg_class ACLs) rather than calling
+ * has_*_privilege for OTHER roles, because those calls require the caller to be
+ * a member of the role being checked — a runtime role is not, and a probe that
+ * throws on every request would fail closed forever rather than prove safety.
+ */
+async function inspectActivationFunction(db, diagnostics, problems) {
+    let fn;
+    try {
+        const rows = await db.$queryRawUnsafe(`
+            SELECT p.oid,
+                   pg_get_userbyid(p.proowner)              AS fn_owner,
+                   p.prosecdef                               AS security_definer,
+                   p.proconfig                               AS proconfig,
+                   pg_get_userbyid(p.proowner) = current_user AS owned_by_runtime,
+                   pg_has_role(current_user, p.proowner, 'MEMBER') AS runtime_member_of_owner,
+                   coalesce(r.rolcanlogin, true)             AS owner_can_login,
+                   coalesce(r.rolsuper, true)                AS owner_superuser,
+                   coalesce(r.rolcreaterole, true)           AS owner_createrole,
+                   coalesce(r.rolcreatedb, true)             AS owner_createdb,
+                   coalesce(r.rolinherit, true)              AS owner_inherit
+              FROM pg_proc p
+              LEFT JOIN pg_roles r ON r.oid = p.proowner
+             WHERE p.oid = to_regprocedure('${ACTIVATION_FUNCTION_REGPROCEDURE}')
+        `);
+        fn = (rows && rows[0]) || null;
+    } catch (_) {
+        problems.push(PROBLEM.ENFORCEMENT_PROBE_FAILED);
+        return;
+    }
+
+    if (!fn) {
+        problems.push(PROBLEM.ACTIVATION_FUNCTION_MISSING);
+        return;
+    }
+
+    diagnostics.activationFunction = {
+        owner: fn.fn_owner,
+        securityDefiner: fn.security_definer === true,
+        proconfig: fn.proconfig,
+    };
+
+    if (fn.security_definer !== true) problems.push(PROBLEM.ACTIVATION_FUNCTION_NOT_SECURITY_DEFINER);
+    if (fn.owned_by_runtime === true) problems.push(PROBLEM.RUNTIME_OWNS_FUNCTION);
+    if (fn.runtime_member_of_owner === true) problems.push(PROBLEM.RUNTIME_CAN_SET_ROLE_TO_FUNCTION_OWNER);
+
+    // The definer identity must not be usable by anything else.
+    if (fn.owner_can_login === true
+        || fn.owner_superuser === true
+        || fn.owner_createrole === true
+        || fn.owner_createdb === true
+        || fn.owner_inherit === true) {
+        problems.push(PROBLEM.ACTIVATION_FUNCTION_OWNER_UNSAFE);
+    }
+
+    // search_path must be pinned to EXACTLY pg_catalog.
+    const proconfig = Array.isArray(fn.proconfig) ? fn.proconfig : [];
+    const searchPathSetting = proconfig
+        .map((c) => String(c))
+        .find((c) => c.toLowerCase().startsWith('search_path='));
+    if (!searchPathSetting || searchPathSetting.split('=').slice(1).join('=').trim() !== 'pg_catalog') {
+        diagnostics.activationFunction.searchPath = searchPathSetting || null;
+        problems.push(PROBLEM.ACTIVATION_FUNCTION_SEARCH_PATH_UNPINNED);
+    }
+
+    // EXECUTE must be pinned to exactly ONE non-owner identity, and that identity
+    // must not be the runtime. Read from the ACL, not from a privilege probe.
+    let execGrants;
+    try {
+        const rows = await db.$queryRawUnsafe(`
+            SELECT a.grantee::text                AS grantee_oid,
+                   CASE WHEN a.grantee = 0::oid THEN 'PUBLIC'
+                        ELSE pg_get_userbyid(a.grantee) END AS grantee,
+                   a.is_grantable                 AS grantable
+              FROM pg_proc p
+              CROSS JOIN LATERAL aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
+             WHERE p.oid = to_regprocedure('${ACTIVATION_FUNCTION_REGPROCEDURE}')
+               AND a.privilege_type = 'EXECUTE'
+               AND a.grantee <> p.proowner
+        `);
+        execGrants = rows || [];
+    } catch (_) {
+        problems.push(PROBLEM.ENFORCEMENT_PROBE_FAILED);
+        return;
+    }
+
+    const publicExec = execGrants.some((g) => g.grantee_oid === '0' || g.grantee === 'PUBLIC');
+    if (publicExec) problems.push(PROBLEM.PUBLIC_CAN_EXECUTE_ACTIVATION_FUNCTION);
+
+    const runtimeExec = execGrants.some((g) => g.grantee === diagnostics.runtimeRole);
+    if (runtimeExec) problems.push(PROBLEM.RUNTIME_CAN_EXECUTE_ACTIVATION_FUNCTION);
+
+    const namedExec = execGrants.filter((g) => g.grantee !== 'PUBLIC' && g.grantee !== diagnostics.runtimeRole);
+    diagnostics.activationFunction.executeGrantees = namedExec.map((g) => g.grantee);
+    if (namedExec.length !== 1) problems.push(PROBLEM.ACTIVATION_FUNCTION_EXECUTE_NOT_PINNED);
+
+    // Who may write the protected record. The table owner holds everything. The
+    // FUNCTION OWNER holds INSERT and nothing else — that INSERT is the whole
+    // point of the SECURITY DEFINER body, so it is allowed here and only here.
+    // Every other grantee with any write privilege is the bypass the function
+    // exists to prevent, including the operator and PUBLIC.
+    try {
+        const rows = await db.$queryRawUnsafe(`
+            SELECT CASE WHEN a.grantee = 0::oid THEN 'PUBLIC'
+                        ELSE pg_get_userbyid(a.grantee) END AS grantee,
+                   a.privilege_type                       AS privilege_type
+              FROM pg_class c
+              CROSS JOIN LATERAL aclexplode(coalesce(c.relacl, acldefault('r', c.relowner))) a
+             WHERE c.oid = to_regclass('${QUALIFIED_TABLE}')
+               AND a.grantee <> c.relowner
+               AND a.privilege_type IN ('INSERT','UPDATE','DELETE','TRUNCATE')
+        `);
+        const functionOwner = diagnostics.activationFunction && diagnostics.activationFunction.owner;
+        const illegal = [];
+        const allowed = [];
+        for (const r of rows || []) {
+            const entry = `${r.grantee}:${r.privilege_type}`;
+            if (r.grantee === functionOwner && r.privilege_type === 'INSERT') allowed.push(entry);
+            else illegal.push(entry);
+        }
+        diagnostics.activationRecordWriters = illegal;
+        diagnostics.activationRecordWritersAllowed = allowed;
+        if (illegal.length > 0) problems.push(PROBLEM.NON_OWNER_CAN_WRITE_ACTIVATION_RECORD);
+    } catch (_) {
+        problems.push(PROBLEM.ENFORCEMENT_PROBE_FAILED);
+    }
+}
+
 async function inspectEnforcement(db) {
     const problems = [];
     const diagnostics = { runtimeRole: null, owner: null, tableExists: false };
@@ -228,6 +381,10 @@ async function inspectEnforcement(db) {
     } catch (_) {
         problems.push(PROBLEM.ENFORCEMENT_PROBE_FAILED);
     }
+
+    // §WP-H B3: the activation function boundary is attested last, because it is
+    // only meaningful once the table and triggers it protects are established.
+    await inspectActivationFunction(db, diagnostics, problems);
 
     return { established: problems.length === 0, problems, diagnostics, row: null };
 }
