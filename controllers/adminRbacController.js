@@ -41,6 +41,10 @@ const ADMIN_ROLES = {
     permissions: [
       'withdrawals.approve', 'withdrawals.review', 'withdrawals.export',
       'trades.view', 'trades.export', 'fees.manage',
+      // Exact money settings: Finance Admin may read AND write quote TTLs, FX
+      // spreads and the step-up threshold. Not general settings: a support or
+      // read-only admin must not reach a money bound through this surface.
+      'money.settings.view', 'money.settings.write',
       'susu.oversee', 'susu.health', 'susu.approve_payout',
       'vaults.view', 'vaults.approve',
       'audit.view', 'audit.export',
@@ -74,6 +78,9 @@ const ADMIN_ROLES = {
       'users.view', 'trades.view', 'withdrawals.review',
       'susu.health', 'vaults.view', 'disputes.view',
       'audit.view', 'reports.view',
+      // Auditors may SEE the current money settings and their history; they may
+      // not change a bound.
+      'money.settings.view',
     ],
     description: 'View-only access for auditors',
   },
