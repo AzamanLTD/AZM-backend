@@ -15,7 +15,9 @@
  *
  * Required environment (all distinct from the API process):
  *   AZM_RECONCILER_MODE=1                 enables the writer guard
- *   AZM_RECONCILER_PROVIDER_USER + AZM_RECONCILER_PROVIDER_PUBKEY           provider API credential
+ *   AZM_RECONCILER_PROVIDER_USER       provider API user (X-API-USER)
+ *   AZM_RECONCILER_PROVIDER_PUBKEY     provider public key (X-API-PUBKEY). Two separate
+ *                                      variables, never one combined name.
  *   WITNESS_DATABASE_URL                  reconciler DB login (INSERT only)
  *   WITNESS_ACCOUNT_CURRENCY_MAP          authoritative account -> currency JSON
  */
@@ -136,7 +138,11 @@ async function witnessOpening(prisma, { openingDedupKey, walletAccount }) {
  * an explicit activation decision.
  */
 async function reconcileTreasuryOpenings({ openingDedupKeys = [] } = {}) {
-    requireEnv('AZM_RECONCILER_MODE');
+    // The writer guard is a VALUE, not a presence flag: AZM_RECONCILER_MODE=0
+    // must keep the reconciler from writing any witness.
+    if (requireEnv('AZM_RECONCILER_MODE') !== '1') {
+        throw new Error('[wp-i reconcile] AZM_RECONCILER_MODE must be exactly 1 to write a witness');
+    }
     requireEnv('WITNESS_ACCOUNT_CURRENCY_MAP');
     const prisma = new PrismaClient({
         datasources: { db: { url: requireEnv('WITNESS_DATABASE_URL') } },

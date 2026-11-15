@@ -27,9 +27,15 @@
 
 const { reconcileTreasuryOpenings } = require('./providerSettlementReconciler');
 
+// One entry per variable the process actually needs. An earlier version listed
+// the two provider credentials as a single combined string, so process.env[...]
+// was always undefined and this entrypoint could never start. The old test could
+// not see it: deleting a name that is not set is a no-op, so every deletion
+// "proved" a refusal.
 const REQUIRED_ENV = [
     'AZM_RECONCILER_MODE',
-    'AZM_RECONCILER_PROVIDER_USER + AZM_RECONCILER_PROVIDER_PUBKEY',
+    'AZM_RECONCILER_PROVIDER_USER',
+    'AZM_RECONCILER_PROVIDER_PUBKEY',
     'WITNESS_DATABASE_URL',
     'WITNESS_ACCOUNT_CURRENCY_MAP',
 ];
@@ -45,6 +51,14 @@ function main(argv) {
         // Fail closed and say exactly what is missing. Running with a partial
         // credential set would mean guessing at authority.
         process.stderr.write(`[wp-i reconciler] refusing to run: missing ${missing.join(', ')}\n`);
+        return 1;
+    }
+    // Presence is not consent: AZM_RECONCILER_MODE=0 or "true" must not open the
+    // writer guard, so the VALUE is checked here and again in the worker.
+    if (process.env.AZM_RECONCILER_MODE !== '1') {
+        process.stderr.write(
+            `[wp-i reconciler] refusing to run: AZM_RECONCILER_MODE must be exactly 1, got ${JSON.stringify(process.env.AZM_RECONCILER_MODE)}\n`
+        );
         return 1;
     }
 
