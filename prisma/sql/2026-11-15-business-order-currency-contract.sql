@@ -30,9 +30,14 @@ ALTER TABLE "BusinessOrder" ALTER COLUMN "amountUsdc" DROP NOT NULL;
 -- native GHS order with no USDC amount. It can never be both, and a GHS-tagged row
 -- must carry the GHS amount.
 ALTER TABLE "BusinessOrder" DROP CONSTRAINT IF EXISTS ck_businessorder_currency_shape;
+-- NULL-SAFE ON PURPOSE. A CHECK passes when it evaluates to NULL, so the natural
+-- phrasing `... AND "currency" = 'GHS'` does NOT reject an UNTAGGED row carrying a
+-- cedi amount: with currency NULL that comparison is NULL, the branch is NULL, and
+-- `FALSE OR NULL` is NULL — which Postgres accepts. COALESCE makes every branch a
+-- real boolean, so an untagged row holding amountGhs is a violation, as intended.
 ALTER TABLE "BusinessOrder" ADD CONSTRAINT ck_businessorder_currency_shape CHECK (
-    ("amountUsdc" IS NOT NULL AND "amountGhs" IS NULL AND ("currency" IS NULL OR "currency" = 'USDC'))
- OR ("amountUsdc" IS NULL     AND "amountGhs" IS NOT NULL AND "currency" = 'GHS')
+    ("amountUsdc" IS NOT NULL AND "amountGhs" IS NULL     AND COALESCE("currency", '') IN ('', 'USDC'))
+ OR ("amountUsdc" IS NULL     AND "amountGhs" IS NOT NULL AND COALESCE("currency", '') = 'GHS')
 );
 
 -- Only the two currencies the platform can actually settle.

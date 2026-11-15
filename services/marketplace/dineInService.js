@@ -5,7 +5,7 @@ const invoiceService = require('../businessInvoiceService');
 const { Prisma } = require('@prisma/client');
 const {
     validateConfiguredProduct,
-    configuredUnitPrice,
+    configuredUnitPriceExact,
     normalizedSelection,
 } = require('../storefrontProductConfigurationService');
 
@@ -149,12 +149,12 @@ class DineInService {
                 dineInTabId: tabId,
                 productId: productId || null,
                 name: String(itemName).slice(0, 200),
-                // Exact arithmetic, plain numeric transport: the value is a
-                // shortest-round-trip rendering of an already-exact Decimal, never
-                // the product of two floats.
-                unitPriceUsdc: Number(unitDec.toString()),
+                // Persisted as Decimals. Exactness must survive persistence and
+                // serialisation; converting back to Number here would hand the
+                // column a double again and throw away the guarantee upstream.
+                unitPriceUsdc: unitDec,
                 quantity: qty,
-                lineTotalUsdc: Number(lineDec.toString()),
+                lineTotalUsdc: lineDec,
                 addedBy: addedBy || tab.customerId,
             },
         });
@@ -175,18 +175,23 @@ class DineInService {
         const validation = validateConfiguredProduct(product, selection);
         if (validation.error) throw new Error(validation.error);
         const normalized = normalizedSelection(product, selection);
-        const unitPrice = configuredUnitPrice(product, normalized);
-        if (!(unitPrice > 0)) throw new Error('Product price must be positive.');
+        // Exact: the configured price is a Decimal built from the product's own
+        // price text plus each charged option's text, so variant/modifier deltas
+        // are never summed as doubles.
+        const unitPriceDec = configuredUnitPriceExact(product, normalized);
+        if (!unitPriceDec.gt(0)) throw new Error('Product price must be positive.');
         const label = selectionLabel(normalized);
+        const lineQty = Number(quantity || 1);
+        if (!Number.isInteger(lineQty) || lineQty < 1) throw new Error('quantity must be a positive integer.');
 
         const configuredItem = await this.prisma.dineInTabItem.create({
             data: {
                 dineInTabId: tabId,
                 productId: product.id,
                 name: String(label ? `${product.name} — ${label}` : product.name).slice(0, 200),
-                unitPriceUsdc: unitPrice,
-                quantity: Number(quantity || 1),
-                lineTotalUsdc: unitPrice * Number(quantity || 1),
+                unitPriceUsdc: unitPriceDec,
+                quantity: lineQty,
+                lineTotalUsdc: unitPriceDec.times(lineQty),
                 addedBy: customerId,
             },
         });
@@ -231,9 +236,10 @@ class DineInService {
                         data: {
                             status: 'FINALIZED',
                             closedAt: new Date(),
-                            // Exact value, plain numeric transport (see addItem).
-                            grandTotalUsdc: Number(total.toString()),
-                            subtotalUsdc: Number(total.toString()),
+                            // The exact Decimal itself (see addItem): no Number
+                            // round-trip between the sum and the money column.
+                            grandTotalUsdc: total,
+                            subtotalUsdc: total,
                         },
                     });
                     if (claimed.count !== 1) throw new Error('Tab was finalized by another request.');

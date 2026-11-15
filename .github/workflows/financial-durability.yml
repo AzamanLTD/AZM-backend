@@ -236,6 +236,10 @@ jobs:
       # PR #292 follow-up: match the test lane + the production release chain
       - name: Install business OS overlay
         run: node infra/install-business-os-overlay.js
+      - name: Install business order currency overlay
+        run: node infra/install-business-currency-overlay.js
+      - name: Install admin money settings overlay
+        run: node infra/install-admin-money-settings-overlay.js
 
       - name: Install inventory restock authority
         run: node infra/install-inventory-restock-overlay.js

@@ -28,9 +28,14 @@ describe('dine-in customer ordering and settlement', () => {
       where: expect.objectContaining({ id: 'product-1', businessProfileId: 'biz-1', isActive: true, isAvailable: true }),
     }));
     expect(addItem).not.toHaveBeenCalled();
-    expect(prisma.dineInTabItem.create).toHaveBeenCalledWith(expect.objectContaining({
-      data: expect.objectContaining({ productId: 'product-1', unitPriceUsdc: 14, lineTotalUsdc: 28, quantity: 2, addedBy: 7 }),
-    }));
+    // Exact Decimals (see the addItem case): pin the decimal text, so 14 x 2 is
+    // asserted to be exactly 28 and the value is never widened to a double.
+    const configured = prisma.dineInTabItem.create.mock.calls[0][0].data;
+    expect(configured.productId).toBe('product-1');
+    expect(configured.quantity).toBe(2);
+    expect(configured.addedBy).toBe(7);
+    expect(String(configured.unitPriceUsdc)).toBe('14');
+    expect(String(configured.lineTotalUsdc)).toBe('28');
   });
 
   test('business-side item additions use the catalog price instead of a caller-supplied price', async () => {
@@ -51,9 +56,13 @@ describe('dine-in customer ordering and settlement', () => {
     expect(prisma.businessProduct.findFirst).toHaveBeenCalledWith(expect.objectContaining({
       where: expect.objectContaining({ id: 'product-1', businessProfileId: 'biz-1', isActive: true, isAvailable: true, locationId: null }),
     }));
-    expect(prisma.dineInTabItem.create).toHaveBeenCalledWith(expect.objectContaining({
-      data: expect.objectContaining({ name: 'Burger', unitPriceUsdc: 10, lineTotalUsdc: 10 }),
-    }));
+    // The payload is now an exact Decimal, not a JS Number. Pin the exact value
+    // by its decimal text so the economics are unchanged and stricter: the
+    // money must read 10 exactly, whatever the carrier type is.
+    const created = prisma.dineInTabItem.create.mock.calls[0][0].data;
+    expect(created.name).toBe('Burger');
+    expect(String(created.unitPriceUsdc)).toBe('10');
+    expect(String(created.lineTotalUsdc)).toBe('10');
   });
 
   test('finalizing a tab does not create or send an invoice', async () => {
@@ -106,8 +115,12 @@ describe('dine-in customer ordering and settlement', () => {
     expect(prisma.$transaction).toHaveBeenCalledTimes(2);
     expect(tx.dineInTab.updateMany).toHaveBeenCalledWith(expect.objectContaining({
       where: { id: 'tab-1', status: 'OPEN' },
-      data: expect.objectContaining({ status: 'FINALIZED', grandTotalUsdc: 20, subtotalUsdc: 20 }),
     }));
+    // Exact Decimal persisted, not a Number rendering of it.
+    const finalized = tx.dineInTab.updateMany.mock.calls[0][0].data;
+    expect(finalized.status).toBe('FINALIZED');
+    expect(String(finalized.grandTotalUsdc)).toBe('20');
+    expect(String(finalized.subtotalUsdc)).toBe('20');
   });
 
   test('customer payment creates, sends, settles and links the canonical invoice', async () => {

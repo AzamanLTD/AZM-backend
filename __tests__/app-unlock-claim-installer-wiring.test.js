@@ -112,6 +112,8 @@ describe('WP-D packaging — the claim table is installed by the real release pa
             'infra/install-business-price-overlay.js',
             'infra/install-marketplace-discovery-overlay.js',
             'infra/install-business-offered-categories-overlay.js',
+            'infra/install-business-currency-overlay.js',
+            'infra/install-admin-money-settings-overlay.js',
         ];
         expect(chain.slice(0, expectedExact.length)).toEqual(expectedExact);
         // The addition is appended; the auth installer runs last, after every

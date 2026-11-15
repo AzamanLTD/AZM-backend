@@ -250,6 +250,20 @@ jobs:
         # CHECK, positive-amount CHECK, closed value domains. Mirrors the
         # release chain (npm run release).
         run: node infra/install-business-price-overlay.js
+
+      - name: Install business order currency overlay
+        # Native-GHS business orders: currency + amountGhs columns, nullable
+        # amountUsdc, and the DB-enforced pairing/non-negative/domain CHECKs that
+        # prisma db push cannot create. Legacy label-less rows stay valid and are
+        # never relabelled. Mirrors the release chain (npm run release).
+        run: node infra/install-business-currency-overlay.js
+
+      - name: Install admin money settings overlay
+        # Append-only money-settings revision log (#404): table, indexes, single
+        # value-carrier CHECK, canonical-2dp GHS CHECK, and a trigger refusing
+        # in-place rewrites of a money revision. Mirrors the release chain
+        # (npm run release).
+        run: node infra/install-admin-money-settings-overlay.js
       - name: Install marketplace discovery overlay
         # Marketplace Mix P1: marketplace-visibility flag (§9 D-5), section
         # taxonomy mapping table + backfill (§4 D-2), discovery indexes
