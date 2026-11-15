@@ -267,6 +267,7 @@ jobs:
         # installers and never `prisma migrate deploy`. Without it app-unlock
         # TOTP fails closed (503). Idempotent; mirrors the release chain.
         run: node infra/install-app-unlock-totp-claim.js
+        node infra/verify-authority-boundary.js
 
       - name: Install inventory restock authority
         run: node infra/install-inventory-restock-overlay.js
