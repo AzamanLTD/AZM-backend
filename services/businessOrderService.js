@@ -1,5 +1,6 @@
 // services/businessOrderService.js
 const { emitWebhookEvent } = require('./webhookEmitter');
+const { sumOrdersByCurrency, averageOrderValue } = require('../src/lib/businessRevenueAggregate');
 const { randomBytes } = require('crypto');
 
 const _generateOrderRef = async (prisma) => {
@@ -203,19 +204,31 @@ const updateOrderStatusFromEscrow = async (prisma, escrowId, escrowStatus) => {
 };
 
 const getBusinessStats = async (prisma, { businessProfileId }) => {
-    const [totalOrders, completedOrders, pendingOrders, disputedOrders, cancelledOrders, revenueAgg, recentOrders, revenueByDay, invoiceSent, invoicePaid, invoiceRevenue] = await Promise.all([
+    const [totalOrders, completedOrders, pendingOrders, disputedOrders, cancelledOrders, revenueAgg, revenueRows, recentOrders, revenueByDay, invoiceSent, invoicePaid, invoiceRevenue] = await Promise.all([
         prisma.businessOrder.count({ where: { businessProfileId } }),
         prisma.businessOrder.count({ where: { businessProfileId, status: 'COMPLETED' } }),
         prisma.businessOrder.count({ where: { businessProfileId, status: { in: ['AWAITING_PAYMENT', 'PAID', 'DELIVERED'] } } }),
         prisma.businessOrder.count({ where: { businessProfileId, status: 'DISPUTED' } }),
         prisma.businessOrder.count({ where: { businessProfileId, status: { in: ['REFUNDED', 'CANCELLED'] } } }),
+        // Legacy USDC scalar. SQL SUM ignores NULLs, so this counts only orders
+        // that actually carry a USDC amount — which is what it has always meant.
         prisma.businessOrder.aggregate({ where: { businessProfileId, status: 'COMPLETED' }, _sum: { amountUsdc: true } }),
+        // Currency-partitioned totals, added alongside it (never merged).
+        // See src/lib/businessRevenueAggregate.js.
+        prisma.businessOrder.findMany({
+            where: { businessProfileId, status: 'COMPLETED' },
+            select: { currency: true, amountUsdc: true, amountGhs: true },
+        }),
         prisma.businessOrder.findMany({ where: { businessProfileId }, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take: 5, include: ORDER_INCLUDE }),
         _getRevenueByDay(prisma, businessProfileId),
         prisma.businessInvoice.count({ where: { businessProfileId, status: 'SENT' } }),
         prisma.businessInvoice.count({ where: { businessProfileId, status: 'PAID' } }),
         prisma.businessInvoice.aggregate({ where: { businessProfileId, status: 'PAID' }, _sum: { billTotalUsdc: true } }),
     ]);
+    const revenue = sumOrdersByCurrency(revenueRows);
+    // `totalRevenue` is kept for existing clients and means USDC revenue ONLY
+    // (the SUM above ignores NULL USDC amounts, so GHS orders never enter it).
+    // It must never become a merged GHS+USDC figure.
     const totalRevenue = Number(revenueAgg._sum.amountUsdc || 0);
     return {
         totalOrders,
@@ -224,6 +237,9 @@ const getBusinessStats = async (prisma, { businessProfileId }) => {
         disputedOrders,
         cancelledOrders,
         totalRevenue,
+        revenue,
+        revenueBasis: 'PER_CURRENCY',
+        avgOrderValueByCurrency: averageOrderValue(revenue),
         avgOrderValue: completedOrders > 0 ? totalRevenue / completedOrders : 0,
         recentOrders,
         revenueByDay,
