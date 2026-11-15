@@ -28,7 +28,8 @@ async function state() {
 describeDb('WP-I treasury promotion race (real PostgreSQL)', () => {
     beforeAll(() => {
         process.env.AZM_RECONCILER_MODE = '1';
-        process.env.AZM_RECONCILER_PROVIDER_KEY = 'race-test-key';
+        process.env.AZM_RECONCILER_PROVIDER_USER = 'reconciler-user';
+        process.env.AZM_RECONCILER_PROVIDER_PUBKEY = 'race-test-key';
     });
 
     beforeEach(async () => {

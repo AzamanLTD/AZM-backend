@@ -83,7 +83,8 @@ function witnessInput(over = {}) {
 
 const RECONCILER_ENV = {
     AZM_RECONCILER_MODE: '1',
-    AZM_RECONCILER_PROVIDER_KEY: 'reconciler-test-credential',
+    AZM_RECONCILER_PROVIDER_USER: 'reconciler-user',
+            AZM_RECONCILER_PROVIDER_PUBKEY: 'reconciler-test-credential',
 };
 
 describe('WP-I provider trust boundary', () => {
@@ -92,12 +93,13 @@ describe('WP-I provider trust boundary', () => {
         Object.assign(process.env, RECONCILER_ENV);
     });
     afterEach(() => {
-        for (const k of ['AZM_RECONCILER_MODE', 'AZM_RECONCILER_PROVIDER_KEY']) delete process.env[k];
+        for (const k of ['AZM_RECONCILER_MODE', 'AZM_RECONCILER_PROVIDER_USER', 'AZM_RECONCILER_PROVIDER_PUBKEY']) delete process.env[k];
         Object.assign(process.env, saved, RECONCILER_ENV);
     });
     afterAll(() => {
         delete process.env.AZM_RECONCILER_MODE;
-        delete process.env.AZM_RECONCILER_PROVIDER_KEY;
+        delete process.env.AZM_RECONCILER_PROVIDER_USER;
+        delete process.env.AZM_RECONCILER_PROVIDER_PUBKEY;
         Object.assign(process.env, saved);
     });
 
@@ -111,7 +113,8 @@ describe('WP-I provider trust boundary', () => {
         });
 
         test('1b. reconciler mode without its own provider credential is refused', async () => {
-            delete process.env.AZM_RECONCILER_PROVIDER_KEY;
+            delete process.env.AZM_RECONCILER_PROVIDER_USER;
+        delete process.env.AZM_RECONCILER_PROVIDER_PUBKEY;
             await expect(async () => assertReconcilerContext())
                 .rejects.toBeInstanceOf(WitnessWriterNotPermittedError);
         });

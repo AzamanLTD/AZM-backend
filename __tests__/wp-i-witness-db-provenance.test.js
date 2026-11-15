@@ -136,7 +136,8 @@ describeDb('WP-I database provenance (real PostgreSQL roles)', () => {
         const savedMode = process.env.AZM_RECONCILER_MODE;
         const savedKey = process.env.AZM_RECONCILER_PROVIDER_KEY;
         delete process.env.AZM_RECONCILER_MODE;
-        delete process.env.AZM_RECONCILER_PROVIDER_KEY;
+        delete process.env.AZM_RECONCILER_PROVIDER_USER;
+        delete process.env.AZM_RECONCILER_PROVIDER_PUBKEY;
         try {
             expect(() => assertReconcilerContext()).toThrow(WitnessWriterNotPermittedError);
         } finally {
