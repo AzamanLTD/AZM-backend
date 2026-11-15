@@ -76,7 +76,9 @@ async function consumeStepUp(tx, req) {
         token: stepUp.token,
         userId: String(req.user.id),
         actionType: stepUp.actionType,
-        actionDigest: stepUp.digest,
+        // The shared canonical contract digests the ACTION itself. Passing the
+        // digest here is what silently bound every consumption to nothing.
+        action: stepUp.action,
     });
 }
 
