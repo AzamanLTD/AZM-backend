@@ -5,7 +5,7 @@ const router = express.Router();
 const { protect } = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
 const { requirePermission } = require('../middleware/requirePermission');
-const { PosOrderService } = require('../services/businessOS/posOrderService');
+const { PosOrderService, applyPosErrorResponse } = require('../services/businessOS/posOrderService');
 
 function getPrisma(req) { return req.app.get('prisma'); }
 
@@ -17,10 +17,16 @@ async function getBusinessProfileId(req) {
     return profile.id;
 }
 
+// WP-POS-C0 — the response contract is decided by the service's typed errors,
+// not by "everything unexpected is a 400". A typed POS refusal keeps its own
+// stable code and status (POS_SETTLEMENT_NOT_ENABLED / 422), a validation
+// problem keeps 400 with its pinned message, and an infrastructure or database
+// failure answers 500 — a broken database is not a client mistake, and it must
+// not be mistaken for the contractual refusal.
 function wrap(handler) {
     return async (req, res) => {
         try { await handler(req, res); }
-        catch (err) { res.status(err.statusCode || 400).json({ success: false, message: err.message }); }
+        catch (err) { applyPosErrorResponse(res, err); }
     };
 }
 

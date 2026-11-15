@@ -61,7 +61,11 @@ async function startWorkers(app, {
         io,
         paymentFailoverService || mtnDisbursementService,
         emailService,
-        smsService
+        smsService,
+        // §P0-2: the bank payout port is dependency-injected and default-off.
+        // When it is not wired, BANK rows park with durable evidence instead of
+        // being polled on the MoMo rail.
+        app.get('moolreBankPayoutPort') || null
     );
 
     const PayoutBatchWorker = require('../../workers/payoutBatchWorker');

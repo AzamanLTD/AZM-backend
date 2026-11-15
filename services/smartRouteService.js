@@ -525,6 +525,13 @@ class SmartRouteService {
         } catch (err) {
             // The guarded executor claims fail closed on concurrent spend:
             // classify honestly instead of blanket FAILED_OTHER.
+            // Route-specific FX gate: a rate-classified refusal blocked a
+            // GHS-converting execution BEFORE any money moved — the run FAILED
+            // with the honest rate reason and the next occurrence retries at
+            // the recovered rate (same contract as the savings executor).
+            if (err?.code === 'RATE_STALE' || err?.code === 'RATE_UNAVAILABLE') {
+                return await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_OTHER', `Smart Route execution blocked — ${err.message}`);
+            }
             if (err?.code === 'INSUFFICIENT_BALANCE') {
                 await this._notifyInsufficient(route, new Prisma.Decimal(0), amount).catch(() => {});
                 return await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_INSUFFICIENT', 'Balance changed before execution');
@@ -565,6 +572,32 @@ class SmartRouteService {
      * it; a run whose dispatch outcome is unprovable parks in
      * AWAITING_RECONCILIATION instead of guessing.
      */
+
+    // ── Route-specific FX gate (AZM-Planning #75, 2026-10-26) ────────────
+    // Policy: a fresh canonical rate is required ONLY where the execution
+    // authorizes a GHS conversion (WITHDRAW_MOMO quotes the USDC amount
+    // into GHS for the payout; the savings executor quotes USDC⇄GHS inside
+    // the savings service). Same-asset executions (INTERNAL_TRANSFER,
+    // VAULT_DEPOSIT) are deliberately NOT rate-gated: no conversion, no
+    // GHS-valued limit. Scheduled/manual executions are NEW authorizations,
+    // one per occurrence; they are NOT settlement of a prior authorization
+    // (the run retries at the next occurrence once the rate recovers). The
+    // ONE exception is the CRASH-RESUME path in _executeMomo: a reservation
+    // that already exists is a prior authorization converging to settlement
+    // — it resumes on the ORIGINALLY reserved GHS amount and is never
+    // re-gated.
+    async _assertFreshRateForNewExecution() {
+        try {
+            await getFreshServerRateGhsPerUsdc({ prisma: this.prisma });
+        } catch (rateErr) {
+            const err = new Error(
+                `stale/unavailable rate (${rateErr.code || 'RATE_UNAVAILABLE'}): ${rateErr.message}`
+            );
+            err.code = rateErr.code || 'RATE_UNAVAILABLE';
+            throw err;
+        }
+    }
+
     async _executeMomo(run, route, occurrenceBased, occurrenceBase) {
         // r19 P0: amount and destination from the run's immutable snapshot.
         const amount = new Prisma.Decimal(run.amountUsdc);
@@ -669,6 +702,16 @@ class SmartRouteService {
                 return await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'AWAITING_RECONCILIATION', 'recovered reservation has no withdrawal mirror — parked');
             }
         } else {
+            // ROUTE-SPECIFIC FX GATE (AZM-Planning #75): a NEW MoMo payout
+            // reservation authorizes a GHS conversion — the USDC amount must
+            // be quoted into GHS for the payout — so the canonical rate MUST
+            // be fresh. Fail closed BEFORE any reservation, lease-driven
+            // provider intent or debit (the run retries at the next
+            // occurrence). Mirrors the manual /api/withdraw/fiat route's
+            // middleware gate, which this scheduled path previously bypassed:
+            // it resolved raw settings.liveRetailRate with NO freshness
+            // validation (the savings executor was hardened; this leg was not).
+            await this._assertFreshRateForNewExecution();
             result = await financeService.processFiatWithdrawal(
                 this.prisma,
                 route.userId,
@@ -1281,6 +1324,14 @@ class SmartRouteService {
         const amount = new Prisma.Decimal(run.amountUsdc);
         const recipientId = run.destFriendUserId || route.destFriendUserId;
 
+        // ROUTE-SPECIFIC FX POLICY (AZM-Planning #75): a scheduled peer
+        // transfer is a same-asset USDC-to-USDC movement — its
+        // authorization converts no GHS and applies no GHS-valued limit,
+        // so it is deliberately NOT FX-gated (matching the manual
+        // /api/wallet/internal-transfer route, which mounts no gate). The
+        // transfer's own transactional guards (final-authorization
+        // re-proof + conditional debit) still apply.
+
         await this.prisma.$transaction(async (tx) => {
             // ── FINAL AUTHORIZATION RE-PROOF (smart-route final-authorization
             // race): the SENDER's live ban predicate and the route's live
@@ -1504,6 +1555,13 @@ class SmartRouteService {
         // r19 P0: amount and vault from the run's immutable snapshot.
         const amount = new Prisma.Decimal(run.amountUsdc);
         const vaultId = run.destVaultId || route.destVaultId;
+
+        // ROUTE-SPECIFIC FX POLICY (AZM-Planning #75): a scheduled vault
+        // deposit is a same-asset USDC movement into a USDC vault — no GHS
+        // conversion, no GHS-valued limit, so it is deliberately NOT
+        // FX-gated (matching the manual /api/vaults/:id/deposit route,
+        // which mounts no gate). The guarded ACTIVE claim and conditional
+        // debit still protect the money.
 
         // Vault deposits commit through vaultService's own transaction (a
         // guarded ACTIVE claim + guarded user debit inside it). The run's

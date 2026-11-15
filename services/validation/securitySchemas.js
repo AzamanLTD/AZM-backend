@@ -81,6 +81,23 @@ const setPinSchema = passthrough().superRefine((data, ctx) => {
 
 // ── VERIFY PIN ───────────────────────────────────────────────────────────────
 // verifyPin line 338: if (!pin) → 'PIN is required.'.
+const setPinRotationSchema = passthrough().superRefine((data, ctx) => {
+  const { pin, currentPin } = data || {};
+  if (!pin) {
+    ctx.addIssue({ code: 'custom', path: ['pin'], message: 'PIN is required.' });
+  } else if (typeof pin !== 'string' || !/^\d{4}$/.test(pin)) {
+    // AppUnlockService.setPin requires exactly four digits, so the schema
+    // mirrors that instead of offering a wider shape the service would reject
+    // a moment later. Shape only: it never stands in for current-PIN proof.
+    ctx.addIssue({ code: 'custom', path: ['pin'], message: 'PIN must be exactly 4 digits.' });
+  }
+  if (currentPin !== undefined && currentPin !== null) {
+    if (typeof currentPin !== 'string' || !/^\d{4}$/.test(currentPin)) {
+      ctx.addIssue({ code: 'custom', path: ['currentPin'], message: 'Current PIN must be exactly 4 digits.' });
+    }
+  }
+});
+
 const verifyPinSchema = passthrough().superRefine((data, ctx) => {
   if (!data.pin) {
     ctx.addIssue({ code: 'custom', path: ['pin'], message: 'PIN is required.' });
@@ -119,6 +136,7 @@ module.exports = {
   verify2FASchema,
   disable2FASchema,
   setPinSchema,
+  setPinRotationSchema,
   verifyPinSchema,
   sendPhoneOtpSchema,
   verifyPhoneOtpSchema,

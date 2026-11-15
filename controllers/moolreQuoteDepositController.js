@@ -357,8 +357,34 @@ exports.webhook = async (req, res) => {
     // and accepted input is never altered on its way to evidence/settlement
     // comparison.
 
+    // ── WP-I §9: gross vs net ───────────────────────────────────────────────
+    // Moolre's documented payload carries `amount` (what the payer sent) and
+    // `value` ("Transaction value after applicable fees"). Crediting `amount`
+    // when the provider deducted a fee overstates the money we actually hold.
+    //
+    // So: when the provider reports `value`, that is the settled figure and the
+    // difference is recorded as the fee. When `value` is ABSENT the provider has
+    // not told us the net, so we keep the pre-WP-I gross behaviour unchanged
+    // (existing money paths must not shift on an absence) and mark the evidence
+    // `netValueUnavailable`, which the treasury witness refuses to accept.
+    let providerFeeGhs = null;
+    let netValueUnavailable = false;
     try {
-        settledGhs = fiatLiquidity.toExactGhsDecimal(data?.amount, { field: 'amount' });
+        const grossGhs = fiatLiquidity.toExactGhsDecimal(data?.amount, { field: 'amount' });
+        const hasNet = data?.value !== undefined && data?.value !== null && String(data.value).trim() !== '';
+        if (hasNet) {
+            settledGhs = fiatLiquidity.toExactGhsDecimal(data.value, { field: 'value' });
+            const fee = grossGhs.minus(settledGhs);
+            // A fee can only be zero or positive; a negative one means the
+            // fields are not the pair we documented, so we do not invent a rule.
+            if (fee.isNegative()) {
+                return res.status(409).json({ success: false, message: 'Callback net value exceeds the gross amount — the payload does not match the documented contract, so it cannot be settled automatically.' });
+            }
+            providerFeeGhs = fee;
+        } else {
+            settledGhs = grossGhs;
+            netValueUnavailable = true;
+        }
     } catch (e) {
         return res.status(400).json({ success: false, message: 'Invalid settlement amount — must be a positive decimal exact to the pesewa (2 decimal places).' });
     }
@@ -547,6 +573,8 @@ exports.webhook = async (req, res) => {
         settlementProviderRef,
         payerMsisdn: data?.payer || null,
         providerData: data,
+        providerFeeGhs,
+        netValueUnavailable,
         evidenceSource: 'moolre_webhook',
     });
 

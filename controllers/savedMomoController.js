@@ -13,11 +13,19 @@
 
 const logger = require('../src/config/logger');
 const bcrypt = require('bcryptjs');
-const speakeasy = require('speakeasy');
+const {
+    verifyAndClaimTotp,
+    sendTotpFailure,
+    sendTotpUnavailable,
+    TOTP_CODES,
+} = require('../src/services/totpStepClaimService');
 
 const wrap = (fn) => async (req, res) => {
     try { await fn(req, res); }
     catch (err) {
+        // §WP-F: a claim-store outage is service-unavailable, never a 400 that
+        // reads like the caller sent a bad request.
+        if (err && err.code === TOTP_CODES.UNAVAILABLE) return sendTotpUnavailable(res);
         logger.error(`[savedMomoController] ${fn.name || 'h'}:`, err.message);
         res.status(400).json({ success: false, message: err.message });
     }
@@ -69,14 +77,14 @@ exports.create = wrap(async function create(req, res) {
                 message: 'Two-factor token required to save a payout destination.',
             });
         }
-        const ok = speakeasy.totp.verify({
+        const verdict = await verifyAndClaimTotp({
+            prisma,
+            userId,
             secret: user.twoFactorSecret,
-            encoding: 'base32',
             token: totpToken,
-            window: 1,
         });
-        if (!ok) {
-            return res.status(401).json({ success: false, message: 'Invalid 2FA token.' });
+        if (!verdict.ok) {
+            return sendTotpFailure(res, verdict, { invalidStatus: 401, invalidMessage: 'Invalid 2FA token.' });
         }
     } else {
         if (!password) {

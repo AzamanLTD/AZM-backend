@@ -11,18 +11,11 @@ let redisClient = null;
 const memoryCache = new Map();
 const CACHE_TTL = 200; // seconds
 
+// Shared cache connection (src/lib/redisConnection.js) — TLS verification is
+// never disabled, and retry is bounded backoff rather than permanent surrender.
 try {
-  const Redis = require('ioredis');
-  if (process.env.REDIS_URL) {
-    const isTLS = process.env.REDIS_URL.startsWith('rediss://');
-    redisClient = new Redis(process.env.REDIS_URL, {
-      maxRetriesPerRequest: 2,
-      tls: isTLS ? { rejectUnauthorized: false } : undefined,
-      retryStrategy: (times) => (times > 3 ? null : Math.min(times * 200, 1000)),
-    });
-    redisClient.on('error', (e) => logger.warn('[StorefrontRender] Redis cache error:', e.message));
-    redisClient.on('connect', () => logger.info('[StorefrontRender] Redis cache connected'));
-  }
+  const { getRedis } = require('../src/lib/redisConnection');
+  redisClient = getRedis('cache');
 } catch (e) {
   logger.warn('[StorefrontRender] Redis not available, using in-memory cache');
 }

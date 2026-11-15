@@ -1,5 +1,11 @@
 const logger = require('../src/config/logger');
 const speakeasy = require('speakeasy');
+const {
+    verifyAndClaimTotp,
+    sendTotpFailure,
+    sendTotpUnavailable,
+    TOTP_CODES,
+} = require('../src/services/totpStepClaimService');
 const QRCode = require('qrcode');
 
 exports.setup2FA = async (req, res) => {
@@ -60,15 +66,15 @@ exports.verify2FA = async (req, res) => {
             return res.status(400).json({ success: false, message: '2FA not set up. Call setup endpoint first.' });
         }
 
-        const verified = speakeasy.totp.verify({
+        const verdict = await verifyAndClaimTotp({
+            prisma,
+            userId,
             secret: user.twoFactorSecret,
-            encoding: 'base32',
             token,
-            window: 1,
         });
 
-        if (!verified) {
-            return res.status(400).json({ success: false, message: 'Invalid 2FA token' });
+        if (!verdict.ok) {
+            return sendTotpFailure(res, verdict, { invalidStatus: 400, invalidMessage: 'Invalid 2FA token' });
         }
 
         await prisma.user.update({
@@ -81,6 +87,7 @@ exports.verify2FA = async (req, res) => {
             message: '2FA verified and enabled successfully',
         });
     } catch (error) {
+        if (error && error.code === TOTP_CODES.UNAVAILABLE) return sendTotpUnavailable(res);
         res.status(500).json({ success: false, error: error.message });
     }
 };
@@ -111,15 +118,15 @@ exports.disable2FA = async (req, res) => {
             return res.status(400).json({ success: false, message: '2FA is not currently enabled.' });
         }
 
-        const verified = speakeasy.totp.verify({
+        const verdict = await verifyAndClaimTotp({
+            prisma,
+            userId,
             secret: user.twoFactorSecret,
-            encoding: 'base32',
             token,
-            window: 1,
         });
 
-        if (!verified) {
-            return res.status(400).json({ success: false, message: 'Invalid 2FA token. Cannot disable.' });
+        if (!verdict.ok) {
+            return sendTotpFailure(res, verdict, { invalidStatus: 400, invalidMessage: 'Invalid 2FA token. Cannot disable.' });
         }
 
         await prisma.user.update({
@@ -135,6 +142,7 @@ exports.disable2FA = async (req, res) => {
             message: '2FA has been disabled successfully.',
         });
     } catch (error) {
+        if (error && error.code === TOTP_CODES.UNAVAILABLE) return sendTotpUnavailable(res);
         res.status(500).json({ success: false, error: error.message });
     }
 };
@@ -409,14 +417,53 @@ exports.sendPhoneOtp = async (req, res) => {
 
         const result = await smsService.sendOTP(phoneNumber, 6, 5);
 
+        // A 200 here must mean the provider ACCEPTED the message. The old
+        // handler returned success unconditionally, so a mock or a refused
+        // provider still told the user "OTP sent".
+        if (!result || result.success !== true) {
+            logger.error({ provider: result?.provider }, '[sendPhoneOtp] provider did not accept the message');
+            return res.status(502).json({
+                success: false,
+                code: 'SMS_SEND_FAILED',
+                message: 'Could not send the verification code. Try again shortly.'
+            });
+        }
+
         return res.status(200).json({
             success: true,
             message: 'OTP sent successfully. Check your phone.',
             expiresAt: result.expiresAt,
-            // In test/dev mode, surface the OTP for easy testing
-            ...(result.otp ? { testOtp: result.otp } : {})
+            // Only a genuine non-production mock surfaces the code, and the
+            // client is told the message was mocked rather than delivered.
+            ...(result.mocked ? { mocked: true } : {}),
+            ...(result.mocked && result.otp ? { testOtp: result.otp } : {})
         });
     } catch (error) {
+        const code = error && error.code;
+        if (
+            code === 'SMS_PROVIDER_MISCONFIGURED'
+            || code === 'SMS_PROVIDER_UNSUPPORTED'
+            || code === 'OTP_STORE_UNAVAILABLE'
+            || code === 'OTP_HASH_SECRET_MISSING'
+        ) {
+            logger.error({ err: error, code }, '[sendPhoneOtp] refusing: verification transport unavailable');
+            return res.status(503).json({
+                success: false,
+                code,
+                message: 'Phone verification is temporarily unavailable. Try again later.'
+            });
+        }
+        if (code === 'OTP_RESEND_TOO_SOON' || code === 'OTP_SEND_LIMIT_EXCEEDED') {
+            return res.status(429).json({
+                success: false,
+                code,
+                message: error.message,
+                ...(error.retryAfterMs ? { retryAfterMs: error.retryAfterMs } : {})
+            });
+        }
+        if (code === 'SMS_SEND_FAILED') {
+            return res.status(502).json({ success: false, code, message: 'Could not send the verification code. Try again shortly.' });
+        }
         logger.error({ err: error }, '[sendPhoneOtp] error');
         return res.status(500).json({ success: false, message: 'Failed to send OTP.' });
     }
