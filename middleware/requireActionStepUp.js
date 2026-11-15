@@ -42,12 +42,19 @@ function requireActionStepUp(spec) {
             if (!token) {
                 // The digest tells the client exactly what to earn a grant for.
                 // It is the server's digest, never a client-supplied one.
+                // `action` is the server's own canonical descriptor. The client
+                // echoes it back verbatim to earn the grant, so it never has to
+                // reconstruct routeScope/path/params by guessing: a guess produces a
+                // different digest and the grant would authorise nothing. Echoing it
+                // is not a weakening - the grant is still bound to exactly these
+                // values, so a client that alters any of them fails on consume.
                 return res.status(CHALLENGE_STATUS).json({
                     success: false,
                     code: 'STEP_UP_REQUIRED',
                     message: 'This action needs a fresh verification bound to it.',
                     actionType: spec.actionType,
                     actionDigest: digest,
+                    action,
                 });
             }
             return next();
