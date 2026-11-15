@@ -7637,5 +7637,39 @@ model ActionStepUpGrant {
 
     @@index([userId])
     @@index([expiresAt])
+}
 
+/// ── Money-settings revision log (append-only) ────────────────────────────────
+/// WHY A DEDICATED MODEL rather than AdminSettingsAuditLog or GlobalSettings:
+///
+///  • GlobalSettings is a fixed-column singleton (id = 1). These settings have
+///    dynamic keys with future-effective revisions, which a column-per-setting
+///    table cannot express without a schema change per new key.
+///  • AdminSettingsAuditLog is a DISPLAY trail: its payload is a free-form Json
+///    `changes` blob with no ordering guarantee and no queryable current value.
+///    Reconstructing "what was in force at T" from it would be guesswork, and
+///    its rows are also written for non-money admin actions.
+///
+/// Invariants this model exists to make enforceable:
+///  • append-only: no update/delete path exists anywhere in the codebase;
+///  • exactness: GHS lives in valueText as a canonical decimal STRING, never a
+///    Float; TTLs and basis points live in valueInt as integers;
+///  • one row can never be read as two currencies, because `kind` is required;
+///  • current value = the newest revision whose effectiveAt is in the past, so a
+///    scheduled change cannot be mistaken for an active one.
+model AdminMoneySettingRevision {
+  id          String   @id @default(uuid())
+  key         String
+  kind        String
+  valueInt    Int?
+  valueText   String?
+  valueEnum   String?
+  effectiveAt DateTime
+  createdAt   DateTime @default(now())
+  adminId     Int
+  adminName   String?
+  reason      String
+
+  @@index([key, effectiveAt(sort: Desc), createdAt(sort: Desc)])
+  @@index([createdAt(sort: Desc)])
 }
