@@ -155,3 +155,22 @@ Reconciler process: `AZM_RECONCILER_MODE=1`, `AZM_RECONCILER_PROVIDER_USER`,
 Installer: `AZM_WITNESS_RUNTIME_ROLE`, `AZM_WITNESS_RECONCILER_ROLE`.
 
 The reconciler must run as its own service and must never be started by the API deployment.
+
+## Wallet account binding (2026-11-15)
+
+`FiatLiquidityReceipt.walletAccount` is now a first-class column. The reconciler reads the
+wallet from the **opening row**, never from `evidence` JSON (which the runtime can write) and
+never from an environment variable.
+
+- An opening with a null `walletAccount` is refused with `OPENING_HAS_NO_WALLET_ACCOUNT`
+  and no provider call is made.
+- `AZM_RECONCILER_ACCOUNT_NUMBER` is now an **operator assertion**, not a source: if it is
+  set and differs from the opening's wallet, the reconciler refuses with
+  `RECONCILER_WALLET_MISMATCH` so a reconciler pinned to one wallet cannot query another.
+  Leave it unset to serve several wallets from one reconciler.
+- `infra/install-fiat-liquidity-overlay.js` adds the column, its index and a backfill from
+  `ProviderSettlementWitness."walletAccount"` for openings already witnessed.
+
+Operational consequence: treasury openings created before this column existed, and never
+witnessed, must have their wallet set by the operator before they can be reconciled. That is
+deliberate — guessing the wallet is what the column removes.

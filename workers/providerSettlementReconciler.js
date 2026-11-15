@@ -80,7 +80,21 @@ async function witnessOpening(prisma, { openingDedupKey, walletAccount }) {
     if (String(opening.status) !== 'RECEIVED') return { witnessed: false, reason: `OPENING_NOT_ELIGIBLE_${opening.status}` };
     if (!opening.providerRef) return { witnessed: false, reason: 'OPENING_HAS_NO_PROVIDER_REFERENCE' };
 
-    const accountNumber = walletAccount || requireEnv('AZM_RECONCILER_ACCOUNT_NUMBER');
+    // The wallet comes from the OPENING, not from the caller and not from the
+    // environment. `evidence` is JSON the runtime can write, so it is not a
+    // source of truth either: an opening without a stored account is refused
+    // rather than reconciled against a guessed wallet.
+    const accountNumber = String(opening.walletAccount || '').trim();
+    if (!accountNumber) {
+        return { witnessed: false, reason: 'OPENING_HAS_NO_WALLET_ACCOUNT' };
+    }
+    // Optional guard for a single-wallet deployment: if the operator has pinned
+    // the wallet, a mismatched opening means the reconciler is pointed at the
+    // wrong wallet's money and must refuse instead of querying the wrong account.
+    const pinnedWallet = String(process.env.AZM_RECONCILER_ACCOUNT_NUMBER || '').trim();
+    if (pinnedWallet && pinnedWallet !== accountNumber) {
+        return { witnessed: false, reason: 'RECONCILER_WALLET_MISMATCH' };
+    }
     const fetchedAt = new Date();
     let response;
     try {

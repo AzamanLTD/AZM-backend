@@ -40,7 +40,9 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
         process.env.AZM_RECONCILER_MODE = '1';
         process.env.AZM_RECONCILER_PROVIDER_USER = 'reconciler-user';
         process.env.AZM_RECONCILER_PROVIDER_PUBKEY = 'reconciler-public-key';
-        process.env.AZM_RECONCILER_ACCOUNT_NUMBER = 'WALLET-AZM-1';
+        // Deliberately NOT pinned: one reconciler may serve several wallets, and the
+        // pin is an operator assertion exercised by its own case.
+        delete process.env.AZM_RECONCILER_ACCOUNT_NUMBER;
         process.env.WITNESS_DATABASE_URL = process.env.TEST_DATABASE_URL;
         process.env.WITNESS_ACCOUNT_CURRENCY_MAP = JSON.stringify({ 'WALLET-AZM-1': 'GHS' });
         jest.resetModules();
@@ -79,7 +81,9 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
                 amountGhs,
                 status: 'RECEIVED',
                 providerRef,
-                evidence: { walletAccount, fundingReference: providerRef },
+                // WP-I: the account is a COLUMN now, not a claim inside evidence JSON.
+                walletAccount,
+                evidence: { fundingReference: providerRef },
             },
         });
     }
@@ -101,6 +105,74 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
         });
         return body;
     }
+
+    // ── The wallet comes from the opening, never from a claim or the environment ──
+    test('the wallet account is read from the opening row, not from evidence JSON', async () => {
+        await seedOpening(OPENING_A, { walletAccount: 'WALLET-FROM-COLUMN' });
+        stubProvider({ accountnumber: 'WALLET-FROM-COLUMN' });
+        delete process.env.AZM_RECONCILER_ACCOUNT_NUMBER;
+        process.env.WITNESS_ACCOUNT_CURRENCY_MAP = JSON.stringify({ 'WALLET-FROM-COLUMN': 'GHS' });
+
+        const results = await reconciler.reconcileTreasuryOpenings({ openingDedupKeys: [OPENING_A] });
+
+        expect(results[0].witnessed).toBe(true);
+        const body = JSON.parse(global.fetch.mock.calls[0][1].body);
+        expect(body.accountnumber).toBe('WALLET-FROM-COLUMN');
+    });
+
+    test('an opening with no stored wallet account is refused, never guessed', async () => {
+        await prisma.fiatLiquidityReceipt.create({
+            data: {
+                provider: 'MOOLRE', dedupKey: OPENING_A, amountGhs: 99, status: 'RECEIVED',
+                providerRef: PROVIDER_REF,
+                // A claim inside evidence is exactly what must NOT be trusted.
+                evidence: { walletAccount: 'WALLET-AZM-1' },
+            },
+        });
+        stubProvider({});
+
+        const results = await reconciler.reconcileTreasuryOpenings({ openingDedupKeys: [OPENING_A] });
+
+        expect(results[0].witnessed).toBe(false);
+        expect(results[0].reason).toBe('OPENING_HAS_NO_WALLET_ACCOUNT');
+        expect(global.fetch).not.toHaveBeenCalled();
+        expect(await prisma.providerSettlementWitness.count()).toBe(0);
+    });
+
+    test('a reconciler pinned to a different wallet refuses instead of querying it', async () => {
+        await seedOpening(OPENING_A, { walletAccount: 'WALLET-AZM-1' });
+        stubProvider({});
+        process.env.AZM_RECONCILER_ACCOUNT_NUMBER = 'WALLET-SOMEONE-ELSE';
+
+        const results = await reconciler.reconcileTreasuryOpenings({ openingDedupKeys: [OPENING_A] });
+
+        expect(results[0].reason).toBe('RECONCILER_WALLET_MISMATCH');
+        expect(global.fetch).not.toHaveBeenCalled();
+    });
+
+    test('the documented backfill fills a null wallet account from witnessed evidence', async () => {
+        await prisma.fiatLiquidityReceipt.create({
+            data: { provider: 'MOOLRE', dedupKey: OPENING_A, amountGhs: 99, status: 'RECEIVED', providerRef: PROVIDER_REF },
+        });
+        await prisma.providerSettlementWitness.create({
+            data: {
+                openingDedupKey: OPENING_A, observationKey: 'backfill-obs', provider: 'MOOLRE',
+                fundingType: 'COLLECTION', witnessKind: 'TYPE1_STATUS', walletAccount: 'WALLET-BACKFILLED',
+                currency: 'GHS', netPesewas: 9900n, providerState: 'SETTLED',
+                endpoint: 'https://api.moolre.com/open/transact/status', requestParams: {},
+                rawResponseDigest: 'digest', rawResponse: '{}', fetchedAt: new Date(),
+            },
+        });
+
+        await prisma.$executeRawUnsafe(
+            `UPDATE "FiatLiquidityReceipt" r SET "walletAccount" = w."walletAccount"
+               FROM "ProviderSettlementWitness" w
+              WHERE w."openingDedupKey" = r."dedupKey" AND r."walletAccount" IS NULL`
+        );
+
+        const row = await prisma.fiatLiquidityReceipt.findUnique({ where: { dedupKey: OPENING_A } });
+        expect(row.walletAccount).toBe('WALLET-BACKFILLED');
+    });
 
     // ── Authority: refuses to run on partial credentials ─────────────────────
     test('the operator entrypoint refuses to run when any of its own credentials is missing', async () => {
@@ -277,7 +349,8 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
             data: {
                 provider: 'MOOLRE', dedupKey: OPENING_A, amountGhs: 99, status: 'RECEIVED',
                 providerRef: PROVIDER_REF,
-                evidence: { walletAccount: 'WALLET-UNMAPPED', fundingReference: PROVIDER_REF },
+                walletAccount: 'WALLET-UNMAPPED',
+                evidence: { fundingReference: PROVIDER_REF },
             },
         });
         stubProvider({});

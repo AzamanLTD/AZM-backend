@@ -1873,6 +1873,7 @@ model FiatLiquidityReceipt {
   dedupKey             String    @unique // economic identity — replays converge
   amountGhs            Decimal   @db.Decimal(20, 2)
   status               String    @default("RECEIVED") // RECEIVED | AVAILABLE | UNMATCHED | RECONCILIATION_REQUIRED | REVERSED
+  walletAccount        String? // WP-I: the Moolre wallet this money lands in — server-side, never caller JSON
   route                String? // §P.5-C selectedRoute — evidence-linked, never invented
   reference            String? // §P.5-D r14 (§B): deposit txHash identity — durable replay identity, never caller JSON
   eventDedupKey        String? // §P.5-D r14 (§B): the durable FiatProviderEvent observation backing this receipt
