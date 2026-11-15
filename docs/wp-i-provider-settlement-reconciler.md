@@ -110,3 +110,48 @@ TEST_DATABASE_URL=… npx jest --runInBand __tests__/wp-i-provider-settlement-re
 Eight cases cover credential refusal, no-lookup refusals, the positive control,
 gross-vs-net, non-final state, provider HTTP failure and single-use binding. The
 suite is registered in `.github/workflows/financial-durability.yml`.
+
+---
+
+## Evidence update — 2026-11-15 (Agent 4)
+
+### Provider contract correction (documented shape)
+
+The reconciler previously sent `X-API-KEY` (private) and omitted `accountnumber`, and the
+witness service read `state` / `txstatus_label`. Neither matches the official
+[Payment Status API](https://docs.moolre.com/ai/live/payment-status.html):
+
+| Item | Documented | Now implemented |
+|---|---|---|
+| Method/URL | `POST https://api.moolre.com/open/transact/status` | same |
+| Headers | `X-API-USER`, `X-API-PUBKEY` | same |
+| Body | `type:1`, `idtype:1`, `id`, `accountnumber` | same |
+| Transaction status | `data.txstatus` (1 success, 0 pending, 2 failed) | mapped, unknown → UNKNOWN |
+| Amounts | `data.amount` gross, `data.value` net after fees | net credited, gross retained |
+
+`src/services/providers/moolreStatusAdapter.js` distinguishes transport success (HTTP 200 and
+wrapper `status === 1`) from transaction settlement (`data.txstatus`). A 200 with a successful
+wrapper and a pending/failed/missing `txstatus` is **not settled**. The undocumented
+`state`/`txstatus_label` shape is still parsed but labelled `moolre-status-legacy-observed-v0`,
+and the witness records which rule produced it in `ProviderSettlementWitness.adapterRule`.
+
+### Evidence classes
+
+- **Confirmed by official documentation:** endpoint, headers, request body, `txstatus` values,
+  `amount` vs `value`, `externalref`, `accountnumber`, `transactionid`, `ts`.
+- **Inferred from code:** that the treasury opening stores its funding reference in
+  `FiatLiquidityReceipt.providerRef`; that one reconciler serves one wallet.
+- **Tested locally (disposable PostgreSQL, no live Moolre call):** adapter parsing of documented,
+  pending, failed, wrapper-failed, missing-`txstatus`, non-JSON and legacy fixtures; witness
+  binding, installer grants, promotion race.
+- **Awaiting live wallet verification:** that the production wallet's status responses match the
+  documented shape, and the authoritative net credited value per pricing band.
+
+### Deployment prerequisites (names only)
+
+Reconciler process: `AZM_RECONCILER_MODE=1`, `AZM_RECONCILER_PROVIDER_USER`,
+`AZM_RECONCILER_PROVIDER_PUBKEY`, `AZM_RECONCILER_ACCOUNT_NUMBER` (or `--wallet`),
+`WITNESS_DATABASE_URL`, `WITNESS_ACCOUNT_CURRENCY_MAP`, optional `AZM_RECONCILER_TIMEOUT_MS`.
+Installer: `AZM_WITNESS_RUNTIME_ROLE`, `AZM_WITNESS_RECONCILER_ROLE`.
+
+The reconciler must run as its own service and must never be started by the API deployment.

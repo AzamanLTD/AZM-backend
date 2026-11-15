@@ -212,7 +212,14 @@ async function recordProviderSettlementWitness(tx, input = {}) {
   const {
     openingDedupKey, provider, fundingType, endpoint, requestParams,
     rawResponse, providerPayload, amounts, fetchedAt, walletAccount,
+    settlementState = null, adapterRule = null,
   } = input;
+
+  // The adapter's documented settlement verdict is authoritative when supplied.
+  // The legacy field sniffing below exists only for historical fixtures and is
+  // recorded on the witness as undocumented.
+  const legacyState = String(providerPayload?.state ?? providerPayload?.txstatus_label ?? '').toUpperCase();
+  const effectiveState = settlementState ? String(settlementState).toUpperCase() : legacyState;
 
   if (!openingDedupKey || typeof openingDedupKey !== 'string') {
     throw new WitnessError(
@@ -220,7 +227,7 @@ async function recordProviderSettlementWitness(tx, input = {}) {
       '[wp-i] a witness must name an existing treasury opening; arbitrary references are refused'
     );
   }
-  if (!provider || !WITNESS_SETTLED_STATES.includes(String(providerPayload?.state ?? providerPayload?.txstatus_label ?? '').toUpperCase())) {
+  if (!provider || !WITNESS_SETTLED_STATES.includes(effectiveState) || effectiveState !== 'SETTLED') {
     // Non-final provider state can never become a witness.
     throw new WitnessError(
       'WITNESS_PROVIDER_STATE_NOT_SETTLED',
@@ -314,9 +321,14 @@ async function recordProviderSettlementWitness(tx, input = {}) {
     ?? providerPayload?.reference
     ?? providerPayload?.transactionid
     ?? digestOf(rawResponse);
+  const observedAccount = providerPayload?.accountnumber ?? walletAccount ?? '';
+  const observedTransactionId = providerPayload?.transactionid ?? requestParams?.transactionid ?? '';
   const observationKey = crypto
     .createHash('sha256')
-    .update([String(provider), fundingType, String(endpoint), String(observedReference)].join('|'))
+    .update([
+      String(provider), fundingType, String(endpoint), String(observedReference),
+      String(observedAccount), String(observedTransactionId),
+    ].join('|'))
     .digest('hex');
   const alreadyUsed = await tx.providerSettlementWitness.findUnique({ where: { observationKey } });
   if (alreadyUsed) {
@@ -339,7 +351,8 @@ async function recordProviderSettlementWitness(tx, input = {}) {
       currency,
       netPesewas,
       grossPesewas: amounts?.grossPesewas ?? null,
-      providerState: String(providerPayload?.state ?? '').toUpperCase(),
+      providerState: effectiveState,
+      adapterRule: adapterRule ?? (settlementState ? null : 'legacy-field-sniffing-undocumented'),
       endpoint: String(endpoint ?? ''),
       requestParams: requestParams ?? {},
       rawResponseDigest: digestOf(rawResponse),

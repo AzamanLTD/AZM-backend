@@ -7600,7 +7600,8 @@ model ProviderSettlementWitness {
   currency         String // GHS only
   netPesewas       BigInt // NET credited value — never the payer gross
   grossPesewas     BigInt?
-  providerState    String // provider-reported settled state
+  providerState    String // provider-reported settled state (documented txstatus, normalised)
+  adapterRule      String? // which provider adapter rule produced this witness; null = legacy sniffing
   endpoint         String
   requestParams    Json
   rawResponseDigest String

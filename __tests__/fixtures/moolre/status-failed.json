@@ -1,0 +1,1 @@
+{ "status": 1, "code": "SS01", "message": "ok", "data": { "txstatus": 2, "txtype": 1, "accountnumber": "100000100002", "amount": "0", "value": "0", "externalref": "AZM-DEP-000123" } }

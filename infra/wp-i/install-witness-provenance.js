@@ -64,6 +64,11 @@ async function main() {
             `REVOKE ALL ON "ProviderSettlementWitness" FROM ${RECONCILER}`,
             `GRANT USAGE ON SCHEMA public TO ${RECONCILER}`,
             `GRANT SELECT, INSERT ON "ProviderSettlementWitness" TO ${RECONCILER}`,
+            // It must also READ the opening it is witnessing. Without this the
+            // reconciler cannot validate the receipt and the whole witness step
+            // fails at runtime with a permission error.
+            `REVOKE ALL ON "FiatLiquidityReceipt" FROM ${RECONCILER}`,
+            `GRANT SELECT ON "FiatLiquidityReceipt" TO ${RECONCILER}`,
         ];
         for (const sql of statements) {
             await prisma.$executeRawUnsafe(sql);
@@ -77,6 +82,17 @@ async function main() {
             RUNTIME, RECONCILER
         );
         console.log('[wp-i] effective grants:', JSON.stringify(rows));
+
+        // Verify the opening read grant actually landed, rather than trusting the list.
+        const receipt = await prisma.$queryRawUnsafe(
+            `SELECT grantee, privilege_type FROM information_schema.role_table_grants
+              WHERE table_name = 'FiatLiquidityReceipt' AND grantee = $1`, RECONCILER
+        );
+        if (!receipt.some((r) => r.privilege_type === 'SELECT')) {
+            console.error('[wp-i] FAILED: reconciler cannot SELECT FiatLiquidityReceipt after install.');
+            process.exit(1);
+        }
+        console.log('[wp-i] reconciler opening read verified:', JSON.stringify(receipt));
         console.log('[wp-i] provenance installed. Treasury activation still requires the witness writer.');
     } finally {
         await prisma.$disconnect();
