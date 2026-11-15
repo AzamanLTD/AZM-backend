@@ -49,6 +49,7 @@ const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-
 const fiatLiquidityActivation = require('../src/services/fiatLiquidityActivationService'); // §P.5-D latch
 const { canonicalProviderName, persistPayoutOwnership } = require('../services/payoutProviderOwnership');
 const { recordReconciliationException } = require('../services/reconciliationExceptionService');
+const authorityState = require('../src/services/authorityState');
 const restrictedObligations = require('../services/restrictedObligationService'); // r17 P0 durable identity
 const withdrawalBridge = require('../services/withdrawalBridgeService'); // r18 durable orphan-adoption claim
 
@@ -547,15 +548,47 @@ class PayoutBatchWorker {
             // it to PROCESSING. If the process dies after this point, the
             // reconciliation worker can safely resume from PROCESSING using the
             // canonical provider reference.
-            const claim = await this.prisma.withdrawal.updateMany({
-                // P0 (APPROVED dead-end): claim admin-approved rows too — the
-                // CAS is the single-winner guard against a concurrent admin
-                // reject (which also claims from APPROVED).
-                where: { id: withdrawal.id, status: { in: ['PENDING', 'APPROVED'] } },
-                data: { status: 'PROCESSING' }
-            });
-            if (claim.count !== 1) {
-                results.errors.push({ id: withdrawal.id, reason: 'WITHDRAWAL_ALREADY_CLAIMED' });
+            // §WP-H CLAIM SERIALISATION. The batch-level authority read above is
+            // an optimisation, not the authorisation for this row: the regime
+            // that governs the durable claim is re-read INSIDE the transaction
+            // that makes the claim, holding the same shared advisory lock the
+            // activation path takes exclusively. Provider I/O stays outside.
+            let claimOutcome;
+            try {
+                claimOutcome = await this.prisma.$transaction(async (tx) => {
+                    await authorityState.lockAuthorityShared(tx);
+                    // The canonical regime reader: tri-state refuses UNKNOWN,
+                    // legacy answers from the flag/latch. Same reader the money
+                    // paths use, so a claim can never outrun the regime decision.
+                    const mode = await fiatLiquidityActivation.readMode(tx);
+                    const fresh = await tx.withdrawal.findUnique({
+                        where: { id: withdrawal.id },
+                        select: { id: true, status: true },
+                    });
+                    if (!fresh || !['PENDING', 'APPROVED'].includes(fresh.status)) {
+                        return { claimed: false, reason: 'WITHDRAWAL_ALREADY_CLAIMED' };
+                    }
+                    const claim = await tx.withdrawal.updateMany({
+                        // P0 (APPROVED dead-end): claim admin-approved rows too —
+                        // the CAS is the single-winner guard against a concurrent
+                        // admin reject (which also claims from APPROVED).
+                        where: { id: fresh.id, status: { in: ['PENDING', 'APPROVED'] } },
+                        data: { status: 'PROCESSING' },
+                    });
+                    return { claimed: claim.count === 1, authorityActive: mode.active };
+                });
+            } catch (claimErr) {
+                if (claimErr && claimErr.code === 'AUTHORITY_STATE_UNAVAILABLE') {
+                    // UNKNOWN: claim nothing, create no provider identity.
+                    results.errors.push({ id: withdrawal.id, reason: claimErr.code });
+                    results.parked = true;
+                    results.parkedReason = results.parkedReason || claimErr.code;
+                    continue;
+                }
+                throw claimErr;
+            }
+            if (!claimOutcome.claimed) {
+                results.errors.push({ id: withdrawal.id, reason: claimOutcome.reason || 'WITHDRAWAL_ALREADY_CLAIMED' });
                 continue;
             }
 
