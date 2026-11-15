@@ -4,6 +4,9 @@ const { sumOrdersByCurrency, averageOrderValue } = require('../src/lib/businessR
 const { randomBytes } = require('crypto');
 const { Prisma } = require('@prisma/client');
 const { OrderCurrencyError, CODES: CURRENCY_CODES } = require('../src/lib/businessOrderCurrency');
+// Native-GHS pricing authority: a cedi order is priced from the merchant's own
+// confirmed price row, never from a client number and never from a conversion.
+const { resolveEffectiveGhsPrice, BusinessPriceError } = require('./businessPriceService');
 
 const _generateOrderRef = async (prisma) => {
     for (let i = 0; i < 5; i++) {
@@ -185,6 +188,70 @@ const createOrder = async (prisma, { businessProfileId, customerId, productId, e
     return order;
 };
 
+// ── Native-GHS order creation ────────────────────────────────────────────────
+// A Ghanaian merchant prices in cedis (BusinessPrice.amountExact, 2dp, currency
+// GHS, confirmed). This is the writer that turns that price into an order: the
+// total is computed server-side from the merchant's own confirmed price, never
+// from a client-supplied number, and the order carries NO USDC amount at all.
+//
+// There is deliberately NO USDC fallback. If a product has no confirmed GHS
+// price, the call is refused rather than quietly priced in another currency: a
+// merchant who has only ever quoted cedis must never discover that a sale was
+// recorded against a USDC column. Creating a GHS order requires no conversion
+// rate, no USDC balance and no external price feed.
+const createGhsOrder = async (prisma, {
+    businessProfileId, customerId, productId, quantity, title, description, customerNotes,
+}) => {
+    if (!businessProfileId) throw new Error('businessProfileId is required.');
+    if (!customerId) throw new Error('customerId is required.');
+    if (!productId) throw new Error('productId is required for a GHS order (the price comes from the product).');
+    const cleanTitle = String(title || '').trim();
+    if (cleanTitle.length < 1 || cleanTitle.length > 200) throw new Error('title must be 1–200 chars.');
+
+    const qty = quantity === undefined || quantity === null ? 1 : Number(quantity);
+    if (!Number.isInteger(qty) || qty < 1 || qty > 999) throw new Error('quantity must be an integer between 1 and 999.');
+
+    const business = await prisma.businessProfile.findUnique({ where: { id: businessProfileId }, select: { id: true, userId: true } });
+    if (!business) throw new Error('Business profile not found.');
+
+    const product = await prisma.businessProduct.findUnique({ where: { id: productId }, select: { id: true, businessProfileId: true, isActive: true, isAvailable: true } });
+    if (!product || product.businessProfileId !== businessProfileId) throw new Error('Product not found.');
+    if (!product.isActive) throw new Error('Product is not available.');
+    if (product.isAvailable === false) throw new Error('Product is not available.');
+
+    // The merchant's confirmed cedi price is the ONLY authority for the amount.
+    const price = await resolveEffectiveGhsPrice(prisma, productId);
+    if (!price) {
+        throw new BusinessPriceError('GHS_PRICE_UNAVAILABLE',
+            `product ${productId} has no confirmed current GHS price — refusing to create an order rather than pricing it in another currency`);
+    }
+
+    // Exact: 2dp cedi price times an integer count stays a Decimal end to end.
+    const unitGhs = new Prisma.Decimal(price.amountExact);
+    if (!unitGhs.gt(0)) throw new BusinessPriceError('GHS_PRICE_NOT_POSITIVE', `product ${productId} has a non-positive GHS price`);
+
+    const orderRef = await _generateOrderRef(prisma);
+    const order = await prisma.businessOrder.create({
+        data: {
+            businessProfileId,
+            customerId,
+            productId,
+            status: 'AWAITING_PAYMENT',
+            orderRef,
+            title: cleanTitle,
+            description: description ? String(description).slice(0, 500) : null,
+            customerNotes: customerNotes ? String(customerNotes).slice(0, 500) : null,
+            currency: 'GHS',
+            amountGhs: unitGhs.times(qty),
+            amountUsdc: null,
+        },
+    });
+    emitWebhookEvent(businessProfileId, 'order.created', {
+        orderId: order.id, orderRef: order.orderRef, customerId, currency: 'GHS', amountGhs: String(order.amountGhs), status: order.status,
+    });
+    return order;
+};
+
 const getOrder = async (prisma, { orderId }) => prisma.businessOrder.findUnique({ where: { id: orderId }, include: ORDER_INCLUDE });
 
 const listOrdersForBusiness = async (prisma, { businessProfileId, status, limit, cursor, customerId, productId, dateFrom, dateTo }) => {
@@ -327,4 +394,4 @@ const getBusinessStats = async (prisma, { businessProfileId }) => {
     };
 };
 
-module.exports = { createOrder, getOrder, listOrdersForBusiness, listOrdersForCustomer, markDelivered, updateOrderStatusFromEscrow, getBusinessStats };
+module.exports = { createOrder, createGhsOrder, getOrder, listOrdersForBusiness, listOrdersForCustomer, markDelivered, updateOrderStatusFromEscrow, getBusinessStats };
