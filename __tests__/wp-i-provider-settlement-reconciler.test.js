@@ -38,7 +38,9 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
 
     beforeEach(() => {
         process.env.AZM_RECONCILER_MODE = '1';
-        process.env.AZM_RECONCILER_PROVIDER_KEY = 'reconciler-provider-key';
+        process.env.AZM_RECONCILER_PROVIDER_USER = 'reconciler-user';
+        process.env.AZM_RECONCILER_PROVIDER_PUBKEY = 'reconciler-public-key';
+        process.env.AZM_RECONCILER_ACCOUNT_NUMBER = 'WALLET-AZM-1';
         process.env.WITNESS_DATABASE_URL = process.env.TEST_DATABASE_URL;
         process.env.WITNESS_ACCOUNT_CURRENCY_MAP = JSON.stringify({ 'WALLET-AZM-1': 'GHS' });
         jest.resetModules();
@@ -48,6 +50,7 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
 
     afterEach(async () => {
         global.fetch = originalFetch;
+        await prisma.fiatProviderEvent.deleteMany({});
         await prisma.providerSettlementWitness.deleteMany({});
         await prisma.fiatLiquidityReceipt.deleteMany({});
     });
@@ -58,7 +61,9 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
         // process across suites: leaving the reconciler mode armed would change
         // how later suites interpret a treasury opening.
         delete process.env.AZM_RECONCILER_MODE;
-        delete process.env.AZM_RECONCILER_PROVIDER_KEY;
+        delete process.env.AZM_RECONCILER_PROVIDER_USER;
+        delete process.env.AZM_RECONCILER_PROVIDER_PUBKEY;
+        delete process.env.AZM_RECONCILER_ACCOUNT_NUMBER;
         delete process.env.WITNESS_DATABASE_URL;
         delete process.env.WITNESS_ACCOUNT_CURRENCY_MAP;
         if (prisma) await prisma.$disconnect();
@@ -83,7 +88,12 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
         const body = JSON.stringify({
             status: 1,
             code: 'P01',
-            data: { externalref: PROVIDER_REF, amount: '100.00', value: '99.00', txtype: 1, state, ...payload },
+            data: {
+                externalref: PROVIDER_REF, accountnumber: 'WALLET-AZM-1', transactionid: 'TXN-AZM-1',
+                amount: '100.00', value: '99.00', txtype: 1,
+                txstatus: ({ SETTLED: 1, PENDING: 0, FAILED: 2 })[state] ?? 1,
+                state, ...payload,
+            },
         });
         global.fetch = jest.fn().mockResolvedValue({
             status: httpStatus,
@@ -171,7 +181,7 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
         const results = await reconciler.reconcileTreasuryOpenings({ openingDedupKeys: [OPENING_A] });
 
         expect(results[0].witnessed).toBe(false);
-        expect(results[0].reason).toMatch(/provider status 500/i);
+        expect(results[0].reason).toMatch(/PROVIDER_TRANSPORT_HTTP_500|provider status 500/i);
         expect(await prisma.providerSettlementWitness.count()).toBe(0);
     });
 

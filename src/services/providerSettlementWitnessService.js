@@ -89,7 +89,7 @@ function assertReconcilerContext() {
       + '(AZM_RECONCILER_MODE=1). The API process is not permitted to manufacture treasury evidence.'
     );
   }
-  if (!process.env.AZM_RECONCILER_PROVIDER_KEY) {
+  if (!process.env.AZM_RECONCILER_PROVIDER_USER || !process.env.AZM_RECONCILER_PROVIDER_PUBKEY) {
     throw new WitnessWriterNotPermittedError(
       '[wp-i] the reconciliation process must present its own provider credential; '
       + 'the API process credential is not acceptable evidence.'

@@ -90,7 +90,7 @@ async function witnessOpening(prisma, { openingDedupKey, walletAccount }) {
         return { witnessed: false, reason: `PROVIDER_TRANSPORT_ERROR_${err && err.name === 'TimeoutError' ? 'TIMEOUT' : 'FAILED'}` };
     }
 
-    const parsed = parseMoolreStatusResponse(response);
+    const parsed = parseMoolreStatusResponse({ httpStatus: response.httpStatus, rawBody: response.raw });
     if (!parsed.transportOk) return { witnessed: false, reason: `PROVIDER_TRANSPORT_${parsed.reason}` };
     if (parsed.settlement !== 'SETTLED') return { witnessed: false, reason: `PROVIDER_NOT_SETTLED_${parsed.settlement}_${parsed.reason}` };
 

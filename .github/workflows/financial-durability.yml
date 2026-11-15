@@ -497,6 +497,7 @@ jobs:
             "__tests__/wp-i-callback-authentication.test.js"
             "__tests__/wp-i-provider-settlement-reconciler.test.js"
             "__tests__/wp-i-treasury-promotion-race.test.js"
+            "__tests__/wp-i-moolre-status-adapter.test.js"
           )
           npx jest --runInBand --forceExit "${SUITES[@]}"
 
