@@ -26,12 +26,39 @@ describe('app unlock against real Redis', () => {
     let AppUnlockService;
     let redis;
 
+    // Every user id this suite touches. Cleanup is scoped to these ids on
+    // purpose: the suite may run against a SHARED hosted database, so it must
+    // never sweep a whole namespace that other keys (or a real deployment's
+    // attempt counters) also live in.
+    const TEST_USER_IDS = [901, 902, 904, 905, 906, 907, 9911];
+
+    /**
+     * Remove only the keys this suite can create, for the ids it uses.
+     * Before: a stale counter would make a repeat run start from an exhausted
+     * attempt budget. After: the shared database is left as it was found.
+     */
+    async function clearSuiteKeys() {
+        for (const id of TEST_USER_IDS) {
+            for (const pattern of [
+                `appunlock:pin:attempts:${id}`,
+                `appunlock:totp:attempts:${id}`,
+                `otp:APP_UNLOCK:${id}:*`,
+                `otp:rl:i:${id}*`,
+                `otp:rl:w:${id}*`,
+            ]) {
+                const found = await redis.keys(pattern);
+                if (found.length) await redis.del(found);
+            }
+        }
+    }
+
     beforeAll(async () => {
         redis = new Redis(process.env.REDIS_URL);
         // Challenge and throttle keys persist across runs by design; clear them
         // so a repeated local run exercises the same ladder as CI.
         const stale = await redis.keys('otp:*');
         if (stale.length) await redis.del(stale);
+        await clearSuiteKeys();
         // Load the service only once REDIS_URL is present: the constructor picks
         // up the durable store at construction time.
         ({ AppUnlockService } = require('../services/appUnlockService'));
@@ -40,7 +67,13 @@ describe('app unlock against real Redis', () => {
     });
 
     afterAll(async () => {
-        if (redis) await redis.quit();
+        // Leave the database exactly as it was found: this suite previously
+        // leaked appunlock:pin:attempts:* counters into the shared Upstash
+        // instance, which is litter at best and a flaky failure at worst.
+        if (redis) {
+            await clearSuiteKeys();
+            await redis.quit();
+        }
     });
 
     const user = (over = {}) => ({
