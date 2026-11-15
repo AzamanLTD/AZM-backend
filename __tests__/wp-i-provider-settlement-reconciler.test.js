@@ -106,6 +106,36 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
         return body;
     }
 
+    test('a malformed currency map refuses every opening instead of guessing GHS', async () => {
+        await seedOpening(OPENING_A, { walletAccount: 'WALLET-AZM-1' });
+        stubProvider({});
+        process.env.WITNESS_ACCOUNT_CURRENCY_MAP = '{not json';
+
+        const results = await reconciler.reconcileTreasuryOpenings({ openingDedupKeys: [OPENING_A] });
+
+        expect(results[0].witnessed).toBe(false);
+        expect(results[0].reason).toBe('WITNESS_ACCOUNT_MAPPING_INVALID');
+        expect(await prisma.providerSettlementWitness.count()).toBe(0);
+    });
+
+    test('a reference that exists only inside evidence JSON cannot drive a lookup', async () => {
+        await prisma.fiatLiquidityReceipt.create({
+            data: {
+                provider: 'MOOLRE', dedupKey: OPENING_A, amountGhs: 99, status: 'RECEIVED',
+                providerRef: null, walletAccount: 'WALLET-AZM-1',
+                // The runtime can write this. It is not evidence of a payment.
+                evidence: { fundingReference: 'INVENTED-BY-RUNTIME' },
+            },
+        });
+        stubProvider({});
+
+        const results = await reconciler.reconcileTreasuryOpenings({ openingDedupKeys: [OPENING_A] });
+
+        expect(results[0].witnessed).toBe(false);
+        expect(results[0].reason).toBe('OPENING_HAS_NO_PROVIDER_REFERENCE');
+        expect(global.fetch).not.toHaveBeenCalled();
+    });
+
     // ── The wallet comes from the opening, never from a claim or the environment ──
     test('the wallet account is read from the opening row, not from evidence JSON', async () => {
         await seedOpening(OPENING_A, { walletAccount: 'WALLET-FROM-COLUMN' });
@@ -196,7 +226,7 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
 
         expect(results).toHaveLength(1);
         expect(results[0].witnessed).toBe(false);
-        expect(results[0].reason).toMatch(/unknown opening/i);
+        expect(results[0].reason).toMatch(/OPENING_NOT_FOUND|unknown opening/i);
         // The reconciler must not go and ask the provider about a reference it
         // was simply told about.
         expect(fetchSpy).not.toHaveBeenCalled();
@@ -213,7 +243,7 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
         const results = await reconciler.reconcileTreasuryOpenings({ openingDedupKeys: [OPENING_A] });
 
         expect(results[0].witnessed).toBe(false);
-        expect(results[0].reason).toMatch(/no provider reference/i);
+        expect(results[0].reason).toMatch(/OPENING_HAS_NO_PROVIDER_REFERENCE|no provider reference/i);
         expect(fetchSpy).not.toHaveBeenCalled();
     });
 

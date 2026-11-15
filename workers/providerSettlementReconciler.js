@@ -144,24 +144,14 @@ async function reconcileTreasuryOpenings({ openingDedupKeys = [] } = {}) {
     const results = [];
     try {
         for (const key of openingDedupKeys) {
-            const opening = await prisma.fiatLiquidityReceipt.findUnique({ where: { dedupKey: key } });
-            if (!opening) {
-                results.push({ openingDedupKey: key, witnessed: false, reason: 'unknown opening' });
-                continue;
-            }
-            const reference = opening.providerRef || opening.evidence?.fundingReference;
-            if (!reference) {
-                results.push({ openingDedupKey: key, witnessed: false, reason: 'opening has no provider reference' });
-                continue;
-            }
+            // ONE authority: witnessOpening reads the opening, decides eligibility,
+            // resolves the wallet and the reference from the row, and returns a
+            // stable reason. The loop must not pre-read or fill gaps from
+            // `evidence` JSON, which the runtime can write.
             try {
                 results.push({
                     openingDedupKey: key,
-                    ...(await witnessOpening(prisma, {
-                        openingDedupKey: key,
-                        fundingReference: reference,
-                        walletAccount: opening.evidence?.walletAccount,
-                    })),
+                    ...(await witnessOpening(prisma, { openingDedupKey: key })),
                 });
             } catch (e) {
                 results.push({ openingDedupKey: key, witnessed: false, reason: e.code || e.message });
