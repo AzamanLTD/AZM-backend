@@ -2,6 +2,7 @@
 'use strict';
 
 const invoiceService = require('../businessInvoiceService');
+const { Prisma } = require('@prisma/client');
 const {
     validateConfiguredProduct,
     configuredUnitPrice,
@@ -118,6 +119,7 @@ class DineInService {
 
         let itemName = name;
         let authoritativePrice = priceNum;
+        let productPriceText = null;
         if (productId) {
             const product = await this.prisma.businessProduct.findFirst({
                 where: await this._productWhereForTab(tab, productId),
@@ -125,19 +127,34 @@ class DineInService {
             });
             if (!product) throw new Error('Product is unavailable for this restaurant/location.');
             authoritativePrice = Number(product.priceUsdc);
+            productPriceText = String(product.priceUsdc);
             itemName = product.name;
         }
         if (!itemName) throw new Error('name is required.');
         if (!Number.isFinite(authoritativePrice) || authoritativePrice <= 0) throw new Error('price must be positive.');
+
+        // Money is arithmetic on Decimals, never on JS numbers. The old path
+        // wrote `authoritativePrice * qty` into a Decimal(20,8) column, so three
+        // 0.10 items stored 0.30000000000000004 and every total built from it
+        // inherited the error. The unit price is taken from the durable product
+        // row as text when there is one (authoritative), and from the caller's
+        // exact text when there is not.
+        const unitDec = productPriceText != null
+            ? new Prisma.Decimal(productPriceText)
+            : new Prisma.Decimal(typeof price === 'string' ? price.trim() : String(price));
+        const lineDec = unitDec.times(qty);
 
         const item = await this.prisma.dineInTabItem.create({
             data: {
                 dineInTabId: tabId,
                 productId: productId || null,
                 name: String(itemName).slice(0, 200),
-                unitPriceUsdc: authoritativePrice,
+                // Exact arithmetic, plain numeric transport: the value is a
+                // shortest-round-trip rendering of an already-exact Decimal, never
+                // the product of two floats.
+                unitPriceUsdc: Number(unitDec.toString()),
                 quantity: qty,
-                lineTotalUsdc: authoritativePrice * qty,
+                lineTotalUsdc: Number(lineDec.toString()),
                 addedBy: addedBy || tab.customerId,
             },
         });
@@ -197,10 +214,27 @@ class DineInService {
                         throw new Error('Tab not found.');
                     }
                     if (tab.status !== 'OPEN') throw new Error('Tab is not OPEN.');
-                    const total = tab.items.reduce((sum, item) => sum + Number(item.unitPriceUsdc) * item.quantity, 0);
+                    // Exact, and deliberately the same authority the cash-close
+                    // path sums (the durable item line totals), so finalize and
+                    // close can never disagree about what a tab is worth.
+                    const total = tab.items.reduce((sum, item) => {
+                        if (item.lineTotalUsdc != null) {
+                            return sum.plus(new Prisma.Decimal(String(item.lineTotalUsdc)));
+                        }
+                        // A row without a stored line total still totals exactly:
+                        // the fallback is Decimal multiplication, not float math.
+                        const unit = new Prisma.Decimal(String(item.unitPriceUsdc));
+                        return sum.plus(unit.times(new Prisma.Decimal(String(item.quantity ?? 0))));
+                    }, new Prisma.Decimal(0));
                     const claimed = await tx.dineInTab.updateMany({
                         where: { id: tabId, status: 'OPEN' },
-                        data: { status: 'FINALIZED', closedAt: new Date(), grandTotalUsdc: total, subtotalUsdc: total },
+                        data: {
+                            status: 'FINALIZED',
+                            closedAt: new Date(),
+                            // Exact value, plain numeric transport (see addItem).
+                            grandTotalUsdc: Number(total.toString()),
+                            subtotalUsdc: Number(total.toString()),
+                        },
                     });
                     if (claimed.count !== 1) throw new Error('Tab was finalized by another request.');
                     return tx.dineInTab.findUnique({ where: { id: tabId }, include: { items: true } });
