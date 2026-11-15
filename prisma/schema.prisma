@@ -1873,6 +1873,7 @@ model FiatLiquidityReceipt {
   dedupKey             String    @unique // economic identity — replays converge
   amountGhs            Decimal   @db.Decimal(20, 2)
   status               String    @default("RECEIVED") // RECEIVED | AVAILABLE | UNMATCHED | RECONCILIATION_REQUIRED | REVERSED
+  walletAccount        String? // WP-I: the Moolre wallet this money lands in — server-side, never caller JSON
   route                String? // §P.5-C selectedRoute — evidence-linked, never invented
   reference            String? // §P.5-D r14 (§B): deposit txHash identity — durable replay identity, never caller JSON
   eventDedupKey        String? // §P.5-D r14 (§B): the durable FiatProviderEvent observation backing this receipt
@@ -7583,4 +7584,58 @@ model SavedBankBeneficiary {
 
   @@unique([userId, accountNumberHmac])
   @@index([userId, status])
+}
+
+
+/// WP-I — independently fetched provider settlement witness.
+/// The ONLY authority that may make a treasury opening AVAILABLE. Written by
+/// the reconciliation process under its own database identity; the API runtime
+/// has no write path to this table. Immutable by convention (no update path is
+/// exposed) and single-use per treasury opening.
+model ProviderSettlementWitness {
+  id               String   @id @default(uuid())
+  openingDedupKey  String   @unique // single-use binding to exactly one opening
+  // Single-use binding on the OBSERVATION itself: the digest identity of the
+  // provider lookup (provider|fundingType|endpoint|requested reference). It is
+  // unique so one provider settlement can never fund two treasury openings;
+  // null only for witnesses written before this binding existed.
+  observationKey   String?  @unique
+  provider         String
+  fundingType      String // COLLECTION | BANK_VIRTUAL_ACCOUNT | PAYMENT_ID | WALLET_INFLOW
+  witnessKind      String // which provider lookup produced this witness
+  walletAccount    String
+  currency         String // GHS only
+  netPesewas       BigInt // NET credited value — never the payer gross
+  grossPesewas     BigInt?
+  providerState    String // provider-reported settled state (documented txstatus, normalised)
+  adapterRule      String? // which provider adapter rule produced this witness; null = legacy sniffing
+  endpoint         String
+  requestParams    Json
+  rawResponseDigest String
+  rawResponse      String
+  fetchedAt        DateTime
+  createdAt        DateTime @default(now())
+
+  @@index([provider, openingDedupKey])
+}
+
+// §WP-H G — action-bound step-up grant. See
+// prisma/migrations/20261115120000_action_step_up_grant and
+// src/services/actionStepUpService.js. Stored as a hash: the plaintext token
+// exists only in the response to the client that earned it.
+model ActionStepUpGrant {
+    id             String    @id
+    tokenHash      String    @unique
+    userId         String
+    actionType     String
+    actionDigest   String
+    routeScope     String
+    idempotencyKey String?
+    issuedAt       DateTime  @default(now())
+    expiresAt      DateTime
+    consumedAt     DateTime?
+
+    @@index([userId])
+    @@index([expiresAt])
+
 }

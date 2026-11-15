@@ -258,6 +258,23 @@ describeOrSkip('r15 follow-up P0: payout provider ownership end-to-end (real Pos
     const PayoutBatchWorker = require('../workers/payoutBatchWorker');
     const WithdrawalReconciliationWorker = require('../workers/withdrawalReconciliationWorker');
 
+    // The batch scans payout candidates GLOBALLY, so on a shared test database
+    // another suite's eligible withdrawal can be claimed first. Drive the batch in
+    // bounded steps until THIS suite's candidate has been claimed, then assert on
+    // it. The ownership, exactly-once and provider-rail assertions are unchanged.
+    async function dispatchUntilClaimed(batch, withdrawalId, { max = 6 } = {}) {
+        let processed = 0;
+        for (let i = 0; i < max; i += 1) {
+            const current = await prisma.withdrawal.findUnique({ where: { id: withdrawalId } });
+            if (!current || (current.status !== 'PENDING' && current.status !== 'APPROVED')) {
+                return processed;
+            }
+            const result = await batch._processBatch(settings, { isManualTrigger: true });
+            processed += (result && result.processed) || 0;
+        }
+        return processed;
+    }
+
     test('A. moolre rejection → mtn dispatch: ownership durably recorded, reconciliation queries the OWNER rail ONLY and settles EXACTLY once', async () => {
         const reference = 'R15K-FAILOVER-1';
         const { user, withdrawal } = await seedAutoPayoutCandidate(reference);
@@ -266,8 +283,8 @@ describeOrSkip('r15 follow-up P0: payout provider ownership end-to-end (real Pos
         mockMtnDispatch();         // mtn accepts the payout
 
         const batch = new PayoutBatchWorker(prisma, { emit: jest.fn() }, failover, null);
-        const result = await batch._processBatch(settings, { isManualTrigger: true });
-        expect(result.processed).toBe(1);
+        const processed = await dispatchUntilClaimed(batch, withdrawal.id);
+        expect(processed).toBeGreaterThanOrEqual(1);
 
         // The withdrawal is claimed and dispatched.
         const claimed = await prisma.withdrawal.findUnique({ where: { id: withdrawal.id } });

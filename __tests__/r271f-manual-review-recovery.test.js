@@ -159,17 +159,35 @@ describeOrSkip('r271f P0 #2: NEEDS_MANUAL_REVIEW deterministic recovery', () => 
 
         // A prisma client whose ReconciliationException INSERT always fails:
         // every other operation passes through to the real DB.
+        //
+        // The evidence write now happens INSIDE the parking transaction (the
+        // exception row and the status CAS commit or roll back together), so the
+        // outage must be injected on the TRANSACTION client. Injecting only on
+        // the root client would leave the transaction untouched and quietly turn
+        // this test into a tautology.
+        const failEvidenceInsert = async (client, sql, ...args) => {
+            if (String(sql).includes('"ReconciliationException"') && String(sql).includes('INSERT')) {
+                throw new Error('simulated evidence-store outage');
+            }
+            return client.$queryRawUnsafe(sql, ...args);
+        };
+        const wrapTx = (tx) => new Proxy(tx, {
+            get(target, prop) {
+                if (prop === '$queryRawUnsafe') return (sql, ...args) => failEvidenceInsert(target, sql, ...args);
+                const value = Reflect.get(target, prop, target);
+                return typeof value === 'function' ? value.bind(target) : value;
+            },
+        });
         const brokenEvidenceClient = new Proxy(prisma, {
-            get(target, prop, receiver) {
-                if (prop === '$queryRawUnsafe') {
-                    return async (sql, ...args) => {
-                        if (String(sql).includes('"ReconciliationException"') && String(sql).includes('INSERT')) {
-                            throw new Error('simulated evidence-store outage');
-                        }
-                        return target.$queryRawUnsafe(sql, ...args);
-                    };
+            get(target, prop) {
+                if (prop === '$queryRawUnsafe') return (sql, ...args) => failEvidenceInsert(target, sql, ...args);
+                if (prop === '$transaction') {
+                    return (arg, ...rest) => (typeof arg === 'function'
+                        ? target.$transaction((tx) => arg(wrapTx(tx)), ...rest)
+                        : target.$transaction(arg, ...rest));
                 }
-                return Reflect.get(target, prop, target);
+                const value = Reflect.get(target, prop, target);
+                return typeof value === 'function' ? value.bind(target) : value;
             },
         });
 

@@ -26,6 +26,12 @@
 const hasDb = !!process.env.TEST_DATABASE_URL;
 if (!hasDb) console.warn('[native-ghs-funded-shortfall-reversal] TEST_DATABASE_URL not set — skipping.');
 
+// ISOLATION: this suite asserts exact ledger amounts, so it runs against a
+// database of its own. A reused identity whose ledger account already carries
+// history from another suite is exactly the contamination this prevents.
+const { createDisposableDatabase } = require('./helpers/disposableDatabase');
+let disposable = null;
+
 if (hasDb) {
     process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
     process.env.NODE_ENV = 'test';
@@ -65,7 +71,9 @@ if (hasDb) {
     let xprisma;
 
     beforeAll(async () => {
-        prisma = new PrismaClient();
+        disposable = await createDisposableDatabase('ghsrev');
+        process.env.DATABASE_URL = disposable.url;
+        prisma = new PrismaClient({ datasources: { db: { url: disposable.url } } });
         ({ seedUser, TEST_PASSWORD } = require('./helpers/factories'));
         xprisma = prisma.$extends({
             query: {
@@ -90,7 +98,10 @@ if (hasDb) {
             },
         });
     });
-    afterAll(async () => { if (prisma) await prisma.$disconnect(); });
+    afterAll(async () => {
+        if (prisma) await prisma.$disconnect();
+        if (disposable) await disposable.drop();
+    }, 120000);
     beforeEach(() => {
         process.env.GHS_RISK_AMOUNT_POLICY = '{"largeGhs":1000000,"hugeGhs":2000000,"newAccountMinGhs":900000}';
     });

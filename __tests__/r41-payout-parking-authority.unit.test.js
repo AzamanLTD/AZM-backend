@@ -30,7 +30,13 @@
 //     rows whose cash position could never be proven.
 // =============================================================================
 
+jest.mock('../src/services/fiatLiquidityActivationService', () => ({
+    isAuthorityModeActive: jest.fn().mockResolvedValue(false),
+    readMode: jest.fn().mockResolvedValue({ active: false, latched: false, flagged: false }),
+}));
+
 const PayoutBatchWorker = require('../workers/payoutBatchWorker');
+const { withTransactions } = require('./helpers/mockTransaction');
 
 describe('r41 — payout parking authority (unit)', () => {
     const makeWorker = ({ rowStatus, claimResult, notifyThrows = false, evidenceFails = false } = {}) => {
@@ -53,7 +59,10 @@ describe('r41 — payout parking authority (unit)', () => {
             ? { sendNotification: jest.fn(async () => { throw new Error('notify down'); }) }
             : { sendNotification: jest.fn(async (n) => sent.push(n)) };
         const worker = Object.create(PayoutBatchWorker.prototype);
-        worker.prisma = prisma;
+        // The parking path now opens a transaction (evidence + status CAS commit
+        // together, under the shared authority lock), so the double it is given
+        // must model one.
+        worker.prisma = withTransactions(prisma);
         worker.notificationService = notificationService;
         worker._sent = sent;
         worker._mocks = prisma;

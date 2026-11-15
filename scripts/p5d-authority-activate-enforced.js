@@ -73,7 +73,7 @@ async function assertOperatorCredential(db) {
     const refusals = [];
     if (row.is_superuser === true) refusals.push('the activation connection is a superuser');
     if (!row.can_select) refusals.push('the activation role cannot read the activation record');
-    if (!row.can_insert) refusals.push('the activation role cannot insert the activation record');
+    if (row.can_insert) refusals.push('the activation role can INSERT the activation record directly, bypassing the sanctioned function');
     if (row.can_update) refusals.push('the activation role can UPDATE an existing activation record');
     if (row.can_delete) refusals.push('the activation role can DELETE an existing activation record');
     if (row.can_truncate) refusals.push('the activation role can TRUNCATE the activation record');
@@ -123,6 +123,15 @@ async function activate(db, args) {
         return;
     }
 
+    const [fnAcl] = await db.$queryRawUnsafe(
+        `SELECT has_function_privilege(current_user, 'public.azm_authority_activate(text,text,text,text,text)'::regprocedure, 'EXECUTE') AS can_execute`
+    );
+    if (!fnAcl || fnAcl.can_execute !== true) {
+        console.error(JSON.stringify({ ok: false, refused: 'OPERATOR_CREDENTIAL_NOT_NARROW', refusals: ['the activation role cannot EXECUTE the sanctioned activation function'] }, null, 2));
+        process.exitCode = 1;
+        return;
+    }
+
     const existing = await enforcement.readActivationRecord(db);
     if (existing) {
         console.error(JSON.stringify({ ok: false, refused: 'ALREADY_ACTIVATED', activatedAt: existing.activatedAt }, null, 2));
@@ -130,15 +139,41 @@ async function activate(db, args) {
         return;
     }
 
-    // One permitted action: INSERT the singleton. The PRIMARY KEY plus the
-    // CHECK (id = 1) make a second activation impossible, not merely refused by
-    // this script.
-    await db.$executeRawUnsafe(
-        `INSERT INTO ${enforcement.QUALIFIED_TABLE}
-           ("id", "activatedBy", "approvedBy", "evidenceReference", "evidenceDigest")
-         VALUES (1, $1, $2, $3, $4)`,
-        String(activatedBy), String(approvedBy), String(evidenceReference), String(evidenceDigest)
-    );
+    // §WP-H: ONE database call. The protected record, the latch, the flag, the
+    // GHS projection and the audit row commit together inside
+    // public.azm_authority_activate(), under the exclusive regime lock. This
+    // script no longer INSERTs the record: an operator that could append the
+    // record alone could leave the system half-activated.
+    //
+    // The status sets are the preflight's definition of "unresolved legacy money".
+    // They are supplied from the service so there is one source of truth for the
+    // set's meaning; the function enforces their presence, disjointness and shape.
+    const { BLOCKING_STATUSES, PARKED_STATUSES } = require('../src/services/fiatLiquidityActivationService');
+    if (!Array.isArray(BLOCKING_STATUSES) || !Array.isArray(PARKED_STATUSES)) {
+        console.error(JSON.stringify({ ok: false, refused: 'PREFLIGHT_STATUS_SETS_MISSING' }, null, 2));
+        process.exitCode = 1;
+        return;
+    }
+    let activation;
+    try {
+        const [row] = await db.$queryRawUnsafe(
+            `SELECT public.azm_authority_activate($1, $2, $3, $4, $5) AS result`,
+            String(activatedBy), String(approvedBy), String(reason || 'operator activation'),
+            String(evidenceReference), String(evidenceDigest),
+        );
+        activation = row && row.result;
+    } catch (err) {
+        // The database refused. Nothing was written: the function runs in one
+        // transaction and every failing branch raises before COMMIT.
+        console.error(JSON.stringify({
+            ok: false,
+            refused: 'DATABASE_REFUSED_ACTIVATION',
+            sqlstate: err && err.meta && err.meta.code ? String(err.meta.code) : null,
+            message: String((err && err.message) || err).split('\n')[0],
+        }, null, 2));
+        process.exitCode = 1;
+        return;
+    }
 
     const proofs = await proveImmutability(db);
     const record = await enforcement.readActivationRecord(db);
