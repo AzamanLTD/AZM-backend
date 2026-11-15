@@ -149,9 +149,12 @@ class DineInService {
                 dineInTabId: tabId,
                 productId: productId || null,
                 name: String(itemName).slice(0, 200),
-                unitPriceUsdc: unitDec,
+                // Exact arithmetic, plain numeric transport: the value is a
+                // shortest-round-trip rendering of an already-exact Decimal, never
+                // the product of two floats.
+                unitPriceUsdc: Number(unitDec.toString()),
                 quantity: qty,
-                lineTotalUsdc: lineDec,
+                lineTotalUsdc: Number(lineDec.toString()),
                 addedBy: addedBy || tab.customerId,
             },
         });
@@ -214,13 +217,24 @@ class DineInService {
                     // Exact, and deliberately the same authority the cash-close
                     // path sums (the durable item line totals), so finalize and
                     // close can never disagree about what a tab is worth.
-                    const total = tab.items.reduce(
-                        (sum, item) => sum.plus(new Prisma.Decimal(String(item.lineTotalUsdc))),
-                        new Prisma.Decimal(0)
-                    );
+                    const total = tab.items.reduce((sum, item) => {
+                        if (item.lineTotalUsdc != null) {
+                            return sum.plus(new Prisma.Decimal(String(item.lineTotalUsdc)));
+                        }
+                        // A row without a stored line total still totals exactly:
+                        // the fallback is Decimal multiplication, not float math.
+                        const unit = new Prisma.Decimal(String(item.unitPriceUsdc));
+                        return sum.plus(unit.times(new Prisma.Decimal(String(item.quantity ?? 0))));
+                    }, new Prisma.Decimal(0));
                     const claimed = await tx.dineInTab.updateMany({
                         where: { id: tabId, status: 'OPEN' },
-                        data: { status: 'FINALIZED', closedAt: new Date(), grandTotalUsdc: total, subtotalUsdc: total },
+                        data: {
+                            status: 'FINALIZED',
+                            closedAt: new Date(),
+                            // Exact value, plain numeric transport (see addItem).
+                            grandTotalUsdc: Number(total.toString()),
+                            subtotalUsdc: Number(total.toString()),
+                        },
                     });
                     if (claimed.count !== 1) throw new Error('Tab was finalized by another request.');
                     return tx.dineInTab.findUnique({ where: { id: tabId }, include: { items: true } });
