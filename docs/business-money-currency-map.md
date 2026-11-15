@@ -3,6 +3,35 @@
 Status: design record for review. No gate has been lifted, no POS settlement has been
 enabled, and no production change is proposed by this document.
 
+## Positioning this document is written against (owner-stated, 2026-11-15)
+
+The customer app and the web portals are **local-fiat-first**. They run with no USDC
+anywhere; USDC is an optional extra, not the primary rail, and the portals are **not**
+required to produce a USDC reading.
+
+This is not an aspiration — it is already the backend's behaviour, and the money PRs are
+the source of truth for it:
+
+| Backend PR | What it establishes |
+|---|---|
+| #369 (financial core) | The headline is the **authoritative native-GHS balance only**, exact, no `≈`. The earlier combined `nativeGhs + availableUsdc × rate` formula is **superseded**; the USDC figure is an *estimate beneath* the GHS headline. A missing FX rate must never blank the GHS headline. Pinned: native 100 GHS + 500 USDC at rate 10 ⇒ `100 GHS`, never a combined figure. |
+| #381 | Native-GHS settlement for Moolre collections, flag-gated and OFF. |
+| #382 / #392 | Native-GHS withdrawal leg, shortfall funding planner, bank beneficiaries. |
+| #380 | Dust settlements refused outright: `0.00` GHS can never pay out. |
+| #399 | Reconciles security, financial-correctness and native-GHS onto one main base. |
+
+**Consequence for the order contract.** GHS is the canonical transactional currency; USDC
+is a secondary, optional rail recorded separately. Therefore:
+
+1. A GHS sale is recorded as exact native GHS — never as a USDC field, and never as a
+   "GHS equivalent" valuation.
+2. No portal may be required to show a USDC figure for the feature to work, and no GHS
+   total may be derived from a USDC amount for spendable display.
+3. Where a USDC equivalent *is* shown, it is labelled an estimate and never folded into a
+   GHS headline, total, receipt or report.
+4. A report that sums USDC amounts while claiming to report a business's takings is wrong
+   for a GHS-first product, not merely imprecise.
+
 ## The finding this document exists to record
 
 The backend has exactly **one** native-GHS primitive and **zero** GHS transactional
@@ -17,6 +46,10 @@ records. Verified against `prisma/schema.prisma`:
 | `DineInTab` | `subtotalUsdc` | `Decimal(20,8)` | A USDC tab. |
 | `BusinessLedgerEntry` | `amount` | `Decimal(20,8)` | Ledger amount in the entry's own unit, with no currency column. |
 | `BusinessLedgerEntry` | `amountGhs` | `Decimal(20,8)`, optional | **A valuation**: "GHS equivalent at time of entry". Not a native GHS amount. |
+
+Read the table with the positioning above in mind: it describes what the schema *does*,
+not what the product *should* be. Four of those rows are USDC-shaped because they were
+built when USDC was the rail; they are the surface that has to change.
 
 The distinction in the last row is the one that matters most and is easiest to get
 wrong. A valuation column records what a USDC amount was *worth* at a moment. A native
