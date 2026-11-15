@@ -174,3 +174,23 @@ never from an environment variable.
 Operational consequence: treasury openings created before this column existed, and never
 witnessed, must have their wallet set by the operator before they can be reconciled. That is
 deliberate — guessing the wallet is what the column removes.
+
+## How an opening gets its wallet (2026-11-15)
+
+The reconciler refuses an opening with no `walletAccount`, so the account has to be recorded when
+the opening is created. `recordReceipt` now resolves it in this order:
+
+1. an explicit provider-derived value passed by the caller, trimmed;
+2. otherwise, for a treasury opening that cites a provider observation (`eventDedupKey`), the
+   account is read **server-side** from that observation's stored payload
+   (`raw -> 'data' ->> 'accountnumber'`) — the provider's own bytes, not a caller claim;
+3. otherwise NULL.
+
+Consequences worth knowing:
+
+- A provider-backed deposit opening populates its wallet without an operator step.
+- An internal treasury liquidation (`provider = AZM_TREASURY`, `rail = INTERNAL`) legitimately has
+  no provider wallet and stays NULL. The reconciler therefore refuses it, which is correct: it is
+  not backed by a Moolre payment and must never become available liquidity through this path.
+- Openings created before this change are backfilled by the overlay from witness evidence. Any
+  remaining NULL needs an operator to set it; the reconciler will not guess.

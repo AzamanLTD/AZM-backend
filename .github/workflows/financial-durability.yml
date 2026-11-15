@@ -503,6 +503,7 @@ jobs:
             "__tests__/wp-i-treasury-promotion-race.test.js"
             "__tests__/wp-i-moolre-status-adapter.test.js"
             "__tests__/wp-i-witness-installer-real.test.js"
+            "__tests__/wp-i-treasury-opening-wallet.test.js"
           )
           npx jest --runInBand --forceExit "${SUITES[@]}"
 
