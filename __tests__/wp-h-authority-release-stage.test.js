@@ -30,8 +30,19 @@ describe('WP-H release-chain authority verification', () => {
         const chain = pkg.scripts.release.split(' && ').map((s) => s.trim());
         expect(chain[chain.length - 1]).toBe('node infra/verify-authority-boundary.js');
 
-        const wf = fs.readFileSync(path.join(ROOT, '.github/workflows/test.yml'), 'utf8');
-        expect(wf).toContain('node infra/verify-authority-boundary.js');
+        // Presence in the file is NOT enough: a line appended inside another
+        // step's `run:` scalar still "contains" the string while making the whole
+        // workflow unparseable, which is exactly how this broke CI once. Parse the
+        // file and require the stage to be a real step of its own.
+        const yaml = require('js-yaml');
+        const wfText = fs.readFileSync(path.join(ROOT, '.github/workflows/test.yml'), 'utf8');
+        const wf = yaml.load(wfText);
+        const steps = Object.values(wf.jobs).flatMap((j) => j.steps || []);
+        const matches = steps.filter((s) => String(s.run || '').includes('node infra/verify-authority-boundary.js'));
+        expect(matches).toHaveLength(1);
+        expect(matches[0].name).toBeTruthy();
+        // and it must not be swallowed into a multi-line run block
+        expect(matches[0].run.trim()).toBe('node infra/verify-authority-boundary.js');
     });
 
     test('the stage provisions nothing: it never issues DDL or grants', () => {
