@@ -137,8 +137,12 @@ if (process.env.REDIS_URL) {
     try {
         const { createAdapter } = require('@socket.io/redis-adapter');
         const { Redis } = require('ioredis');
-        const isTLS = process.env.REDIS_URL.startsWith('rediss://');
-        const pubClient = new Redis(process.env.REDIS_URL, isTLS ? { tls: {} } : {});
+        // Validate through the shared layer so an Upstash REST URL, a malformed
+        // URL, or a plaintext-in-production URL cannot reach ioredis here.
+        const { normalizeRedisUrl } = require('./src/lib/redisConnection');
+        const redisUrl = normalizeRedisUrl(process.env.REDIS_URL);
+        const isTLS = redisUrl.startsWith('rediss://');
+        const pubClient = new Redis(redisUrl, isTLS ? { tls: {} } : {});
         const subClient = pubClient.duplicate();
         pubClient.on('connect', () => { redisStatus = 'connected'; });
         pubClient.on('error', (e) => {

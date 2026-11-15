@@ -126,8 +126,17 @@ class BullScheduler {
      */
     async init() {
         if (!process.env.REDIS_URL) {
-            this.mode = 'single_instance_fallback';
-            this._logMode('REDIS_URL not set (Redis-off single-instance mode)');
+            // An EXPLICIT, ENFORCED mode, never an inference. Local scheduling is
+            // only correct when this process really is the only one; an instance
+            // that merely lost its Redis config must not quietly become a second
+            // scheduler running the same financial jobs.
+            if (String(process.env.SCHEDULER_SINGLE_INSTANCE || '').toLowerCase() === 'true') {
+                this.mode = 'single_instance_fallback';
+                this._logMode('REDIS_URL unset + SCHEDULER_SINGLE_INSTANCE=true — explicit single-instance scheduling');
+            } else {
+                this.mode = 'disabled_no_scheduling';
+                this._logMode('REDIS_URL unset and SCHEDULER_SINGLE_INSTANCE is not true — NO scheduling (fail closed)');
+            }
             return;
         }
 
@@ -167,8 +176,12 @@ class BullScheduler {
             // Clean wholesale fallback: no partial Bull state, no retry loop.
             await this._hardDisconnect();
             this.useBull = false;
-            this.mode = 'single_instance_fallback';
-            this._logMode(`Redis unavailable at boot (${err.message}) — single-instance fallback`);
+            // Redis was CONFIGURED and did not answer. Falling back to local
+            // scheduling here is exactly how N instances each become an
+            // independent scheduler and run the same financial job N times. The
+            // scheduler refuses to schedule until Redis answers again.
+            this.mode = 'unavailable_no_scheduling';
+            this._logMode(`Redis configured but unavailable at boot (${err.message}) — NO scheduling (fail closed)`);
         }
     }
 
@@ -219,7 +232,7 @@ class BullScheduler {
             logger.error(`[BullScheduler] Circuit breaker OPEN (${reason}: ${detail}) — switching ALL jobs to in-process fallback`);
             await this._shutdownBull();
             this.useBull = false;
-            this.mode = 'single_instance_fallback';
+            this.mode = 'unavailable_no_scheduling';
             for (const [name, job] of this.jobs) {
                 if (!this.fallbacks.has(name)) {
                     this._registerFallback(name, job.cronExpr, job.handler, job.opts);
@@ -351,7 +364,7 @@ class BullScheduler {
             // one mode even if the restore half-failed.
             await this._shutdownBull().catch(() => {});
             this.useBull = false;
-            this.mode = 'single_instance_fallback';
+            this.mode = 'unavailable_no_scheduling';
             for (const [name, job] of this.jobs) {
                 if (!this.fallbacks.has(name)) {
                     this._registerFallback(name, job.cronExpr, job.handler, job.opts);
