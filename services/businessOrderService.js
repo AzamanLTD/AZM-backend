@@ -2,6 +2,8 @@
 const { emitWebhookEvent } = require('./webhookEmitter');
 const { sumOrdersByCurrency, averageOrderValue } = require('../src/lib/businessRevenueAggregate');
 const { randomBytes } = require('crypto');
+const { Prisma } = require('@prisma/client');
+const { OrderCurrencyError, CODES: CURRENCY_CODES } = require('../src/lib/businessOrderCurrency');
 
 const _generateOrderRef = async (prisma) => {
     for (let i = 0; i < 5; i++) {
@@ -58,9 +60,39 @@ const _getRevenueByDay = async (prisma, businessProfileId) => {
     from.setUTCHours(0, 0, 0, 0);
     from.setUTCDate(from.getUTCDate() - 29);
 
+    // PARTITIONED BY CURRENCY, NEVER MERGED (local-fiat-first).
+    //
+    // This series used to be COALESCE(SUM("amountUsdc"), 0) per day. A native-GHS
+    // order carries NO USDC amount at all (the CHECK enforces the pairing), so a
+    // merchant who takes only cedis saw a chart of zeros while their money was
+    // real. A total that omits the customer's money is not a display nuance, it
+    // is a wrong number. Merging the two would be wrong the other way: it would
+    // present cedis as dollars.
+    //
+    // Rules this shape encodes:
+    //  - GHS comes from "amountGhs" (exact pesewas), never from a valuation.
+    //  - USDC comes from "amountUsdc". Rows written before the currency contract
+    //    carry a USDC amount and a NULL currency; they count as USDC, which is
+    //    what they are, and are never re-labelled as cedis.
+    //  - A currency with no activity that day is null, not 0: a merchant with no
+    //    USDC takings simply has no USDC reading. That is the normal state.
+    //  - Sums come back ::text so no value passes through a JS float.
+    //  - a corrupt row (both amounts, or neither for a tagged order, or an
+    //    unknown currency) does NOT get counted into a total and does NOT get
+    //    skipped. The per-order reader refuses such a row outright, and this
+    //    series refuses with it: two different answers to "what is this row
+    //    worth" is how a chart quietly disagrees with a total.
     const rows = await prisma.$queryRaw`
         SELECT DATE_TRUNC('day', "createdAt") AS date,
-               COALESCE(SUM("amountUsdc"), 0) AS revenue
+               COALESCE(SUM(CASE WHEN "currency" = 'GHS' THEN "amountGhs" ELSE 0 END), 0)::text AS ghs,
+               COUNT(*) FILTER (WHERE "currency" = 'GHS') AS ghs_count,
+               COALESCE(SUM(CASE WHEN ("currency" IS NULL OR "currency" = 'USDC') THEN "amountUsdc" ELSE 0 END), 0)::text AS usdc,
+               COUNT(*) FILTER (WHERE "currency" IS NULL OR "currency" = 'USDC') AS usdc_count,
+               COUNT(*) FILTER (
+                   WHERE ("currency" = 'GHS'  AND ("amountGhs" IS NULL OR "amountUsdc" IS NOT NULL))
+                      OR ("currency" = 'USDC' AND "amountUsdc" IS NULL)
+                      OR ("currency" IS NOT NULL AND "currency" NOT IN ('GHS', 'USDC'))
+               ) AS corrupt
         FROM "BusinessOrder"
         WHERE "businessProfileId" = ${businessProfileId}
           AND status = 'COMPLETED'
@@ -71,8 +103,19 @@ const _getRevenueByDay = async (prisma, businessProfileId) => {
 
     const byDate = new Map();
     for (const row of rows) {
-        const key = new Date(row.date).toISOString().slice(0, 10);
-        byDate.set(key, Number(row.revenue) || 0);
+        byDate.set(new Date(row.date).toISOString().slice(0, 10), row);
+    }
+
+    const corruptDays = rows.filter((row) => Number(row.corrupt) > 0);
+    if (corruptDays.length > 0) {
+        // Same refusal as sumOrdersByCurrency / readOrderAmount. A row that
+        // cannot be read must never be guessed at, silently counted, or quietly
+        // left out of the money the merchant sees.
+        throw new OrderCurrencyError(
+            CURRENCY_CODES.CORRUPT,
+            `Revenue series contains ${corruptDays.length} day(s) with unreadable order amounts.`,
+            { days: corruptDays.map((r) => new Date(r.date).toISOString().slice(0, 10)) }
+        );
     }
 
     const result = [];
@@ -83,7 +126,28 @@ const _getRevenueByDay = async (prisma, businessProfileId) => {
             day: 'numeric',
             timeZone: 'UTC',
         }).format(cursor);
-        result.push({ date: key, label, revenue: byDate.get(key) || 0 });
+
+        const row = byDate.get(key);
+        const ghsCount = row ? Number(row.ghs_count) : 0;
+        const usdcCount = row ? Number(row.usdc_count) : 0;
+        // A caller-supplied row is read defensively: the legacy series contract
+        // was {date, revenue}, and a double that still returns exactly that must
+        // not crash the endpoint. Missing partitions simply mean no reading.
+        const ghs = row ? new Prisma.Decimal(row.ghs ?? '0') : null;
+        const usdc = row ? new Prisma.Decimal(row.usdc ?? '0') : null;
+
+        result.push({
+            date: key,
+            label,
+            // Legacy USDC scalar, unchanged meaning, kept for existing clients.
+            revenue: row && row.revenue !== undefined
+                ? Number(row.revenue)
+                : (usdc ? Number(usdc) : 0),
+            byCurrency: {
+                GHS: ghsCount > 0 ? ghs.toFixed(2) : null,
+                USDC: usdcCount > 0 ? usdc.toFixed(8) : null,
+            },
+        });
     }
     return result;
 };
@@ -226,6 +290,16 @@ const getBusinessStats = async (prisma, { businessProfileId }) => {
         prisma.businessInvoice.aggregate({ where: { businessProfileId, status: 'PAID' }, _sum: { billTotalUsdc: true } }),
     ]);
     const revenue = sumOrdersByCurrency(revenueRows);
+
+    // The single figure a dashboard can show without lying. Native GHS wins
+    // whenever the merchant has taken cedis, because GHS is the primary rail and
+    // for many merchants the only one. USDC appears only when it is the sole
+    // activity. This is a CHOICE BETWEEN the two, never a sum of them, and it is
+    // null when there is no revenue at all rather than 0.00 of some assumed
+    // currency.
+    const headline = revenue.counts.GHS > 0
+        ? { currency: 'GHS', amount: revenue.GHS }
+        : (revenue.counts.USDC > 0 ? { currency: 'USDC', amount: revenue.USDC } : null);
     // `totalRevenue` is kept for existing clients and means USDC revenue ONLY
     // (the SUM above ignores NULL USDC amounts, so GHS orders never enter it).
     // It must never become a merged GHS+USDC figure.
@@ -238,11 +312,13 @@ const getBusinessStats = async (prisma, { businessProfileId }) => {
         cancelledOrders,
         totalRevenue,
         revenue,
+        headline,
         revenueBasis: 'PER_CURRENCY',
         avgOrderValueByCurrency: averageOrderValue(revenue),
         avgOrderValue: completedOrders > 0 ? totalRevenue / completedOrders : 0,
         recentOrders,
         revenueByDay,
+        revenueByDayBasis: 'PER_CURRENCY',
         invoiceStats: {
             sent: invoiceSent,
             paid: invoicePaid,
