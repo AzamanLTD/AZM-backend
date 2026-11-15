@@ -55,7 +55,39 @@ function normalizeRedisUrl(raw) {
     if (!/^rediss?:\/\//i.test(url)) {
         throw new Error('[redis] REDIS_URL must start with redis:// or rediss://');
     }
+    assertTransportSecurity(url);
     return url;
+}
+
+/**
+ * Refuse an UNENCRYPTED Redis URL in production.
+ *
+ * Verified 2026-11-14 against Redis Cloud: the free Essentials plan cannot
+ * enable TLS at all — the API answers FIXED_DATABASE_ENABLE_TLS_NOT_SUPPORTED_
+ * IN_REQUESTED_PLAN. So `redis://` in production is not a hypothetical, it is
+ * what a free-tier endpoint forces, and it sends the password and every key
+ * over the public internet in the clear.
+ *
+ * Refusing here rather than accepting quietly is deliberate: the caller then
+ * sees "not configured", and the OTP path fails closed with
+ * OTP_STORE_UNAVAILABLE instead of writing codes through an unencrypted link.
+ * The escape hatch exists for a genuinely private network and is one explicit
+ * variable, never an inference from the hostname.
+ */
+function assertTransportSecurity(url, env = process.env) {
+    if (String(env.NODE_ENV || '') !== 'production') return url;   // dev/test: unchanged
+    if (/^rediss:\/\//i.test(url)) return url;                     // encrypted, fine
+    if (String(env.REDIS_ALLOW_PLAINTEXT || '').toLowerCase() === 'true') {
+        logger.warn(
+            '[redis] REDIS_ALLOW_PLAINTEXT=true — accepting an UNENCRYPTED redis:// URL in production. '
+            + 'Only correct for a private network; the password and all keys are visible on the wire.'
+        );
+        return url;
+    }
+    throw new Error(
+        '[redis] refusing plaintext redis:// in production: use rediss:// so the password and keys are '
+        + 'encrypted. If this endpoint really is on a private network, set REDIS_ALLOW_PLAINTEXT=true explicitly.'
+    );
 }
 
 /**
@@ -167,6 +199,7 @@ module.exports = {
     isConfigured,
     disconnectAll,
     normalizeRedisUrl,
+    assertTransportSecurity,
     retryStrategy,
     PROFILES,
 };
