@@ -29,6 +29,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Added so an exact head can be rehearsed on demand. Without this the lane could
+  # only be reached by a push or PR event, which left stacked branches with no way
+  # to obtain durability evidence at all.
+  workflow_dispatch:
 
 concurrency:
   group: financial-durability-${{ github.ref }}
