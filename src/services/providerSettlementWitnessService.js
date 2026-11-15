@@ -276,6 +276,24 @@ async function recordProviderSettlementWitness(tx, input = {}) {
   // Currency comes from the authoritative mapping, never from the payload.
   const currency = currencyForAccount(walletAccount, resolveCurrencyMapping(input.currencyMapping));
 
+  // The account the provider NAMES in its own response must be the account we
+  // reconciled. Asking about wallet Y while the provider answers for wallet Z is
+  // not evidence about Y, so it is a refusal — even when the amounts happen to
+  // agree. An answer that names no account is allowed: the query was scoped to
+  // the opening's wallet and the provider returned nothing for it.
+  const reportedAccount = providerPayload && providerPayload.accountnumber != null
+    ? String(providerPayload.accountnumber).trim()
+    : '';
+  const reconciledAccount = walletAccount == null ? '' : String(walletAccount).trim();
+  if (reportedAccount !== '' && reconciledAccount !== '' && reportedAccount !== reconciledAccount) {
+    throw new WitnessError(
+      'WITNESS_ACCOUNT_MISMATCH',
+      `[wp-i] the provider settled ${reportedAccount}, not the reconciled wallet ${reconciledAccount}`,
+      { reportedAccount, reconciledAccount }
+    );
+  }
+
+
   const fetched = fetchedAt instanceof Date ? fetchedAt : new Date(fetchedAt);
   if (Number.isNaN(fetched.getTime())) {
     throw new WitnessError('WITNESS_FETCH_TIME_INVALID', '[wp-i] witness requires the real time of the provider fetch');

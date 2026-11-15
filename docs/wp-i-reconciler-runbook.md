@@ -89,6 +89,7 @@ Each opening reports `witnessed` or a stable refusal reason. Refusal reasons wor
 | `PROVIDER_NOT_SETTLED_*` | pending, failed, unknown or malformed provider state |
 | `PROVIDER_TRANSPORT_*` | timeout, HTTP error, non-JSON |
 | `WITNESS_OBSERVATION_ALREADY_USED` | that payment already funds another opening |
+| `WITNESS_ACCOUNT_MISMATCH` | the provider settled a different wallet than the opening's; the answer is not evidence about this opening |
 
 A transport failure is **not** retried with a different reference. Re-run the same opening when
 the provider is reachable; the response is refetched and re-digested.

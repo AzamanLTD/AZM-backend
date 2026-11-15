@@ -106,6 +106,18 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
         return body;
     }
 
+    test('a provider answer for a DIFFERENT wallet cannot vouch for this opening', async () => {
+        await seedOpening(OPENING_A, { walletAccount: 'WALLET-AZM-1' });
+        // Settled, correct amount, correct reference — but another wallet's money.
+        stubProvider({ accountnumber: 'WALLET-SOMEBODY-ELSE' });
+
+        const results = await reconciler.reconcileTreasuryOpenings({ openingDedupKeys: [OPENING_A] });
+
+        expect(results[0].witnessed).toBe(false);
+        expect(results[0].reason).toBe('WITNESS_ACCOUNT_MISMATCH');
+        expect(await prisma.providerSettlementWitness.count()).toBe(0);
+    });
+
     test('a malformed currency map refuses every opening instead of guessing GHS', async () => {
         await seedOpening(OPENING_A, { walletAccount: 'WALLET-AZM-1' });
         stubProvider({});
