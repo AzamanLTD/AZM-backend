@@ -236,6 +236,58 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
         }
     }
 
+    // ── C: attacker-created roles ───────────────────────────────────────────
+    // The loop above only knows the three role names. A role minted while the
+    // function owner still held CREATEROLE, or one granted membership by an
+    // operator, is an inheritance path INTO the activation role that no name list
+    // catches. So enumerate the catalog instead of trusting a list.
+    //
+    // Remediate first, then fail: the database is left safe either way, but
+    // evidence of tampering must reach a human instead of passing as a clean
+    // install (same posture as an unexpected owned object).
+    const allow = new Set([owner, operator, runtime]);
+    const foreignMemberships = [];
+    // The function owner is included deliberately: whoever inherits it can replace
+    // the SECURITY DEFINER function, which is the same power as owning the record.
+    for (const grantor of [owner, operator, functionOwner]) {
+        const rows = await prisma.$queryRawUnsafe(
+            `SELECT m.rolname AS member
+               FROM pg_auth_members am
+               JOIN pg_roles g ON g.oid = am.roleid
+               JOIN pg_roles m ON m.oid = am.member
+              WHERE g.rolname = $1 AND m.rolname <> $1
+              ORDER BY m.rolname`,
+            grantor
+        ).catch(() => []);
+        for (const row of rows) {
+            foreignMemberships.push(`${row.member} inherits ${grantor}`);
+            await prisma.$executeRawUnsafe(
+                `REVOKE ${quoteIdent(grantor)} FROM ${quoteIdent(row.member)}`
+            );
+            report.applied.push(`REVOKE ${grantor} FROM ${row.member} (foreign membership)`);
+        }
+    }
+
+    // Privileges are read from the catalog too, not inferred from what this
+    // installer just granted. An ACL entry is "grantee=privs/grantor"; a bare "="
+    // is PUBLIC, which is revoked above and must stay gone.
+    const aclRows = await prisma.$queryRawUnsafe(
+        `SELECT unnest(relacl)::text AS acl FROM pg_class WHERE oid = $1::regclass
+         UNION ALL
+         SELECT unnest(proacl)::text AS acl FROM pg_proc WHERE oid = $2::regproc`,
+        TABLE, TRIGGER_FN
+    ).catch(() => []);
+    const foreignGrantees = new Set();
+    for (const row of aclRows) {
+        const grantee = String(row.acl || '').split('=')[0].replace(/"/g, '');
+        if (grantee && !allow.has(grantee)) foreignGrantees.add(grantee);
+    }
+    for (const grantee of foreignGrantees) {
+        await prisma.$executeRawUnsafe(`REVOKE ALL ON TABLE ${TABLE} FROM ${quoteIdent(grantee)}`);
+        await prisma.$executeRawUnsafe(`REVOKE ALL ON FUNCTION ${TRIGGER_FN} FROM ${quoteIdent(grantee)}`);
+        report.applied.push(`REVOKE ALL FROM ${grantee} (foreign grantee on the boundary)`);
+    }
+
     // ── verify, then fail loudly ────────────────────────────────────────────
     // §WP-H: the operator no longer inserts the record itself; the sanctioned
     // path is the SECURITY DEFINER function owned by the dedicated NOLOGIN role.
@@ -301,6 +353,12 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
     if (ownerRow && ownerRow.rolsuper) report.problems.push('owner role is a superuser');
 
     if (hasRoleContext && fnReport && Array.isArray(fnReport.problems)) report.problems.push(...fnReport.problems);
+    for (const edge of foreignMemberships) {
+        report.problems.push(`foreign role membership revoked: ${edge} (investigate how it was granted)`);
+    }
+    for (const grantee of foreignGrantees) {
+        report.problems.push(`foreign grantee had privileges on the boundary: ${grantee} (revoked)`);
+    }
     report.ok = report.problems.length === 0;
     report.applicable = {
         superuser: superuser && superuser.is_superuser === true,
