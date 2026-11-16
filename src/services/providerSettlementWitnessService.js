@@ -165,6 +165,84 @@ function currencyForAccount(accountNumber, mapping) {
 }
 
 /**
+ * THE DOCUMENTED MOOLRE PAYMENT STATUS CONTRACT.
+ *
+ * The only provider answer that may evidence treasury funding is the Payment
+ * Status response: a wrapper carrying `status`, and a `data` object carrying a
+ * NUMERIC `txstatus` alongside `externalref`, `accountnumber`, `value` (net) and
+ * `amount` (gross).
+ *
+ * Two things this rules out, both of which previously authorised money:
+ *   - the legacy `state` / `txstatus_label` vocabulary. Those are not the
+ *     documented numeric field, and treating free-text "success" as settlement
+ *     is an adapter guessing at a provider's semantics. For funding they are
+ *     UNKNOWN, never success.
+ *   - identity fields being OPTIONAL. A response naming no account and no
+ *     reference proves nothing about either, and the old `?? walletAccount`
+ *     fallback silently substituted the wallet we asked about for the account
+ *     the provider actually named.
+ */
+const DOCUMENTED_ADAPTER_RULE = 'moolre-payment-status-v1';
+const TXSTATUS_SUCCESS = 1;
+
+/** `data.txstatus` is numeric by contract; a numeric string is tolerated, anything else is absent. */
+function numericTxstatus(value) {
+    if (typeof value === 'number' && Number.isFinite(value)) return value;
+    if (typeof value === 'string' && /^[0-9]+$/.test(value.trim())) return Number(value.trim());
+    return null;
+}
+
+function parseDocumentedStatusBytes(rawResponse) {
+    let doc;
+    try {
+        doc = JSON.parse(String(rawResponse));
+    } catch (_) {
+        throw new WitnessError(
+            'WITNESS_RAW_RESPONSE_UNPARSEABLE',
+            '[wp-i] the retained provider response is not JSON, so none of its claims can be re-derived'
+        );
+    }
+    if (!doc || typeof doc !== 'object' || Array.isArray(doc)) {
+        throw new WitnessError('WITNESS_RAW_RESPONSE_UNPARSEABLE', '[wp-i] the retained provider response is not a JSON object');
+    }
+    const data = doc.data && typeof doc.data === 'object' && !Array.isArray(doc.data) ? doc.data : null;
+    if (!data) {
+        throw new WitnessError(
+            'WITNESS_PROVIDER_PAYLOAD_ABSENT',
+            '[wp-i] the documented Moolre status response carries a `data` object; this one does not'
+        );
+    }
+    const txstatus = numericTxstatus(data.txstatus);
+    if (txstatus === null) {
+        throw new WitnessError(
+            'WITNESS_LEGACY_STATUS_NOT_FUNDABLE',
+            '[wp-i] no numeric data.txstatus; legacy state/txstatus_label observations are UNKNOWN for funding'
+        );
+    }
+    if (txstatus !== TXSTATUS_SUCCESS) {
+        throw new WitnessError(
+            'WITNESS_PROVIDER_STATE_NOT_SETTLED',
+            '[wp-i] provider txstatus ' + txstatus + ' is not settlement; only ' + TXSTATUS_SUCCESS + ' may evidence funding'
+        );
+    }
+    const externalref = data.externalref == null ? '' : String(data.externalref).trim();
+    const accountnumber = data.accountnumber == null ? '' : String(data.accountnumber).trim();
+    if (!externalref || !accountnumber) {
+        throw new WitnessError(
+            'WITNESS_IDENTITY_FIELDS_REQUIRED',
+            '[wp-i] the response must name both externalref and accountnumber; a missing identity field is not optional for treasury proof'
+        );
+    }
+    return {
+        wrapperStatus: doc.status === undefined || doc.status === null ? null : String(doc.status),
+        data: data,
+        txstatus: txstatus,
+        externalref: externalref,
+        accountnumber: accountnumber,
+    };
+}
+
+/**
  * Moolre reports BOTH `amount` (payer gross) and `value` (net after fees).
  * The ledger may only credit what the wallet actually received, so net is
  * authoritative and gross is retained alongside it for reconciliation.
@@ -218,8 +296,10 @@ async function recordProviderSettlementWitness(tx, input = {}) {
   // The adapter's documented settlement verdict is authoritative when supplied.
   // The legacy field sniffing below exists only for historical fixtures and is
   // recorded on the witness as undocumented.
-  const legacyState = String(providerPayload?.state ?? providerPayload?.txstatus_label ?? '').toUpperCase();
-  const effectiveState = settlementState ? String(settlementState).toUpperCase() : legacyState;
+  // There is no legacy fallback any more. `state` / `txstatus_label` are not the
+  // documented field and must never be read as settlement; parseDocumentedStatusBytes
+  // below refuses an envelope without a numeric data.txstatus.
+  const effectiveState = settlementState ? String(settlementState).toUpperCase() : 'SETTLED';
 
   if (!openingDedupKey || typeof openingDedupKey !== 'string') {
     throw new WitnessError(
@@ -264,7 +344,33 @@ async function recordProviderSettlementWitness(tx, input = {}) {
 
   // The amounts are DERIVED from the provider payload, never taken on trust
   // from the caller. A caller-supplied figure must agree with the bytes.
-  const derived = settledAmountFromProviderPayload(providerPayload);
+  // THE BYTES ARE THE EVIDENCE. Everything below is re-derived from rawResponse,
+  // never taken from a caller's parsed copy. A supplied providerPayload is
+  // accepted only when it IS the parse of these exact bytes.
+  const parsed = parseDocumentedStatusBytes(rawResponse);
+  if (providerPayload !== undefined && providerPayload !== null) {
+    if (JSON.stringify(providerPayload) !== JSON.stringify(parsed.data)) {
+      throw new WitnessMismatchError(
+        '[wp-i] the supplied providerPayload is not the parse of the retained raw response bytes',
+        { parsedDigest: digestOf(JSON.stringify(parsed.data)), suppliedDigest: digestOf(JSON.stringify(providerPayload)) }
+      );
+    }
+  }
+  if (adapterRule !== null && adapterRule !== undefined && adapterRule !== DOCUMENTED_ADAPTER_RULE) {
+    throw new WitnessError(
+      'WITNESS_ADAPTER_RULE_UNSUPPORTED',
+      '[wp-i] adapter rule ' + String(adapterRule) + ' is not the documented ' + DOCUMENTED_ADAPTER_RULE
+    );
+  }
+  const derived = settledAmountFromProviderPayload(parsed.data);
+  if (derived.grossPesewas !== null && derived.grossPesewas < derived.netPesewas) {
+    // A gross below net is not a fee, it is a contradiction. Never invent a
+    // negative fee to make the arithmetic close.
+    throw new WitnessMismatchError(
+      '[wp-i] provider gross ' + derived.grossPesewas + ' pesewas is BELOW net ' + derived.netPesewas + ' pesewas',
+      { grossPesewas: derived.grossPesewas.toString(), netPesewas: derived.netPesewas.toString() }
+    );
+  }
   const netPesewas = derived.netPesewas;
   if (amounts?.netPesewas !== undefined && BigInt(amounts.netPesewas) !== netPesewas) {
     throw new WitnessMismatchError(
@@ -281,9 +387,7 @@ async function recordProviderSettlementWitness(tx, input = {}) {
   // not evidence about Y, so it is a refusal — even when the amounts happen to
   // agree. An answer that names no account is allowed: the query was scoped to
   // the opening's wallet and the provider returned nothing for it.
-  const reportedAccount = providerPayload && providerPayload.accountnumber != null
-    ? String(providerPayload.accountnumber).trim()
-    : '';
+  const reportedAccount = parsed.accountnumber;
   const reconciledAccount = walletAccount == null ? '' : String(walletAccount).trim();
   if (reportedAccount !== '' && reconciledAccount !== '' && reportedAccount !== reconciledAccount) {
     throw new WitnessError(
@@ -298,10 +402,16 @@ async function recordProviderSettlementWitness(tx, input = {}) {
   // externalref means we are holding an answer to a different question, and
   // matching amounts would otherwise let it vouch for this opening.
   const requestedReferenceRaw = requestParams && (requestParams.id ?? requestParams.reference);
-  const reportedReferenceRaw = providerPayload && (providerPayload.externalref ?? providerPayload.reference);
+  const reportedReferenceRaw = parsed.externalref;
   const requestedReference = requestedReferenceRaw == null ? '' : String(requestedReferenceRaw).trim();
   const reportedReference = reportedReferenceRaw == null ? '' : String(reportedReferenceRaw).trim();
-  if (requestedReference !== '' && reportedReference !== '' && reportedReference !== requestedReference) {
+  if (reportedReference === '') {
+    throw new WitnessError(
+      'WITNESS_IDENTITY_FIELDS_REQUIRED',
+      '[wp-i] the response names no externalref, so it cannot be bound to a specific provider payment'
+    );
+  }
+  if (requestedReference !== '' && reportedReference !== requestedReference) {
     throw new WitnessError(
       'WITNESS_REFERENCE_MISMATCH',
       `[wp-i] the provider answered for ${reportedReference}, not the requested reference ${requestedReference}`,
@@ -349,14 +459,9 @@ async function recordProviderSettlementWitness(tx, input = {}) {
   // payment, so fall back to the reference the provider reported and finally to
   // the response bytes themselves — two different payments can never collide,
   // and the same payment always does.
-  const observedReference = requestParams?.id
-    ?? requestParams?.reference
-    ?? providerPayload?.externalref
-    ?? providerPayload?.reference
-    ?? providerPayload?.transactionid
-    ?? digestOf(rawResponse);
-  const observedAccount = providerPayload?.accountnumber ?? walletAccount ?? '';
-  const observedTransactionId = providerPayload?.transactionid ?? requestParams?.transactionid ?? '';
+  const observedReference = parsed.externalref;
+  const observedAccount = parsed.accountnumber;
+  const observedTransactionId = parsed.data.transactionid ?? requestParams?.transactionid ?? '';
   const observationKey = crypto
     .createHash('sha256')
     .update([
@@ -384,9 +489,9 @@ async function recordProviderSettlementWitness(tx, input = {}) {
       walletAccount: String(walletAccount ?? ''),
       currency,
       netPesewas,
-      grossPesewas: amounts?.grossPesewas ?? null,
+      grossPesewas: derived.grossPesewas,
       providerState: effectiveState,
-      adapterRule: adapterRule ?? (settlementState ? null : 'legacy-field-sniffing-undocumented'),
+      adapterRule: DOCUMENTED_ADAPTER_RULE,
       endpoint: String(endpoint ?? ''),
       requestParams: requestParams ?? {},
       rawResponseDigest: digestOf(rawResponse),
