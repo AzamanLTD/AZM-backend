@@ -51,7 +51,7 @@ router.post('/initiate', protectActive, requireKyc('trade'), require2FA(),
     idempotency(), initiateTrade);
 
 // ── Vendor approval actions ──────────────────────────────────────────────────
-router.post('/accept',  protectActive,
+router.post('/accept',  protectActive, requireKyc('trade'),
     idempotency(), acceptTrade);
 router.post('/decline', protectActive, declineTrade);
 
