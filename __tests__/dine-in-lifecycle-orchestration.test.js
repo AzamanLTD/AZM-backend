@@ -76,7 +76,10 @@ describe('dine-in lifecycle orchestration', () => {
       expect.objectContaining({
         businessProfileId: 'biz-1',
         customerId: 7,
-        lineItems: [{ description: 'Jollof', quantity: 1, unitPrice: 40 }],
+        // Exact decimal string, not a Number: the invoice is built without a
+        // float round-trip. currency: null pins the legacy untagged-USDC tab.
+        lineItems: [{ description: 'Jollof', quantity: 1, unitPrice: '40' }],
+        currency: null,
         idempotencyKey: 'DINE_IN_TAB:tab-1',
       }),
     );
