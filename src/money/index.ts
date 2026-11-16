@@ -40,7 +40,14 @@ export {
   type Ordering,
   type Quantity,
 } from './arithmetic';
-export { applyRounding, roundMinorUnits, type RoundingMode } from './rounding';
+export {
+  ROUNDING_MODES,
+  applyRounding,
+  assertRoundingMode,
+  isRoundingMode,
+  roundMinorUnits,
+  type RoundingMode,
+} from './rounding';
 export {
   formatValuation,
   valuationToJSONValue,

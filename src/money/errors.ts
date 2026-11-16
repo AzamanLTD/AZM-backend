@@ -19,6 +19,7 @@ export type MoneyErrorCode =
   | 'QUANTITY_UNSAFE'
   | 'INVALID_RATE'
   | 'INVALID_PROVENANCE'
+  | 'INVALID_ROUNDING_MODE'
   | 'DIVISOR_INVALID';
 
 export class MoneyError extends Error {

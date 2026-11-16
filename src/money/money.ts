@@ -18,6 +18,7 @@
 import { CURRENCIES, type CurrencyCode } from './currency';
 import { MoneyError } from './errors';
 import { formatMinor } from './format';
+import { serialiseMoney, type SerialisedMoney } from './serialised';
 
 declare const moneyBrand: unique symbol;
 
@@ -25,8 +26,13 @@ export interface Money<C extends CurrencyCode> {
   readonly currency: C;
   readonly minorUnits: bigint;
   readonly [moneyBrand]: C;
-  /** Exact decimal string. JSON.stringify uses this, never the bigint. */
-  toJSON(): string;
+  /**
+   * Automatic serialisation: a currency-tagged object, never a bare string and
+   * never the bigint. The tag is load-bearing — GHS and USDC are different
+   * liabilities, so `JSON.stringify({ amount })` must not lose which one this is.
+   */
+  toJSON(): SerialisedMoney<C>;
+  /** Human-facing rendering, e.g. "12.34 GHS". Not a wire format. */
   toString(): string;
 }
 
@@ -41,8 +47,8 @@ export function moneyFromMinorUnits<C extends CurrencyCode>(currency: C, minorUn
   const value: Money<C> = {
     currency,
     minorUnits,
-    toJSON(): string {
-      return formatMinor(minorUnits, decimals);
+    toJSON(): SerialisedMoney<C> {
+      return serialiseMoney(currency, minorUnits);
     },
     toString(): string {
       return `${formatMinor(minorUnits, decimals)} ${currency}`;

@@ -31,7 +31,7 @@ import { CURRENCIES, type CurrencyCode } from './currency';
 import { MoneyError } from './errors';
 import { formatMinor } from './format';
 import type { Money } from './money';
-import { applyRounding, type RoundingMode } from './rounding';
+import { applyRounding, assertRoundingMode, type RoundingMode } from './rounding';
 
 export interface QuoteProvenance {
   /** Where the rate came from, e.g. a pricing service identifier. */
@@ -193,6 +193,9 @@ export function valueWithQuote<B extends CurrencyCode, Q extends CurrencyCode>(
   quote: FxQuote<B, Q>,
   mode: RoundingMode,
 ): MoneyValuation<Q> {
+  // A conversion is where rounding policy actually decides money, so an unknown
+  // mode is refused before the quote is even evaluated.
+  assertRoundingMode(mode);
   if (amount.currency !== quote.base) {
     throw new MoneyError(
       'CURRENCY_MISMATCH',

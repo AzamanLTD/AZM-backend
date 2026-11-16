@@ -13,17 +13,22 @@ import { CURRENCIES, currencySpec, type CurrencyCode } from './currency';
 import { formatMinor } from './format';
 import type { Money } from './money';
 import { parseMoney } from './parse';
+import { serialiseMoney, type SerialisedMoney } from './serialised';
 
-export interface SerialisedMoney<C extends CurrencyCode = CurrencyCode> {
-  readonly currency: C;
-  readonly amount: string;
-}
+export type { SerialisedMoney } from './serialised';
 
+/**
+ * The same tagged shape `JSON.stringify` produces through `Money.toJSON`.
+ * Kept as an explicit helper for code that cannot rely on method dispatch.
+ */
 export function moneyToJSONValue<C extends CurrencyCode>(money: Money<C>): SerialisedMoney<C> {
-  return { currency: money.currency, amount: formatMinor(money.minorUnits, CURRENCIES[money.currency].decimals) };
+  return serialiseMoney(money.currency, money.minorUnits);
 }
 
-/** Prisma DECIMAL column value: a string, never a float. */
+/**
+ * Prisma DECIMAL column value: a bare decimal string, never a float and never
+ * tagged, because the column itself determines the currency.
+ */
 export function moneyToDecimalString<C extends CurrencyCode>(money: Money<C>): string {
   return formatMinor(money.minorUnits, CURRENCIES[money.currency].decimals);
 }

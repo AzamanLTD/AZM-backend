@@ -20,7 +20,10 @@ import {
   multiplyByQuantity,
   parseMoney,
   subtract,
+  ROUNDING_MODES,
   applyRounding,
+  isRoundingMode,
+  roundMinorUnits,
   moneyToDecimalString,
   moneyToJSONValue,
   moneyFromDecimalString,
@@ -50,7 +53,7 @@ test('large values stay exact because they are bigints, not doubles', () => {
   // Past Number.MAX_SAFE_INTEGER in minor units (2^53-1 = 9007199254740991).
   const huge = moneyFromMinorUnits('GHS', 9007199254740993n);
   assert.equal(huge.minorUnits, 9007199254740993n);
-  assert.equal(huge.toJSON(), '90071992547409.93');
+  assert.equal(huge.toJSON().amount, '90071992547409.93');
 
   assert.equal(add(large, ghs('0.01')).minorUnits, 100000000000000000000n);
 });
@@ -64,7 +67,7 @@ test('USDC keeps its existing eight-decimal precision', () => {
 
 test('negative amounts parse, compare and render exactly', () => {
   assert.equal(ghs('-0.01').minorUnits, -1n);
-  assert.equal(ghs('-0.01').toJSON(), '-0.01');
+  assert.equal(ghs('-0.01').toJSON().amount, '-0.01');
   assert.equal(compare(ghs('-0.01'), ghs('0.00')), -1);
   assert.equal(compare(ghs('0.30'), ghs('0.30')), 0);
   assert.equal(subtract(ghs('0.30'), ghs('0.10')).minorUnits, 20n);
@@ -172,8 +175,13 @@ test('splitting exposes the remainder instead of losing it', () => {
 
 test('JSON serialisation never leaks a bigint and stays exact', () => {
   const amount = ghs('0.30');
-  assert.equal(JSON.stringify({ amount }), '{"amount":"0.30"}');
-  assert.equal(JSON.stringify({ amount: usdc('0.00000001') }), '{"amount":"0.00000001"}');
+  // The default contract is a CURRENCY-TAGGED object: a bare "0.30" would say
+  // nothing about which liability bucket it belongs to.
+  assert.equal(JSON.stringify({ amount }), '{"amount":{"currency":"GHS","amount":"0.30"}}');
+  assert.equal(
+    JSON.stringify({ amount: usdc('0.00000001') }),
+    '{"amount":{"currency":"USDC","amount":"0.00000001"}}',
+  );
   assert.deepEqual(moneyToJSONValue(ghs('1234.50')), { currency: 'GHS', amount: '1234.50' });
   assert.equal(moneyToDecimalString(ghs('-0.01')), '-0.01');
   // Round trip through the boundary representation is lossless.
@@ -198,7 +206,7 @@ test('property-style: integer arithmetic over a fixed pseudo-random sequence', (
     // (a + b) - b === a
     assert.equal(subtract(add(a, b), b).minorUnits, a.minorUnits);
     // rendering then re-parsing is lossless for any amount that fits the scale
-    assert.equal(parseMoney(a.toJSON(), 'GHS').minorUnits, a.minorUnits);
+    assert.equal(parseMoney(formatMoney(a), 'GHS').minorUnits, a.minorUnits);
     // multiplication distributes over addition
     assert.equal(
       multiplyByQuantity(add(a, b), 3).minorUnits,
@@ -214,8 +222,8 @@ test('property-style: integer arithmetic over a fixed pseudo-random sequence', (
 test('the only constructor derives precision from the currency registry', () => {
   // Same integer count of minor units, different currency, different rendering:
   // nothing about precision travels with the caller.
-  assert.equal(moneyFromMinorUnits('GHS', 123n).toJSON(), '1.23');
-  assert.equal(moneyFromMinorUnits('USDC', 123n).toJSON(), '0.00000123');
+  assert.equal(moneyFromMinorUnits('GHS', 123n).toJSON().amount, '1.23');
+  assert.equal(moneyFromMinorUnits('USDC', 123n).toJSON().amount, '0.00000123');
   assert.equal(formatMoney(moneyFromMinorUnits('USDC', 100000000n)), '1.00000000');
 });
 
@@ -229,4 +237,74 @@ test('the public surface exposes no way to choose a precision', () => {
   assert.equal(surface['makeMoney'], undefined);
   assert.equal(typeof surface['moneyFromMinorUnits'], 'function');
   assert.equal(typeof surface['formatMoney'], 'function');
+});
+
+// ── Correction: automatic serialisation carries the currency ──────────────────
+
+test('automatic JSON keeps GHS and USDC apart without a helper call', () => {
+  const payload = JSON.parse(JSON.stringify({
+    receivable: ghs('1.50'),
+    stable: usdc('1.50000000'),
+  })) as Record<string, Record<string, unknown>>;
+
+  // Same numeric value, different buckets — and the wire says which is which.
+  assert.deepEqual(payload['receivable'], { currency: 'GHS', amount: '1.50' });
+  assert.deepEqual(payload['stable'], { currency: 'USDC', amount: '1.50000000' });
+  assert.notDeepEqual(payload['receivable'], payload['stable']);
+
+  // Still exact, still string-typed, still no bigint and no float.
+  for (const entry of Object.values(payload)) {
+    assert.equal(typeof entry['amount'], 'string');
+    assert.equal('minorUnits' in entry, false);
+  }
+});
+
+test('the method and the helper agree, and the Prisma form stays bare', () => {
+  for (const money of [ghs('0.30'), usdc('1234.56789012'), ghs('-0.01')]) {
+    assert.deepEqual(money.toJSON(), moneyToJSONValue(money));
+    // A DECIMAL column is currency-typed by its own definition, so it takes the
+    // bare exact string — an explicit choice, not the default serialisation.
+    assert.equal(moneyToDecimalString(money), money.toJSON().amount);
+    assert.equal(typeof moneyToDecimalString(money), 'string');
+  }
+
+  // Round trip through the tagged shape restores the same amount.
+  const wire = JSON.parse(JSON.stringify(ghs('999999999999999999.99'))) as { currency: string; amount: string };
+  assert.equal(moneyFromDecimalString(wire.amount, wire.currency).minorUnits, ghs('999999999999999999.99').minorUnits);
+});
+
+// ── Correction: an unsupported rounding mode is refused, not guessed ──────────
+
+test('applyRounding refuses any mode it does not implement', () => {
+  const bad: unknown[] = ['BANKERS', 'down', '', 'HALF_DOWN', null, undefined, 1, {}, ['DOWN']];
+  for (const mode of bad) {
+    assert.throws(
+      () => applyRounding(1n, 2n, mode as never),
+      (e: unknown) => e instanceof MoneyError && e.code === 'INVALID_ROUNDING_MODE',
+      `mode ${JSON.stringify(mode)} must be refused`,
+    );
+  }
+  // The previously silent behaviour — falling through to the quotient — is gone:
+  // an unknown mode no longer behaves like DOWN, it refuses.
+  assert.equal(applyRounding(1n, 2n, 'DOWN'), 0n);
+});
+
+test('the public rounding paths refuse an unsupported mode too', () => {
+  assert.equal(isRoundingMode('HALF_EVEN'), true);
+  assert.equal(isRoundingMode('nearest'), false);
+  assert.deepEqual([...ROUNDING_MODES], ['DOWN', 'UP', 'HALF_UP', 'HALF_EVEN']);
+
+  assert.throws(
+    () => roundMinorUnits(1n, 2n, 'GHS', 'NEAREST' as never),
+    (e: unknown) => e instanceof MoneyError && e.code === 'INVALID_ROUNDING_MODE',
+  );
+  assert.throws(
+    () => roundMinorUnits(1n, 2n, 'GHS', undefined as never),
+    (e: unknown) => e instanceof MoneyError && e.code === 'INVALID_ROUNDING_MODE',
+  );
+
+  // Valid modes keep their exact behaviour through the same public path.
+  assert.equal(roundMinorUnits(1n, 2n, 'GHS', 'HALF_UP').toJSON().amount, '0.01');
+  assert.equal(roundMinorUnits(1n, 2n, 'GHS', 'HALF_EVEN').toJSON().amount, '0.00');
+  assert.equal(roundMinorUnits(-3n, 2n, 'GHS', 'HALF_UP').toJSON().amount, '-0.02');
 });

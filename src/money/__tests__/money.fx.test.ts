@@ -17,6 +17,7 @@ import {
   parseRate,
   valuationToJSONValue,
   valueWithQuote,
+  type RoundingMode,
 } from '../index';
 
 const provenance = {
@@ -147,4 +148,21 @@ test('quotedAt must be ISO-8601 with an explicit zone', () => {
       `${value} should be refused as provenance`,
     );
   }
+});
+
+test('a conversion refuses an unsupported rounding mode before converting', () => {
+  const one = parseMoney('1.00000000', 'USDC');
+  for (const mode of ['NEAREST', 'down', '', null, 1]) {
+    assert.throws(
+      () => valueWithQuote(one, quote, mode as unknown as RoundingMode),
+      (e: unknown) => e instanceof MoneyError && e.code === 'INVALID_ROUNDING_MODE',
+      `mode ${JSON.stringify(mode)} must be refused`,
+    );
+  }
+  // And the valid policy still applies exactly as before, including negatives.
+  assert.equal(formatValuation(valueWithQuote(one, quote, 'DOWN')), '12.50');
+  assert.equal(
+    formatValuation(valueWithQuote(parseMoney('-1.00000000', 'USDC'), quote, 'HALF_UP')),
+    '-12.50',
+  );
 });

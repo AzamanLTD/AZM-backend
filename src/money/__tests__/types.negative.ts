@@ -12,6 +12,7 @@ import {
   makeQuote,
   moneyFromMinorUnits,
   parseMoney,
+  roundMinorUnits,
   valuationToJSONValue,
   valueWithQuote,
   type Money,
@@ -52,6 +53,16 @@ const serialised: SerialisedValuation<'GHS'> = valuationToJSONValue(valuation);
 // @ts-expect-error a serialised valuation is not spendable money
 const spendable: Money<'GHS'> = serialised;
 void spendable;
+
+// The default serialisation contract is the tagged object, not a bare string: a
+// bare string would drop the currency, which is exactly the bug this prevents.
+// @ts-expect-error toJSON no longer returns a plain string
+const bare: string = cedis.toJSON();
+void bare;
+
+// An unsupported rounding mode is not part of the type, and is refused at runtime.
+// @ts-expect-error 'NEAREST' is not a RoundingMode
+roundMinorUnits(1n, 2n, 'GHS', 'NEAREST');
 
 // The raw decimal primitive left the public surface with the same reasoning.
 // @ts-expect-error formatMinor is not exported publicly

@@ -11,8 +11,34 @@ import { moneyFromMinorUnits, type Money } from './money';
 
 export type RoundingMode = 'DOWN' | 'UP' | 'HALF_UP' | 'HALF_EVEN';
 
+/** The complete set, in one place, so validation cannot drift from the switch. */
+export const ROUNDING_MODES = ['DOWN', 'UP', 'HALF_UP', 'HALF_EVEN'] as const;
+
+export function isRoundingMode(value: unknown): value is RoundingMode {
+  return typeof value === 'string' && (ROUNDING_MODES as readonly string[]).includes(value);
+}
+
+/**
+ * Refuse an unsupported rounding mode BEFORE any arithmetic.
+ *
+ * The type says `RoundingMode`, but a value can still arrive from JSON, from a
+ * JavaScript caller, or from `as any`. Without this check an unknown string fell
+ * through the switch and returned the truncated quotient — silently applying DOWN,
+ * i.e. choosing a rounding policy on the caller's behalf. For money, guessing a
+ * policy is not a small thing: it changes which bucket a pesewa lands in.
+ */
+export function assertRoundingMode(mode: unknown): asserts mode is RoundingMode {
+  if (!isRoundingMode(mode)) {
+    throw new MoneyError(
+      'INVALID_ROUNDING_MODE',
+      `unsupported rounding mode ${JSON.stringify(mode)}; expected one of ${ROUNDING_MODES.join(', ')}`,
+    );
+  }
+}
+
 /** Round a rational amount (numerator/denominator) of MAJOR units to minor units. */
 export function applyRounding(numerator: bigint, denominator: bigint, mode: RoundingMode): bigint {
+  assertRoundingMode(mode);
   if (denominator === 0n) {
     throw new MoneyError('DIVISOR_INVALID', 'cannot round with a zero denominator');
   }
@@ -55,5 +81,8 @@ export function roundMinorUnits<C extends CurrencyCode>(
   currency: C,
   mode: RoundingMode,
 ): Money<C> {
+  // Validated here as well as inside applyRounding: this is a public entry point,
+  // and a refusal should name the rounding mode, not surface as a divide error.
+  assertRoundingMode(mode);
   return moneyFromMinorUnits(currency, applyRounding(numerator, denominator, mode));
 }
