@@ -9,6 +9,7 @@
 const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client');
 const ledger = require('../services/ledgerService');
+const { consumeStepUp, isStepUpEnforced } = require('../middleware/requireActionStepUp');
 const {
     verifyAndClaimTotp,
     sendTotpFailure,
@@ -97,6 +98,18 @@ exports.requestWithdrawal = async (req, res) => {
 
         // 3. Execute the Transaction
         const result = await prisma.$transaction(async (tx) => {
+            // §WP-H G — the grant is spent INSIDE the economic transaction, so a
+            // grant and the money move together or not at all. Throwing here rolls
+            // back the debit, the ledger reservation and the fee realisation, and
+            // the capability survives for a retry of the corrected action.
+            if (isStepUpEnforced()) {
+                const verdict = await consumeStepUp(tx, req);
+                if (!verdict || !verdict.ok) {
+                    const rejected = new Error('Step-up verification does not authorise this exact action.');
+                    rejected.code = 'STEP_UP_REJECTED';
+                    throw rejected;
+                }
+            }
             // r25 — ATOMIC BALANCE CLAIM: a conditional decrement makes the
             // insufficient-balance race deterministic (a concurrent debit from
             // another financial endpoint can consume funds between the read
@@ -250,6 +263,17 @@ exports.requestWithdrawal = async (req, res) => {
         if (emitBalanceUpdate) await emitBalanceUpdate(userId);
 
     } catch (error) {
+        if (error && error.code === 'STEP_UP_REJECTED') {
+            // 4xx releases the idempotency claim so the user can retry with a fresh
+            // grant; nothing was executed, because the throw rolled the whole
+            // transaction back.
+            res.locals.financialClaimRelease = true;
+            return res.status(409).json({
+                success: false,
+                code: 'STEP_UP_REJECTED',
+                message: 'This verification does not match this action or was already used. Nothing was executed.',
+            });
+        }
         res.status(400).json({ success: false, message: error.message });
     }
 };

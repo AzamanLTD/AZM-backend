@@ -7579,3 +7579,23 @@ model SavedBankBeneficiary {
   @@unique([userId, accountNumberHmac])
   @@index([userId, status])
 }
+
+// §WP-H G — action-bound step-up grant. See
+// prisma/migrations/20261115120000_action_step_up_grant and
+// src/services/actionStepUpService.js. Stored as a hash: the plaintext token
+// exists only in the response to the client that earned it.
+model ActionStepUpGrant {
+    id             String    @id
+    tokenHash      String    @unique
+    userId         String
+    actionType     String
+    actionDigest   String
+    routeScope     String
+    idempotencyKey String?
+    issuedAt       DateTime  @default(now())
+    expiresAt      DateTime
+    consumedAt     DateTime?
+
+    @@index([userId])
+    @@index([expiresAt])
+}

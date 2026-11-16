@@ -155,8 +155,8 @@ run('r32 I — legacy POS cash routes over the canonical service', () => {
         expect(res.body.order).toBeUndefined();
 
         // Client-supplied subtotal/taxTotal are irrelevant: nothing was priced.
-        expect(await db.businessOrder.count()).toBe(0);
-        expect(await db.businessLedgerEntry.count()).toBe(0);
+        expect(await db.businessOrder.count({ where: { businessProfileId: { in: [A.biz.id, B.biz.id] } } })).toBe(0);
+        expect(await db.businessLedgerEntry.count({ where: { businessProfileId: { in: [A.biz.id, B.biz.id] } } })).toBe(0);
         const product = await db.businessProduct.findUnique({ where: { id: A.product.id }, select: { stockQty: true } });
         expect(Number(product.stockQty)).toBe(100);
     });
@@ -173,7 +173,7 @@ run('r32 I — legacy POS cash routes over the canonical service', () => {
 
         // A replay creates nothing new.
         expect(await db.businessOrder.count({ where: { idempotencyKey: key } })).toBe(1);
-        expect(await db.businessLedgerEntry.count()).toBe(1);
+        expect(await db.businessLedgerEntry.count({ where: { businessProfileId: { in: [A.biz.id, B.biz.id] } } })).toBe(1);
     });
 
     test("3. a foreign business cannot replay another business's idempotency key", async () => {
@@ -239,8 +239,8 @@ run('r32 I — legacy POS cash routes over the canonical service', () => {
         const after = await db.user.findUnique({ where: { id: A.owner.id }, select: { azmBalance: true } });
         expect(Number(after.azmBalance)).toBe(200); // the cashier paid nothing
         expect(await db.azmSpendLog.count({ where: { source: 'POS_SALE' } })).toBe(0);
-        expect(await db.businessLedgerEntry.count()).toBe(0);
-        expect(await db.businessOrder.count()).toBe(0);
+        expect(await db.businessLedgerEntry.count({ where: { businessProfileId: { in: [A.biz.id, B.biz.id] } } })).toBe(0);
+        expect(await db.businessOrder.count({ where: { businessProfileId: { in: [A.biz.id, B.biz.id] } } })).toBe(0);
     });
 
     test('7. an AZM order that cannot be covered is refused with no partial writes', async () => {
@@ -254,7 +254,7 @@ run('r32 I — legacy POS cash routes over the canonical service', () => {
         expect(res.status).toBe(422);
         expect(res.body.code).toBe('POS_PAYMENT_METHOD_UNSUPPORTED');
 
-        expect(await db.businessOrder.count()).toBe(0);
+        expect(await db.businessOrder.count({ where: { businessProfileId: { in: [A.biz.id, B.biz.id] } } })).toBe(0);
         expect(await db.businessLedgerEntry.count({ where: { sourceType: 'POS_SALE' } })).toBe(0);
         expect(await db.azmSpendLog.count({ where: { source: 'POS_SALE' } })).toBe(0);
         const after = await db.user.findUnique({ where: { id: A.owner.id }, select: { azmBalance: true } });

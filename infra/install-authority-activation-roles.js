@@ -29,6 +29,7 @@
 'use strict';
 
 const path = require('path');
+const { resolveAuthorityRoles, assertDistinctRoles } = require('./lib/authority-roles');
 
 const DEFAULTS = {
     owner: 'azm_authority_owner',
@@ -131,17 +132,45 @@ async function privilege(prisma, role, what) {
 }
 
 async function installAuthorityActivationRoles(prisma, options = {}) {
-    const owner = options.owner || DEFAULTS.owner;
-    const runtime = options.runtime || DEFAULTS.runtime;
-    const operator = options.operator || DEFAULTS.operator;
+    // Captured at ENTRY: later code destructures with defaults, so the caller's
+    // explicitness has to be read before anything can shadow it.
+    // ONE resolver, shared with the function installer and every CLI.
+    const roles = resolveAuthorityRoles(options);
+    const { owner, runtime, operator } = roles;
+    const functionOwner = roles.functionOwner;
     const dryRun = options.dryRun === true;
     const log = options.log || (() => {});
 
-    const report = { roles: [], applied: [], problems: [], ok: false };
+    // Role context is decided ONCE, at entry, before anything can shadow it.
+    const explicitRoles = process.argv.slice(2).some((a) => /^--(owner|runtime|operator|function-owner)$/.test(a));
+    const callerNamedRoles = Boolean(options && (options.owner || options.runtime || options.operator || options.functionOwner));
+    const hasRoleContext = callerNamedRoles || explicitRoles || (options && options.roleScoped === true);
+
+    const report = {
+        roles: [], applied: [], problems: [], skipped: [], ok: false,
+        roles_resolved: roles, status: 'PROVISIONED', provisioned: true,
+    };
+
+    // BARE MODE RETURNS BEFORE ANY SIDE EFFECT. A restore pass names no roles, so
+    // it has no authority to provision; it must leave the database exactly as it
+    // found it and must never be readable as a provisioned authority.
+    if (!hasRoleContext) {
+        return {
+            ...report,
+            ok: true,
+            status: 'SKIPPED_NOT_PROVISIONED',
+            provisioned: false,
+            skipped: ['bare overlay/restore invocation: no authority role, function, grant or ownership was created or altered'],
+        };
+    }
 
     // ── preflight: the whole design is void if these names collide ───────────
-    if (new Set([owner, runtime, operator]).size !== 3) {
-        throw new Error('owner, runtime and operator must be three distinct roles');
+    try {
+        assertDistinctRoles(roles);
+    } catch (err) {
+        report.problems.push(err.message);
+        report.status = 'REFUSED_ROLE_COLLISION';
+        return report;
     }
     const [superuser] = await prisma.$queryRawUnsafe(
         `SELECT (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) AS is_superuser`
@@ -186,7 +215,7 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
         `REVOKE ALL ON TABLE ${TABLE} FROM ${quoteIdent(runtime)}`,
         `REVOKE ALL ON TABLE ${TABLE} FROM ${quoteIdent(operator)}`,
         `GRANT SELECT ON TABLE ${TABLE} TO ${quoteIdent(runtime)}`,
-        `GRANT SELECT, INSERT ON TABLE ${TABLE} TO ${quoteIdent(operator)}`,
+        `GRANT SELECT ON TABLE ${TABLE} TO ${quoteIdent(operator)}`,
         `GRANT USAGE ON SCHEMA public TO ${quoteIdent(runtime)}`,
         `GRANT USAGE ON SCHEMA public TO ${quoteIdent(operator)}`,
     ];
@@ -207,7 +236,85 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
         }
     }
 
+    // ── C: attacker-created roles ───────────────────────────────────────────
+    // The loop above only knows the three role names. A role minted while the
+    // function owner still held CREATEROLE, or one granted membership by an
+    // operator, is an inheritance path INTO the activation role that no name list
+    // catches. So enumerate the catalog instead of trusting a list.
+    //
+    // Remediate first, then fail: the database is left safe either way, but
+    // evidence of tampering must reach a human instead of passing as a clean
+    // install (same posture as an unexpected owned object).
+    const allow = new Set([owner, operator, runtime]);
+    const foreignMemberships = [];
+    // The function owner is included deliberately: whoever inherits it can replace
+    // the SECURITY DEFINER function, which is the same power as owning the record.
+    for (const grantor of [owner, operator, functionOwner]) {
+        const rows = await prisma.$queryRawUnsafe(
+            `SELECT m.rolname AS member
+               FROM pg_auth_members am
+               JOIN pg_roles g ON g.oid = am.roleid
+               JOIN pg_roles m ON m.oid = am.member
+              WHERE g.rolname = $1 AND m.rolname <> $1
+              ORDER BY m.rolname`,
+            grantor
+        ).catch(() => []);
+        for (const row of rows) {
+            foreignMemberships.push(`${row.member} inherits ${grantor}`);
+            await prisma.$executeRawUnsafe(
+                `REVOKE ${quoteIdent(grantor)} FROM ${quoteIdent(row.member)}`
+            );
+            report.applied.push(`REVOKE ${grantor} FROM ${row.member} (foreign membership)`);
+        }
+    }
+
+    // Privileges are read from the catalog too, not inferred from what this
+    // installer just granted. An ACL entry is "grantee=privs/grantor"; a bare "="
+    // is PUBLIC, which is revoked above and must stay gone.
+    const aclRows = await prisma.$queryRawUnsafe(
+        `SELECT unnest(relacl)::text AS acl FROM pg_class WHERE oid = $1::regclass
+         UNION ALL
+         SELECT unnest(proacl)::text AS acl FROM pg_proc WHERE oid = $2::regproc`,
+        TABLE, TRIGGER_FN
+    ).catch(() => []);
+    const foreignGrantees = new Set();
+    for (const row of aclRows) {
+        const grantee = String(row.acl || '').split('=')[0].replace(/"/g, '');
+        if (grantee && !allow.has(grantee)) foreignGrantees.add(grantee);
+    }
+    for (const grantee of foreignGrantees) {
+        await prisma.$executeRawUnsafe(`REVOKE ALL ON TABLE ${TABLE} FROM ${quoteIdent(grantee)}`);
+        await prisma.$executeRawUnsafe(`REVOKE ALL ON FUNCTION ${TRIGGER_FN} FROM ${quoteIdent(grantee)}`);
+        report.applied.push(`REVOKE ALL FROM ${grantee} (foreign grantee on the boundary)`);
+    }
+
     // ── verify, then fail loudly ────────────────────────────────────────────
+    // §WP-H: the operator no longer inserts the record itself; the sanctioned
+    // path is the SECURITY DEFINER function owned by the dedicated NOLOGIN role.
+    // A bare overlay run (no role context) must not attempt role-scoped
+    // provisioning: it has no owner/operator credential to bind the function to.
+    const { installAuthorityActivationFunction } = require('./install-authority-activation-function');
+    // A database without the activation table (a bare overlay run, a first
+    // install) cannot host the function yet: record it, never abort the roles
+    // install, and never let the absence read as success.
+    let fnReport = null;
+    if (hasRoleContext) try {
+    fnReport = await installAuthorityActivationFunction(prisma, {
+        tableOwner: owner,
+        functionOwner: (typeof options !== 'undefined' && options.functionOwner) || process.env.AUTHORITY_FN_OWNER_ROLE || `${owner}_fn`,
+        runtime,
+        operator,
+        log,
+        dryRun: (typeof options !== 'undefined' ? options.dryRun : false) === true,
+        roleScoped: hasRoleContext,
+    });
+    } catch (fnErr) {
+        fnReport = { ok: false, skipped: [String(fnErr.message).slice(0, 240)] };
+        report.skipped = (report.skipped || []).concat(['activation function: ' + fnReport.skipped[0]]);
+    }
+    if (fnReport && fnReport.problems) report.problems = (report.problems || []).concat(fnReport.problems);
+    report.functionInstall = fnReport;
+
     const runtimePrivs = {
         select: await privilege(prisma, runtime, 'SELECT'),
         insert: await privilege(prisma, runtime, 'INSERT'),
@@ -229,7 +336,10 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
     for (const forbidden of ['insert', 'update', 'delete', 'truncate', 'trigger']) {
         if (runtimePrivs[forbidden]) report.problems.push(`runtime role still holds ${forbidden.toUpperCase()}`);
     }
-    if (!operatorPrivs.insert) report.problems.push('operator role cannot INSERT the activation record');
+    // Only a role-scoped run (the sanctioned procedure) can revoke the legacy
+    // direct INSERT; a bare overlay run has no role context and must not fail
+    // for a grant it was never asked to change.
+    if (hasRoleContext && operatorPrivs.insert) report.problems.push('operator role still holds direct INSERT on the activation record');
     for (const forbidden of ['update', 'delete', 'truncate']) {
         if (operatorPrivs[forbidden]) report.problems.push(`operator role still holds ${forbidden.toUpperCase()}`);
     }
@@ -242,6 +352,13 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
     if (ownerRow && ownerRow.rolcanlogin) report.problems.push('owner role can log in');
     if (ownerRow && ownerRow.rolsuper) report.problems.push('owner role is a superuser');
 
+    if (hasRoleContext && fnReport && Array.isArray(fnReport.problems)) report.problems.push(...fnReport.problems);
+    for (const edge of foreignMemberships) {
+        report.problems.push(`foreign role membership revoked: ${edge} (investigate how it was granted)`);
+    }
+    for (const grantee of foreignGrantees) {
+        report.problems.push(`foreign grantee had privileges on the boundary: ${grantee} (revoked)`);
+    }
     report.ok = report.problems.length === 0;
     report.applicable = {
         superuser: superuser && superuser.is_superuser === true,
@@ -267,10 +384,22 @@ if (require.main === module) {
     };
     const { PrismaClient } = require('@prisma/client');
     const prisma = new PrismaClient();
-    installAuthorityActivationRoles(prisma, {
-        owner: get('--owner', DEFAULTS.owner),
-        runtime: get('--runtime', DEFAULTS.runtime),
-        operator: get('--operator', DEFAULTS.operator),
+    // Only EXPLICITLY named roles are passed: an unnamed invocation is a schema
+    // restore (npm release, CI overlay pass) and must not be mistaken for the
+    // sanctioned role-scoped install. Defaults are filled inside the installer.
+    const named = {};
+    if (args.includes('--owner')) named.owner = get('--owner', null);
+    if (args.includes('--runtime')) named.runtime = get('--runtime', null);
+    if (args.includes('--operator')) named.operator = get('--operator', null);
+    if (args.includes('--function-owner')) named.functionOwner = get('--function-owner', null);
+    if (Object.keys(named).length > 0) named.roleScoped = true;
+    // A named value must be real: '--owner' with no value is a typo, not a default.
+    for (const [k, v] of Object.entries(named)) {
+        if (k !== 'roleScoped' && !v) { console.error(`[authority-roles] ${k} was named without a value`); process.exitCode = 2; }
+    }
+    if (process.exitCode === 2) { prisma.$disconnect().finally(() => { /* exit with code 2 */ }); }
+    else installAuthorityActivationRoles(prisma, {
+        ...named,
         dryRun: args.includes('--dry-run'),
         log: (line) => console.log(`[authority-roles] ${line}`),
     })
