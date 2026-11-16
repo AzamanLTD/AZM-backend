@@ -327,6 +327,29 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
         expect(await prisma.providerSettlementWitness.count()).toBe(0);
     });
 
+    test('CROSS-PATH: a collection already used to settle a customer deposit cannot fund a treasury opening', async () => {
+        // The same Moolre payment, two economic uses. Settling a customer deposit
+        // leaves a FiatProviderEvent keyed event:moolre-collection:<externalref>
+        // and NO witness row, so a witness-only single-use check would let the
+        // same money be counted twice. This is the real anti-replay proof.
+        await seedOpening(OPENING_A, { walletAccount: 'WALLET-AZM-1' });
+        await prisma.fiatProviderEvent.create({
+            data: {
+                provider: 'MOOLRE', rail: 'MOMO', direction: 'INBOUND', status: 'FUNDED',
+                providerRef: PROVIDER_REF,
+                dedupKey: `event:moolre-collection:${PROVIDER_REF}`,
+                amountGhs: 99,
+            },
+        });
+        stubProvider({});
+
+        const results = await reconciler.reconcileTreasuryOpenings({ openingDedupKeys: [OPENING_A] });
+
+        expect(results[0].witnessed).toBe(false);
+        expect(results[0].reason).toBe('WITNESS_OBSERVATION_SPENT_ON_DEPOSIT');
+        expect(await prisma.providerSettlementWitness.count()).toBe(0);
+    });
+
     test('a provider HTTP failure never becomes a witness', async () => {
         await seedOpening(OPENING_A);
         stubProvider({}, { httpStatus: 500 });

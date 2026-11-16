@@ -483,6 +483,30 @@ async function recordProviderSettlementWitness(tx, input = {}) {
       String(observedAccount), String(observedTransactionId),
     ].join('|'))
     .digest('hex');
+  // ── CROSS-PATH SINGLE USE ────────────────────────────────────────────────
+  // The check below only sees witnesses. A collection that already settled an
+  // ORDINARY CUSTOMER DEPOSIT leaves no witness row, so without this guard the
+  // same Moolre payment could be spent once as a deposit and again as treasury
+  // funding - two economic uses, one payment. The deposit path's durable record
+  // is a FiatProviderEvent keyed `event:moolre-collection:<externalref>`
+  // (src/services/moolreDepositSettlement.js), so that key is the evidence that
+  // the observation is spent. Absence of the model on a stub client is treated
+  // as "cannot prove", which refuses rather than allows.
+  const collectionKey = observedReference ? `event:moolre-collection:${observedReference}` : null;
+  if (collectionKey) {
+      const depositUse = await tx.fiatProviderEvent.findFirst({
+          where: { dedupKey: collectionKey },
+          select: { dedupKey: true, status: true },
+      });
+      if (depositUse) {
+          throw new WitnessError(
+              'WITNESS_OBSERVATION_SPENT_ON_DEPOSIT',
+              '[wp-i] this provider collection already settled a customer deposit; one payment cannot also fund a treasury opening',
+              { dedupKey: collectionKey }
+          );
+      }
+  }
+
   const alreadyUsed = await tx.providerSettlementWitness.findUnique({ where: { observationKey } });
   if (alreadyUsed) {
     throw new WitnessError(
