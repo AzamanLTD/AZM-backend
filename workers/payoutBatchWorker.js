@@ -539,7 +539,18 @@ class PayoutBatchWorker {
                 // it for manual resolution so a human decides the refund.
                 // (Authority-recorded rows cannot be dust: the reservation
                 // was only creatable through the guarded service path.)
-                const legacyPayoutGhs = parseFloat((amount * liveRate).toFixed(2));
+                // Exact-rate adaptation: #380 computed this with float arithmetic
+                // (`amount * liveRate`), but this branch deliberately replaced
+                // that with the §r42.2 exact Decimal rate (`liveRateExact`),
+                // because rounding a BINARY product is itself a money defect.
+                // The guard is preserved exactly, on the exact rate the worker
+                // already uses, and `liveRate` is NOT reintroduced.
+                let legacyPayoutGhs = NaN;
+                try {
+                    legacyPayoutGhs = Number(new Prisma.Decimal(amount).times(liveRateExact).toFixed(2));
+                } catch (_) {
+                    legacyPayoutGhs = NaN;
+                }
                 // Finite-only: an unrateable row (NaN) is a rate problem,
                 // not proven dust — it must never dispatch, but parking it
                 // as DUST_SETTLEMENT would mislabel the failure. Only a
@@ -547,7 +558,7 @@ class PayoutBatchWorker {
                 if (Number.isFinite(legacyPayoutGhs) && legacyPayoutGhs <= 0) {
                     const parked = await this._parkForManualReview(withdrawal, 'DUST_SETTLEMENT', {
                         amount,
-                        liveRate,
+                        liveRate: liveRateExact.toString(),
                         payoutGhs: legacyPayoutGhs,
                         message: `Dust settlement: ${amount} USDC quantizes to 0.00 GHS at the current rate — never dispatched, parked for manual resolution`
                     });

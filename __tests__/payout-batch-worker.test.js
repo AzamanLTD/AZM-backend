@@ -178,6 +178,11 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
             $queryRawUnsafe: jest.fn().mockResolvedValue([]),
             $executeRawUnsafe: jest.fn().mockResolvedValue(1),
         };
+        // §WP-H D2: parking is ONE transaction — evidence write + status CAS
+        // under the authority lock. The harness must model that transaction,
+        // otherwise _claimForManualReview catches its own TypeError, returns
+        // false, and the guard looks like it never fired.
+        prisma.$transaction = jest.fn(async (cb) => cb(prisma));
         const worker = new PayoutBatchWorker(prisma, null, { initiateTransfer }, null);
         const result = await worker._processBatch({ ...settings, liveRetailRate: 13 }, { isManualTrigger: true });
 
