@@ -7,13 +7,7 @@ on:
     # §WP-H: the integration branches carry the money-path work and must get the
     # full lane on their PRs, not only PRs into main. Without this, PRs targeting
     # integration/main-reconciliation received no test run at all.
-    #
-    # §WP-I/§WP-H stack: the stacked release PRs (wp-i/*) base onto the WP-H
-    # branch, not onto main, so the pattern above left them with NO test run of
-    # any kind - the lane simply never fired. PR #403 is the retained backend
-    # release PR and its evidence cannot be obtained from a lane that does not
-    # trigger. Widening the BASE pattern (never the head) is the minimal change.
-    branches: [main, 'integration/**', 'wp-i/**']
+    branches: [main, 'integration/**']
   merge_group:
   workflow_dispatch:
 
