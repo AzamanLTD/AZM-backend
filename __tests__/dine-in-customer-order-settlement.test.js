@@ -144,7 +144,11 @@ describe('dine-in customer ordering and settlement', () => {
 
     expect(createInvoice).toHaveBeenCalledWith(prisma, expect.objectContaining({
       businessProfileId: 'biz-1', customerId: 7, locationId: 'loc-1', tableId: 'table-1',
-      lineItems: [{ description: 'Burger', quantity: 1, unitPrice: 20 }],
+      // Exact decimal string, not a Number: money never round-trips through a JS
+                    // float on its way to an invoice. currency: null pins the legacy
+                    // untagged-USDC behaviour for a tab that chose no currency.
+                    lineItems: [{ description: 'Burger', quantity: 1, unitPrice: '20' }],
+                    currency: null,
     }));
     expect(sendInvoice).toHaveBeenCalledWith(prisma, { invoiceId: 'invoice-1', businessProfileId: 'biz-1' });
     expect(payInvoice).toHaveBeenCalledWith(expect.objectContaining({

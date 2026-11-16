@@ -222,7 +222,18 @@ class DineInService {
                     // Exact, and deliberately the same authority the cash-close
                     // path sums (the durable item line totals), so finalize and
                     // close can never disagree about what a tab is worth.
+                    // The tab's currency decides WHICH durable line values are
+                    // summed. A cedi tab's money is in the cedi columns; summing
+                    // the USDC columns there would finalise it at 0.00.
+                    const tabIsGhs = tab.currency === 'GHS';
                     const total = tab.items.reduce((sum, item) => {
+                        if (tabIsGhs) {
+                            if (item.lineTotalGhs != null) {
+                                return sum.plus(new Prisma.Decimal(String(item.lineTotalGhs)));
+                            }
+                            const unitGhs = new Prisma.Decimal(String(item.unitPriceGhs ?? 0));
+                            return sum.plus(unitGhs.times(new Prisma.Decimal(String(item.quantity ?? 0))));
+                        }
                         if (item.lineTotalUsdc != null) {
                             return sum.plus(new Prisma.Decimal(String(item.lineTotalUsdc)));
                         }
@@ -231,21 +242,38 @@ class DineInService {
                         const unit = new Prisma.Decimal(String(item.unitPriceUsdc));
                         return sum.plus(unit.times(new Prisma.Decimal(String(item.quantity ?? 0))));
                     }, new Prisma.Decimal(0));
+                    const totalQ = tabIsGhs
+                        ? total.toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP)
+                        : total;
                     const claimed = await tx.dineInTab.updateMany({
                         where: { id: tabId, status: 'OPEN' },
-                        data: {
+                        data: tabIsGhs ? {
+                            status: 'FINALIZED',
+                            closedAt: new Date(),
+                            // Cedis in the cedi columns at 2dp; the USDC columns
+                            // stay at their zero defaults.
+                            grandTotalGhs: totalQ,
+                            subtotalGhs: totalQ,
+                        } : {
                             status: 'FINALIZED',
                             closedAt: new Date(),
                             // The exact Decimal itself (see addItem): no Number
                             // round-trip between the sum and the money column.
-                            grandTotalUsdc: total,
-                            subtotalUsdc: total,
+                            grandTotalUsdc: totalQ,
+                            subtotalUsdc: totalQ,
                         },
                     });
                     if (claimed.count !== 1) throw new Error('Tab was finalized by another request.');
                     return tx.dineInTab.findUnique({ where: { id: tabId }, include: { items: true } });
                 }, { isolationLevel: 'Serializable' });
-                this.io?.to(`user_${finalized.customerId}`).emit('dine_in_tab_finalized', { tabId, totalAmount: finalized.grandTotalUsdc, items: finalized.items });
+                this.io?.to(`user_${finalized.customerId}`).emit('dine_in_tab_finalized', {
+                    tabId,
+                    currency: finalized.currency || null,
+                    // The total a client displays must be the total that was stored,
+                    // in its own currency.
+                    totalAmount: finalized.currency === 'GHS' ? finalized.grandTotalGhs : finalized.grandTotalUsdc,
+                    items: finalized.items,
+                });
                 return finalized;
             } catch (error) {
                 if (!isSerializableConflict(error) || attempt === SERIALIZABLE_RETRY_LIMIT - 1) throw error;
@@ -270,10 +298,21 @@ class DineInService {
             if (!tab.items.length) throw new Error('Cannot pay an empty dine-in tab.');
             const idempotencyKey = `DINE_IN_TAB:${tabId}`;
             try {
+                const tabIsGhs = tab.currency === 'GHS';
                 invoice = await invoiceService.createInvoice(this.prisma, {
                     businessProfileId: tab.businessProfileId, customerId: tab.customerId,
                     locationId: tab.locationId, tableId: tab.tableId,
-                    lineItems: tab.items.map(item => ({ description: item.name, quantity: item.quantity, unitPrice: Number(item.unitPriceUsdc) })),
+                    // The bill inherits the tab's currency, and the line price is
+                    // taken from the column that actually holds the money: a GHS
+                    // tab's cedi price, as an exact decimal string. Number() here
+                    // used to read 0.00 from the zeroed USDC column of a cedi tab
+                    // and bill the customer nothing.
+                    currency: tab.currency || null,
+                    lineItems: tab.items.map(item => ({
+                        description: item.name,
+                        quantity: item.quantity,
+                        unitPrice: String(tabIsGhs ? (item.unitPriceGhs ?? 0) : item.unitPriceUsdc),
+                    })),
                     // A missing taxLines argument lets the invoice service use the
                     // business's current default tax preset. Explicit tax-free
                     // callers can continue to pass taxLines: [].

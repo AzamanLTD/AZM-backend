@@ -86,3 +86,50 @@ ALTER TABLE "BusinessLedgerEntry" DROP CONSTRAINT IF EXISTS ck_businessledgerent
 ALTER TABLE "BusinessLedgerEntry" ADD CONSTRAINT ck_businessledgerentry_amount_present CHECK (
     "amount" IS NOT NULL OR "amountGhs" IS NOT NULL
 );
+
+-- ── BusinessInvoice ──────────────────────────────────────────────────────────
+ALTER TABLE "BusinessInvoice" ADD COLUMN IF NOT EXISTS "currency" VARCHAR(8);
+ALTER TABLE "BusinessInvoice" ADD COLUMN IF NOT EXISTS "subtotalGhs" DECIMAL(20,2);
+ALTER TABLE "BusinessInvoice" ADD COLUMN IF NOT EXISTS "taxTotalGhs" DECIMAL(20,2);
+ALTER TABLE "BusinessInvoice" ADD COLUMN IF NOT EXISTS "tipGhs" DECIMAL(20,2);
+ALTER TABLE "BusinessInvoice" ADD COLUMN IF NOT EXISTS "billTotalGhs" DECIMAL(20,2);
+ALTER TABLE "BusinessInvoice" ADD COLUMN IF NOT EXISTS "customerPaidGhs" DECIMAL(20,2);
+
+ALTER TABLE "BusinessInvoice" DROP CONSTRAINT IF EXISTS ck_businessinvoice_currency_allowed;
+ALTER TABLE "BusinessInvoice" ADD CONSTRAINT ck_businessinvoice_currency_allowed CHECK (
+    "currency" IS NULL OR "currency" IN ('GHS', 'USDC')
+);
+
+-- Same rule as a dine-in tab: a bill is EITHER legacy/untagged USDC (no cedi
+-- figures) OR native GHS (cedi figures, no USDC money). Mixing is unreadable.
+-- A DRAFT GHS bill has a subtotal and total from creation; the cedi columns are
+-- therefore required whenever the row is tagged GHS.
+ALTER TABLE "BusinessInvoice" DROP CONSTRAINT IF EXISTS ck_businessinvoice_currency_shape;
+ALTER TABLE "BusinessInvoice" ADD CONSTRAINT ck_businessinvoice_currency_shape CHECK (
+    (COALESCE("currency", '') = 'GHS'
+        AND "currency" IS NOT NULL
+        AND "billTotalGhs" IS NOT NULL
+        AND COALESCE("subtotalUsdc", 0) = 0
+        AND COALESCE("taxTotalUsdc", 0) = 0
+        AND COALESCE("tipUsdc", 0) = 0
+        AND COALESCE("billTotalUsdc", 0) = 0
+        AND COALESCE("feeUsdc", 0) = 0
+        AND COALESCE("customerPaidUsdc", 0) = 0)
+ OR (COALESCE("currency", '') <> 'GHS'
+        AND "subtotalGhs" IS NULL AND "taxTotalGhs" IS NULL
+        AND "tipGhs" IS NULL AND "billTotalGhs" IS NULL
+        AND "customerPaidGhs" IS NULL)
+);
+
+-- ── BusinessInvoiceLineItem ──────────────────────────────────────────────────
+ALTER TABLE "BusinessInvoiceLineItem" ADD COLUMN IF NOT EXISTS "unitPriceGhs" DECIMAL(20,2);
+ALTER TABLE "BusinessInvoiceLineItem" ADD COLUMN IF NOT EXISTS "lineTotalGhs" DECIMAL(20,2);
+
+ALTER TABLE "BusinessInvoiceLineItem" DROP CONSTRAINT IF EXISTS ck_invoicelineitem_ghs_complete;
+ALTER TABLE "BusinessInvoiceLineItem" ADD CONSTRAINT ck_invoicelineitem_ghs_complete CHECK (
+    ("unitPriceGhs" IS NULL AND "lineTotalGhs" IS NULL)
+ OR ("unitPriceGhs" IS NOT NULL AND "lineTotalGhs" IS NOT NULL)
+);
+
+-- ── BusinessInvoiceTaxLine ───────────────────────────────────────────────────
+ALTER TABLE "BusinessInvoiceTaxLine" ADD COLUMN IF NOT EXISTS "computedAmountGhs" DECIMAL(20,2);

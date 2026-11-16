@@ -3173,6 +3173,16 @@ model BusinessInvoice {
   customerId         Int // the Azaman user being billed
   invoiceRef         String        @unique // e.g. "INV-260620-A3F2"
   status             InvoiceStatus @default(DRAFT)
+  // Native currency. NULL = legacy/untagged USDC (the historical meaning).
+  // 'GHS' = the bill is cedis: the *Ghs columns carry the money at exact 2dp
+  // and the *Usdc columns stay at zero. See
+  // 2026-11-16-dine-in-currency-contract.sql.
+  currency           String?       @db.VarChar(8)
+  subtotalGhs        Decimal?      @db.Decimal(20, 2)
+  taxTotalGhs        Decimal?      @db.Decimal(20, 2)
+  tipGhs             Decimal?      @db.Decimal(20, 2)
+  billTotalGhs       Decimal?      @db.Decimal(20, 2)
+  customerPaidGhs    Decimal?      @db.Decimal(20, 2)
   subtotalUsdc       Decimal       @db.Decimal(20, 8) // sum of lineItem totals
   taxTotalUsdc       Decimal       @default(0.0) @db.Decimal(20, 8) // sum of all tax lines
   tipUsdc            Decimal       @default(0.0) @db.Decimal(20, 8) // set at payment time
@@ -3218,6 +3228,9 @@ model BusinessInvoiceLineItem {
   invoiceId   String
   description String  @db.VarChar(200) // e.g. "Jollof Special", "1hr Web Dev"
   quantity    Int     @default(1)
+  // Native-GHS line money at exact 2dp (see BusinessInvoice.currency).
+  unitPriceGhs Decimal? @db.Decimal(20, 2)
+  lineTotalGhs Decimal? @db.Decimal(20, 2)
   unitPrice   Decimal @db.Decimal(20, 8)
   lineTotal   Decimal @db.Decimal(20, 8) // quantity * unitPrice, snapshotted at creation
 
@@ -3232,6 +3245,7 @@ model BusinessInvoiceTaxLine {
   name           String      @db.VarChar(100) // e.g. "VAT", "NHIL", "Service Charge"
   type           TaxLineType
   value          Decimal     @db.Decimal(10, 4) // percent (15.0) or flat amount (5.00)
+  computedAmountGhs Decimal? @db.Decimal(20, 2) // native-GHS tax at exact 2dp
   computedAmount Decimal     @db.Decimal(20, 8) // snapshotted at creation — never re-calc later
 
   invoice BusinessInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
