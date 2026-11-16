@@ -60,25 +60,10 @@ function fakeTx({ opening = OPENING } = {}) {
     };
 }
 
-// The documented Moolre Payment Status response: wrapper `status` plus a `data`
-// object with a NUMERIC txstatus, externalref, accountnumber, net `value` and
-// gross `amount`. The legacy `state`/`txstatus_label` vocabulary is no longer
-// accepted for funding, so the fixtures speak the real contract.
-const settledData = {
-    txstatus: 1,
-    externalref: 'EXT-1',
-    accountnumber: '0244000000',
-    value: '250.00',
-    amount: '252.50',
-};
-const settledPayload = settledData;
-
-function documentedEnvelope(over = {}) {
-    return { status: '1', data: { ...settledData, ...over } };
-}
+const settledPayload = { state: 'SETTLED', value: '250.00', amount: '252.50' };
 
 function witnessInput(over = {}) {
-    const raw = JSON.stringify(documentedEnvelope());
+    const raw = JSON.stringify({ ...settledPayload, externalref: 'EXT-1' });
     return {
         openingDedupKey: OPENING.dedupKey,
         provider: 'MOOLRE',
@@ -86,7 +71,7 @@ function witnessInput(over = {}) {
         endpoint: 'https://api.moolre.com/open/transact/status',
         requestParams: { type: 1, idtype: 1, id: 'EXT-1' },
         rawResponse: raw,
-        providerPayload: settledData,
+        providerPayload: settledPayload,
         amounts: { netPesewas: 25000n, grossPesewas: 25250n },
         fetchedAt: new Date('2026-11-14T09:00:00Z'),
         walletAccount: '0244000000',
@@ -167,8 +152,7 @@ describe('WP-I provider trust boundary', () => {
         test('14. a non-settled provider state cannot witness funding', async () => {
             const tx = fakeTx();
             await expect(recordProviderSettlementWitness(tx, witnessInput({
-                rawResponse: JSON.stringify(documentedEnvelope({ txstatus: 0 })),
-                providerPayload: { ...settledData, txstatus: 0 },
+                providerPayload: { state: 'PENDING', value: '250.00' },
             }))).rejects.toMatchObject({ code: 'WITNESS_PROVIDER_STATE_NOT_SETTLED' });
             expect(tx.witnesses).toHaveLength(0);
         });
@@ -247,7 +231,7 @@ describe('WP-I provider trust boundary', () => {
             const tx = fakeTx();
             await recordProviderSettlementWitness(tx, witnessInput());
             // Simulate a process that wrote a row directly without a provider call.
-            tx.witnesses[0].rawResponse = JSON.stringify(documentedEnvelope({ txstatus: 1, transactionid: 'forged' }));
+            tx.witnesses[0].rawResponse = JSON.stringify({ state: 'SETTLED', value: '250.00', forged: true });
             await expect(findWitnessForOpening(tx, { openingDedupKey: OPENING.dedupKey, provider: 'MOOLRE' }))
                 .rejects.toBeInstanceOf(WitnessMismatchError);
         });
