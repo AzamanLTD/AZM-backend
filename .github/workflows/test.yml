@@ -91,6 +91,12 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+      - name: Money core (strict typecheck + unit tests)
+        # WP-MONEY: a separate strict project, so it is its own gate. Money that is
+        # not typechecked is not money.
+        run: |
+          npm run typecheck:money
+          npm run test:money
 
       - name: Prisma schema validation gate
         # Explicit, named validation of prisma/schema.prisma — do not rely on

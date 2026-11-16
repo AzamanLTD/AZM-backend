@@ -16,7 +16,10 @@ if (!process.env.NODE_ENV) {
 
 module.exports = {
     testEnvironment: 'node',
-    testPathIgnorePatterns: ['/node_modules/', '/__tests__/helpers/'],
+    // WP-MONEY runs on its own runner (`npm run test:money` through tsx), because
+    // Jest here has no TypeScript transform and its default testMatch would pick
+    // up src/money/__tests__/*.test.ts and fail to parse them.
+    testPathIgnorePatterns: ['/node_modules/', '/__tests__/helpers/', '/src/money/'],
     setupFiles: ['./jest.setup.js'],
     setupFilesAfterEnv: ['./test-support/setup-shift-business-context.js'],
     // Jest 29 has no `hookTimeout` config option — the repo's old
