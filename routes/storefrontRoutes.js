@@ -9,6 +9,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const { Prisma } = require('@prisma/client');
 const router = require('express').Router();
 const { protect } = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
@@ -808,7 +809,48 @@ router.post('/:businessProfileId/order', protect, protectActive, wrap(async (req
   }
 
   const qty = Math.max(1, parseInt(quantity, 10) || 1);
-  const amount = parseFloat(product.priceUsdc) * qty;
+
+  // ── Currency is explicit, server-priced and durable ───────────────────────
+  // The customer never supplies the economic amount; it is always derived here
+  // from the merchant's own price row for the requested currency.
+  //
+  //   currency: 'GHS'  -> the merchant's confirmed BusinessPrice.amountExact,
+  //                       exact 2dp x quantity. No confirmed cedi price means a
+  //                       refusal, NEVER a silent USDC fallback.
+  //   currency: 'USDC' -> product.priceUsdc, exact Decimal x quantity, tagged.
+  //   omitted          -> the pre-contract legacy path: USDC from priceUsdc,
+  //                       left untagged (currency null) exactly as before, so
+  //                       existing clients are unaffected.
+  const requestedCurrency = req.body.currency == null ? null : String(req.body.currency).trim().toUpperCase();
+  if (requestedCurrency && !['GHS', 'USDC'].includes(requestedCurrency)) {
+    return res.status(400).json({ success: false, code: 'INVALID_CURRENCY', message: 'currency must be GHS or USDC.' });
+  }
+
+  let moneyFields;
+  if (requestedCurrency === 'GHS') {
+    const ghsPrice = await priceService.resolveEffectiveGhsPrice(prisma, productId);
+    if (!ghsPrice) {
+      // Fail closed with a typed code: the merchant has not published a
+      // confirmed cedi price, so there is no honest cedi amount to charge.
+      return res.status(422).json({
+        success: false,
+        code: 'GHS_PRICE_UNAVAILABLE',
+        message: 'This item has no confirmed GHS price yet.',
+      });
+    }
+    moneyFields = {
+      currency: 'GHS',
+      amountGhs: new Prisma.Decimal(ghsPrice.amountExact).times(qty),
+      amountUsdc: null,
+    };
+  } else {
+    moneyFields = {
+      currency: requestedCurrency === 'USDC' ? 'USDC' : null,
+      amountUsdc: new Prisma.Decimal(String(product.priceUsdc)).times(qty),
+      amountGhs: null,
+    };
+  }
+
   const orderTitle = qty > 1 ? `${product.name} x${qty}` : product.name;
 
   // Create the order
@@ -826,7 +868,7 @@ router.post('/:businessProfileId/order', protect, protectActive, wrap(async (req
         orderRef,
         title: orderTitle,
         description: `Storefront order for ${orderTitle}`,
-        amountUsdc: amount,
+        ...moneyFields,
         customerNotes: customerNotes ? String(customerNotes).slice(0, 500) : null,
         deliveryNotes: deliveryNotes ? String(deliveryNotes).slice(0, 500) : null,
         idempotencyKey: idempotencyKey || null,
@@ -852,6 +894,12 @@ router.post('/:businessProfileId/order', protect, protectActive, wrap(async (req
     throw err;
   }
 
+  // The amount a human reads must state its own currency: cedis are never
+  // printed with a USDC label, and vice versa.
+  const moneyText = order.currency === 'GHS'
+    ? `${new Prisma.Decimal(String(order.amountGhs)).toFixed(2)} GHS`
+    : `${new Prisma.Decimal(String(order.amountUsdc)).toFixed(2)} USDC`;
+
   // Track order event
   try {
     await prisma.storefrontAnalyticsEvent.create({
@@ -859,7 +907,13 @@ router.post('/:businessProfileId/order', protect, protectActive, wrap(async (req
         businessProfileId,
         eventType: 'order_placed',
         visitorId: `user_${userId}`,
-        metadata: { orderId: order.id, productId, quantity: qty, amount },
+        metadata: {
+          orderId: order.id,
+          productId,
+          quantity: qty,
+          currency: order.currency || null,
+          amount: String(order.currency === 'GHS' ? order.amountGhs : order.amountUsdc),
+        },
       },
     });
   } catch (_) { /* analytics is best-effort */ }
@@ -875,8 +929,16 @@ router.post('/:businessProfileId/order', protect, protectActive, wrap(async (req
         businessProfileId,
         type: 'NEW_ORDER',
         title: `New Storefront Order — ${orderRef}`,
-        body: `${customer?.displayName || 'A customer'} ordered ${orderTitle} (${amount.toFixed(2)} USDC). Status: Awaiting Payment.`,
-        metadata: { orderId: order.id, orderRef, amount, productId, quantity: qty, source: 'storefront' },
+        body: `${customer?.displayName || 'A customer'} ordered ${orderTitle} (${moneyText}). Status: Awaiting Payment.`,
+        metadata: {
+          orderId: order.id,
+          orderRef,
+          currency: order.currency || null,
+          amount: String(order.currency === 'GHS' ? order.amountGhs : order.amountUsdc),
+          productId,
+          quantity: qty,
+          source: 'storefront',
+        },
       },
     });
   } catch (_) { /* notification is best-effort */ }
