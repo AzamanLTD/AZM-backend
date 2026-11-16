@@ -264,6 +264,12 @@ jobs:
         # in-place rewrites of a money revision. Mirrors the release chain
         # (npm run release).
         run: node infra/install-admin-money-settings-overlay.js
+      - name: Install dine-in currency contract overlay
+        # Native-GHS dine-in and ledger money (2026-11-16): DineInTab/DineInTabItem
+        # cedi carriers, BusinessLedgerEntry currency with a nullable amount, and
+        # the CHECKs that stop a cedi sale being stored as USDC income. Mirrors the
+        # release chain (npm run release).
+        run: node infra/install-dine-in-currency-overlay.js
       - name: Install marketplace discovery overlay
         # Marketplace Mix P1: marketplace-visibility flag (§9 D-5), section
         # taxonomy mapping table + backfill (§4 D-2), discovery indexes

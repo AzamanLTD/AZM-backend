@@ -3445,7 +3445,7 @@ router.post('/pos/cash-sale', requirePermission('orders.manage'), wrap(async (re
 router.post('/pos/cash-close-tab', requirePermission('orders.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
-    const { tabId, cashReceived, tipAmount, idempotencyKey } = req.body;
+    const { tabId, cashReceived, tipAmount, idempotencyKey, currency } = req.body;
     if (!tabId) return res.status(400).json({ success: false, message: 'Tab ID required' });
 
     const { DineInCashCloseService } = require('../services/businessOS/dineInCashCloseService');
@@ -3457,10 +3457,14 @@ router.post('/pos/cash-close-tab', requirePermission('orders.manage'), wrap(asyn
             cashReceived,
             tipAmount,
             idempotencyKey,
+            // Explicit at the boundary: a Ghana till closes in cedis. Omitted keeps
+            // the legacy behaviour for callers that have not opted in.
+            currency,
         });
         const payload = {
             success: true,
             tab: result.tab,
+            currency: result.currency,
             subtotal: result.subtotal,
             taxTotal: result.taxTotal,
             grandTotal: result.grandTotal,

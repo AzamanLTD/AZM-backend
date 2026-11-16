@@ -119,6 +119,7 @@ describe('WP-D packaging — the claim table is installed by the real release pa
             'infra/install-business-offered-categories-overlay.js',
             'infra/install-business-currency-overlay.js',
             'infra/install-admin-money-settings-overlay.js',
+            'infra/install-dine-in-currency-overlay.js',
         ];
         expect(chain.slice(0, expectedExact.length)).toEqual(expectedExact);
         // Additions are inserted BETWEEN the overlays and the auth installer:

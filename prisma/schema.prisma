@@ -4923,6 +4923,15 @@ model DineInTab {
   status            String    @default("OPEN")
   openedAt          DateTime  @default(now())
   closedAt          DateTime?
+  // Currency contract (2026-11-16): a tab is EITHER legacy/untagged USDC
+  // (currency NULL, the *Usdc columns) OR native GHS (currency 'GHS', the *Ghs
+  // columns at exact 2dp). The sets are mutually exclusive, enforced by
+  // 2026-11-16-dine-in-currency-contract.sql — never by convention alone.
+  currency          String?   @db.VarChar(8)
+  subtotalGhs       Decimal?  @db.Decimal(20, 2)
+  taxTotalGhs       Decimal?  @db.Decimal(20, 2)
+  tipGhs            Decimal?  @db.Decimal(20, 2)
+  grandTotalGhs     Decimal?  @db.Decimal(20, 2)
   subtotalUsdc      Decimal   @default(0.0) @db.Decimal(20, 8)
   taxTotalUsdc      Decimal   @default(0.0) @db.Decimal(20, 8)
   tipUsdc           Decimal   @default(0.0) @db.Decimal(20, 8)
@@ -4950,6 +4959,10 @@ model DineInTabItem {
   dineInTabId   String
   productId     String?
   name          String   @db.VarChar(200)
+  // Native-GHS line money, exact 2dp (see DineInTab.currency). A GHS tab's
+  // line totals live here; the *Usdc columns stay for legacy tabs only.
+  unitPriceGhs  Decimal? @db.Decimal(20, 2)
+  lineTotalGhs  Decimal? @db.Decimal(20, 2)
   unitPriceUsdc Decimal  @db.Decimal(20, 8)
   quantity      Int      @default(1)
   lineTotalUsdc Decimal  @db.Decimal(20, 8)
@@ -5408,8 +5421,12 @@ model BusinessLedgerEntry {
   type        LedgerEntryType
   category    String          @db.VarChar(100) // sub-category e.g. "Room Revenue", "Food Sales", "Fuel", "Salaries"
   description String          @db.VarChar(500)
-  amount      Decimal         @db.Decimal(20, 8) // positive for income, negative for expense
-  amountGhs   Decimal?        @db.Decimal(20, 8) // GHS equivalent at time of entry
+  // Native currency of this entry. NULL = legacy/untagged USDC (the historical
+  // meaning). 'GHS' = the amount is cedis, carried in amountGhs at exact 2dp,
+  // and amount is NULL. A cedi sale must never be stored as USDC income.
+  currency    String?         @db.VarChar(8)
+  amount      Decimal?        @db.Decimal(20, 8) // positive income, negative expense; NULL on a native-GHS row
+  amountGhs   Decimal?        @db.Decimal(20, 8) // native GHS amount when currency='GHS'; legacy rows use it as a valuation
 
   // Source tracking
   sourceType String? @db.VarChar(50) // "ORDER", "PAYROLL", "MANUAL", "ESCROW", "AD"

@@ -240,6 +240,8 @@ jobs:
         run: node infra/install-business-currency-overlay.js
       - name: Install admin money settings overlay
         run: node infra/install-admin-money-settings-overlay.js
+      - name: Install dine-in currency contract overlay
+        run: node infra/install-dine-in-currency-overlay.js
 
       - name: Install inventory restock authority
         run: node infra/install-inventory-restock-overlay.js
