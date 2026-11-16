@@ -14,7 +14,7 @@
  */
 import { CURRENCIES, type CurrencyCode } from './currency';
 import { MoneyError } from './errors';
-import { makeMoney, type Money } from './money';
+import { moneyFromMinorUnits, type Money } from './money';
 
 const DECIMAL_PATTERN = /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/;
 
@@ -70,7 +70,7 @@ export function parseMoney<C extends CurrencyCode>(
 
   const fractionPadded = fractionPart.slice(0, spec.decimals).padEnd(spec.decimals, '0');
   const minorUnits = BigInt(`${wholePart}${fractionPadded}`);
-  return makeMoney(currency, negative ? -minorUnits : minorUnits, spec.decimals);
+  return moneyFromMinorUnits(currency, negative ? -minorUnits : minorUnits);
 }
 
 /** Parse only when the value is present; `undefined` stays `undefined`. */

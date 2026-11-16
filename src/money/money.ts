@@ -3,18 +3,22 @@
  *
  * `Money<C>` is an exact integer count of MINOR units plus its currency. It is
  * branded by currency, so `Money<'GHS'>` and `Money<'USDC'>` are different types
- * and adding one to the other does not compile. That is the whole point of the
- * module: the units cannot be confused at runtime because they cannot be
- * confused at all.
+ * and adding one to the other does not compile.
  *
- * No JavaScript `Number` ever touches an amount. The single numeric field is a
- * bigint of minor units, and it is not enumerable by JSON on purpose.
+ * PRECISION IS NOT A PARAMETER. The only constructor takes a currency and a
+ * count of minor units; the number of decimals always comes from the currency
+ * registry. An earlier version accepted a `decimals` argument, which let a
+ * caller build 3-decimal cedis or 2-decimal USDC and silently misrender every
+ * later amount. There is no longer a public door to that mistake.
+ *
+ * No JavaScript `Number` ever touches an amount: the single numeric field is a
+ * bigint of minor units, and JSON never sees it (`toJSON` renders an exact
+ * decimal string).
  */
-import type { CurrencyCode } from './currency';
+import { CURRENCIES, type CurrencyCode } from './currency';
 import { MoneyError } from './errors';
 import { formatMinor } from './format';
 
-/** Brand keeps structurally-identical money of different currencies apart. */
 declare const moneyBrand: unique symbol;
 
 export interface Money<C extends CurrencyCode> {
@@ -26,11 +30,14 @@ export interface Money<C extends CurrencyCode> {
   toString(): string;
 }
 
-export function makeMoney<C extends CurrencyCode>(
-  currency: C,
-  minorUnits: bigint,
-  decimals: number,
-): Money<C> {
+/**
+ * The only way to build money from an integer count of minor units.
+ *
+ * Its contract is safe for application callers precisely because `decimals`
+ * cannot be supplied: the currency registry is the single source of precision.
+ */
+export function moneyFromMinorUnits<C extends CurrencyCode>(currency: C, minorUnits: bigint): Money<C> {
+  const { decimals } = CURRENCIES[currency];
   const value: Money<C> = {
     currency,
     minorUnits,
@@ -42,6 +49,11 @@ export function makeMoney<C extends CurrencyCode>(
     },
   } as Money<C>;
   return Object.freeze(value);
+}
+
+/** Exact decimal rendering of a value, at the precision its currency holds. */
+export function formatMoney<C extends CurrencyCode>(money: Money<C>): string {
+  return formatMinor(money.minorUnits, CURRENCIES[money.currency].decimals);
 }
 
 /**

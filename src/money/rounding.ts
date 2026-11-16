@@ -5,9 +5,9 @@
  * mode, so a fee, a split and a statement can each pick the policy their
  * accounting actually wants — and the choice is visible in review.
  */
-import { CURRENCIES, type CurrencyCode } from './currency';
+import type { CurrencyCode } from './currency';
 import { MoneyError } from './errors';
-import { makeMoney, type Money } from './money';
+import { moneyFromMinorUnits, type Money } from './money';
 
 export type RoundingMode = 'DOWN' | 'UP' | 'HALF_UP' | 'HALF_EVEN';
 
@@ -55,5 +55,5 @@ export function roundMinorUnits<C extends CurrencyCode>(
   currency: C,
   mode: RoundingMode,
 ): Money<C> {
-  return makeMoney(currency, applyRounding(numerator, denominator, mode), CURRENCIES[currency].decimals);
+  return moneyFromMinorUnits(currency, applyRounding(numerator, denominator, mode));
 }

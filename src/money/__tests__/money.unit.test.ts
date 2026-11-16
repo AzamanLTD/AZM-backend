@@ -8,14 +8,15 @@
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import * as moneyApi from '../index';
 
 import {
   MoneyError,
   add,
   compare,
   divideIntoParts,
-  formatMinor,
-  makeMoney,
+  formatMoney,
+  moneyFromMinorUnits,
   multiplyByQuantity,
   parseMoney,
   subtract,
@@ -39,7 +40,7 @@ test('GHS holds exactly two decimals', () => {
 
   // The case that breaks binary floating point: 0.1 + 0.2 === 0.3 exactly.
   assert.equal(add(ghs('0.10'), ghs('0.20')).minorUnits, 30n);
-  assert.equal(formatMinor(add(ghs('0.10'), ghs('0.20')).minorUnits, 2), '0.30');
+  assert.equal(formatMoney(add(ghs('0.10'), ghs('0.20'))), '0.30');
 });
 
 test('large values stay exact because they are bigints, not doubles', () => {
@@ -47,9 +48,9 @@ test('large values stay exact because they are bigints, not doubles', () => {
   assert.equal(large.minorUnits, 99999999999999999999n);
 
   // Past Number.MAX_SAFE_INTEGER in minor units (2^53-1 = 9007199254740991).
-  const huge = makeMoney('GHS', 9007199254740993n, 2);
+  const huge = moneyFromMinorUnits('GHS', 9007199254740993n);
   assert.equal(huge.minorUnits, 9007199254740993n);
-  assert.equal(formatMinor(huge.minorUnits, 2), '90071992547409.93');
+  assert.equal(huge.toJSON(), '90071992547409.93');
 
   assert.equal(add(large, ghs('0.01')).minorUnits, 100000000000000000000n);
 });
@@ -58,17 +59,17 @@ test('USDC keeps its existing eight-decimal precision', () => {
   assert.equal(usdc('1.00000000').minorUnits, 100000000n);
   assert.equal(usdc('0.00000001').minorUnits, 1n);
   assert.equal(usdc('1234.56789012').minorUnits, 123456789012n);
-  assert.equal(formatMinor(usdc('0.00000001').minorUnits, 8), '0.00000001');
+  assert.equal(formatMoney(usdc('0.00000001')), '0.00000001');
 });
 
 test('negative amounts parse, compare and render exactly', () => {
   assert.equal(ghs('-0.01').minorUnits, -1n);
-  assert.equal(formatMinor(ghs('-0.01').minorUnits, 2), '-0.01');
+  assert.equal(ghs('-0.01').toJSON(), '-0.01');
   assert.equal(compare(ghs('-0.01'), ghs('0.00')), -1);
   assert.equal(compare(ghs('0.30'), ghs('0.30')), 0);
   assert.equal(subtract(ghs('0.30'), ghs('0.10')).minorUnits, 20n);
   // A negative that nets to zero must not render as "-0.00".
-  assert.equal(formatMinor(subtract(ghs('0.01'), ghs('0.01')).minorUnits, 2), '0.00');
+  assert.equal(formatMoney(subtract(ghs('0.01'), ghs('0.01'))), '0.00');
 });
 
 test('precision boundaries are refused, never rounded implicitly', () => {
@@ -130,7 +131,7 @@ test('mixing currencies fails at runtime too, with a typed refusal', () => {
 
 test('multiplication is by whole quantities only', () => {
   assert.equal(multiplyByQuantity(ghs('0.30'), 3).minorUnits, 90n);
-  assert.equal(formatMinor(multiplyByQuantity(ghs('0.30'), 3).minorUnits, 2), '0.90');
+  assert.equal(formatMoney(multiplyByQuantity(ghs('0.30'), 3)), '0.90');
   assert.equal(multiplyByQuantity(ghs('0.30'), 3n).minorUnits, 90n);
   assert.equal(multiplyByQuantity(ghs('0.30'), -2).minorUnits, -60n);
 
@@ -191,13 +192,13 @@ test('property-style: integer arithmetic over a fixed pseudo-random sequence', (
   for (let i = 0; i < 200; i += 1) {
     const aMinor = (next() % 1000000000n) - 500000000n; // +/- 5,000,000.00 GHS
     const bMinor = (next() % 1000000000n) - 500000000n;
-    const a = makeMoney('GHS', aMinor, 2);
-    const b = makeMoney('GHS', bMinor, 2);
+    const a = moneyFromMinorUnits('GHS', aMinor);
+    const b = moneyFromMinorUnits('GHS', bMinor);
 
     // (a + b) - b === a
     assert.equal(subtract(add(a, b), b).minorUnits, a.minorUnits);
     // rendering then re-parsing is lossless for any amount that fits the scale
-    assert.equal(parseMoney(formatMinor(a.minorUnits, 2), 'GHS').minorUnits, a.minorUnits);
+    assert.equal(parseMoney(a.toJSON(), 'GHS').minorUnits, a.minorUnits);
     // multiplication distributes over addition
     assert.equal(
       multiplyByQuantity(add(a, b), 3).minorUnits,
@@ -206,4 +207,26 @@ test('property-style: integer arithmetic over a fixed pseudo-random sequence', (
     // comparison agrees with integer comparison
     assert.equal(compare(a, b), a.minorUnits < b.minorUnits ? -1 : a.minorUnits > b.minorUnits ? 1 : 0);
   }
+});
+
+// ── Correction 1: precision comes from the registry, never from a caller ──────
+
+test('the only constructor derives precision from the currency registry', () => {
+  // Same integer count of minor units, different currency, different rendering:
+  // nothing about precision travels with the caller.
+  assert.equal(moneyFromMinorUnits('GHS', 123n).toJSON(), '1.23');
+  assert.equal(moneyFromMinorUnits('USDC', 123n).toJSON(), '0.00000123');
+  assert.equal(formatMoney(moneyFromMinorUnits('USDC', 100000000n)), '1.00000000');
+});
+
+test('the public surface exposes no way to choose a precision', () => {
+  // The internal primitive and the old three-argument constructor are gone from
+  // the public surface on purpose: exporting either would let application code
+  // invent 3-decimal cedis. Read through an index signature so this asserts the
+  // ABSENCE at runtime without the compiler objecting to the names.
+  const surface = moneyApi as unknown as Record<string, unknown>;
+  assert.equal(surface['formatMinor'], undefined);
+  assert.equal(surface['makeMoney'], undefined);
+  assert.equal(typeof surface['moneyFromMinorUnits'], 'function');
+  assert.equal(typeof surface['formatMoney'], 'function');
 });

@@ -7,7 +7,16 @@
  * currency, or makes a valuation assignable to money), `tsc` reports an unused
  * `@ts-expect-error` and `npm run typecheck:money` fails.
  */
-import { add, makeQuote, parseMoney, valueWithQuote, type Money } from '../index';
+import {
+  add,
+  makeQuote,
+  moneyFromMinorUnits,
+  parseMoney,
+  valuationToJSONValue,
+  valueWithQuote,
+  type Money,
+  type SerialisedValuation,
+} from '../index';
 
 const cedis = parseMoney('10.00', 'GHS');
 const dollars = parseMoney('10.00000000', 'USDC');
@@ -33,5 +42,20 @@ add(cedis, valuation);
 // @ts-expect-error a valuation cannot be assigned to Money<'GHS'>
 const notMoney: Money<'GHS'> = valuation;
 void notMoney;
+
+// Precision is not a caller decision: there is no third argument to pass.
+// @ts-expect-error the constructor takes only a currency and minor units
+moneyFromMinorUnits('GHS', 100n, 2);
+
+// A serialised valuation keeps saying it is a valuation, and is still not money.
+const serialised: SerialisedValuation<'GHS'> = valuationToJSONValue(valuation);
+// @ts-expect-error a serialised valuation is not spendable money
+const spendable: Money<'GHS'> = serialised;
+void spendable;
+
+// The raw decimal primitive left the public surface with the same reasoning.
+// @ts-expect-error formatMinor is not exported publicly
+import { formatMinor } from '../index';
+void formatMinor;
 
 export {};

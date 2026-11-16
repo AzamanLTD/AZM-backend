@@ -16,8 +16,12 @@ export {
   type CurrencyCode,
   type CurrencySpec,
 } from './currency';
-export { makeMoney, assertSameCurrency, type Money } from './money';
-export { formatMinor } from './format';
+// Public surface rule: only constructors whose contract is safe for application
+// callers are exported. `moneyFromMinorUnits` takes no precision argument (the
+// currency registry owns it) and `formatMoney` renders at that same precision, so
+// neither can be used to invent a 3-decimal cedi. The raw `formatMinor(minor,
+// decimals)` primitive stays internal for the same reason.
+export { moneyFromMinorUnits, formatMoney, assertSameCurrency, type Money } from './money';
 export { parseMoney, parseOptionalMoney } from './parse';
 export {
   abs,
@@ -39,12 +43,15 @@ export {
 export { applyRounding, roundMinorUnits, type RoundingMode } from './rounding';
 export {
   formatValuation,
+  valuationToJSONValue,
+  isIso8601Timestamp,
   makeQuote,
   parseRate,
   valueWithQuote,
   type FxQuote,
   type MoneyValuation,
   type QuoteProvenance,
+  type SerialisedValuation,
 } from './fx';
 export {
   moneyFromDecimalString,

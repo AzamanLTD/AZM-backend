@@ -8,8 +8,7 @@
  */
 import type { CurrencyCode } from './currency';
 import { MoneyError } from './errors';
-import { assertSameCurrency, makeMoney, type Money } from './money';
-import { CURRENCIES } from './currency';
+import { assertSameCurrency, moneyFromMinorUnits, type Money } from './money';
 
 export type Ordering = -1 | 0 | 1;
 
@@ -19,20 +18,20 @@ export type Ordering = -1 | 0 | 1;
 
 export function add<C extends CurrencyCode>(a: Money<C>, b: Money<NoInfer<C>>): Money<C> {
   assertSameCurrency(a, b);
-  return makeMoney(a.currency, a.minorUnits + b.minorUnits, CURRENCIES[a.currency].decimals);
+  return moneyFromMinorUnits(a.currency, a.minorUnits + b.minorUnits);
 }
 
 export function subtract<C extends CurrencyCode>(a: Money<C>, b: Money<NoInfer<C>>): Money<C> {
   assertSameCurrency(a, b);
-  return makeMoney(a.currency, a.minorUnits - b.minorUnits, CURRENCIES[a.currency].decimals);
+  return moneyFromMinorUnits(a.currency, a.minorUnits - b.minorUnits);
 }
 
 export function negate<C extends CurrencyCode>(a: Money<C>): Money<C> {
-  return makeMoney(a.currency, -a.minorUnits, CURRENCIES[a.currency].decimals);
+  return moneyFromMinorUnits(a.currency, -a.minorUnits);
 }
 
 export function abs<C extends CurrencyCode>(a: Money<C>): Money<C> {
-  return makeMoney(a.currency, a.minorUnits < 0n ? -a.minorUnits : a.minorUnits, CURRENCIES[a.currency].decimals);
+  return moneyFromMinorUnits(a.currency, a.minorUnits < 0n ? -a.minorUnits : a.minorUnits);
 }
 
 export function isZero<C extends CurrencyCode>(a: Money<C>): boolean {
@@ -89,7 +88,7 @@ export function multiplyByQuantity<C extends CurrencyCode>(amount: Money<C>, qua
     }
     units = BigInt(quantity);
   }
-  return makeMoney(amount.currency, amount.minorUnits * units, CURRENCIES[amount.currency].decimals);
+  return moneyFromMinorUnits(amount.currency, amount.minorUnits * units);
 }
 
 /**
@@ -107,7 +106,7 @@ export function divideIntoParts<C extends CurrencyCode>(
   const quotient = amount.minorUnits / divisor;
   const remainder = amount.minorUnits % divisor;
   return {
-    quotient: makeMoney(amount.currency, quotient, CURRENCIES[amount.currency].decimals),
+    quotient: moneyFromMinorUnits(amount.currency, quotient),
     remainderMinorUnits: remainder,
   };
 }
