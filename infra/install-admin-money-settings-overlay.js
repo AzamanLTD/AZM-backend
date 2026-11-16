@@ -68,24 +68,51 @@ const STATEMENTS = [
      END IF;
    END $$;`,
 
-  // A GHS setting is stored as a canonical 2dp decimal string, never a float
-  // rendering and never sub-pesewa.
-  `DO $$ BEGIN
-     IF NOT EXISTS (
-       SELECT 1 FROM pg_constraint WHERE conname = 'admin_money_setting_ghs_canonical_check'
-     ) THEN
-       ALTER TABLE "AdminMoneySettingRevision"
-         ADD CONSTRAINT "admin_money_setting_ghs_canonical_check"
-         CHECK ("kind" <> 'ghs' OR "valueText" ~ '^[0-9]+(\\.[0-9]{1,2})?$');
-     END IF;
-   END $$;`,
+  // A GHS setting is stored as a CANONICAL two-decimal string: "25.00" yes,
+  // "25" and "25.1" no. The earlier form accepted integer and one-decimal text,
+  // which is exactly the ambiguity this model exists to remove ("25" cannot be
+  // distinguished from a whole-unit amount by a reader that has to re-render it).
+  //
+  // DROP-then-ADD rather than IF NOT EXISTS on purpose: a looser constraint
+  // already installed in an environment must be REPLACED, and IF NOT EXISTS
+  // would silently keep it. The ADD fails closed if any existing row violates
+  // the stricter shape, which is the correct outcome.
+  `ALTER TABLE "AdminMoneySettingRevision"
+     DROP CONSTRAINT IF EXISTS admin_money_setting_ghs_canonical_check;`,
+  `ALTER TABLE "AdminMoneySettingRevision"
+     ADD CONSTRAINT admin_money_setting_ghs_canonical_check
+     CHECK ("kind" <> 'ghs' OR "valueText" ~ '^[0-9]+\\.[0-9]{2}$');`,
 
-  // Append-only: revisions are history. Refuse in-place rewrites at the
-  // database, not merely by convention in the service.
+  // Append-only: revisions are history. Refusing UPDATE alone does not make a
+  // log append-only — an UPDATE-only guard still permits DELETE and TRUNCATE, so
+  // the history disappears one row or one statement at a time. All three are
+  // refused here, at the database, for every identity that is not able to drop
+  // the trigger itself.
+  //
+  // ENFORCED BOUNDARY, stated exactly rather than implied:
+  //   • EVERY identity that is not the table owner is refused UPDATE, DELETE and
+  //     TRUNCATE — that is the runtime/service identity, which is who could
+  //     actually destroy history in production. Proved with a restricted LOGIN
+  //     role that holds DELETE and TRUNCATE privileges and is still refused.
+  //   • The table OWNER (and a superuser) retains administrative capability, and
+  //     can also drop the trigger or set `session_replication_role = replica`.
+  //     Allowing the owner is deliberate: it is what lets intended maintenance
+  //     and test teardown clear the table, and pretending otherwise would be a
+  //     claim this mechanism cannot make. A fully owner-proof log needs the owner
+  //     and the writer to be different PostgreSQL identities, which is a
+  //     deployment decision rather than something an overlay can grant itself.
   `CREATE OR REPLACE FUNCTION admin_money_setting_revision_append_only()
      RETURNS trigger AS $fn$
+   DECLARE
+     is_owner boolean;
    BEGIN
-     RAISE EXCEPTION 'AdminMoneySettingRevision is append-only: write a new revision instead of updating %', OLD.id
+     SELECT (current_user = tableowner) INTO is_owner
+       FROM pg_tables WHERE schemaname = 'public' AND tablename = 'AdminMoneySettingRevision';
+     IF is_owner THEN
+       IF TG_OP = 'DELETE' THEN RETURN OLD; END IF;
+       RETURN NULL; -- UPDATE and TRUNCATE: allow the owner's own statement through
+     END IF;
+     RAISE EXCEPTION 'AdminMoneySettingRevision is append-only: % is refused for % (write a new revision)', TG_OP, current_user
        USING ERRCODE = 'check_violation';
    END;
    $fn$ LANGUAGE plpgsql;`,
@@ -97,6 +124,26 @@ const STATEMENTS = [
        CREATE TRIGGER admin_money_setting_revision_no_update
          BEFORE UPDATE ON "AdminMoneySettingRevision"
          FOR EACH ROW EXECUTE FUNCTION admin_money_setting_revision_append_only();
+     END IF;
+   END $$;`,
+
+  `DO $$ BEGIN
+     IF NOT EXISTS (
+       SELECT 1 FROM pg_trigger WHERE tgname = 'admin_money_setting_revision_no_delete'
+     ) THEN
+       CREATE TRIGGER admin_money_setting_revision_no_delete
+         BEFORE DELETE ON "AdminMoneySettingRevision"
+         FOR EACH ROW EXECUTE FUNCTION admin_money_setting_revision_append_only();
+     END IF;
+   END $$;`,
+
+  `DO $$ BEGIN
+     IF NOT EXISTS (
+       SELECT 1 FROM pg_trigger WHERE tgname = 'admin_money_setting_revision_no_truncate'
+     ) THEN
+       CREATE TRIGGER admin_money_setting_revision_no_truncate
+         BEFORE TRUNCATE ON "AdminMoneySettingRevision"
+         FOR EACH STATEMENT EXECUTE FUNCTION admin_money_setting_revision_append_only();
      END IF;
    END $$;`,
 ];

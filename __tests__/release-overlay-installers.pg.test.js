@@ -49,6 +49,17 @@ run('money installers on a clean disposable database (the release path)', () => 
     const { PrismaClient } = require('@prisma/client');
     let adminPg;
     let db;
+    let runtime;
+    const ROLE = 'azm_release_runtime';
+    const RPW = 'release-runtime-pw';
+    const urlForRole = (role, password) => {
+        const u = baseUrl();
+        u.username = role;
+        u.password = password;
+        u.pathname = `/${DB}`;
+        u.search = '';
+        return u.toString();
+    };
 
     const psql = async (sql) => db.$executeRawUnsafe(sql);
 
@@ -89,9 +100,19 @@ run('money installers on a clean disposable database (the release path)', () => 
 
         // AdminMoneySettingRevision is deliberately NOT created: the #404 gap was a
         // Prisma model with nothing in production to back it.
+
+        // A restricted RUNTIME identity, holding ordinary DML rights including
+        // TRUNCATE, proves the append-only guard is the trigger and not merely a
+        // missing privilege. Note it must NOT be the table owner: the owner keeps
+        // administrative capability by design (see the installer's boundary note).
+        await db.$executeRawUnsafe(`DROP ROLE IF EXISTS ${ROLE}`);
+        await db.$executeRawUnsafe(`CREATE ROLE ${ROLE} LOGIN PASSWORD '${RPW}' NOSUPERUSER NOCREATEDB NOCREATEROLE`);
+        await db.$executeRawUnsafe(`GRANT USAGE ON SCHEMA public TO ${ROLE}`);
+        runtime = new PrismaClient({ datasources: { db: { url: urlForRole(ROLE, RPW) } } });
     }, 60000);
 
     afterAll(async () => {
+        await runtime?.$disconnect().catch(() => {});
         await db?.$disconnect().catch(() => {});
         if (adminPg) {
             await adminPg.$executeRawUnsafe(`DROP DATABASE IF EXISTS ${el(DB)} WITH (FORCE)`).catch(() => {});
@@ -120,9 +141,11 @@ run('money installers on a clean disposable database (the release path)', () => 
     });
 
     describe('after the release installers run', () => {
-        beforeAll(() => {
+        beforeAll(async () => {
             runInstaller('install-business-currency-overlay.js');
             runInstaller('install-admin-money-settings-overlay.js');
+            // Rights are granted only once the tables exist.
+            await db.$executeRawUnsafe(`GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON "AdminMoneySettingRevision" TO ${ROLE}`);
         }, 120000);
 
         test('the currency columns are added with the declared precision', async () => {
@@ -246,7 +269,10 @@ run('money installers on a clean disposable database (the release path)', () => 
         });
 
         test('an existing revision cannot be rewritten in place', async () => {
-            await expect(psql(`UPDATE "AdminMoneySettingRevision" SET "valueInt" = 3600 WHERE id = 'rev-int'`))
+            // Through the RUNTIME identity: the owner keeps administrative
+            // capability by design, so the owner's own connection is not the
+            // identity this invariant is about.
+            await expect(runtime.$executeRawUnsafe(`UPDATE "AdminMoneySettingRevision" SET "valueInt" = 3600 WHERE id = 'rev-int'`))
                 .rejects.toThrow(/append-only/);
             // The correction path is a new revision, and the history is still there.
             await psql(`INSERT INTO "AdminMoneySettingRevision" ("id","key","kind","valueInt","effectiveAt","adminId","reason")
@@ -271,6 +297,60 @@ run('money installers on a clean disposable database (the release path)', () => 
                 `SELECT count(*)::int AS n FROM "AdminMoneySettingRevision"`
             );
             expect(row.n).toBe(3);
+        }, 120000);
+    });
+
+    describe('money-settings database hardening', () => {
+        // A restricted RUNTIME identity, holding ordinary DML rights including
+        // TRUNCATE, proves the append-only guard is the trigger and not merely a
+        // missing privilege.
+        test('a GHS value must be canonical two decimals: integer and one-decimal forms are refused', async () => {
+            const insert = (id, valueText) => psql(`INSERT INTO "AdminMoneySettingRevision" ("id","key","kind","valueText","effectiveAt","adminId","reason")
+                VALUES ('${id}','hardening.ghs','ghs','${valueText}','2026-01-01T00:00:00Z',1,'probe')`);
+
+            for (const bad of ['25', '25.1', '25.005', '25.010', '.50', '25,00', ' 25.00']) {
+                await expect(insert(`bad-${bad.replace(/\W/g, 'x')}`, bad))
+                    .rejects.toThrow(/admin_money_setting_ghs_canonical_check/);
+            }
+            await expect(insert('good-ghs', '25.00')).resolves.toBeGreaterThan(0);
+            const [row] = await db.$queryRawUnsafe(
+                `SELECT "valueText" FROM "AdminMoneySettingRevision" WHERE id = 'good-ghs'`);
+            expect(row.valueText).toBe('25.00');
+        });
+
+        test('the runtime identity can append but cannot delete or truncate history', async () => {
+            // Appending is what the service does, and it works.
+            await expect(runtime.$executeRawUnsafe(
+                `INSERT INTO "AdminMoneySettingRevision" ("id","key","kind","valueInt","effectiveAt","adminId","reason")
+                 VALUES ('runtime-ok','hardening.int','int',5,'2026-01-01T00:00:00Z',1,'runtime append')`
+            )).resolves.toBeGreaterThan(0);
+
+            // Every destructive path is refused by the trigger, even though the
+            // role holds DELETE and TRUNCATE privileges.
+            await expect(runtime.$executeRawUnsafe(
+                `DELETE FROM "AdminMoneySettingRevision" WHERE id = 'runtime-ok'`)).rejects.toThrow(/append-only/);
+            await expect(runtime.$executeRawUnsafe(
+                `UPDATE "AdminMoneySettingRevision" SET "valueInt" = 9 WHERE id = 'runtime-ok'`)).rejects.toThrow(/append-only/);
+            await expect(runtime.$executeRawUnsafe('TRUNCATE "AdminMoneySettingRevision"')).rejects.toThrow(/append-only/);
+
+            // History survived every attempt.
+            const [row] = await db.$queryRawUnsafe(
+                `SELECT "valueInt" FROM "AdminMoneySettingRevision" WHERE id = 'runtime-ok'`);
+            expect(row.valueInt).toBe(5);
+        });
+
+        test('re-running the installer keeps the STRICTER constraint, it does not silently keep a looser one', async () => {
+            runInstaller('install-admin-money-settings-overlay.js');
+            await expect(psql(`INSERT INTO "AdminMoneySettingRevision" ("id","key","kind","valueText","effectiveAt","adminId","reason")
+                VALUES ('post-rerun','hardening.ghs2','ghs','25','2026-01-01T00:00:00Z',1,'probe')`))
+                .rejects.toThrow(/admin_money_setting_ghs_canonical_check/);
+            const triggers = await db.$queryRawUnsafe(
+                `SELECT tgname FROM pg_trigger WHERE tgrelid = '"AdminMoneySettingRevision"'::regclass AND NOT tgisinternal ORDER BY 1`);
+            expect(triggers.map((t) => t.tgname)).toEqual([
+                'admin_money_setting_revision_no_delete',
+                'admin_money_setting_revision_no_truncate',
+                'admin_money_setting_revision_no_update',
+            ]);
         }, 120000);
     });
 });
