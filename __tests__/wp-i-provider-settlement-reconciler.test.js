@@ -353,7 +353,10 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
             provider: 'AZM_TREASURY', rail: 'INTERNAL', dedupKey: 'treasury:dir-a',
             amountGhs: 100, treasury: true, evidence: { kind: 'AUDITED_TREASURY_OPENING' },
         }));
-        const raw = JSON.stringify({ status: 1, data: { state: 'SETTLED', value: '100.00', accountnumber: 'WALLET-AZM-1' } });
+        const raw = JSON.stringify({
+            status: '1',
+            data: { txstatus: 1, externalref: 'REF-DIR', accountnumber: 'WALLET-AZM-1', value: '100.00', amount: '102.00' },
+        });
         await prisma.$transaction((tx) => witnesses.recordProviderSettlementWitness(tx, {
             openingDedupKey: 'treasury:dir-a',
             provider: 'MOOLRE',
@@ -361,7 +364,7 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
             endpoint: 'https://api.moolre.com/open/transact/status',
             requestParams: { reference: 'REF-DIR' },
             rawResponse: raw,
-            providerPayload: { state: 'SETTLED', value: '100.00' },
+            providerPayload: { txstatus: 1, externalref: 'REF-DIR', accountnumber: 'WALLET-AZM-1', value: '100.00', amount: '102.00' },
             fetchedAt: new Date(),
             walletAccount: 'WALLET-AZM-1',
             currencyMapping: { 'WALLET-AZM-1': 'GHS' },
@@ -412,8 +415,10 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
             fundingType: 'BANK_DEPOSIT_QUERIED_AS_TYPE_1',
             endpoint: 'https://api.moolre.com/open/transact/status',
             requestParams: { id: PROVIDER_REF },
-            rawResponse: JSON.stringify({ status: 1, data: { state: 'SETTLED', value: '99.00' } }),
-            providerPayload: { state: 'SETTLED', value: '99.00' },
+            rawResponse: JSON.stringify({
+                status: '1',
+                data: { txstatus: 1, externalref: PROVIDER_REF, accountnumber: 'WALLET-AZM-1', value: '99.00', amount: '100.00' },
+            }),
             fetchedAt: new Date(),
             walletAccount: 'WALLET-AZM-1',
             currencyMapping: { 'WALLET-AZM-1': 'GHS' },
@@ -458,7 +463,10 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
         // detection: the witness stops being usable evidence.
         await prisma.providerSettlementWitness.update({
             where: { openingDedupKey: OPENING_A },
-            data: { rawResponse: JSON.stringify({ status: 1, data: { state: 'SETTLED', value: '999999.00' } }) },
+            data: { rawResponse: JSON.stringify({
+                status: '1',
+                data: { txstatus: 1, externalref: PROVIDER_REF, accountnumber: 'WALLET-AZM-1', value: '999999.00', amount: '999999.00' },
+            }) },
         });
 
         await expect(prisma.$transaction((tx) => witnesses.findWitnessForOpening(tx, {

@@ -182,7 +182,12 @@ function currencyForAccount(accountNumber, mapping) {
  *     fallback silently substituted the wallet we asked about for the account
  *     the provider actually named.
  */
-const DOCUMENTED_ADAPTER_RULE = 'moolre-payment-status-v1';
+// The canonical rules live in exactly one place. Inventing a second name here is
+// how a boundary ends up with two vocabularies that silently disagree.
+const {
+    ADAPTER_DOCUMENTED: DOCUMENTED_ADAPTER_RULE,
+    ADAPTER_LEGACY: LEGACY_ADAPTER_RULE,
+} = require('./providers/moolreStatusAdapter');
 const TXSTATUS_SUCCESS = 1;
 
 /** `data.txstatus` is numeric by contract; a numeric string is tolerated, anything else is absent. */
@@ -355,6 +360,15 @@ async function recordProviderSettlementWitness(tx, input = {}) {
         { parsedDigest: digestOf(JSON.stringify(parsed.data)), suppliedDigest: digestOf(JSON.stringify(providerPayload)) }
       );
     }
+  }
+  // A LEGACY observation must never authorise treasury funding, even though the
+  // adapter still parses it for historical evidence. The refusal is by RULE, not
+  // by the presence of a lucky txstatus field.
+  if (adapterRule === LEGACY_ADAPTER_RULE) {
+    throw new WitnessError(
+      'WITNESS_LEGACY_ADAPTER_NOT_FUNDABLE',
+      '[wp-i] adapter rule ' + LEGACY_ADAPTER_RULE + ' is undocumented evidence and cannot authorise treasury funding'
+    );
   }
   if (adapterRule !== null && adapterRule !== undefined && adapterRule !== DOCUMENTED_ADAPTER_RULE) {
     throw new WitnessError(
