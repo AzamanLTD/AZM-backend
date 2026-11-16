@@ -52,6 +52,7 @@ const {
     digestOfTriggerSource,
     isCanonicalTriggerSource,
 } = require('./authorityTriggerContract');
+const { resolveAuthorityRoles } = require('../../infra/lib/authority-roles');
 
 const TABLE_NAME = 'FiatLiquidityAuthorityActivation';
 const QUALIFIED_TABLE = `public."${TABLE_NAME}"`;
@@ -101,6 +102,20 @@ const PROBLEM = Object.freeze({
     ACTIVATION_FUNCTION_EXECUTE_NOT_PINNED: 'ACTIVATION_FUNCTION_EXECUTE_NOT_PINNED',
     NON_OWNER_CAN_WRITE_ACTIVATION_RECORD: 'NON_OWNER_CAN_WRITE_ACTIVATION_RECORD',
     ACTIVATION_FUNCTION_OWNER_HAS_WIDE_PRIVILEGES: 'ACTIVATION_FUNCTION_OWNER_HAS_WIDE_PRIVILEGES',
+    // §WP-H A — the shape of the boundary AROUND the boundary.
+    ROLE_MISSING: 'ROLE_MISSING',
+    ROLE_ATTRIBUTE_UNSAFE: 'ROLE_ATTRIBUTE_UNSAFE',
+    ROLE_HAS_MEMBER: 'ROLE_HAS_MEMBER',
+    TRIGGER_BINDING_DRIFT: 'TRIGGER_BINDING_DRIFT',
+    TRIGGER_FUNCTION_OWNER_NOT_TABLE_OWNER: 'TRIGGER_FUNCTION_OWNER_NOT_TABLE_OWNER',
+    COLUMN_ACL_EXPOSED: 'COLUMN_ACL_EXPOSED',
+    PUBLIC_HAS_RECORD_PRIVILEGE: 'PUBLIC_HAS_RECORD_PRIVILEGE',
+    RECORD_ACL_FOREIGN_GRANTEE: 'RECORD_ACL_FOREIGN_GRANTEE',
+    RECORD_WRITER_PRIVILEGE_TOO_BROAD: 'RECORD_WRITER_PRIVILEGE_TOO_BROAD',
+    ACTIVATION_FUNCTION_EXECUTE_TO_RUNTIME: 'ACTIVATION_FUNCTION_EXECUTE_TO_RUNTIME',
+    ACTIVATION_FUNCTION_EXECUTE_GRANTEE_NOT_OPERATOR: 'ACTIVATION_FUNCTION_EXECUTE_GRANTEE_NOT_OPERATOR',
+    ACTIVATION_FUNCTION_EXECUTE_AMBIGUOUS: 'ACTIVATION_FUNCTION_EXECUTE_AMBIGUOUS',
+    BOUNDARY_ATTESTATION_UNVERIFIABLE: 'BOUNDARY_ATTESTATION_UNVERIFIABLE',
 });
 
 /**
@@ -265,6 +280,374 @@ async function inspectActivationFunction(db, diagnostics, problems) {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// §WP-H A — ATTEST THE ENTIRE BOUNDARY, NOT JUST THE PARTS THAT ARE EASY TO READ.
+//
+// The checks above establish that the runtime cannot write, that the trigger
+// function is canonical, that the triggers exist and are enabled, and that the
+// activation function is a pinned SECURITY DEFINER. None of that describes the
+// shape of the boundary AROUND those facts, and each gap is a way in:
+//
+//   * an owner that can LOG IN, create roles, replicate or bypass RLS is a
+//     second identity that can simply be assumed;
+//   * a role that is a member of the owner — directly or through a chain — can
+//     SET ROLE to it, which no privilege check on the runtime ever reveals;
+//   * a trigger with the right name but a different relation, function, timing
+//     or scope is not this trigger;
+//   * a table-level grant hides a column-level one, and a PUBLIC grant hides
+//     behind OID 0 rather than a role name;
+//   * an EXECUTE grantee is only acceptable if it is the CONFIGURED operator,
+//     not merely a differently-named role that happens to hold the privilege.
+//
+// Everything below reads pg_catalog. Nothing trusts the installer, an env flag
+// or a previous success, so drift after provisioning is detected. Any catalog
+// that cannot be read is a refusal, never a pass.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ROLE_ATTRIBUTE_RULES = Object.freeze([
+    { column: 'rolcanlogin', label: 'LOGIN' },
+    { column: 'rolsuper', label: 'SUPERUSER' },
+    { column: 'rolcreatedb', label: 'CREATEDB' },
+    { column: 'rolcreaterole', label: 'CREATEROLE' },
+    { column: 'rolreplication', label: 'REPLICATION' },
+    { column: 'rolbypassrls', label: 'BYPASSRLS' },
+    { column: 'rolinherit', label: 'INHERIT' },
+]);
+
+// pg_trigger.tgtype bit masks, straight from the catalog format.
+const TG_ROW = 1;
+const TG_BEFORE = 2;
+const TG_DELETE = 8;
+const TG_UPDATE = 16;
+const TG_TRUNCATE = 32;
+const TG_INSTEAD = 64;
+
+const EXPECTED_TRIGGER_BINDINGS = Object.freeze({
+    [`${TABLE_NAME}_no_update`]: TG_ROW | TG_BEFORE | TG_UPDATE,
+    [`${TABLE_NAME}_no_delete`]: TG_ROW | TG_BEFORE | TG_DELETE,
+    [`${TABLE_NAME}_no_truncate`]: TG_BEFORE | TG_TRUNCATE,
+});
+
+const TRUTHY = (v) => v === true || v === 't' || v === 'true' || v === 1;
+const TABLE_WRITE_LETTERS = new Set(['w', 'a', 'd', 'D', 'x', 't', 'm']);
+const stripQuotes = (name) => String(name ?? '').replace(/^"|"$/g, '').trim();
+
+/**
+ * Parse a PostgreSQL aclitem[] rendered as text.
+ *
+ * Splitting on ',' would break a quoted role name containing one, so the split
+ * tracks quote state. The PUBLIC grantee is the EMPTY name (OID 0) and is
+ * returned with `isPublic`, because "no role named here" is exactly how a
+ * privilege reaches every role in the cluster.
+ */
+function parseAclEntries(raw) {
+    const text = String(raw ?? '').trim();
+    if (!text || text === '{}') return [];
+    const inner = text.replace(/^\{/, '').replace(/\}$/, '');
+    if (!inner.trim()) return [];
+    const parts = [];
+    let quoted = false;
+    let current = '';
+    for (const ch of inner) {
+        if (ch === '"') quoted = !quoted;
+        if (ch === ',' && !quoted) { parts.push(current); current = ''; continue; }
+        current += ch;
+    }
+    parts.push(current);
+    return parts.filter(Boolean).map((entry) => {
+        const slash = entry.lastIndexOf('/');
+        const left = slash === -1 ? entry : entry.slice(0, slash);
+        const eq = left.indexOf('=');
+        const granteeRaw = eq === -1 ? left : left.slice(0, eq);
+        const privs = eq === -1 ? '' : left.slice(eq + 1);
+        const grantee = stripQuotes(granteeRaw);
+        return { grantee, privs: privs.trim(), isPublic: grantee === '' };
+    });
+}
+
+async function inspectRoleAttributes(db, roleName, label, problems, diagnostics) {
+    if (!roleName) { problems.push(`${PROBLEM.ROLE_MISSING}:${label}`); return; }
+    try {
+        const [row] = await db.$queryRawUnsafe(
+            `SELECT rolcanlogin, rolsuper, rolcreatedb, rolcreaterole,
+                    rolreplication, rolbypassrls, rolinherit
+               FROM pg_roles WHERE rolname = $1`, roleName);
+        if (!row) { problems.push(`${PROBLEM.ROLE_MISSING}:${label}:${roleName}`); return; }
+        const seen = {};
+        for (const rule of ROLE_ATTRIBUTE_RULES) {
+            const on = TRUTHY(row[rule.column]);
+            seen[rule.label] = on;
+            if (on) problems.push(`${PROBLEM.ROLE_ATTRIBUTE_UNSAFE}:${label}:${rule.label}`);
+        }
+        diagnostics[`${label}Attributes`] = seen;
+    } catch (_) {
+        problems.push(`${PROBLEM.BOUNDARY_ATTESTATION_UNVERIFIABLE}:${label}-attributes`);
+    }
+}
+
+async function inspectMembershipReachability(db, roleName, label, problems, diagnostics) {
+    if (!roleName) return;
+    try {
+        // RECURSIVE, because the dangerous path is the indirect one: a role is a
+        // member of a member of the owner and can still SET ROLE to it. A check
+        // that lists known names can never see that; the catalog can.
+        const rows = await db.$queryRawUnsafe(`
+            WITH RECURSIVE reachable(member_oid) AS (
+                SELECT m.member
+                  FROM pg_auth_members m
+                 WHERE m.roleid = (SELECT oid FROM pg_roles WHERE rolname = $1)
+                UNION
+                SELECT m.member
+                  FROM pg_auth_members m
+                  JOIN reachable r ON m.roleid = r.member_oid
+            )
+            SELECT DISTINCT pg_get_userbyid(reachable.member_oid) AS member
+              FROM reachable
+        `, roleName);
+        const members = (rows || [])
+            .map((r) => r.member)
+            .filter((name) => name && name !== roleName);
+        diagnostics[`${label}Members`] = members;
+        for (const member of members) problems.push(`${PROBLEM.ROLE_HAS_MEMBER}:${label}:${member}`);
+    } catch (_) {
+        problems.push(`${PROBLEM.BOUNDARY_ATTESTATION_UNVERIFIABLE}:${label}-members`);
+    }
+}
+
+async function inspectTriggerBindings(db, tableOwner, problems, diagnostics) {
+    try {
+        const rows = await db.$queryRawUnsafe(`
+            SELECT t.tgname,
+                   t.tgenabled,
+                   t.tgtype,
+                   t.tgnargs,
+                   (t.tgqual IS NOT NULL)                                   AS has_when,
+                   t.tgfoid::text                                           AS tgfoid,
+                   to_regprocedure('${TRIGGER_FUNCTION_REGPROCEDURE}')::oid::text AS expected_foid,
+                   pg_get_userbyid(p.proowner)                             AS fn_owner,
+                   n.nspname                                               AS fn_schema,
+                   c.relname                                               AS rel_name
+              FROM pg_trigger t
+              JOIN pg_proc p      ON p.oid = t.tgfoid
+              JOIN pg_namespace n ON n.oid = p.pronamespace
+              JOIN pg_class c     ON c.oid = t.tgrelid
+             WHERE t.tgrelid = to_regclass('${QUALIFIED_TABLE}')
+               AND NOT t.tgisinternal
+        `);
+        const seen = new Map();
+        for (const row of rows || []) {
+            seen.set(row.tgname, row);
+            const expected = EXPECTED_TRIGGER_BINDINGS[row.tgname];
+            if (expected === undefined) {
+                problems.push(`${PROBLEM.TRIGGER_BINDING_DRIFT}:${row.tgname}:unexpected`);
+                continue;
+            }
+            const actual = Number(row.tgtype) & ~TG_INSTEAD;
+            if (actual !== expected) problems.push(`${PROBLEM.TRIGGER_BINDING_DRIFT}:${row.tgname}:timing-or-scope`);
+            if (row.tgenabled !== 'O') problems.push(`${PROBLEM.TRIGGER_BINDING_DRIFT}:${row.tgname}:not-enabled`);
+            if (Number(row.tgnargs) !== 0) problems.push(`${PROBLEM.TRIGGER_BINDING_DRIFT}:${row.tgname}:has-arguments`);
+            if (TRUTHY(row.has_when)) problems.push(`${PROBLEM.TRIGGER_BINDING_DRIFT}:${row.tgname}:conditional`);
+            if (row.expected_foid && String(row.tgfoid) !== String(row.expected_foid)) {
+                problems.push(`${PROBLEM.TRIGGER_BINDING_DRIFT}:${row.tgname}:wrong-function`);
+            }
+            if (row.fn_schema !== 'public') problems.push(`${PROBLEM.TRIGGER_BINDING_DRIFT}:${row.tgname}:function-schema`);
+            // Not "different from runtime": EXACTLY the table owner.
+            if (tableOwner && row.fn_owner !== tableOwner) {
+                problems.push(`${PROBLEM.TRIGGER_FUNCTION_OWNER_NOT_TABLE_OWNER}:${row.tgname}`);
+            }
+        }
+        for (const name of REQUIRED_TRIGGERS) {
+            if (!seen.has(name)) problems.push(`${PROBLEM.TRIGGER_BINDING_DRIFT}:${name}:missing`);
+        }
+        diagnostics.triggerBindings = [...seen.keys()];
+    } catch (_) {
+        problems.push(`${PROBLEM.BOUNDARY_ATTESTATION_UNVERIFIABLE}:trigger-bindings`);
+    }
+}
+
+async function inspectRecordAcl(db, identities, problems, diagnostics) {
+    let row;
+    try {
+        [row] = await db.$queryRawUnsafe(`
+            SELECT c.relacl::text AS relacl,
+                   COALESCE((
+                       SELECT array_to_string(
+                                  array_agg(a.attname || '=>' || a.attacl::text), '|')
+                         FROM pg_attribute a
+                        WHERE a.attrelid = c.oid
+                          AND a.attnum > 0
+                          AND NOT a.attisdropped
+                          AND a.attacl IS NOT NULL
+                   ), '') AS colacl
+              FROM pg_class c
+             WHERE c.oid = to_regclass('${QUALIFIED_TABLE}')
+        `);
+    } catch (_) {
+        problems.push(`${PROBLEM.BOUNDARY_ATTESTATION_UNVERIFIABLE}:record-acl`);
+        return;
+    }
+    if (!row) { problems.push(PROBLEM.TABLE_MISSING); return; }
+
+    for (const part of String(row.colacl || '').split('|').filter(Boolean)) {
+        problems.push(`${PROBLEM.COLUMN_ACL_EXPOSED}:${part.split('=>')[0]}`);
+    }
+
+    const kinds = new Map();
+    if (identities.owner) kinds.set(identities.owner, 'owner');
+    if (identities.writer) kinds.set(identities.writer, 'writer');
+    for (const reader of identities.readers) if (reader) kinds.set(reader, 'reader');
+
+    for (const entry of parseAclEntries(row.relacl)) {
+        if (entry.isPublic) {
+            if (entry.privs) problems.push(`${PROBLEM.PUBLIC_HAS_RECORD_PRIVILEGE}:${entry.privs}`);
+            continue;
+        }
+        const kind = kinds.get(entry.grantee);
+        if (!kind) { problems.push(`${PROBLEM.RECORD_ACL_FOREIGN_GRANTEE}:${entry.grantee}`); continue; }
+        if (kind === 'owner') continue;
+        if (kind === 'writer') {
+            // The one intended non-owner writer, and ONLY its insert.
+            // SELECT + INSERT is the sanctioned writer set (infra/lib/authority-role-
+            // normalisation.js): the definer function reads the singleton it guards.
+            // Anything that can OVERWRITE or REMOVE the record is not sanctioned.
+            const beyondInsert = entry.privs.split('').filter((ch) => ch !== '' && ch !== 'a' && ch !== 'r');
+            if (beyondInsert.length) {
+                problems.push(`${PROBLEM.RECORD_WRITER_PRIVILEGE_TOO_BROAD}:${entry.grantee}:${beyondInsert.join('')}`);
+            }
+            continue;
+        }
+        const writes = entry.privs.split('').filter((ch) => TABLE_WRITE_LETTERS.has(ch));
+        if (writes.length) {
+            problems.push(`${PROBLEM.NON_OWNER_CAN_WRITE_ACTIVATION_RECORD}:${entry.grantee}:${writes.join('')}`);
+        }
+    }
+}
+
+/**
+ * WHICH identity may activate. Derived from the CATALOG, not from a name this
+ * module hopes was configured: whoever actually holds EXECUTE on the SECURITY
+ * DEFINER function is the operator, whatever it is called. That inverts the
+ * older name comparison, which reported a perfectly safe boundary as broken
+ * whenever the deployment used different role names — and would equally have
+ * blessed a role that merely shared the configured name.
+ *
+ * The configured role is then an INTENT check: if AUTHORITY_OPERATOR_ROLE is set
+ * explicitly, the catalog must agree with it. Silence in the environment is not
+ * an assertion, so an unset variable proves nothing either way.
+ *
+ * Returns the derived operator (or null) so the record ACL is judged against the
+ * identity that really holds the capability.
+ */
+async function inspectActivationExecuteGrantee(db, identities, problems, diagnostics) {
+    let row;
+    try {
+        [row] = await db.$queryRawUnsafe(`
+            SELECT p.proacl::text AS acl,
+                   pg_get_userbyid(p.proowner) AS fn_owner
+              FROM pg_proc p
+             WHERE p.oid = to_regprocedure('${ACTIVATION_FUNCTION_REGPROCEDURE}')
+        `);
+    } catch (_) {
+        problems.push(`${PROBLEM.BOUNDARY_ATTESTATION_UNVERIFIABLE}:activation-execute`);
+        return { operator: null };
+    }
+    if (!row) { problems.push(PROBLEM.ACTIVATION_FUNCTION_MISSING); return { operator: null }; }
+    diagnostics.activationFunctionOwner = row.fn_owner;
+
+    // A NULL acl is NOT "no grants": PostgreSQL's default grants EXECUTE to
+    // PUBLIC, so an unset acl is the widest possible state and must fail.
+    if (!row.acl) {
+        problems.push(PROBLEM.PUBLIC_CAN_EXECUTE_ACTIVATION_FUNCTION);
+        return { operator: null };
+    }
+
+    const candidates = [];
+    for (const entry of parseAclEntries(row.acl)) {
+        if (!entry.privs.includes('X')) continue;
+        if (entry.isPublic) { problems.push(PROBLEM.PUBLIC_CAN_EXECUTE_ACTIVATION_FUNCTION); continue; }
+        if (entry.grantee === row.fn_owner || entry.grantee === identities.owner) continue;
+        if (entry.grantee === identities.runtime) {
+            problems.push(PROBLEM.ACTIVATION_FUNCTION_EXECUTE_TO_RUNTIME);
+            continue;
+        }
+        candidates.push(entry.grantee);
+    }
+
+    if (candidates.length === 0) {
+        problems.push(`${PROBLEM.ACTIVATION_FUNCTION_EXECUTE_GRANTEE_NOT_OPERATOR}:none-granted`);
+        return { operator: null };
+    }
+    if (candidates.length > 1) {
+        // Two non-owner EXECUTE identities is an ambiguous boundary, and the
+        // tests must not silently pick one.
+        diagnostics.activationExecuteCandidates = candidates;
+        problems.push(`${PROBLEM.ACTIVATION_FUNCTION_EXECUTE_AMBIGUOUS}:${candidates.join(',')}`);
+        return { operator: null };
+    }
+
+    const operator = candidates[0];
+    diagnostics.activationOperator = operator;
+
+    const configured = String(process.env.AUTHORITY_OPERATOR_ROLE || '').trim();
+    if (configured && configured !== operator) {
+        problems.push(`${PROBLEM.ACTIVATION_FUNCTION_EXECUTE_GRANTEE_NOT_OPERATOR}:${operator}:configured-is-${configured}`);
+    }
+    return { operator };
+}
+
+async function inspectBoundaryAttestation(db, diagnostics, problems) {
+    const roles = resolveAuthorityRoles({}, process.env);
+    diagnostics.attestedRoles = { owner: roles.owner, operator: roles.operator, runtime: roles.runtime, functionOwner: roles.functionOwner };
+
+    let tableOwner = null;
+    try {
+        const [row] = await db.$queryRawUnsafe(
+            `SELECT pg_get_userbyid(c.relowner) AS owner
+               FROM pg_class c WHERE c.oid = to_regclass('${QUALIFIED_TABLE}')`);
+        tableOwner = (row && row.owner) || null;
+    } catch (_) {
+        problems.push(`${PROBLEM.BOUNDARY_ATTESTATION_UNVERIFIABLE}:table-owner`);
+        return;
+    }
+    diagnostics.tableOwner = tableOwner;
+    if (!tableOwner) { problems.push(PROBLEM.TABLE_MISSING); return; }
+
+    let activationOwner = null;
+    try {
+        const [row] = await db.$queryRawUnsafe(
+            `SELECT pg_get_userbyid(p.proowner) AS owner
+               FROM pg_proc p WHERE p.oid = to_regprocedure('${ACTIVATION_FUNCTION_REGPROCEDURE}')`);
+        activationOwner = (row && row.owner) || null;
+    } catch (_) {
+        problems.push(`${PROBLEM.BOUNDARY_ATTESTATION_UNVERIFIABLE}:activation-owner`);
+    }
+
+    await inspectRoleAttributes(db, tableOwner, 'owner', problems, diagnostics);
+    await inspectRoleAttributes(db, activationOwner, 'functionOwner', problems, diagnostics);
+    await inspectMembershipReachability(db, tableOwner, 'owner', problems, diagnostics);
+    await inspectMembershipReachability(db, activationOwner, 'functionOwner', problems, diagnostics);
+    await inspectTriggerBindings(db, tableOwner, problems, diagnostics);
+
+    // Derived first: the record ACL is judged against the identity that ACTUALLY
+    // holds the activation capability, and against the runtime that is connected.
+    const { operator } = await inspectActivationExecuteGrantee(
+        db,
+        { owner: tableOwner, runtime: diagnostics.runtimeRole },
+        problems,
+        diagnostics,
+    );
+    await inspectRecordAcl(
+        db,
+        {
+            owner: tableOwner,
+            writer: activationOwner,
+            readers: [diagnostics.runtimeRole, operator].filter(Boolean),
+        },
+        problems,
+        diagnostics,
+    );
+}
+
 async function inspectEnforcement(db) {
     const problems = [];
     const diagnostics = { runtimeRole: null, owner: null, tableExists: false };
@@ -385,6 +768,9 @@ async function inspectEnforcement(db) {
     // §WP-H B3: the activation function boundary is attested last, because it is
     // only meaningful once the table and triggers it protects are established.
     await inspectActivationFunction(db, diagnostics, problems);
+
+    // §WP-H A: the shape of the boundary around those facts.
+    await inspectBoundaryAttestation(db, diagnostics, problems);
 
     return { established: problems.length === 0, problems, diagnostics, row: null };
 }

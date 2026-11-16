@@ -29,6 +29,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Added so an exact head can be rehearsed on demand. Without this the lane could
+  # only be reached by a push or PR event, which left stacked branches with no way
+  # to obtain durability evidence at all.
+  workflow_dispatch:
 
 concurrency:
   group: financial-durability-${{ github.ref }}
@@ -492,6 +496,15 @@ jobs:
             "__tests__/app-unlock-durable-state.test.js"
             "__tests__/app-unlock-claim-installer-wiring.test.js"
             "__tests__/pos-settlement-containment.test.js"
+            "__tests__/wp-i-provider-trust-boundary.test.js"
+            "__tests__/wp-i-witness-db-provenance.test.js"
+            "__tests__/wp-i-callback-authentication.test.js"
+            "__tests__/wp-i-provider-settlement-reconciler.test.js"
+            "__tests__/wp-i-treasury-promotion-race.test.js"
+            "__tests__/wp-i-moolre-status-adapter.test.js"
+            "__tests__/wp-i-witness-installer-real.test.js"
+            "__tests__/wp-i-deployment-provisioning.test.js"
+            "__tests__/wp-i-treasury-opening-wallet.test.js"
           )
           npx jest --runInBand --forceExit "${SUITES[@]}"
 
