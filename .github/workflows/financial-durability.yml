@@ -87,6 +87,12 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+      - name: Money core (strict typecheck + unit tests)
+        # WP-MONEY: a separate strict project, so it is its own gate. Money that is
+        # not typechecked is not money.
+        run: |
+          npm run typecheck:money
+          npm run test:money
 
       - name: 'Guard: authenticate the runner (GitHub OIDC)'
         # GITHUB_ACTIONS=true, a container label and a run id are all settable by
