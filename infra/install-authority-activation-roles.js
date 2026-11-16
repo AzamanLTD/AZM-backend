@@ -190,9 +190,37 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
         log(`role ${name}: ${result.created ? 'created' : 'already present'}`);
     }
 
-    // The owner must be non-login: no connection may authenticate as it.
-    await prisma.$executeRawUnsafe(`ALTER ROLE ${quoteIdent(owner)} NOLOGIN NOCREATEROLE NOSUPERUSER`);
-    report.applied.push(`ALTER ROLE ${owner} NOLOGIN`);
+    // ── the custodian identities are hardened COMPLETELY, not partially ──────
+    // This used to set only NOLOGIN NOCREATEROLE NOSUPERUSER. CREATEDB,
+    // REPLICATION, BYPASSRLS and INHERIT were never stated, and PostgreSQL's
+    // DEFAULT for INHERIT is TRUE - so every install produced a custodian that
+    // inherited privileges from any group it is ever placed in. That is precisely
+    // the attribute set the runtime gate now attests, so a partially hardened
+    // installer would leave the gate permanently UNKNOWN on a correctly deployed
+    // database: fail-closed, but unusable, and the operator would be told the
+    // boundary is unprovable on a boundary they had just installed.
+    // INHERIT defaults on, so it must be named explicitly.
+    const HARDENED_ATTRIBUTES = 'NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT';
+    // functionOwner may not exist yet: it is created by
+    // install-authority-activation-function.js. ALTER ROLE on a missing role is a
+    // hard error that would abort the whole release, so it is only hardened when
+    // present, and the installer that creates it hardens it at creation.
+    const roleExists = async (name) => (
+        await prisma.$queryRawUnsafe('SELECT 1 FROM pg_roles WHERE rolname = $1', name)
+    ).length > 0;
+    for (const name of [owner, functionOwner || `${owner}_fn`]) {
+        if (!(await roleExists(name))) continue;
+        await prisma.$executeRawUnsafe(`ALTER ROLE ${quoteIdent(name)} ${HARDENED_ATTRIBUTES}`);
+        report.applied.push(`ALTER ROLE ${name} ${HARDENED_ATTRIBUTES}`);
+    }
+    // DML is granted explicitly to the two login identities, so they gain nothing
+    // from inheritance either; the same set is applied so no release can leave a
+    // half-normalised role behind. LOGIN is preserved - they must authenticate.
+    for (const name of [runtime, operator]) {
+        await prisma.$executeRawUnsafe(
+            `ALTER ROLE ${quoteIdent(name)} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT`);
+        report.applied.push(`ALTER ROLE ${name} LOGIN (attributes normalised, NOINHERIT)`);
+    }
 
     // ── the append-only record (idempotent DDL, same file the migration ships) */
     const fs = require('fs');
