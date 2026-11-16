@@ -165,7 +165,14 @@ run('WP-F — global TOTP replay protection (real PostgreSQL)', () => {
     // ── 4. payout address, then saved-MoMo ──────────────────────────────────
     test('4. payout-address verification first, then saved-MoMo: refused', async () => {
         const { user, secret } = await makeUser();
-        const code = codeAt(secret, 0);
+        // ONE captured instant, used for BOTH the code and the expectation.
+        // The service deliberately claims the MATCHED step (the code's step,
+        // inside a one-step window), so reading the clock again at assertion
+        // time races the 30s edge: a code generated late in step N and verified
+        // early in N+1 is legitimately accepted and claimed at N, and a
+        // clock-derived expectation would then ask for N+1 and fail.
+        const t0 = new Date();
+        const code = codeAt(secret, 0, t0.getTime());
 
         const addr = await post('/wallet/payout-address', {
             type: 'MOMO', label: 'Test', address: '+233241234567', totpToken: code,
@@ -176,7 +183,12 @@ run('WP-F — global TOTP replay protection (real PostgreSQL)', () => {
         expect(addr.status).not.toBe(401);
         expect(addr.status).not.toBe(409);
         expect(addr.status).not.toBe(503);
-        expect(await prisma.totpStepClaim.count({ where: { userId: user.id, step: stepOf(new Date()) } })).toBe(1);
+        // Stronger than counting at the clock step: the claim must be the MATCHED
+        // step AND must be the only one. The old form could pass with the claim
+        // recorded at a wrong step, and failed whenever an edge was crossed.
+        const claimsAfterFirstUse = await prisma.totpStepClaim.findMany({ where: { userId: user.id } });
+        expect(claimsAfterFirstUse).toHaveLength(1);
+        expect(claimsAfterFirstUse[0].step).toBe(stepOf(t0));
 
         const momo = await post('/saved-momo', {
             nickname: 'Test', provider: 'MTN', phoneNumber: '+233241234567', totpToken: code,
@@ -220,8 +232,11 @@ run('WP-F — global TOTP replay protection (real PostgreSQL)', () => {
     // ── 7, 8, 9, 10. matched-step boundaries ────────────────────────────────
     test('7. a previous-window code is claimed at the PREVIOUS step', async () => {
         const { user, secret } = await makeUser();
-        const expected = stepOf(new Date()) - 1;
-        const res = await post('/mfa/wired', { totpToken: codeAt(secret, -1) }, user);
+        // The code and the expected step come from the SAME captured instant, so
+        // a 30s edge falling mid-test cannot make them disagree.
+        const t0 = new Date();
+        const expected = stepOf(t0) - 1;
+        const res = await post('/mfa/wired', { totpToken: codeAt(secret, -1, t0.getTime()) }, user);
         expect(res.status).toBe(200);
         const claim = await prisma.totpStepClaim.findFirst({ where: { userId: user.id } });
         expect(claim.step).toBe(expected);
@@ -229,16 +244,22 @@ run('WP-F — global TOTP replay protection (real PostgreSQL)', () => {
 
     test('8. a current-window code is claimed at the CURRENT step', async () => {
         const { user, secret } = await makeUser();
-        const expected = stepOf(new Date());
-        expect((await post('/mfa/wired', { totpToken: codeAt(secret, 0) }, user)).status).toBe(200);
+        // The code and the expected step come from the SAME captured instant, so
+        // a 30s edge falling mid-test cannot make them disagree.
+        const t0 = new Date();
+        const expected = stepOf(t0);
+        expect((await post('/mfa/wired', { totpToken: codeAt(secret, 0, t0.getTime()) }, user)).status).toBe(200);
         const claim = await prisma.totpStepClaim.findFirst({ where: { userId: user.id } });
         expect(claim.step).toBe(expected);
     });
 
     test('9. a next-window code is accepted by the existing policy and claimed at the NEXT step', async () => {
         const { user, secret } = await makeUser();
-        const expected = stepOf(new Date()) + 1;
-        expect((await post('/mfa/wired', { totpToken: codeAt(secret, 1) }, user)).status).toBe(200);
+        // The code and the expected step come from the SAME captured instant, so
+        // a 30s edge falling mid-test cannot make them disagree.
+        const t0 = new Date();
+        const expected = stepOf(t0) + 1;
+        expect((await post('/mfa/wired', { totpToken: codeAt(secret, 1, t0.getTime()) }, user)).status).toBe(200);
         const claim = await prisma.totpStepClaim.findFirst({ where: { userId: user.id } });
         expect(claim.step).toBe(expected);
     });
@@ -264,10 +285,14 @@ run('WP-F — global TOTP replay protection (real PostgreSQL)', () => {
     test('11. two users can each spend the same time-step with their own secret', async () => {
         const one = await makeUser();
         const two = await makeUser();
-        const step = stepOf(new Date());
+        // One captured instant for BOTH codes: otherwise a 30s edge between the
+        // two requests puts the users on different steps and the assertion fails
+        // for a reason that has nothing to do with isolation.
+        const t0 = new Date();
+        const step = stepOf(t0);
 
-        expect((await post('/mfa/wired', { totpToken: codeAt(one.secret, 0) }, one.user)).status).toBe(200);
-        expect((await post('/mfa/wired', { totpToken: codeAt(two.secret, 0) }, two.user)).status).toBe(200);
+        expect((await post('/mfa/wired', { totpToken: codeAt(one.secret, 0, t0.getTime()) }, one.user)).status).toBe(200);
+        expect((await post('/mfa/wired', { totpToken: codeAt(two.secret, 0, t0.getTime()) }, two.user)).status).toBe(200);
 
         const claims = await prisma.totpStepClaim.findMany({ where: { step } });
         expect(claims.map((c) => c.userId).sort()).toEqual([one.user.id, two.user.id].sort());
