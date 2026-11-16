@@ -3,31 +3,28 @@
 // AZAMAN — PER-SOCKET-EVENT RATE LIMITING
 // =============================================================================
 
-const logger = require('../src/config/logger');
-const Redis = require('ioredis');
+const { getRedis } = require('../src/lib/redisConnection');
 
-let _redisClient = null;
-const _getRedis = () => {
-    if (!process.env.REDIS_URL) return null;
-    if (!_redisClient) {
-        _redisClient = new Redis(process.env.REDIS_URL, {
-            maxRetriesPerRequest: 3,
-            enableReadyCheck: false,
-            lazyConnect: true,
-        });
-        _redisClient.on('error', (err) => logger.error({ err: err }, '[socketRateLimiter] redis error'));
-    }
-    return _redisClient;
-};
+// Shared default connection — a socket storm must not open its own client.
+const _getRedis = () => getRedis('default');
 
 // In-memory fallback store: eventKey -> { count, windowStart }
 const _memStore = new Map();
 
+// INCR then PEXPIRE as two round-trips can crash between them, leaving a key
+// with NO expiry: that socket would be rate-limited forever after the first
+// packet. One script makes "create the counter" and "arm its window" a single
+// atomic step, so a partial key cannot exist.
+const _INCR_WITH_TTL = `
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then redis.call('PEXPIRE', KEYS[1], ARGV[1]) end
+return count
+`;
+
 async function _incrAndCheck(key, windowMs, max) {
     const redis = _getRedis();
     if (redis) {
-        const count = await redis.incr(key);
-        if (count === 1) await redis.pexpire(key, windowMs);
+        const count = Number(await redis.eval(_INCR_WITH_TTL, 1, key, String(windowMs)));
         return count <= max;
     }
     // Memory fallback

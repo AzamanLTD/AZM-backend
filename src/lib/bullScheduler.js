@@ -126,8 +126,17 @@ class BullScheduler {
      */
     async init() {
         if (!process.env.REDIS_URL) {
-            this.mode = 'single_instance_fallback';
-            this._logMode('REDIS_URL not set (Redis-off single-instance mode)');
+            // An EXPLICIT, ENFORCED mode, never an inference. Local scheduling is
+            // only correct when this process really is the only one; an instance
+            // that merely lost its Redis config must not quietly become a second
+            // scheduler running the same financial jobs.
+            if (String(process.env.SCHEDULER_SINGLE_INSTANCE || '').toLowerCase() === 'true') {
+                this.mode = 'single_instance_fallback';
+                this._logMode('REDIS_URL unset + SCHEDULER_SINGLE_INSTANCE=true — explicit single-instance scheduling');
+            } else {
+                this.mode = 'disabled_no_scheduling';
+                this._logMode('REDIS_URL unset and SCHEDULER_SINGLE_INSTANCE is not true — NO scheduling (fail closed)');
+            }
             return;
         }
 
@@ -147,7 +156,7 @@ class BullScheduler {
                 // still recovers automatically (next attempt is at most 10s
                 // away); a dead Redis costs at most ~6 attempts/min, not ~600.
                 retryStrategy: (times) => Math.min(RETRY_FLOOR_MS * Math.pow(2, Math.min(times - 1, 5)), RETRY_CAP_MS),
-                ...(isTLS ? { tls: { rejectUnauthorized: false } } : {}),
+                ...(isTLS ? { tls: {} } : {}),
             });
 
             this._installBreakerHooks(this.redisConnection);
@@ -167,8 +176,12 @@ class BullScheduler {
             // Clean wholesale fallback: no partial Bull state, no retry loop.
             await this._hardDisconnect();
             this.useBull = false;
-            this.mode = 'single_instance_fallback';
-            this._logMode(`Redis unavailable at boot (${err.message}) — single-instance fallback`);
+            // Redis was CONFIGURED and did not answer. Falling back to local
+            // scheduling here is exactly how N instances each become an
+            // independent scheduler and run the same financial job N times. The
+            // scheduler refuses to schedule until Redis answers again.
+            this.mode = 'unavailable_no_scheduling';
+            this._logMode(`Redis configured but unavailable at boot (${err.message}) — NO scheduling (fail closed)`);
         }
     }
 
@@ -219,13 +232,15 @@ class BullScheduler {
             logger.error(`[BullScheduler] Circuit breaker OPEN (${reason}: ${detail}) — switching ALL jobs to in-process fallback`);
             await this._shutdownBull();
             this.useBull = false;
-            this.mode = 'single_instance_fallback';
-            for (const [name, job] of this.jobs) {
-                if (!this.fallbacks.has(name)) {
-                    this._registerFallback(name, job.cronExpr, job.handler, job.opts);
-                }
-            }
-            logger.info(`[BullScheduler] Fallback active for ${this.fallbacks.size}/${this.jobs.size} jobs — distributed scheduling disabled until Redis recovers`);
+            // NO local fallback here. A tripped breaker means Redis stopped
+            // answering; in a multi-replica deployment every replica would trip at
+            // roughly the same moment and then each run the same financial job.
+            // Jobs stay registered and resume when the probe restores Bull.
+            this.mode = 'unavailable_no_scheduling';
+            logger.info(
+                `[BullScheduler] ${this.jobs.size} job(s) NOT scheduled while Redis is unavailable — `
+                + 'distributed scheduling disabled until Redis recovers (no local fallback)'
+            );
         } finally {
             this._transitioning = false;
         }
@@ -285,7 +300,7 @@ class BullScheduler {
                 maxRetriesPerRequest: 1,
                 retryStrategy: () => 60_000, // probe owns its retries; never auto-loop
                 enableReadyCheck: true,
-                ...(isTLS ? { tls: { rejectUnauthorized: false } } : {}),
+                ...(isTLS ? { tls: {} } : {}),
             });
             probe.on('error', () => {}); // silence — failure is the normal path
             await _withTimeout(probe.connect().then(() => probe.ping()), BOOT_PING_TIMEOUT_MS, 'Redis probe');
@@ -314,7 +329,7 @@ class BullScheduler {
                 enableReadyCheck: true,
                 lazyConnect: false,
                 retryStrategy: (times) => Math.min(RETRY_FLOOR_MS * Math.pow(2, Math.min(times - 1, 5)), RETRY_CAP_MS),
-                ...(isTLS ? { tls: { rejectUnauthorized: false } } : {}),
+                ...(isTLS ? { tls: {} } : {}),
             });
             await _withTimeout(conn.ping(), BOOT_PING_TIMEOUT_MS, 'Redis restore PING');
             conn.disconnect();
@@ -328,7 +343,7 @@ class BullScheduler {
                 enableReadyCheck: true,
                 lazyConnect: false,
                 retryStrategy: (times) => Math.min(RETRY_FLOOR_MS * Math.pow(2, Math.min(times - 1, 5)), RETRY_CAP_MS),
-                ...(isTLS ? { tls: { rejectUnauthorized: false } } : {}),
+                ...(isTLS ? { tls: {} } : {}),
             });
             this._installBreakerHooks(this.redisConnection);
             this.Queue = Queue;
@@ -351,7 +366,7 @@ class BullScheduler {
             // one mode even if the restore half-failed.
             await this._shutdownBull().catch(() => {});
             this.useBull = false;
-            this.mode = 'single_instance_fallback';
+            this.mode = 'unavailable_no_scheduling';
             for (const [name, job] of this.jobs) {
                 if (!this.fallbacks.has(name)) {
                     this._registerFallback(name, job.cronExpr, job.handler, job.opts);
@@ -388,6 +403,20 @@ class BullScheduler {
         }
 
         if (!this.useBull && !this.fallbacks.has(name)) {
+            // ENFORCEMENT POINT. Local scheduling is only legal in the explicit
+            // single-instance mode. In 'disabled_no_scheduling' or
+            // 'unavailable_no_scheduling' the job stays registered but is never
+            // scheduled here: a replica that merely lost Redis must not become an
+            // independent scheduler and run the same financial job again.
+            if (this.mode !== 'single_instance_fallback') {
+                this._refusedLocalScheduling = (this._refusedLocalScheduling || 0) + 1;
+                logger.error(
+                    { job: name, mode: this.mode },
+                    `[BullScheduler] NOT scheduling "${name}" locally: mode=${this.mode}. `
+                    + 'Set REDIS_URL (distributed) or SCHEDULER_SINGLE_INSTANCE=true (explicit single instance).'
+                );
+                return;
+            }
             try {
                 this._registerFallback(name, cronExpr, handler, opts);
             } catch (err) {

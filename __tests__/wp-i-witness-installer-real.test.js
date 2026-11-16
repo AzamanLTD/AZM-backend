@@ -106,6 +106,61 @@ describeDb('the shipped witness installer (real PostgreSQL)', () => {
         expect(await failsAs(RECONCILER_ROLE, `INSERT INTO "FiatLiquidityReceipt" ("id","provider","dedupKey","amountGhs","status") VALUES ('z','MOOLRE','z',1,'AVAILABLE')`)).toBe(true);
     });
 
+    // The installer must refuse an identifier it cannot safely quote. A role name
+    // is not a value: interpolating one is how a security installer becomes the
+    // vulnerability.
+    test('a role name that is not a plain identifier is refused before any grant', () => {
+        const env = {
+            ...process.env,
+            DATABASE_URL: ADMIN_URL,
+            AZM_WITNESS_RUNTIME_ROLE: 'runtime; DROP TABLE "ProviderSettlementWitness"',
+            AZM_WITNESS_RECONCILER_ROLE: RECONCILER_ROLE,
+        };
+        let out = '';
+        let code = 0;
+        try {
+            out = execFileSync(process.execPath, [path.join('infra', 'wp-i', 'install-witness-provenance.js')],
+                { env, encoding: 'utf8', stdio: 'pipe' });
+        } catch (e) {
+            code = e.status;
+            out = `${e.stdout || ''}${e.stderr || ''}`;
+        }
+        expect(code).toBe(1);
+        expect(out).toMatch(/refusing to use/);
+    });
+
+    // The proof must be EFFECTIVE privilege, not a list of requested grants. A
+    // role that inherits authority through membership still has it, so the
+    // installer must fail on membership even when every direct grant is correct.
+    test('inherited authority is refused even when every direct grant is correct', async () => {
+        const env = {
+            ...process.env,
+            DATABASE_URL: ADMIN_URL,
+            AZM_WITNESS_RUNTIME_ROLE: RUNTIME_ROLE,
+            AZM_WITNESS_RECONCILER_ROLE: RECONCILER_ROLE,
+        };
+        const run = () => {
+            try {
+                return { code: 0, out: execFileSync(process.execPath,
+                    [path.join('infra', 'wp-i', 'install-witness-provenance.js')],
+                    { env, encoding: 'utf8', stdio: 'pipe' }) };
+            } catch (e) {
+                return { code: e.status, out: `${e.stdout || ''}${e.stderr || ''}` };
+            }
+        };
+        await admin.$executeRawUnsafe(`GRANT ${RECONCILER_ROLE} TO ${RUNTIME_ROLE}`);
+        try {
+            const bad = run();
+            expect(bad.code).toBe(1);
+            expect(bad.out).toMatch(/inherits/);
+        } finally {
+            await admin.$executeRawUnsafe(`REVOKE ${RECONCILER_ROLE} FROM ${RUNTIME_ROLE}`);
+        }
+        const good = run();
+        expect(good.code).toBe(0);
+        expect(good.out).toMatch(/provenance installed/i);
+    });
+
     test('neither role can become the other', async () => {
         expect(await failsAs(RUNTIME_ROLE, `SET ROLE ${RECONCILER_ROLE}`)).toBe(true);
         expect(await failsAs(RECONCILER_ROLE, `SET ROLE ${RUNTIME_ROLE}`)).toBe(true);

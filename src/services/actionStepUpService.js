@@ -35,34 +35,12 @@ const REASON = Object.freeze({
     UNAVAILABLE: 'STEP_UP_GRANT_STORE_UNAVAILABLE',
 });
 
-/** Money and identity fields are compared as exact strings. Anything the
- *  normaliser does not recognise is included by name so a new material field
- *  cannot silently escape the binding. */
-function canonicalAction(input = {}) {
-    const pick = (v) => (v === undefined || v === null ? null : String(v));
-    return {
-        method: pick(input.method).toUpperCase(),
-        route: pick(input.route),
-        operation: pick(input.operation),
-        currency: pick(input.currency),
-        amount: pick(input.amount),
-        destination: pick(input.destination),
-        resource: pick(input.resource),
-        idempotencyKey: pick(input.idempotencyKey),
-        parameters: input.parameters && typeof input.parameters === 'object'
-            ? Object.keys(input.parameters).sort().reduce((acc, k) => {
-                acc[k] = pick(input.parameters[k]);
-                return acc;
-            }, {})
-            : {},
-    };
-}
-
-/** Stable digest of the canonical form. Key order is fixed by construction. */
-function actionDigest(input) {
-    const canonical = canonicalAction(input);
-    return crypto.createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
-}
+// ONE canonical contract. The challenge (middleware/requireActionStepUp), the
+// issuance (controllers/stepUpController) and the transaction consumption
+// (consumeGrant below) all digest through src/services/canonicalAction.js. A
+// second implementation here meant a grant was issued for one digest and spent
+// against another, so every consumption refused with ACTION_MISMATCH.
+const { canonicalAction, actionDigest } = require('./canonicalAction');
 
 const hashToken = (token) => crypto.createHash('sha256').update(String(token)).digest('hex');
 
@@ -107,6 +85,11 @@ async function issueGrant(prisma, {
 async function consumeGrant(tx, { token, userId, action, actionType }) {
     if (!token) return { ok: false, reason: REASON.MISSING };
     if (!userId) return { ok: false, reason: REASON.WRONG_USER };
+    // Defensive: a caller that forgets the action would otherwise digest an empty
+    // canonical form and burn the grant's single use against nothing.
+    if (!action || typeof action !== 'object') {
+        return { ok: false, reason: REASON.INVALID };
+    }
 
     const digest = actionDigest(action);
     let rows;

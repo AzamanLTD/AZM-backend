@@ -42,12 +42,19 @@ function requireActionStepUp(spec) {
             if (!token) {
                 // The digest tells the client exactly what to earn a grant for.
                 // It is the server's digest, never a client-supplied one.
+                // `action` is the server's own canonical descriptor. The client
+                // echoes it back verbatim to earn the grant, so it never has to
+                // reconstruct routeScope/path/params by guessing: a guess produces a
+                // different digest and the grant would authorise nothing. Echoing it
+                // is not a weakening - the grant is still bound to exactly these
+                // values, so a client that alters any of them fails on consume.
                 return res.status(CHALLENGE_STATUS).json({
                     success: false,
                     code: 'STEP_UP_REQUIRED',
                     message: 'This action needs a fresh verification bound to it.',
                     actionType: spec.actionType,
                     actionDigest: digest,
+                    action,
                 });
             }
             return next();
@@ -69,8 +76,22 @@ async function consumeStepUp(tx, req) {
         token: stepUp.token,
         userId: String(req.user.id),
         actionType: stepUp.actionType,
-        actionDigest: stepUp.digest,
+        // The shared canonical contract digests the ACTION itself. Passing the
+        // digest here is what silently bound every consumption to nothing.
+        action: stepUp.action,
     });
 }
 
-module.exports = { requireActionStepUp, consumeStepUp, actionForRequest, GRANT_HEADER };
+// Enforcement is a deliberate, single-source switch. Default OFF keeps today's
+// behaviour exactly: require2FA() governs the route and nothing changes for
+// clients that have not shipped the challenge flow yet. Turning it ON swaps the
+// proof mechanism for that route rather than stacking two of them.
+function isStepUpEnforced() {
+    return String(process.env.STEP_UP_ENFORCEMENT || '').toLowerCase() === 'on';
+}
+
+function whenStepUpEnforced(middleware) {
+    return (req, res, next) => (isStepUpEnforced() ? middleware(req, res, next) : next());
+}
+
+module.exports = { requireActionStepUp, consumeStepUp, actionForRequest, isStepUpEnforced, whenStepUpEnforced, GRANT_HEADER };

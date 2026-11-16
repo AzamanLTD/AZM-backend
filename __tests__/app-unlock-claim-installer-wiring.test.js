@@ -100,6 +100,11 @@ describe('WP-D packaging — the claim table is installed by the real release pa
             'infra/install-e2ee-server-blind-overlay.js',
             'infra/install-phase3-overlay.js',
             'infra/install-payout-reconciliation-infra.js',
+            // WP-I: the settlement witness table must exist before the liquidity
+            // overlay backfills FiatLiquidityReceipt.walletAccount from it. A
+            // clean production release never runs Prisma migrations, so the
+            // table has to come from this chain.
+            'infra/install-wp-i-settlement-witness.js',
             'infra/install-fiat-liquidity-overlay.js',
             'infra/install-model-b-settlement-overlay.js',
             'infra/install-ghs-wallet-overlay.js',
@@ -116,9 +121,10 @@ describe('WP-D packaging — the claim table is installed by the real release pa
             'infra/install-admin-money-settings-overlay.js',
         ];
         expect(chain.slice(0, expectedExact.length)).toEqual(expectedExact);
-        // The addition is appended; the auth installer runs last, after every
-        // financial overlay has run.
-        expect(chain).toEqual([...expectedExact, INSTALLER]);
+        // Additions are inserted BETWEEN the overlays and the auth installer:
+        // the auth installer still runs last, after every financial overlay.
+        const STEP_UP_GRANT_INSTALLER = 'infra/install-action-step-up-grant.js';
+        expect(chain).toEqual([...expectedExact, STEP_UP_GRANT_INSTALLER, INSTALLER]);
         expect(chain.filter((s) => s === INSTALLER)).toHaveLength(1);
     });
 

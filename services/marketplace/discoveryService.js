@@ -216,18 +216,14 @@ function afterKeyWhere(key) {
 let redisClient = null;
 const memoryCache = new Map();
 
+// Shared cache connection (src/lib/redisConnection.js). The previous local
+// client disabled TLS certificate verification (rejectUnauthorized: false) and
+// stopped retrying permanently after three attempts; both are fixed centrally.
 try {
-    const Redis = require('ioredis');
-    if (process.env.REDIS_URL) {
-        const isTLS = process.env.REDIS_URL.startsWith('rediss://');
-        redisClient = new Redis(process.env.REDIS_URL, {
-            maxRetriesPerRequest: 2,
-            tls: isTLS ? { rejectUnauthorized: false } : undefined,
-            retryStrategy: (times) => (times > 3 ? null : Math.min(times * 200, 1000)),
-        });
-        redisClient.on('error', (e) => logger.warn('[DiscoveryFeed] Redis cache error:', e.message));
-    }
-} catch {
+    const { getRedis } = require('../../src/lib/redisConnection');
+    redisClient = getRedis('cache');
+} catch (e) {
+    logger.warn('[DiscoveryFeed] Redis cache unavailable:', e.message);
     redisClient = null;
 }
 

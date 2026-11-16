@@ -36,7 +36,17 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
         prisma = new PrismaClient();
     });
 
-    beforeEach(() => {
+    // This suite must start from a known state. afterEach alone meant the FIRST
+    // case inherited whatever an earlier suite left in the witness table, so a
+    // "no witness was written" assertion could read another suite's row.
+    const clearFixtureTables = async () => {
+        await prisma.fiatProviderEvent.deleteMany({});
+        await prisma.providerSettlementWitness.deleteMany({});
+        await prisma.fiatLiquidityReceipt.deleteMany({});
+    };
+
+    beforeEach(async () => {
+        await clearFixtureTables();
         process.env.AZM_RECONCILER_MODE = '1';
         process.env.AZM_RECONCILER_PROVIDER_USER = 'reconciler-user';
         process.env.AZM_RECONCILER_PROVIDER_PUBKEY = 'reconciler-public-key';
@@ -52,9 +62,7 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
 
     afterEach(async () => {
         global.fetch = originalFetch;
-        await prisma.fiatProviderEvent.deleteMany({});
-        await prisma.providerSettlementWitness.deleteMany({});
-        await prisma.fiatLiquidityReceipt.deleteMany({});
+        await clearFixtureTables();
     });
 
     afterAll(async () => {
@@ -105,6 +113,37 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
         });
         return body;
     }
+
+    // Paired with the wallet binding: an answer to a DIFFERENT question is not
+    // evidence about this opening, even when wallet and amount agree.
+    test('a provider answer naming a DIFFERENT reference cannot vouch for this opening', async () => {
+        await seedOpening(OPENING_A, { walletAccount: 'WALLET-AZM-1' });
+        stubProvider({ externalref: 'MREF-SOMEBODY-ELSE' });
+
+        const results = await reconciler.reconcileTreasuryOpenings({ openingDedupKeys: [OPENING_A] });
+
+        expect(results[0].witnessed).toBe(false);
+        expect(results[0].reason).toBe('WITNESS_REFERENCE_MISMATCH');
+        expect(await prisma.providerSettlementWitness.count()).toBe(0);
+    });
+
+    // Transport timeout: the provider never answered. An unanswered question is
+    // not a failure and is certainly not success — it must produce no witness.
+    test('a provider call that times out never becomes a witness', async () => {
+        await seedOpening(OPENING_A, { walletAccount: 'WALLET-AZM-1' });
+        const timeout = new Error('The operation was aborted due to timeout');
+        timeout.name = 'TimeoutError';
+        global.fetch = jest.fn().mockRejectedValue(timeout);
+
+        const results = await reconciler.reconcileTreasuryOpenings({ openingDedupKeys: [OPENING_A] });
+
+        expect(results[0].witnessed).toBe(false);
+        expect(results[0].reason).toBe('PROVIDER_TRANSPORT_ERROR_TIMEOUT');
+        expect(await prisma.providerSettlementWitness.count()).toBe(0);
+        // The opening is untouched: a timeout is not a failed payment.
+        const row = await prisma.fiatLiquidityReceipt.findUnique({ where: { dedupKey: OPENING_A } });
+        expect(row.status).toBe('RECEIVED');
+    });
 
     test('a provider answer for a DIFFERENT wallet cannot vouch for this opening', async () => {
         await seedOpening(OPENING_A, { walletAccount: 'WALLET-AZM-1' });

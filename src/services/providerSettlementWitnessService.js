@@ -293,6 +293,22 @@ async function recordProviderSettlementWitness(tx, input = {}) {
     );
   }
 
+  // The reference the answer DESCRIBES must be the reference that was ASKED
+  // ABOUT. The provider scopes a type-1 lookup by id, so a mismatched
+  // externalref means we are holding an answer to a different question, and
+  // matching amounts would otherwise let it vouch for this opening.
+  const requestedReferenceRaw = requestParams && (requestParams.id ?? requestParams.reference);
+  const reportedReferenceRaw = providerPayload && (providerPayload.externalref ?? providerPayload.reference);
+  const requestedReference = requestedReferenceRaw == null ? '' : String(requestedReferenceRaw).trim();
+  const reportedReference = reportedReferenceRaw == null ? '' : String(reportedReferenceRaw).trim();
+  if (requestedReference !== '' && reportedReference !== '' && reportedReference !== requestedReference) {
+    throw new WitnessError(
+      'WITNESS_REFERENCE_MISMATCH',
+      `[wp-i] the provider answered for ${reportedReference}, not the requested reference ${requestedReference}`,
+      { reportedReference, requestedReference }
+    );
+  }
+
 
   const fetched = fetchedAt instanceof Date ? fetchedAt : new Date(fetchedAt);
   if (Number.isNaN(fetched.getTime())) {
