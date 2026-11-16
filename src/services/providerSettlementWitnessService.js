@@ -494,7 +494,20 @@ async function recordProviderSettlementWitness(tx, input = {}) {
   // as "cannot prove", which refuses rather than allows.
   const collectionKey = observedReference ? `event:moolre-collection:${observedReference}` : null;
   if (collectionKey) {
-      const depositUse = await tx.fiatProviderEvent.findFirst({
+      // A client that cannot see fiatProviderEvent cannot prove the collection is
+      // UNSPENT, so it must not fund anything. This is a typed refusal rather
+      // than a TypeError: the first version of this guard called .findFirst on an
+      // absent delegate and crashed the six trust-boundary cases that use a fake
+      // transaction, which is exactly how a missing capability should NOT behave.
+      const depositDelegate = tx.fiatProviderEvent;
+      if (!depositDelegate || typeof depositDelegate.findFirst !== 'function') {
+          throw new WitnessError(
+              'WITNESS_DEPOSIT_USE_UNVERIFIABLE',
+              '[wp-i] this settlement client cannot prove whether the collection already settled a customer deposit, so it cannot fund a treasury opening',
+              { dedupKey: collectionKey }
+          );
+      }
+      const depositUse = await depositDelegate.findFirst({
           where: { dedupKey: collectionKey },
           select: { dedupKey: true, status: true },
       });

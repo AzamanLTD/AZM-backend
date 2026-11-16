@@ -42,6 +42,12 @@ function fakeTx({ opening = OPENING } = {}) {
             findUnique: async ({ where }) =>
                 opening && where.dedupKey === opening.dedupKey ? { ...opening } : null,
         },
+        // The cross-path guard asks the deposit ledger whether this collection was
+        // already spent. A stub transaction must expose the delegate, otherwise
+        // the guard has to refuse - which is what it now does, deliberately.
+        fiatProviderEvent: {
+            findFirst: async () => (global.__depositUseStub ? { dedupKey: global.__depositUseStub, status: 'FUNDED' } : null),
+        },
         providerSettlementWitness: {
             create: async ({ data }) => {
                 // Model the schema's @unique(openingDedupKey): one witness, one opening.
@@ -240,6 +246,18 @@ describe('WP-I provider trust boundary', () => {
             expect(ghsToPesewas('100.30').toString()).toBe('10030');
             expect(() => ghsToPesewas('100.3000001')).toThrow(WitnessError);
         });
+    });
+
+    test('CROSS-PATH: a collection that already settled a deposit cannot be witnessed', async () => {
+        const tx = fakeTx();
+        global.__depositUseStub = 'event:moolre-collection:EXT-1';
+        try {
+            await expect(recordProviderSettlementWitness(tx, witnessInput()))
+                .rejects.toMatchObject({ code: 'WITNESS_OBSERVATION_SPENT_ON_DEPOSIT' });
+            expect(tx.witnesses).toHaveLength(0);
+        } finally {
+            global.__depositUseStub = null;
+        }
     });
 
     describe('immutability and tamper detection', () => {
