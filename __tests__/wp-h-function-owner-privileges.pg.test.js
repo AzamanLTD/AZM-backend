@@ -320,6 +320,51 @@ run('WP-H function-owner privilege normalisation (real PostgreSQL)', () => {
         expect(row.pool).toBe('5000.00');
     }, 60000);
 
+    t('a role created while the function owner was poisoned cannot inherit into it', async () => {
+        // C: the installer reconciled only the three KNOWN role names, so a fourth
+        // role holding membership in the activation role survived as an inheritance
+        // path into the record. Mint one and hand it membership, THEN re-run the
+        // installer: remediation plus a loud report is the required behaviour.
+        const attacker = `wp_h_attacker_${RUN}`;
+        const { installAuthorityActivationRoles } = require('../infra/install-authority-activation-roles');
+        try {
+            await admin.$executeRawUnsafe(`CREATE ROLE ${el(attacker)} NOLOGIN`);
+            await admin.$executeRawUnsafe(`GRANT ${el(ROLE.fnOwner)} TO ${el(attacker)}`);
+            const [before] = await admin.$queryRawUnsafe(
+                `SELECT count(*)::int AS c FROM pg_auth_members
+                  WHERE member = (SELECT oid FROM pg_roles WHERE rolname = $1)
+                    AND roleid = (SELECT oid FROM pg_roles WHERE rolname = $2)`,
+                attacker, ROLE.fnOwner);
+            expect(before.c).toBe(1);
+
+            const report = await installAuthorityActivationRoles(admin, {
+                owner: ROLE.owner, runtime: ROLE.runtime, operator: ROLE.operator,
+                functionOwner: ROLE.fnOwner, log: () => {},
+            });
+
+            const [after] = await admin.$queryRawUnsafe(
+                `SELECT count(*)::int AS c FROM pg_auth_members
+                  WHERE member = (SELECT oid FROM pg_roles WHERE rolname = $1)
+                    AND roleid = (SELECT oid FROM pg_roles WHERE rolname = $2)`,
+                attacker, ROLE.fnOwner);
+            expect(after.c).toBe(0);
+
+            // tampering is REPORTED, never silently cleaned up
+            expect(report.ok).toBe(false);
+            expect((report.problems || []).join(' ')).toMatch(/foreign role membership revoked/);
+
+            // and the attacker role holds nothing on the boundary
+            const [ex] = await admin.$queryRawUnsafe(
+                `SELECT has_function_privilege($1, $2, 'EXECUTE') AS ok`, attacker, FN);
+            expect(ex.ok).toBe(false);
+            const [ins] = await admin.$queryRawUnsafe(
+                `SELECT has_table_privilege($1, $2, 'INSERT') AS ok`, attacker, TABLE);
+            expect(ins.ok).toBe(false);
+        } finally {
+            await admin.$executeRawUnsafe(`DROP ROLE IF EXISTS ${el(attacker)}`).catch(() => {});
+        }
+    });
+
     t('an unexpected owned object fails the install with precise diagnostics', async () => {
         await admin.$executeRawUnsafe(`CREATE TABLE "AttackerOwned" ("id" int)`);
         await admin.$executeRawUnsafe(`ALTER TABLE "AttackerOwned" OWNER TO ${el(ROLE.fnOwner)}`);

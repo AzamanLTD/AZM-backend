@@ -107,6 +107,7 @@ const { protect }              = require('../middleware/authMiddleware');
 const { idempotency } = require('../middleware/idempotency');
 const { require2FA } = require('../middleware/require2FA');
 const { protectActive }        = require('../middleware/banGuardMiddleware');
+const { requireActionStepUp, whenStepUpEnforced, isStepUpEnforced } = require('../middleware/requireActionStepUp');
 
 // Route-specific FX gate (AZM-Planning #75 — PROPOSED, pending owner
 // approval): the wallet withdrawal is FX-dependent exactly when the
@@ -129,10 +130,26 @@ const { requireFreshFxRate } = require('../middleware/fxTransactionGateMiddlewar
 // Binance Pay IDs, TRC20 and EVM wallet addresses are same-asset USDC
 // dispatches and are NOT FX-gated. A saved/demo fallback rate never opens
 // the gate. Classification is shared — see the module comment above.
+// §WP-H G — action-bound step-up on the fiat withdrawal.
+//
+// Ordering is the whole point:
+//   * the gate runs AFTER idempotency, so an exact retry of a COMMITTED request
+//     converges on the stored response and never needs a second grant;
+//   * a rejected gate is a 4xx, so the idempotency claim is released and the key
+//     stays reusable for the corrected request;
+//   * require2FA() and the gate are mutually exclusive. When step-up is enforced
+//     the grant IS the second factor (it was earned with a TOTP bound to this
+//     action); running both would burn two TOTP steps for one withdrawal.
+const stepUpGate = whenStepUpEnforced(
+    requireActionStepUp({ actionType: 'FIAT_WITHDRAWAL', routeScope: 'POST /api/withdraw' })
+);
+const secondFactor = (req, res, next) => (isStepUpEnforced() ? next() : require2FA()(req, res, next));
+
 router.post('/withdraw',
-    protectActive, requireKyc('withdraw'), require2FA(),
+    protectActive, requireKyc('withdraw'), secondFactor,
     requireFreshFxRate({ when: 'MOMO_PAYOUT_DESTINATION' }),
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
+    stepUpGate,
     walletController.requestWithdrawal);
 
 // Read-only history (banned users still need to see their own history)

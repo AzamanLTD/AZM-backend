@@ -119,9 +119,10 @@ describe('WP-D packaging — the claim table is installed by the real release pa
             'infra/install-business-offered-categories-overlay.js',
         ];
         expect(chain.slice(0, expectedExact.length)).toEqual(expectedExact);
-        // The addition is appended; the auth installer runs last, after every
-        // financial overlay has run.
-        expect(chain).toEqual([...expectedExact, INSTALLER]);
+        // Additions are inserted BETWEEN the overlays and the auth installer:
+        // the auth installer still runs last, after every financial overlay.
+        const STEP_UP_GRANT_INSTALLER = 'infra/install-action-step-up-grant.js';
+        expect(chain).toEqual([...expectedExact, STEP_UP_GRANT_INSTALLER, INSTALLER]);
         expect(chain.filter((s) => s === INSTALLER)).toHaveLength(1);
     });
 
