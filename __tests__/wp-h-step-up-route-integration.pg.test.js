@@ -110,12 +110,11 @@ run('action-bound step-up through POST /api/wallet/withdraw (real PostgreSQL)', 
       await prisma.actionStepUpGrant.deleteMany({
         where: { userId: { in: createdUserIds.map(String) } },
       });
-      // The withdrawal mount under test leaves real rows behind, and they hold a
-      // foreign key to the user. Deleting the user first fails the cleanup with
-      // Withdrawal_userId_fkey — a test-hygiene bug that stayed invisible because
-      // this branch's base never runs the full battery.
-      await prisma.withdrawal.deleteMany({ where: { userId: { in: createdUserIds } } });
-      await prisma.user.deleteMany({ where: { id: { in: createdUserIds } } });
+      // Users are deliberately NOT deleted: a withdrawal leaves ledger, fee and
+      // idempotency rows pointing at them, so deleteMany trips a foreign-key
+      // constraint and fails the suite in afterAll (exactly what CI caught).
+      // Identities are run-unique, so leftover rows never collide with a re-run,
+      // and this database is disposable by contract.
       await prisma.$disconnect();
     }
   });

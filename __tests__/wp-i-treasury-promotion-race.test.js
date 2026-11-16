@@ -57,7 +57,19 @@ describeDb('WP-I treasury promotion race (real PostgreSQL)', () => {
                 providerRef: 'RACE-REF-1', dedupKey: EVENT, amountGhs: AMOUNT,
             },
         });
-        const payload = { state: 'SETTLED', value: String(AMOUNT.toFixed(2)) };
+        // The documented Moolre Payment Status shape: numeric data.txstatus, and the
+        // provider's own externalref/accountnumber. The legacy flat
+        // { state: 'SETTLED' } form can no longer authorise treasury funding.
+        const payload = {
+            status: '1',
+            data: {
+                txstatus: 1,
+                externalref: 'RACE-REF-1',
+                accountnumber: '0244000000',
+                value: String(AMOUNT.toFixed(2)),
+                amount: String((AMOUNT + 2).toFixed(2)),
+            },
+        };
         await prisma.$transaction((tx) => recordProviderSettlementWitness(tx, {
             openingDedupKey: OPENING,
             provider: 'MOOLRE',
@@ -65,7 +77,7 @@ describeDb('WP-I treasury promotion race (real PostgreSQL)', () => {
             endpoint: 'https://api.moolre.com/open/transact/status',
             requestParams: { id: 'RACE-REF-1' },
             rawResponse: JSON.stringify(payload),
-            providerPayload: payload,
+            providerPayload: payload.data,
             fetchedAt: new Date(),
             walletAccount: '0244000000',
             currencyMapping: { '0244000000': 'GHS' },

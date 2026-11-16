@@ -115,7 +115,14 @@ const witnesses = require('../src/services/providerSettlementWitnessService');
 
 async function recordWitness(openingDedupKey, amountGhs, ref) {
     const value = Number(amountGhs).toFixed(2);
-    const raw = JSON.stringify({ status: 1, data: { state: 'SETTLED', value, accountnumber: '1000000001' } });
+    // The documented Moolre Payment Status envelope: a numeric data.txstatus is
+    // what evidences settlement. `state: 'SETTLED'` is Moolre's vocabulary for
+    // OTHER endpoints and must never authorise treasury funding.
+    const gross = (Number(amountGhs) + 2).toFixed(2);
+    const raw = JSON.stringify({
+        status: '1',
+        data: { txstatus: 1, externalref: ref, accountnumber: '1000000001', value, amount: gross },
+    });
     process.env.AZM_RECONCILER_MODE = '1';
     process.env.AZM_RECONCILER_PROVIDER_USER = 'reconciler-user';
         process.env.AZM_RECONCILER_PROVIDER_PUBKEY = 'test-reconciler-key';
@@ -124,7 +131,7 @@ async function recordWitness(openingDedupKey, amountGhs, ref) {
             openingDedupKey, provider: 'MOOLRE', fundingType: 'COLLECTION',
             endpoint: '/api/v1/payment/status', requestParams: { reference: ref },
             rawResponse: raw,
-            providerPayload: { state: 'SETTLED', value, accountnumber: '1000000001' },
+            providerPayload: { txstatus: 1, externalref: ref, accountnumber: '1000000001', value, amount: gross },
             amounts: { netPesewas: BigInt(Math.round(Number(amountGhs) * 100)) },
             fetchedAt: new Date(), walletAccount: '1000000001',
             // Currency comes from the authoritative account mapping (WP-I), not

@@ -89,9 +89,14 @@ beforeAll(async () => {
         admin = new PrismaClient({ datasources: { db: { url: urlFor(null, DB) } } });
         clients.push(admin);
 
-        await admin.$executeRawUnsafe(`CREATE ROLE ${q(ROLE.owner)} NOLOGIN`);
+        // Attribute-normalised at creation, matching what the installer provisions
+        // (infra/lib/authority-role-normalisation.js). Creating these roles with
+        // PostgreSQL's DEFAULTS left INHERIT on, so a membership conferred real
+        // privilege and the boundary was weaker than its own contract claimed.
+        const SAFE = 'NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT';
+        await admin.$executeRawUnsafe(`CREATE ROLE ${q(ROLE.owner)} NOLOGIN ${SAFE}`);
         for (const r of [ROLE.runtime, ROLE.operator, ROLE.migrator]) {
-            await admin.$executeRawUnsafe(`CREATE ROLE ${q(r)} LOGIN PASSWORD '${PWD}'`);
+            await admin.$executeRawUnsafe(`CREATE ROLE ${q(r)} LOGIN PASSWORD '${PWD}' ${SAFE}`);
         }
 
         // The tables the legacy latch lives on, and the pool the mode reader uses.

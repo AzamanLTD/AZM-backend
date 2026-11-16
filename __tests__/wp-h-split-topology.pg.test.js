@@ -58,7 +58,10 @@ test('the split boundary positively proves ENFORCED_INACTIVE (the state producti
 
     for (const [name, login] of [[ROLE.owner, false], [ROLE.runtime, true], [ROLE.operator, true]]) {
         await admin.$executeRawUnsafe(
-            `CREATE ROLE ${q(name)} ${login ? `LOGIN PASSWORD 'wphsplitpass'` : 'NOLOGIN'}`);
+            // PostgreSQL DEFAULTS INHERIT to true: a fixture that omits it builds a
+            // boundary the contract calls unsafe, and the gate now says so.
+            `CREATE ROLE ${q(name)} ${login ? `LOGIN PASSWORD 'wphsplitpass'` : 'NOLOGIN'} `
+            + 'NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS NOINHERIT');
     }
 
     const report = await installAuthorityActivationRoles(admin, {
