@@ -2,11 +2,17 @@
 
 ## Deploying schema changes
 
-Push to main → Render runs `npm run release` → the additive overlay
-installers (`infra/install-*-overlay.js` + `install-prod-drift-remediation.js`)
-apply any pending idempotent DDL → server restarts with new features live.
-Boot additionally self-heals via `infra/autoRelease.js` (same installers,
-non-fatal).
+Deploys are MANUAL: the live service has `autoDeploy: false`, so moving
+`main` deploys nothing by itself. When an operator deploys from `main`, the
+Build Command runs `npm install && npm run build && npm run release` — the full
+31-step release chain (29 installers, the susu foundation seed, the final authority gate) — and only then does the new version receive
+traffic. The chain is the sole production DDL path.
+
+Boot-time self-healing via `infra/autoRelease.js` still happens, but it is a
+DIFFERENT and SMALLER set of installers, and it is not a schema barrier:
+`server.js` calls `bootTreasury(app, prisma)` without awaiting it, and every
+boot installer failure is non-fatal. Never rely on boot to provision schema a
+release requires.
 
 **Schema authority (single, unambiguous):** production DDL is deployed
 EXCLUSIVELY by the overlay installers. `prisma migrate deploy` is NOT part
@@ -23,6 +29,65 @@ it. (The `20260920060000_r15_receipt_available_unique` migration file was
 removed for exactly this reason — the fiat-liquidity overlay creates that
 unique index.)
 
+## Verified production deployment state (checked 2026-11-17 12:56 UTC)
+
+Read from the Render API for service `AZM-backend` (Frankfurt). Do not trust
+older prose over this table; re-verify before changing anything.
+
+| Setting | Live value |
+| --- | --- |
+| Compute plan | `free` |
+| Auto-deploy | off (`autoDeployTrigger: off`) — deploys are manual |
+| Linked branch | `main` |
+| Build Command | `npm install && npm run build && npm run release` |
+| Pre-Deploy Command | configured historically, **not executed** on Free |
+| Start Command | `node index.js` |
+| Currently deployed commit | `48c17ab10248` (2026-10-15T16:59:51Z) |
+
+### What runs where
+
+| Path | Installers | Barrier? |
+| --- | --- | --- |
+| Build (manual deploy of `main`) | guard + all 31 steps | YES — completes before traffic |
+| Pre-Deploy | none (Free plan does not support it) | n/a |
+| Boot (`infra/autoRelease.js`) | its own smaller subset, non-fatal | NO |
+
+**Not provisioned at boot, ever:** `ProviderSettlementWitness` (installer step
+12), `ProviderObservationClaim` (step 29), `AppUnlockTotpClaim` (step 30) and
+`ActionStepUpGrant` (step 28). These four authorities exist only if a release
+chain ran. `infra/autoRelease.js` must not be given them: an un-awaited
+background boot call that swallows failures cannot be the thing money paths
+depend on.
+
+### Release-chain ordering that must not drift
+
+1. `infra/verify-release-target.js` — refuses previews, non-`main` branches and
+   local/private database targets; exits non-zero, so `&&` stops the chain.
+2. `infra/install-wp-i-settlement-witness.js` (step 12) — creates
+   `ProviderSettlementWitness`.
+3. `infra/install-provider-observation-claim.js` (step 29) — creates
+   `ProviderObservationClaim` and backfills it. It reads the witness table, so
+   it must come after step 12. It claims only economically settled deposits and
+   existing witnesses, never resolves a historical cross-path collision on its
+   own, and is idempotent across runs.
+4. `infra/install-app-unlock-totp-claim.js` (step 30).
+5. `infra/verify-authority-boundary.js` (step 31) — the final gate. Nothing may
+   be appended after it.
+
+Schema provisioning activates no authority and starts no provider
+reconciliation. It only creates tables, indexes and constraints.
+
+### Operations that stay separate DBA / operator procedures
+
+- **Provider-observation backfill review.** `node
+  infra/install-provider-observation-claim.js --dry-run` reports deposits,
+  witnesses, skipped observations and historical collisions without writing.
+  A collision is a human decision: the installer reports both sides and claims
+  neither. It must never be run against production from this repository's CI.
+- **WP-I provenance role grants.** A least-privilege database role provisioned
+  by an operator, not by the application boot path.
+- **WP-H / WP-I authority activation.** Explicitly not enabled by any installer.
+
 ## Free-plan Render deploy path (CURRENT LIVE SERVICE)
 
 The **live azaman-backend Render service is on the Free plan** (verified
@@ -31,13 +96,13 @@ preflight for the Marketplace Mix discovery surface). Its actual execution
 paths are:
 
 - **Build Command** (Settings → Build & Deploy):
-  `npm install && npm run build && node infra/install-e2ee-server-blind-overlay.js && node infra/install-inventory-restock-overlay.js && node infra/install-reservation-capacity-overlay.js`
-  — i.e. `prisma generate` plus THREE overlay installers (E2EE server-blind,
-  inventory-restock, reservation-capacity). It does NOT include the other
-  fifteen installers of the release chain.
-- **Pre-Deploy Command**: `npm run release` is CONFIGURED but the Free plan
-  does NOT execute it. The full 18-installer release chain therefore does
-  not run on deploys.
+  `npm install && npm run build && npm run release`
+  — i.e. `prisma generate`, then the FULL 31-step release chain (29 installers, the susu foundation seed, the final authority gate) preceded by
+  `infra/verify-release-target.js`. This is the production schema path.
+- **Pre-Deploy Command**: not used on this plan. It was previously configured
+  as `npm run release`, but the Free plan does NOT execute a Pre-Deploy
+  Command, so the chain silently never ran. `npm run release` therefore lives in
+  the Build Command, exactly once — never in both.
 - **Start Command**: `node index.js` → `server.js` → `bootTreasury(app, prisma)`
   → `infra/autoRelease.js` — the boot-time auto-release path runs at EVERY
   process start, in the background, non-fatal. Its current `main` sequence
