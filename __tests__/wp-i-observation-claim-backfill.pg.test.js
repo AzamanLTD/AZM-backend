@@ -114,7 +114,7 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL)', () => {
                 amountUsdc: '10.00000000',
                 amountGhs: '120.00',
                 txHash: `${tag}-settled-tx`,
-                metadata: { settlementExternalRef: SETTLED_REF },
+                metadata: { provider: 'moolre', settlementExternalRef: SETTLED_REF },
             },
         });
         settledTxId = settled.id;
@@ -129,7 +129,7 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL)', () => {
                 amountUsdc: '10.00000000',
                 amountGhs: '120.00',
                 txHash: `${tag}-pending-tx`,
-                metadata: { settlementExternalRef: PENDING_REF },
+                metadata: { provider: 'moolre', settlementExternalRef: PENDING_REF },
             },
         });
 
@@ -197,7 +197,7 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL)', () => {
                 amountUsdc: '5.00000000',
                 amountGhs: '60.00',
                 txHash: `${tag}-collide-tx`,
-                metadata: { settlementExternalRef: COLLIDE_REF },
+                metadata: { provider: 'moolre', settlementExternalRef: COLLIDE_REF },
             },
         });
         collideTxId = collideTx.id;
@@ -337,13 +337,16 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL)', () => {
         // Exactly the two settled observations are claimed for this tag: the
         // reference-less witness invented no key, so it is absent rather than
         // present under a guessed reference.
-        expect([...byKey.keys()].sort()).toEqual([key(SETTLED_REF), key(WITNESS_REF)].sort());
+        // The collision key is now present as a QUARANTINE row (see the
+        // collision test): present, but owned by neither path.
+        expect([...byKey.keys()].sort()).toEqual([key(SETTLED_REF), key(WITNESS_REF), key(COLLIDE_REF)].sort());
+        expect(byKey.get(key(COLLIDE_REF)).purpose).toBe('QUARANTINE');
         const invented = await prisma.providerObservationClaim.count({
             where: { claimedByRef: `${tag}-opening-2` },
         });
         expect(invented).toBe(0);
         // And the installer says so out loud, instead of dropping it silently.
-        expect(res.stdout).toMatch(/skipped\(deposits=\d+,witnesses=[1-9]\d*\)/);
+        expect(res.stdout).toMatch(/skipped\(deposits=\d+,witnesses=[1-9]\d*,nonMoolreProvider=\d+\)/);
     }, 60000);
 
     test('the backfilled key is byte-identical to the key the runtime claims with', () => {
@@ -358,13 +361,18 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL)', () => {
 
     // ── the collision ─────────────────────────────────────────────────────────
 
-    test('a historical cross-path collision is surfaced for review and left unclaimed', async () => {
+    test('a historical cross-path collision is quarantined so NEITHER path can consume it again', async () => {
         const res = runInstaller();
         expect(res.code).toBe(0);
 
-        // Neither side wins. No claim row exists for the shared reference.
+        // Reporting alone was not enough: with no row for the key, whichever
+        // path ran next would claim it and the second economic use would
+        // proceed. The collision is therefore quarantined — a claim row that
+        // names no legitimate owner.
         const rows = await claimsFor([COLLIDE_REF]);
-        expect(rows).toHaveLength(0);
+        expect(rows).toHaveLength(1);
+        expect(rows[0].purpose).toBe('QUARANTINE');
+        expect(rows[0].claimedByRef).toBeNull();
 
         // And the operator is told, with both sides named, on stderr.
         expect(res.stderr).toMatch(/COLLISION/i);
@@ -373,6 +381,92 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL)', () => {
         expect(res.stderr).toContain(`${tag}-opening-3`);
         expect(res.stderr).toMatch(/operator review/i);
     }, 60000);
+
+    test('the quarantined observation is refused by BOTH economic paths at runtime', async () => {
+        const { claimProviderObservation, CLAIM_PURPOSE } = require('../src/services/providerObservationClaimService');
+        // A fresh installer run first, exactly as the release chain does it.
+        expect(runInstaller().code).toBe(0);
+
+        const purposes = [CLAIM_PURPOSE.CUSTOMER_DEPOSIT, CLAIM_PURPOSE.TREASURY_WITNESS];
+        for (const purpose of purposes) {
+            await expect(
+                prisma.$transaction((tx) => claimProviderObservation(tx, {
+                    provider: 'moolre',
+                    reference: COLLIDE_REF,
+                    purpose,
+                    claimedByRef: `${purpose}-after-quarantine`,
+                })),
+            ).rejects.toMatchObject({ code: 'OBSERVATION_QUARANTINED' });
+        }
+
+        // Still exactly one row, still ownerless: a retry neither resolves it
+        // nor picks a winner.
+        const rows = await claimsFor([COLLIDE_REF]);
+        expect(rows).toHaveLength(1);
+        expect(rows[0].claimedByRef).toBeNull();
+    }, 60000);
+
+    test('unrelated providers are not classified as Moolre observations', async () => {
+        const foreignRef = ref('paystack');
+        const unmarkedRef = ref('unmarked');
+        await prisma.transactionHistory.create({
+            data: {
+                userId, type: 'DEPOSIT_FIAT', status: 'COMPLETED',
+                amountUsdc: '5.00000000', amountGhs: '60.00', txHash: `${tag}-paystack-tx`,
+                metadata: { provider: 'paystack', settlementExternalRef: foreignRef },
+            },
+        });
+        await prisma.transactionHistory.create({
+            data: {
+                userId, type: 'DEPOSIT_FIAT', status: 'COMPLETED',
+                amountUsdc: '6.00000000', amountGhs: '72.00', txHash: `${tag}-unmarked-tx`,
+                metadata: { settlementExternalRef: unmarkedRef },
+            },
+        });
+        // ...and a witness recorded by a different provider.
+        const foreignWitnessRef = ref('mtnwitness');
+        await prisma.providerSettlementWitness.create({
+            data: {
+                openingDedupKey: `${tag}-opening-foreign`,
+                provider: 'MTN',
+                fundingType: 'COLLECTION',
+                witnessKind: 'payment_status_lookup',
+                walletAccount: '0244000001',
+                currency: 'GHS',
+                netPesewas: 6000n,
+                grossPesewas: 6000n,
+                providerState: 'settled',
+                endpoint: '/payment/status',
+                requestParams: { id: foreignWitnessRef },
+                rawResponseDigest: 'digest-foreign',
+                rawResponse: JSON.stringify({ status: 1, data: { transactionid: foreignWitnessRef } }),
+                fetchedAt: new Date(),
+            },
+        });
+
+        const res = runInstaller();
+        expect(res.code).toBe(0);
+
+        // A settlement reference is not a Moolre observation merely because a
+        // metadata field carries it, and the same holds for a witness recorded
+        // by another provider.
+        const rows = await claimsFor([foreignRef, unmarkedRef, foreignWitnessRef]);
+        expect(rows).toHaveLength(0);
+        // And the installer reports what it declined to classify.
+        expect(res.stdout).toMatch(/nonMoolreProvider=[1-9]/);
+    }, 60000);
+
+    test('re-running the installer neither duplicates nor re-quarantines', async () => {
+        const first = runInstaller();
+        const second = runInstaller();
+        expect(first.code).toBe(0);
+        expect(second.code).toBe(0);
+        expect(Number(/quarantined=(\d+)/.exec(second.stdout)?.[1])).toBe(0);
+        const rows = await claimsFor([COLLIDE_REF]);
+        expect(rows).toHaveLength(1);
+    }, 60000);
+
+    // ── idempotency    }, 60000);
 
     // ── idempotency ───────────────────────────────────────────────────────────
 
@@ -403,7 +497,7 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL)', () => {
                 amountUsdc: '1.00000000',
                 amountGhs: '12.00',
                 txHash: `${tag}-after-failure`,
-                metadata: { settlementExternalRef: freshRef },
+                metadata: { provider: 'moolre', settlementExternalRef: freshRef },
             },
         });
 
@@ -455,7 +549,7 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL)', () => {
                 amountUsdc: '2.00000000',
                 amountGhs: '24.00',
                 txHash: `${tag}-dry`,
-                metadata: { settlementExternalRef: dryRef },
+                metadata: { provider: 'moolre', settlementExternalRef: dryRef },
             },
         });
 

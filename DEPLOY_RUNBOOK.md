@@ -2,17 +2,11 @@
 
 ## Deploying schema changes
 
-Deploys are MANUAL: the live service has `autoDeploy: false`, so moving
-`main` deploys nothing by itself. When an operator deploys from `main`, the
-Build Command runs `npm install && npm run build && npm run release` — the full
-31-step release chain (29 installers, the susu foundation seed, the final authority gate) — and only then does the new version receive
-traffic. The chain is the sole production DDL path.
-
-Boot-time self-healing via `infra/autoRelease.js` still happens, but it is a
-DIFFERENT and SMALLER set of installers, and it is not a schema barrier:
-`server.js` calls `bootTreasury(app, prisma)` without awaiting it, and every
-boot installer failure is non-fatal. Never rely on boot to provision schema a
-release requires.
+Deploys are MANUAL: the live service has `autoDeploy: false`, so moving `main`
+deploys nothing by itself. Today the live Build Command does not run the release
+chain (see the ACTUAL table below); once the PROPOSED build command is applied,
+a deploy from `main` will run the full chain before the new version receives
+traffic.
 
 **Schema authority (single, unambiguous):** production DDL is deployed
 EXCLUSIVELY by the overlay installers. `prisma migrate deploy` is NOT part
@@ -29,49 +23,73 @@ it. (The `20260920060000_r15_receipt_available_unique` migration file was
 removed for exactly this reason — the fiat-liquidity overlay creates that
 unique index.)
 
-## Verified production deployment state (checked 2026-11-17 12:56 UTC)
+## Deployment state: ACTUAL vs PROPOSED (read this before deploying)
 
-Read from the Render API for service `AZM-backend` (Frankfurt). Do not trust
-older prose over this table; re-verify before changing anything.
+Verified read-only against the Render API on **2026-11-17 12:56 UTC** for service
+`AZM-backend` (`srv-da1pvvrncjis73fru9fg`, Frankfurt).
+
+### ACTUAL live configuration (last verified 2026-11-17 12:56 UTC)
 
 | Setting | Live value |
 | --- | --- |
 | Compute plan | `free` |
 | Auto-deploy | off (`autoDeployTrigger: off`) — deploys are manual |
 | Linked branch | `main` |
-| Build Command | `npm install && npm run build && npm run release` |
-| Pre-Deploy Command | configured historically, **not executed** on Free |
+| Build Command | `npm install && npm run build && node infra/install-e2ee-server-blind-overlay.js && node infra/install-inventory-restock-overlay.js && node infra/install-reservation-capacity-overlay.js` |
+| Pre-Deploy Command | `npm run release` is CONFIGURED but the Free plan does NOT execute it |
 | Start Command | `node index.js` |
 | Currently deployed commit | `48c17ab10248` (2026-10-15T16:59:51Z) |
+| Approved production database | host `ep-crimson-cell-ab81e3bp.eu-west-2.aws.neon.tech`, port `5432`, database `neondb` |
 
-### What runs where
+**What that means today:** the live Build Command installs only three overlays
+and the Pre-Deploy step never runs, so **the release chain does not execute on
+deploy at all**. Every table the new release needs is therefore NOT provisioned
+by deploying this branch. Do not describe the release chain as a live setting:
+it is not one.
+
+### PROPOSED configuration (NOT APPLIED — requires an operator change)
+
+| Setting | Proposed value |
+| --- | --- |
+| Build Command | `npm install && npm run build && npm run release` |
+| Pre-Deploy Command | none (the Free plan does not execute one) |
+| Deploy trigger | manual only |
+| Chain position | the full 31-step release chain (`npm run release`) runs in the Build Command, after `npm run build` and before the new version receives traffic |
+| Guard | `npm run release` begins with `infra/verify-release-target.js` |
+
+Nothing in this section is live. `render.yaml` is **proposed** configuration
+too: its service name (`azaman-backend`) does not match the live service
+(`AZM-backend`), and applying it blindly would propose creating a second service.
+Treat that file as documentation of the intended state until an operator changes
+the real setting, and never sync it without reading its header.
+
+### What runs where (once the proposal is applied)
 
 | Path | Installers | Barrier? |
 | --- | --- | --- |
-| Build (manual deploy of `main`) | guard + all 31 steps | YES — completes before traffic |
-| Pre-Deploy | none (Free plan does not support it) | n/a |
+| Build (manual deploy of `main`) | target guard + all 31 release steps | YES — completes before traffic |
+| Pre-Deploy | none (Free plan) | n/a |
 | Boot (`infra/autoRelease.js`) | its own smaller subset, non-fatal | NO |
 
-**Not provisioned at boot, ever:** `ProviderSettlementWitness` (installer step
-12), `ProviderObservationClaim` (step 29), `AppUnlockTotpClaim` (step 30) and
-`ActionStepUpGrant` (step 28). These four authorities exist only if a release
-chain ran. `infra/autoRelease.js` must not be given them: an un-awaited
-background boot call that swallows failures cannot be the thing money paths
-depend on.
+**Not provisioned at boot, ever:** `ProviderSettlementWitness` (release step 12),
+`ProviderObservationClaim` (step 29), `AppUnlockTotpClaim` (step 30) and
+`ActionStepUpGrant` (step 28). These exist only if a release chain ran. The boot
+path must not be given them: `server.js` calls `bootTreasury` without awaiting
+it and every boot installer failure is non-fatal, so it cannot be the barrier
+money paths depend on.
 
 ### Release-chain ordering that must not drift
 
-1. `infra/verify-release-target.js` — refuses previews, non-`main` branches and
-   local/private database targets; exits non-zero, so `&&` stops the chain.
+1. `infra/verify-release-target.js` — proves the context: approved Render
+   service, canonical branch, no preview, and the exact approved database
+   identity. It exits non-zero on anything else, so `&&` stops the chain before
+   the first installer.
 2. `infra/install-wp-i-settlement-witness.js` (step 12) — creates
    `ProviderSettlementWitness`.
 3. `infra/install-provider-observation-claim.js` (step 29) — creates
-   `ProviderObservationClaim` and backfills it. It reads the witness table, so
-   it must come after step 12. It claims only economically settled deposits and
-   existing witnesses, never resolves a historical cross-path collision on its
-   own, and is idempotent across runs.
+   `ProviderObservationClaim` and backfills it, so it must follow step 12.
 4. `infra/install-app-unlock-totp-claim.js` (step 30).
-5. `infra/verify-authority-boundary.js` (step 31) — the final gate. Nothing may
+5. `infra/verify-authority-boundary.js` (step 31) — the final gate; nothing may
    be appended after it.
 
 Schema provisioning activates no authority and starts no provider
@@ -82,27 +100,43 @@ reconciliation. It only creates tables, indexes and constraints.
 - **Provider-observation backfill review.** `node
   infra/install-provider-observation-claim.js --dry-run` reports deposits,
   witnesses, skipped observations and historical collisions without writing.
-  A collision is a human decision: the installer reports both sides and claims
-  neither. It must never be run against production from this repository's CI.
+- **Historical cross-path collisions.** The backfill QUARANTINES a reference
+  whose money was used on both paths: it writes a claim with no legitimate
+  owner, so both economic paths fail closed (`OBSERVATION_QUARANTINED`) until an
+  operator resolves the history by hand. The installer never picks a winner.
 - **WP-I provenance role grants.** A least-privilege database role provisioned
-  by an operator, not by the application boot path.
+  by an operator, never by the application boot path.
 - **WP-H / WP-I authority activation.** Explicitly not enabled by any installer.
 
-## Free-plan Render deploy path (CURRENT LIVE SERVICE)
+### Historical statements, corrected (do not follow them)
+
+Dated so they cannot be mistaken for current instructions:
+
+- Before 2026-11-17 this runbook described a chain of 18 installers, a working
+  Pre-Deploy Command, and "push to `main` → Render runs `npm run release`". All
+  three were wrong for the live Free-plan service: the chain is 31 steps,
+  Pre-Deploy does not execute, and deploys are manual.
+- The Build Command shown in older copies (three overlay installers) is the
+  ACTUAL live value above, not a recommendation.
+- Earlier prose claimed boot-time installers gave "the same installers" as the
+  release. They do not, and boot is explicitly not a schema barrier.
+
+## Free-plan Render deploy path
 
 The **live azaman-backend Render service is on the Free plan** (verified
 read-only against the Render API on 2026-10-15, alongside the release-path
 preflight for the Marketplace Mix discovery surface). Its actual execution
 paths are:
 
-- **Build Command** (Settings → Build & Deploy):
-  `npm install && npm run build && npm run release`
-  — i.e. `prisma generate`, then the FULL 31-step release chain (29 installers, the susu foundation seed, the final authority gate) preceded by
-  `infra/verify-release-target.js`. This is the production schema path.
-- **Pre-Deploy Command**: not used on this plan. It was previously configured
-  as `npm run release`, but the Free plan does NOT execute a Pre-Deploy
-  Command, so the chain silently never ran. `npm run release` therefore lives in
-  the Build Command, exactly once — never in both.
+- **Build Command — ACTUAL (live today):** `npm install && npm run build && node infra/install-e2ee-server-blind-overlay.js && node infra/install-inventory-restock-overlay.js && node infra/install-reservation-capacity-overlay.js`
+  — `prisma generate` plus three overlays. It does NOT include the release
+  chain, so no release-provisioned table exists because of a deploy.
+- **Build Command — PROPOSED (not applied):** `npm install && npm run build && npm run release`
+  — the full 31-step chain, once, after the build. Until an operator applies
+  this, production schema comes from nothing automatic.
+- **Pre-Deploy Command:** configured as `npm run release` but NOT executed on
+  the Free plan, so it is dead configuration today and must be removed rather
+  than relied on. Release must never run through both build and pre-deploy.
 - **Start Command**: `node index.js` → `server.js` → `bootTreasury(app, prisma)`
   → `infra/autoRelease.js` — the boot-time auto-release path runs at EVERY
   process start, in the background, non-fatal. Its current `main` sequence

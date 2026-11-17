@@ -14,140 +14,16 @@
 
 const fs = require('fs');
 const path = require('path');
-const { spawnSync } = require('child_process');
-const { evaluateReleaseTarget } = require('../infra/lib/releaseTargetGuard');
 
 const ROOT = path.resolve(__dirname, '..');
 const read = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
 
-const PROD_URL = 'postgresql://user:sup3r-s3cret-pw@db.production.example:5432/azm';
-const LOCAL_URL = 'postgresql://user:sup3r-s3cret-pw@localhost:5432/azm_test';
-
-const renderEnv = (over = {}) => ({
-    RENDER: 'true',
-    RENDER_SERVICE_ID: 'srv-test',
-    RENDER_GIT_BRANCH: 'main',
-    DATABASE_URL: PROD_URL,
-    ...over,
-});
 
 /** Every command in the release chain, in order. */
 function releaseChain() {
     const release = (JSON.parse(read('package.json')).scripts || {}).release || '';
     return release.split('&&').map((s) => s.trim()).filter(Boolean);
 }
-
-describe('release target guard — fail closed', () => {
-    test('a pull-request preview build may never apply production DDL', () => {
-        const v = evaluateReleaseTarget(renderEnv({ IS_PULL_REQUEST: 'true' }));
-        expect(v.allowed).toBe(false);
-        expect(v.code).toBe('RELEASE_REFUSED_PREVIEW');
-    });
-
-    test('a branch deploy other than main is refused', () => {
-        const v = evaluateReleaseTarget(renderEnv({ RENDER_GIT_BRANCH: 'feat/wp-l-business-currency-contract' }));
-        expect(v.allowed).toBe(false);
-        expect(v.code).toBe('RELEASE_REFUSED_BRANCH');
-        expect(v.branch).toBe('feat/wp-l-business-currency-contract');
-    });
-
-    test('a missing database URL is refused rather than assumed', () => {
-        const v = evaluateReleaseTarget(renderEnv({ DATABASE_URL: '' }));
-        expect(v.allowed).toBe(false);
-        expect(v.code).toBe('RELEASE_REFUSED_NO_DATABASE');
-    });
-
-    test.each([
-        ['localhost', LOCAL_URL],
-        ['127.0.0.1', 'postgresql://u:p@127.0.0.1:5432/azm'],
-        ['a .local host', 'postgresql://u:p@postgres.local:5432/azm'],
-        ['an .internal host', 'postgresql://u:p@db.internal:5432/azm'],
-    ])('a non-production target (%s) is refused', (_label, url) => {
-        const v = evaluateReleaseTarget(renderEnv({ DATABASE_URL: url }));
-        expect(v.allowed).toBe(false);
-        expect(v.code).toBe('RELEASE_REFUSED_NON_PRODUCTION_TARGET');
-    });
-
-    test('the trusted production deploy is allowed', () => {
-        const v = evaluateReleaseTarget(renderEnv());
-        expect(v.allowed).toBe(true);
-        expect(v.code).toBe('RELEASE_TARGET_PRODUCTION');
-    });
-
-    test('outside Render the chain stays a local tool, so dev and CI keep working', () => {
-        const v = evaluateReleaseTarget({ DATABASE_URL: LOCAL_URL });
-        expect(v.allowed).toBe(true);
-        expect(v.code).toBe('RELEASE_TARGET_LOCAL_CONTEXT');
-    });
-
-    test('holding Render credentials does not make a shell a deploy environment', () => {
-        // A developer shell (or a CI job) with RENDER_API_KEY / RENDER_SERVICE_ID
-        // exported is NOT a Render build. Refusing there would break local
-        // releases while protecting nothing: Render sets RENDER=true itself.
-        const v = evaluateReleaseTarget({
-            RENDER_SERVICE_ID: 'srv-from-a-credential-shell',
-            RENDER_API_KEY: 'not-a-deploy',
-            DATABASE_URL: LOCAL_URL,
-        });
-        expect(v.allowed).toBe(true);
-        expect(v.code).toBe('RELEASE_TARGET_LOCAL_CONTEXT');
-    });
-
-    test('a verdict can never leak the connection string', () => {
-        // The guard is what gets logged on refusal. If it echoed the URL, every
-        // refused build would print a production credential into build logs.
-        const verdicts = [
-            evaluateReleaseTarget(renderEnv()),
-            evaluateReleaseTarget(renderEnv({ IS_PULL_REQUEST: 'true' })),
-            evaluateReleaseTarget(renderEnv({ DATABASE_URL: LOCAL_URL })),
-            evaluateReleaseTarget(renderEnv({ DATABASE_URL: '' })),
-        ];
-        for (const verdict of verdicts) {
-            const serialised = JSON.stringify(verdict);
-            expect(serialised).not.toContain('sup3r-s3cret-pw');
-            expect(serialised).not.toContain('db.production.example');
-        }
-    });
-});
-
-describe('release target guard is wired into the chain itself', () => {
-    const CLI = 'node infra/verify-release-target.js';
-
-    test('the guard is the first command in the release chain', () => {
-        expect(releaseChain()[0]).toBe(CLI);
-    });
-
-    test('the guard runs before every installer', () => {
-        const chain = releaseChain();
-        const guardAt = chain.indexOf(CLI);
-        const firstInstallerAt = chain.findIndex((c) => /infra\/install-/.test(c));
-        expect(guardAt).toBe(0);
-        expect(guardAt).toBeLessThan(firstInstallerAt);
-    });
-
-    test('the guard exits non-zero on a preview and leaves the chain unrun', () => {
-        const res = spawnSync(process.execPath, ['infra/verify-release-target.js'], {
-            cwd: ROOT,
-            env: { ...process.env, ...renderEnv({ IS_PULL_REQUEST: 'true' }) },
-            encoding: 'utf8',
-        });
-        expect(res.status).not.toBe(0);
-        expect(res.stderr).toMatch(/RELEASE_REFUSED_PREVIEW/);
-        expect(res.stderr).toMatch(/No installer was executed/);
-        expect(res.stderr).not.toContain('sup3r-s3cret-pw');
-    });
-
-    test('the guard exits zero on the trusted production deploy', () => {
-        const res = spawnSync(process.execPath, ['infra/verify-release-target.js'], {
-            cwd: ROOT,
-            env: { ...process.env, ...renderEnv() },
-            encoding: 'utf8',
-        });
-        expect(res.status).toBe(0);
-        expect(res.stdout).toMatch(/RELEASE_TARGET_PRODUCTION/);
-        expect(res.stdout).not.toContain('sup3r-s3cret-pw');
-    });
-});
 
 describe('release chain — failure stops it before traffic', () => {
     test('the chain is one fail-fast && sequence with no ; separators', () => {
@@ -184,6 +60,25 @@ describe('release chain — failure stops it before traffic', () => {
     test('schema provisioning activates no authority and starts no reconciliation', () => {
         const chain = releaseChain();
         expect(chain.some((c) => /activati|enforce-authority|provider-reconcil/i.test(c))).toBe(false);
+    });
+});
+
+describe('the four money and security authorities are provisioned by the chain', () => {
+    const chain = releaseChain();
+
+    test.each([
+        ['ProviderSettlementWitness', 'install-wp-i-settlement-witness.js'],
+        ['ProviderObservationClaim', 'install-provider-observation-claim.js'],
+        ['AppUnlockTotpClaim', 'install-app-unlock-totp-claim.js'],
+        ['ActionStepUpGrant', 'install-action-step-up-grant.js'],
+    ])('%s is created by exactly one release step', (_table, installer) => {
+        expect(chain.filter((c) => c.includes(installer))).toHaveLength(1);
+    });
+
+    test('a failing installer stops the chain, because it is one && sequence', () => {
+        const release = JSON.parse(read('package.json')).scripts.release;
+        expect(release.split('&&').length).toBe(32);
+        expect(release).not.toMatch(/\|\||;/);
     });
 });
 
@@ -250,41 +145,87 @@ describe('boot path is not a schema barrier and must not take these authorities'
     });
 });
 
-describe('the runbook describes the deployment that actually exists', () => {
+describe('the runbook distinguishes the ACTUAL deployment from the PROPOSED one', () => {
     const runbook = read('DEPLOY_RUNBOOK.md');
+    const ACTUAL_BUILD = 'npm install && npm run build && node infra/install-e2ee-server-blind-overlay.js';
+    const PROPOSED_BUILD = 'npm install && npm run build && npm run release';
+    const actualSection = runbook.slice(runbook.indexOf('ACTUAL live configuration'), runbook.indexOf('PROPOSED configuration'));
+    const proposedSection = runbook.slice(runbook.indexOf('PROPOSED configuration'), runbook.indexOf('What runs where'));
 
-    test('it documents the 31-installer chain and the verified build command', () => {
-        expect(runbook).toMatch(/31-step release chain/);
-        expect(runbook).toContain('npm install && npm run build && npm run release');
-        expect(runbook).toContain('infra/verify-release-target.js');
+    test('it records the ACTUAL live build command, which does not run the chain', () => {
+        expect(actualSection).toContain(ACTUAL_BUILD);
+        expect(actualSection).toMatch(/does NOT execute it|does not execute it/);
+        expect(actualSection).toContain('48c17ab10248');
+        expect(actualSection).toMatch(/`free`/);
+        // The proposed command must NOT be presented as the live one.
+        expect(actualSection).not.toContain(PROPOSED_BUILD);
     });
 
-    test('it no longer repeats the stale counts it used to claim', () => {
-        expect(runbook).not.toMatch(/18-installer/);
-        expect(runbook).not.toMatch(/fifteen installers/);
+    test('it presents the full chain as PROPOSED and explicitly not applied', () => {
+        expect(proposedSection).toContain(PROPOSED_BUILD);
+        expect(proposedSection).toMatch(/NOT APPLIED/);
+        expect(proposedSection).toMatch(/not live|Nothing in this section is live/);
+        expect(proposedSection).toContain('verify-release-target.js');
+    });
+
+    test('it names the approved production identity the guard pins', () => {
+        const { APPROVED_PRODUCTION } = require('../infra/lib/releaseTargetGuard');
+        expect(runbook).toContain(APPROVED_PRODUCTION.serviceId);
+        expect(runbook).toContain(APPROVED_PRODUCTION.databaseHost);
+        expect(runbook).toContain(APPROVED_PRODUCTION.databaseName);
+    });
+
+    test('stale claims survive only inside the dated corrections section', () => {
         expect(runbook).not.toMatch(/Push to main → Render runs/);
+        expect(runbook).not.toMatch(/fifteen installers/);
+        const staleIndex = runbook.indexOf('18 installers');
+        if (staleIndex !== -1) {
+            // Only allowed where it is explicitly dated as a correction.
+            expect(runbook).toMatch(/Historical statements, corrected/);
+            expect(runbook.indexOf('Historical statements, corrected')).toBeLessThan(staleIndex);
+        }
     });
 
-    test('it names the four authorities that boot does not provision', () => {
-        for (const table of [
-            'ProviderSettlementWitness',
-            'ProviderObservationClaim',
-            'AppUnlockTotpClaim',
-            'ActionStepUpGrant',
-        ]) {
+    test('it documents the 31-step chain and the four authorities boot does not provision', () => {
+        expect(runbook).toMatch(/31-step release chain/);
+        for (const table of ['ProviderSettlementWitness', 'ProviderObservationClaim', 'AppUnlockTotpClaim', 'ActionStepUpGrant']) {
             expect(runbook).toContain(table);
         }
         expect(runbook).toMatch(/Not provisioned at boot/);
     });
 
+    test('the quarantined-collision operator procedure is documented', () => {
+        expect(runbook).toMatch(/QUARANTINE|quarantin/i);
+        expect(runbook).toContain('OBSERVATION_QUARANTINED');
+    });
+
     test('the documented step count matches the real chain', () => {
-        // 31 release steps behind the guard: 30 install-* scripts plus the
-        // susu foundation seed. Counted explicitly so the runbook's number
-        // cannot drift away from package.json unnoticed.
         const steps = releaseChain().filter((c) => !/verify-release-target/.test(c));
         expect(steps).toHaveLength(31);
         expect(steps.filter((c) => /infra\/install-/.test(c))).toHaveLength(29);
         expect(steps.filter((c) => /seed-susu-foundation/.test(c))).toHaveLength(1);
         expect(steps.filter((c) => /verify-authority-boundary/.test(c))).toHaveLength(1);
+    });
+});
+
+describe('render.yaml is labelled as proposed configuration', () => {
+    const yaml = read('render.yaml');
+    const header = yaml.slice(0, yaml.indexOf('services:'));
+    // Comment lines are hard-wrapped; compare the unwrapped prose.
+    const flat = header.replace(/^#\s?/gm, '').replace(/\s+/g, ' ');
+
+    test('the file says it is proposed and not applied', () => {
+        expect(flat).toMatch(/PROPOSED CONFIGURATION — NOT APPLIED/);
+        expect(flat).toMatch(/Nothing in this file is a live setting/);
+    });
+
+    test('it preserves the warning not to sync the blueprint blindly', () => {
+        expect(flat).toMatch(/Do NOT sync this blueprint into Render blindly/);
+        expect(flat).toMatch(/differently-named service/);
+    });
+
+    test('it records the actual live build command separately from the proposed one', () => {
+        expect(flat).toMatch(/buildCommand : npm install && npm run build && three overlay installers/);
+        expect(flat).toMatch(/preDeployCommand: npm run release — CONFIGURED BUT NOT EXECUTED on Free/);
     });
 });

@@ -94,7 +94,11 @@ function canonicalObservationIdentity({ provider, reference, accountNumber = nul
     };
 }
 
+/** Histories that are not a legitimate claim by either path. */
+const QUARANTINE_PURPOSE = 'QUARANTINE';
+
 module.exports = {
+    QUARANTINE_PURPOSE,
     CLAIM_PURPOSE,
     SUPPORTED_PROVIDERS,
     ObservationIdentityError,

@@ -49,7 +49,7 @@ function referenceFromWitness(row) {
 async function main() {
     const dryRun = process.argv.includes('--dry-run');
     const prisma = new PrismaClient();
-    const report = { installed: false, deposits: 0, witnesses: 0, collisions: [], skipped: { deposits: 0, witnesses: 0 } };
+    const report = { installed: false, deposits: 0, witnesses: 0, quarantined: 0, collisions: [], skipped: { deposits: 0, witnesses: 0, nonMoolreProvider: 0 } };
     try {
         if (!dryRun) {
             const sql = fs.readFileSync(SQL_FILE, 'utf8');
@@ -65,7 +65,7 @@ async function main() {
 
         // ── settled customer deposits ───────────────────────────────────────
         const deposits = await prisma.$queryRawUnsafe(`
-            SELECT "id", "metadata"->>'settlementExternalRef' AS ref
+            SELECT "id", "metadata"->>'settlementExternalRef' AS ref, COALESCE("metadata"->>'provider', '') AS provider
             FROM "TransactionHistory"
             WHERE "type" IN ('DEPOSIT_FIAT', 'DEPOSIT_CRYPTO')
               AND "status" = 'COMPLETED'
@@ -75,6 +75,15 @@ async function main() {
         for (const d of deposits) {
             const ref = String(d.ref || '').trim();
             if (!ref) { report.skipped.deposits += 1; continue; }
+            // GENUINE MOOLRE ONLY. A settlement reference on an unrelated
+            // provider's deposit (or one with no provider marker at all) is not
+            // a Moolre collection observation, so it must not be pre-claimed
+            // under the Moolre canonical identity. Skipped rows are counted and
+            // named in the report, never silently dropped.
+            if (String(d.provider || '').trim().toLowerCase() !== 'moolre') {
+                report.skipped.nonMoolreProvider += 1;
+                continue;
+            }
             depositByKey.set(`moolre|collection|${ref}`, d.id);
         }
 
@@ -84,6 +93,10 @@ async function main() {
         });
         const witnessByKey = new Map();
         for (const w of witnesses) {
+            if (String(w.provider || '').trim().toLowerCase() !== 'moolre') {
+                report.skipped.nonMoolreProvider += 1;
+                continue;
+            }
             const ref = referenceFromWitness(w);
             if (!ref) { report.skipped.witnesses += 1; continue; }
             witnessByKey.set(`moolre|collection|${ref}`, w.openingDedupKey);
@@ -96,11 +109,26 @@ async function main() {
                     observationKey: key,
                     depositId,
                     openingDedupKey: witnessByKey.get(key),
-                    action: 'none: operator review required',
+                    action: 'QUARANTINED: neither path may consume it; operator review required',
                 });
                 depositByKey.delete(key);
                 witnessByKey.delete(key);
             }
+        }
+
+        // A collision that is merely REPORTED is still consumable: with no row
+        // for the key, whichever path runs next would happily claim it and the
+        // second economic use would proceed. So the collision is quarantined —
+        // a claim row with no legitimate owner (claimedByRef NULL) — which makes
+        // BOTH paths fail closed until an operator resolves the history.
+        for (const collision of report.collisions) {
+            if (dryRun) continue;
+            const n = await prisma.$executeRawUnsafe(
+                `INSERT INTO "ProviderObservationClaim" ("id","observationKey","purpose","claimedByRef","provider","accountKey","createdAt","updatedAt")
+                 VALUES (gen_random_uuid()::text,$1,'QUARANTINE',NULL,'moolre',NULL, now(), now())
+                 ON CONFLICT ("observationKey") DO NOTHING`, collision.observationKey,
+            );
+            report.quarantined += n;
         }
 
         if (!dryRun) {
@@ -122,9 +150,9 @@ async function main() {
             }
         }
 
-        console.log(`[provider-observation-claim] installed=${report.installed} dryRun=${dryRun} `
+        console.log(`[provider-observation-claim] installed=${report.installed} dryRun=${dryRun} quarantined=${report.quarantined} `
             + `depositClaims=${report.deposits} witnessClaims=${report.witnesses} `
-            + `skipped(deposits=${report.skipped.deposits},witnesses=${report.skipped.witnesses})`);
+            + `skipped(deposits=${report.skipped.deposits},witnesses=${report.skipped.witnesses},nonMoolreProvider=${report.skipped.nonMoolreProvider})`);
         if (report.collisions.length) {
             console.error(`[provider-observation-claim] ${report.collisions.length} HISTORICAL CROSS-PATH COLLISION(S) — `
                 + 'left unclaimed for operator review:');

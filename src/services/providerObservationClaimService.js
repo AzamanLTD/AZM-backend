@@ -27,6 +27,7 @@
 const crypto = require('crypto');
 const {
     CLAIM_PURPOSE,
+    QUARANTINE_PURPOSE,
     ObservationIdentityError,
     canonicalObservationIdentity,
 } = require('./providerObservationIdentity');
@@ -114,6 +115,17 @@ async function claimProviderObservation(tx, {
             'OBSERVATION_CLAIM_RACING',
             '[wp-i] another transaction is claiming this provider observation right now',
             { observationKey: identity.observationKey },
+        );
+    }
+
+    if (existing.purpose === QUARANTINE_PURPOSE) {
+        // Historical cross-path collision, quarantined during the backfill.
+        // Neither path is declared the owner, and neither may consume it: the
+        // only way past this is an operator resolving the history by hand.
+        throw new ProviderObservationClaimError(
+            'OBSERVATION_QUARANTINED',
+            '[wp-i] this provider observation was used economically by BOTH paths in historical records and is quarantined for operator review; neither path may consume it',
+            { observationKey: existing.observationKey, heldBy: existing.purpose, claimedByRef: existing.claimedByRef },
         );
     }
 

@@ -1,35 +1,38 @@
 # =============================================================================
 # Render Blueprint — AZM backend
 #
-# VERIFIED LIVE STATE, checked 2026-11-17 12:56 UTC against the Render API
-# (service "AZM-backend", srv-da1pvvrncjis73fru9fg, Frankfurt):
+# STATUS: PROPOSED CONFIGURATION — NOT APPLIED. Nothing in this file is a live
+# setting. It records the configuration we WANT, so it can be reviewed and then
+# applied by an operator. The live service is described in DEPLOY_RUNBOOK.md
+# under "ACTUAL live configuration".
 #
+# ACTUAL live state, verified read-only via the Render API on 2026-11-17:
 #   plan            : free
 #   autoDeploy      : no  (autoDeployTrigger: off — deploys are manual)
 #   branch          : main
-#   buildCommand    : npm install && npm run build && npm run release
-#   preDeployCommand: NOT EXECUTED on the Free plan
+#   buildCommand    : npm install && npm run build && three overlay installers
+#                     (it does NOT run the release chain)
+#   preDeployCommand: npm run release — CONFIGURED BUT NOT EXECUTED on Free
 #   startCommand    : node index.js
 #   live commit     : 48c17ab10248 (deployed 2026-10-15T16:59:51Z)
 #
-# This file now mirrors those values. Before 2026-11-17 it declared
-# `plan: starter`, `preDeployCommand: npm run release` and `autoDeploy: true`,
-# so the repository and the live service disagreed about the one thing that
-# matters: WHERE the schema installers run. On Free, Render does not run a
-# Pre-Deploy Command, so `npm run release` never executed on deploy.
+# PROPOSED (this file):
+#   buildCommand    : npm install && npm run build && npm run release
+#   preDeployCommand: absent — Free does not execute it, and declaring it here
+#                     is what made the repository disagree with reality
+#   deploys         : manual only
 #
 # WHY THE FULL CHAIN RUNS IN BUILD: the release chain is the only sanctioned
-# production DDL path, and a Build Command runs to completion BEFORE the new
-# version receives traffic — the same barrier Pre-Deploy would provide. The
-# chain must be the whole thing (31 installers, dependency-ordered, authority
-# verification last). Do not replace it with a hand-picked subset: the
-# installers have ordering and coverage dependencies, and
-# `infra/verify-authority-boundary.js` is a required final gate.
+# production DDL path, and a Build Command completes BEFORE the new version
+# receives traffic — the barrier Pre-Deploy would have provided. It must be the
+# whole chain (31 steps, dependency-ordered, authority verification last), not a
+# hand-picked subset.
 #
 # WHY THE GUARD COMES FIRST: `npm run release` begins with
-# `infra/verify-release-target.js`, which refuses to run when the context is a
-# pull-request preview, a non-main branch, or a local/private database target.
-# Production DDL can therefore never be applied by an untrusted build.
+# `infra/verify-release-target.js`, which requires the approved Render service
+# id, the canonical branch, a non-preview build and the exact approved database
+# identity — an allow-list, so an unexpected host, database or branch is refused
+# before any installer runs.
 #
 # SCHEMA AUTHORITY: production schema changes are deployed EXCLUSIVELY by the
 # `infra/install-*` raw-SQL installers. `prisma migrate deploy` is not part of
@@ -37,12 +40,10 @@
 # table. Never add a `prisma/migrations` file for an invariant an installer
 # owns: the installers are the single source of truth for production DDL.
 #
-# Every installer is idempotent, so re-running the release step is safe.
-#
-# NOTE ON IDENTITY: the live service is named "AZM-backend". The `name` below
-# is historical. Do not "sync" this blueprint into Render blindly — it would
-# propose creating a differently-named service. Treat it as documentation of
-# the live configuration, not as a provisioning source.
+# NOTE ON IDENTITY (preserved deliberately): the live service is named
+# "AZM-backend"; the `name` below is historical. Do NOT sync this blueprint into
+# Render blindly — it would propose creating a differently-named service. Treat
+# it as documentation of the intended configuration, not a provisioning source.
 # =============================================================================
 services:
   - type: web
