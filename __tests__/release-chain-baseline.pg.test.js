@@ -47,9 +47,17 @@ run('the release chain on a clean disposable database at the documented baseline
 
     const runRelease = () => {
         // NODE_ENV is left alone: this must be the same command an operator runs.
+        //
+        // This is a DISPOSABLE database, so the guard's explicit policy applies:
+        // outside the approved Render deploy, `npm run release` refuses anything
+        // it cannot prove is throwaway, and this declaration is how this suite
+        // says "this target is throwaway". Without it the chain refuses before
+        // the first installer (RELEASE_REFUSED_TARGET_POLICY_MISSING) — which is
+        // the guard working, not a defect. The target is still a local host, and
+        // the production identity would be refused here regardless.
         const out = execFileSync('npm', ['run', 'release'], {
             cwd: ROOT,
-            env: { ...process.env, DATABASE_URL: urlFor(DB) },
+            env: { ...process.env, DATABASE_URL: urlFor(DB), AZM_RELEASE_TARGET_POLICY: 'disposable-postgres' },
             stdio: 'pipe',
             maxBuffer: 64 * 1024 * 1024,
         });
