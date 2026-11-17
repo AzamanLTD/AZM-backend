@@ -125,7 +125,17 @@ describe('WP-D packaging — the claim table is installed by the real release pa
         // Additions are inserted BETWEEN the overlays and the auth installer:
         // the auth installer still runs last, after every financial overlay.
         const STEP_UP_GRANT_INSTALLER = 'infra/install-action-step-up-grant.js';
-        expect(chain).toEqual([...expectedExact, STEP_UP_GRANT_INSTALLER, INSTALLER]);
+        // §WP-I: the provider-observation claim is another install-* overlay. It
+        // runs with the financial overlays (before the auth installers) because
+        // both economic paths call claimProviderObservation() at runtime.
+        const PROVIDER_OBSERVATION_INSTALLER = 'infra/install-provider-observation-claim.js';
+        expect(chain).toEqual([
+            ...expectedExact,
+            STEP_UP_GRANT_INSTALLER,
+            PROVIDER_OBSERVATION_INSTALLER,
+            INSTALLER,
+        ]);
+        expect(chain.filter((s) => s === PROVIDER_OBSERVATION_INSTALLER)).toHaveLength(1);
         expect(chain.filter((s) => s === INSTALLER)).toHaveLength(1);
     });
 

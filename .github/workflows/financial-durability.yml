@@ -364,6 +364,8 @@ jobs:
           fi
           npx jest --runInBand --forceExit "${NG_SUITES[@]}"
 
+      - name: Install provider-observation claim (§WP-I cross-path single use)
+        run: node infra/install-provider-observation-claim.js
       - name: Financial-integrity suites (production commit mode)
         # The explicit settlement/reconciliation/reversal set. Every suite here
         # proves a money-movement invariant that must hold under real commit
@@ -508,6 +510,7 @@ jobs:
             "__tests__/app-unlock-durable-state.test.js"
             "__tests__/app-unlock-claim-installer-wiring.test.js"
             "__tests__/pos-settlement-containment.test.js"
+            "__tests__/wp-i-observation-claim-concurrency.pg.test.js",
             "__tests__/wp-i-provider-trust-boundary.test.js"
             "__tests__/wp-i-witness-db-provenance.test.js"
             "__tests__/wp-i-callback-authentication.test.js"
