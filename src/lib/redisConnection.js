@@ -170,6 +170,89 @@ async function ping(profile = 'default') {
     }
 }
 
+/**
+ * Bounded backoff that NEVER gives up.
+ *
+ * `retryStrategy` above gives up after 30 attempts, which is right for a
+ * request-scoped client: the request should fail fast rather than hang. A
+ * BullMQ connection is the opposite — maxRetriesPerRequest: null means commands
+ * queue client-side, and the scheduler's own circuit breaker (not the socket)
+ * decides when work stops. A connection that gave up here would leave the
+ * scheduler believing it is "distributed" with a dead socket, so this variant
+ * keeps retrying at the 10s cap forever.
+ */
+function queueRetryStrategy(times) {
+    return Math.min(500 * 2 ** Math.min(Math.max(times, 1) - 1, 5), 10_000);
+}
+
+/**
+ * Build a DEDICATED ioredis client for a BullMQ queue/worker or scheduler probe.
+ *
+ * WHY A FACTORY AND NOT `new Redis(process.env.REDIS_URL, …)` AT THE CALL SITE
+ * (2026-11-17 audit, defect B): src/lib/bullScheduler.js constructed ioredis
+ * directly in four places and decided TLS by sniffing the `rediss://` prefix
+ * itself. A production `redis://` URL was therefore refused by the shared
+ * request-path client and happily accepted by the scheduler — the same secret
+ * and keys travelling in clear on the wire, through the one component that
+ * moves money. Every queue connection now goes through the SAME normalisation
+ * and transport-security gate as getRedis().
+ *
+ * TLS: ioredis enables TLS for rediss:// itself; we additionally assert
+ * certificate verification explicitly. `rejectUnauthorized: false` is never an
+ * option here — Upstash serves a public CA certificate.
+ *
+ * Returns the client and does NOT cache it: BullMQ owns connection lifecycle,
+ * and the scheduler must be able to close/replace these independently of the
+ * shared request-path clients.
+ */
+/**
+ * Optional private-CA bundle for a `rediss://` endpoint whose certificate is not
+ * issued by a public CA (self-hosted Redis, or a private-CA deployment).
+ *
+ * REDIS_TLS_CA is a PATH to a PEM bundle. It is only ever ADDED to a verifying
+ * context: verification stays on. A missing, empty or unreadable file is a
+ * configuration error and fails closed rather than silently trusting anything.
+ * Unset is the normal case (Upstash serves a public certificate).
+ */
+function readTlsCa(env = process.env) {
+    const p = String(env.REDIS_TLS_CA || '').trim();
+    if (!p) return null;
+    let pem;
+    try {
+        pem = require('fs').readFileSync(p, 'utf8');
+    } catch (e) {
+        throw new Error(`[redis] REDIS_TLS_CA is set but unreadable (${p}): ${e.message}`);
+    }
+    if (!pem.includes('BEGIN CERTIFICATE')) {
+        throw new Error(`[redis] REDIS_TLS_CA does not contain a PEM certificate: ${p}`);
+    }
+    return [pem];
+}
+
+function createQueueClient({ env = process.env, overrides = {}, label = 'queue' } = {}) {
+    const url = normalizeRedisUrl(env.REDIS_URL);   // throws on malformed/insecure
+    if (!url) throw new Error('[redis] REDIS_URL is not configured — no queue connection to build');
+
+    const tlsOptions = /^rediss:\/\//i.test(url)
+        ? { tls: { rejectUnauthorized: true, ...(readTlsCa(env) ? { ca: readTlsCa(env) } : {}) } }
+        : {};
+    const client = new Redis(url, {
+        ...PROFILES.queue,          // maxRetriesPerRequest: null — BullMQ's requirement
+        enableReadyCheck: true,
+        lazyConnect: false,
+        retryStrategy: queueRetryStrategy,
+        ...tlsOptions,
+        ...overrides,
+    });
+    client.__azmProfile = label;
+    // A dedicated listener so an unhandled 'error' can never crash the process;
+    // the scheduler layers its breaker hooks on top of this one.
+    client.on('error', (err) => {
+        client.__azmLastError = err?.message ?? String(err);
+    });
+    return client;
+}
+
 /** Redacted status for /health. Never returns the URL or the password. */
 function status() {
     const profiles = {};
@@ -201,5 +284,7 @@ module.exports = {
     normalizeRedisUrl,
     assertTransportSecurity,
     retryStrategy,
+    queueRetryStrategy,
+    createQueueClient,
     PROFILES,
 };
