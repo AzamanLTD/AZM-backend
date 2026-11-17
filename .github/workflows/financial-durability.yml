@@ -362,6 +362,25 @@ jobs:
             echo "::error::AZM_EXPECTED_TEST_DB_ADDRESS is not set. The native-GHS suites must run against a proven database identity."
             exit 1
           fi
+
+          # ── every configured path must be a real file ─────────────────────
+          # jest treats unmatched arguments as patterns, not paths: a typo or a
+          # renamed file loses the suite from the battery and the lane stays
+          # green. That already happened once here (a trailing comma silently
+          # dropped the §WP-I concurrency proof). Refuse to run instead.
+          missing=0
+          for path in "${NG_SUITES[@]}"; do
+            if [ ! -f "$path" ]; then
+              echo "::error::configured test path does not exist: $path"
+              missing=$((missing + 1))
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::$missing configured test path(s) are missing; refusing to run a battery that would silently test less"
+            exit 1
+          fi
+          echo "preflight: all ${#NG_SUITES[@]} configured suite paths resolve"
+
           npx jest --runInBand --forceExit "${NG_SUITES[@]}"
 
       - name: Install provider-observation claim (§WP-I cross-path single use)
@@ -511,6 +530,7 @@ jobs:
             "__tests__/app-unlock-claim-installer-wiring.test.js"
             "__tests__/pos-settlement-containment.test.js"
             "__tests__/wp-i-observation-claim-concurrency.pg.test.js"
+            "__tests__/wp-i-observation-claim-backfill.pg.test.js"
             "__tests__/wp-i-provider-trust-boundary.test.js"
             "__tests__/wp-i-witness-db-provenance.test.js"
             "__tests__/wp-i-callback-authentication.test.js"
@@ -521,6 +541,25 @@ jobs:
             "__tests__/wp-i-deployment-provisioning.test.js"
             "__tests__/wp-i-treasury-opening-wallet.test.js"
           )
+
+          # ── every configured path must be a real file ─────────────────────
+          # jest treats unmatched arguments as patterns, not paths: a typo or a
+          # renamed file loses the suite from the battery and the lane stays
+          # green. That already happened once here (a trailing comma silently
+          # dropped the §WP-I concurrency proof). Refuse to run instead.
+          missing=0
+          for path in "${SUITES[@]}"; do
+            if [ ! -f "$path" ]; then
+              echo "::error::configured test path does not exist: $path"
+              missing=$((missing + 1))
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::$missing configured test path(s) are missing; refusing to run a battery that would silently test less"
+            exit 1
+          fi
+          echo "preflight: all ${#SUITES[@]} configured suite paths resolve"
+
           npx jest --runInBand --forceExit "${SUITES[@]}"
 
       - name: 'Guard: re-verify commit mode was never relaxed mid-run'
