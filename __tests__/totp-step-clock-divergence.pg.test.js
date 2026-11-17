@@ -83,6 +83,10 @@ run('WP-F — one captured instant for TOTP verification and its claim (real Pos
     beforeAll(async () => {
         prisma = new PrismaClient();
         await prisma.$connect();
+        // CLAIM TABLE IS USER-ID KEYED AND IDS ARE RECYCLED: a claim written for
+        // a user deleted by an earlier suite is indistinguishable from a replay
+        // for a fresh user that inherits that id. Start from no claims at all.
+        await prisma.totpStepClaim.deleteMany({});
         // The production DDL path is the release installer, not db push.
         execFileSync('node', ['infra/install-app-unlock-totp-claim.js'], {
             cwd: process.cwd(),

@@ -93,6 +93,10 @@ run('WP-F — global TOTP replay protection (real PostgreSQL)', () => {
     beforeAll(async () => {
         prisma = new PrismaClient({ datasources: { db: { url: DB_URL } } });
         await prisma.$connect();
+        // CLAIM TABLE IS USER-ID KEYED AND IDS ARE RECYCLED: a claim written for
+        // a user deleted by an earlier suite is indistinguishable from a replay
+        // for a fresh user that inherits that id. Start from no claims at all.
+        await prisma.totpStepClaim.deleteMany({});
         app = buildApp();
     });
 

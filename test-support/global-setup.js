@@ -44,6 +44,34 @@ module.exports = async () => {
     const prisma = new PrismaClient();
     try {
         await prisma.$executeRaw`INSERT INTO "GlobalSettings" ("id", "updatedAt") VALUES (1, now()) ON CONFLICT ("id") DO NOTHING`;
+
+        // CLAIM TABLES ARE USER-ID KEYED, AND USER IDS GET RECYCLED.
+        // ─────────────────────────────────────────────────────────
+        // Suites truncate "User" with RESTART IDENTITY, but a claim row carries
+        // only the numeric userId it was written for — no foreign key back to
+        // the row it belonged to. A later suite's brand-new user can therefore
+        // inherit the id of a deleted one, and any claim still standing for that
+        // id reads as a replay: a valid TOTP step is refused (WP-F) and a genuine
+        // provider observation looks already spent (WP-I).
+        //
+        // That cannot happen inside one invocation if each suite is hermetic, but
+        // CI invokes the battery twice when the first pass fails, and the second
+        // pass starts from the first pass's residue. Clearing the claim tables at
+        // invocation start makes every run start from the same state, so a retry
+        // measures the code instead of the previous run's leftovers.
+        //
+        // Guarded: the tables come from overlay installers, so a database that
+        // has not installed them yet must not fail setup.
+        await prisma.$executeRawUnsafe(`
+            DO $$
+            BEGIN
+                IF to_regclass('"AppUnlockTotpClaim"') IS NOT NULL THEN
+                    TRUNCATE TABLE "AppUnlockTotpClaim";
+                END IF;
+                IF to_regclass('"ProviderObservationClaim"') IS NOT NULL THEN
+                    TRUNCATE TABLE "ProviderObservationClaim";
+                END IF;
+            END $$;`);
     } finally {
         await prisma.$disconnect();
     }
