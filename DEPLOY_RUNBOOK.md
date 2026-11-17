@@ -63,38 +63,73 @@ too: its service name (`azaman-backend`) does not match the live service
 Treat that file as documentation of the intended state until an operator changes
 the real setting, and never sync it without reading its header.
 
-### Release authorization (independent of the environment tuple)
+### Release authorization: one signed release, not a service-wide token
 
 The Build Command's guard checks the Render identity signals — but a local shell
 can export every one of them, so those variables are identity, not proof. The
-production allow therefore also requires a signature:
+production allow therefore also requires a signature that binds ONE release:
 
-| Piece | Where it lives |
+| Bound fact | Where it comes from |
 | --- | --- |
-| Ed25519 **private** key | held by the operator; never in the repository, CI or chat |
-| Ed25519 **public** key | pinned in `infra/lib/releaseTargetGuard.js` |
-| `AZM_DEPLOY_AUTH_TOKEN` | the signature, set in the approved service's environment |
+| approved service ID | signed payload, compared with `RENDER_SERVICE_ID` |
+| canonical branch | signed payload, compared with `RENDER_GIT_BRANCH` |
+| **exact deploy commit** | signed payload, compared with `RENDER_GIT_COMMIT` |
+| production database identity | signed payload, compared with `DATABASE_URL` |
+| issuance time + expiry | signed payload, checked against the clock |
 
-Mint the token with the operator key:
+`RENDER_GIT_COMMIT` is the commit SHA of the deploy Render is building; Render
+documents it under default environment variables as available at build time and
+runtime. That is what makes the binding real at the phase where `npm run release`
+runs.
 
-```
-node infra/sign-deploy-authorization.js --key /secure/path/azm-release-auth.key
-```
+**Operator workflow for one manual release**
 
-The payload is `release:v1:<approvedServiceId>:<approvedBranch>`, so a token
-minted for another service (for example Azaman-New) does not verify.
+1. Deploy the exact commit you intend to release (commit `C`).
+2. On your own machine, mint a token for that commit, in the repository checkout
+   that is at `C` (never in CI, never in an agent workspace, never in chat):
 
-**Stated trust assumption, not implied:** this proves the process holds the
-operator's signing key. It is NOT cryptographic proof that Render started the
+   ```
+   node infra/sign-deploy-authorization.js --key /secure/offline/azm-release-auth.key --commit C --ttl-minutes 10
+   ```
+
+   The tool prints the token on stdout and the signed payload, commit and
+   validity window on stderr.
+3. Put the token in the approved service's environment as
+   `AZM_DEPLOY_AUTH_TOKEN` for that deploy, and remove it afterwards. The
+   environment variable is short-lived by design; nothing depends on a
+   long-lived static token.
+4. Trigger the deploy. The chain refuses before any installer if the token is
+   absent, expired, minted for another commit, service, branch or database.
+
+**Failure behaviour (fail closed, every case).**
+
+| Condition | Code |
+| --- | --- |
+| no token | `RELEASE_REFUSED_NO_DEPLOY_AUTHORIZATION` |
+| malformed token or bad signature | `RELEASE_REFUSED_INVALID_DEPLOY_AUTHORIZATION` |
+| wrong service | `RELEASE_REFUSED_AUTH_SERVICE` |
+| wrong branch | `RELEASE_REFUSED_AUTH_BRANCH` |
+| wrong or missing commit | `RELEASE_REFUSED_AUTH_COMMIT` |
+| wrong database identity | `RELEASE_REFUSED_AUTH_DATABASE` |
+| expired | `RELEASE_REFUSED_AUTH_EXPIRED` |
+| issued in the future | `RELEASE_REFUSED_AUTH_NOT_YET_VALID` |
+| window longer than 60 minutes | `RELEASE_REFUSED_AUTH_WINDOW_TOO_LONG` |
+
+**Replay scope, stated plainly.** This is NOT single-use authorization. There is
+no nonce store: a genuine one-use mechanism would need persistent state in the
+production database before the guard has decided the target is production, or an
+external service the release chain cannot depend on. The residual capability is
+that the SAME token can be replayed — but only for the same service, branch,
+commit and database, and only until it expires (15 minutes by default, 60 at
+most). It cannot authorize any other release. Do not describe it as one-time.
+
+**Trust assumption, not implied.** The signature proves possession of the
+operator's private key. It is NOT cryptographic proof that Render started the
 process; that cannot be established from inside a process. If the private key
 leaks, the guard is defeated, which is why the deploy action keeps independent
-operator authorization and the key must be rotatable by a reviewed change to the
-pinned public key.
-
-Without a valid token the chain refuses with
-`RELEASE_REFUSED_NO_DEPLOY_AUTHORIZATION` (absent) or
-`RELEASE_REFUSED_INVALID_DEPLOY_AUTHORIZATION` (wrong or foreign signature), and
-no installer runs.
+operator authorization, the key lives outside the repository and outside any
+agent workspace, and rotation is a reviewed change to the public key pinned in
+`infra/lib/releaseTargetGuard.js`.
 
 ### The release chain is 32 `&&` segments: the guard, then 31 commands
 

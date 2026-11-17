@@ -228,11 +228,19 @@ describe('every document agrees on the chain and the production schema path', ()
         expect(read('DEPLOY_RUNBOOK.md')).toMatch(/`prisma migrate deploy` is NOT part/);
     });
 
-    test('the production release chain requires operator-signed authorization', () => {
-        expect(read('DEPLOY_RUNBOOK.md')).toMatch(/Release authorization/);
-        expect(read('DEPLOY_RUNBOOK.md')).toMatch(/AZM_DEPLOY_AUTH_TOKEN/);
-        expect(read('DEPLOY_RUNBOOK.md')).toMatch(/NOT cryptographic proof that Render\s+started the\s+process/);
+    test('the production release chain requires a per-release, commit-bound authorization', () => {
+        const runbook = read('DEPLOY_RUNBOOK.md');
+        expect(runbook).toMatch(/Release authorization/);
+        expect(runbook).toMatch(/AZM_DEPLOY_AUTH_TOKEN/);
+        expect(runbook).toMatch(/RENDER_GIT_COMMIT/);
+        expect(runbook).toMatch(/RELEASE_REFUSED_AUTH_COMMIT/);
+        expect(runbook).toMatch(/RELEASE_REFUSED_AUTH_EXPIRED/);
+        expect(runbook).toMatch(/NOT cryptographic proof that Render\s+started the\s+process/);
+        // The replay scope must be stated, and must not be overstated.
+        expect(runbook).toMatch(/NOT single-use authorization/);
+        expect(runbook).not.toMatch(/one-time authorization/i);
         expect(read('render.yaml')).toMatch(/AZM_DEPLOY_AUTH_TOKEN/);
+        expect(read('render.yaml')).toMatch(/RENDER_GIT_COMMIT/);
     });
 
     test('no workflow runs the production release chain against a non-production database', () => {

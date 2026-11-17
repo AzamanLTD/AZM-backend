@@ -38,7 +38,21 @@ const PROD_URL = `postgresql://${USER}:${SECRET}@${APPROVED_PRODUCTION.databaseH
 const testKeyPair = crypto.generateKeyPairSync('ed25519');
 const TEST_PRIVATE_PEM = testKeyPair.privateKey.export({ type: 'pkcs8', format: 'pem' });
 const PINNED_PUBLIC_PEM = DEPLOY_AUTH.publicKeyPem;
-const AUTH_TOKEN = computeDeployAuthorizationToken(TEST_PRIVATE_PEM);
+const TEST_COMMIT = 'a9401446f2ce045b49e98ed2a935be5b190a1c1b';
+/**
+ * Mint a per-release authorization with THIS suite's keypair.
+ * `now` can be shifted to model an expired or future-dated release.
+ */
+const mintToken = (over = {}) => {
+    const issued = over.issuedAt ? Date.parse(over.issuedAt) : Date.now();
+    return computeDeployAuthorizationToken(TEST_PRIVATE_PEM, {
+        commit: TEST_COMMIT,
+        issuedAt: new Date(issued).toISOString(),
+        expiresAt: new Date(issued + (over.ttlSeconds ?? 15 * 60) * 1000).toISOString(),
+        ...over,
+    });
+};
+const AUTH_TOKEN = mintToken();
 
 beforeAll(() => { DEPLOY_AUTH.publicKeyPem = testKeyPair.publicKey.export({ type: 'spki', format: 'pem' }); });
 afterAll(() => { DEPLOY_AUTH.publicKeyPem = PINNED_PUBLIC_PEM; });
@@ -49,6 +63,7 @@ const renderIdentity = (over = {}) => ({
     IS_PULL_REQUEST: 'false',
     RENDER_GIT_BRANCH: 'main',
     RENDER_SERVICE_ID: APPROVED_PRODUCTION.serviceId,
+    RENDER_GIT_COMMIT: TEST_COMMIT,
     DATABASE_URL: PROD_URL,
     ...over,
 });
@@ -174,6 +189,103 @@ describe('refuses every wrong context', () => {
     });
 });
 
+describe('the authorization is bound to ONE release', () => {
+    test('a token for this exact service, branch, commit, database and window is allowed', () => {
+        const v = evaluateReleaseTarget(approvedDeploy());
+        expect(v.allowed).toBe(true);
+        expect(v.code).toBe('RELEASE_TARGET_PRODUCTION');
+    });
+
+    test('an expired authorization is refused, even though it is otherwise perfect', () => {
+        const issuedAt = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+        const token = mintToken({ issuedAt, ttlSeconds: 15 * 60 });
+        const v = evaluateReleaseTarget(approvedDeploy({ AZM_DEPLOY_AUTH_TOKEN: token }));
+        expect(v.allowed).toBe(false);
+        expect(v.code).toBe('RELEASE_REFUSED_AUTH_EXPIRED');
+    });
+
+    test('a future-dated authorization is refused', () => {
+        const issuedAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+        const token = mintToken({ issuedAt });
+        const v = evaluateReleaseTarget(approvedDeploy({ AZM_DEPLOY_AUTH_TOKEN: token }));
+        expect(v.allowed).toBe(false);
+        expect(v.code).toBe('RELEASE_REFUSED_AUTH_NOT_YET_VALID');
+    });
+
+    test('a window longer than the maximum is refused', () => {
+        const token = mintToken({ ttlSeconds: 2 * 60 * 60 });
+        const v = evaluateReleaseTarget(approvedDeploy({ AZM_DEPLOY_AUTH_TOKEN: token }));
+        expect(v.allowed).toBe(false);
+        expect(v.code).toBe('RELEASE_REFUSED_AUTH_WINDOW_TOO_LONG');
+    });
+
+    test('a token minted for another commit is refused on this deploy', () => {
+        const token = mintToken({ commit: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef' });
+        const v = evaluateReleaseTarget(approvedDeploy({ AZM_DEPLOY_AUTH_TOKEN: token }));
+        expect(v.allowed).toBe(false);
+        expect(v.code).toBe('RELEASE_REFUSED_AUTH_COMMIT');
+    });
+
+    test('a deploy with no commit identity cannot be authorized at all', () => {
+        const v = evaluateReleaseTarget(approvedDeploy({ RENDER_GIT_COMMIT: undefined }));
+        expect(v.allowed).toBe(false);
+        expect(v.code).toBe('RELEASE_REFUSED_AUTH_COMMIT');
+    });
+
+    test('a token minted for another service, branch or database is refused', () => {
+        const otherService = mintToken({ serviceId: 'srv-azaman-new' });
+        expect(evaluateReleaseTarget(approvedDeploy({ AZM_DEPLOY_AUTH_TOKEN: otherService })).code)
+            .toBe('RELEASE_REFUSED_AUTH_SERVICE');
+
+        const otherBranch = mintToken({ branch: 'feat/wp-l-business-currency-contract' });
+        expect(evaluateReleaseTarget(approvedDeploy({ AZM_DEPLOY_AUTH_TOKEN: otherBranch })).code)
+            .toBe('RELEASE_REFUSED_AUTH_BRANCH');
+
+        const otherDb = mintToken({ database: { host: 'ep-other-123.eu-west-2.aws.neon.tech', port: '5432', name: 'neondb' } });
+        expect(evaluateReleaseTarget(approvedDeploy({ AZM_DEPLOY_AUTH_TOKEN: otherDb })).code)
+            .toBe('RELEASE_REFUSED_AUTH_DATABASE');
+    });
+
+    test('a corrupted signature or malformed payload is refused', () => {
+        const good = mintToken();
+        const [payloadPart, sigPart] = good.split('.');
+        const flipped = Buffer.from(sigPart, 'base64url');
+        flipped[0] ^= 0xff;
+        expect(evaluateReleaseTarget(approvedDeploy({ AZM_DEPLOY_AUTH_TOKEN: `${payloadPart}.${flipped.toString('base64url')}` })).code)
+            .toBe('RELEASE_REFUSED_INVALID_DEPLOY_AUTHORIZATION');
+
+        expect(evaluateReleaseTarget(approvedDeploy({ AZM_DEPLOY_AUTH_TOKEN: payloadPart })).code)
+            .toBe('RELEASE_REFUSED_INVALID_DEPLOY_AUTHORIZATION');
+
+        // A correctly signed payload in the OLD (v1) shape carries no release facts.
+        const v1Payload = 'release:v1:srv-da1pvvrncjis73fru9fg:main';
+        const v1Sig = crypto.sign(null, Buffer.from(v1Payload), TEST_PRIVATE_PEM);
+        const v1Token = `${Buffer.from(v1Payload).toString('base64url')}.${v1Sig.toString('base64url')}`;
+        expect(evaluateReleaseTarget(approvedDeploy({ AZM_DEPLOY_AUTH_TOKEN: v1Token })).code)
+            .toBe('RELEASE_REFUSED_INVALID_DEPLOY_AUTHORIZATION');
+    });
+
+    test('REPLAY SCOPE: the same token is accepted again for the same release, and for nothing else', () => {
+        // Documented residual capability: no nonce store, so a valid token can be
+        // replayed — but only for this service/branch/commit/database, and only
+        // inside its window. It can never authorize a different release.
+        const token = mintToken();
+        expect(evaluateReleaseTarget(approvedDeploy({ AZM_DEPLOY_AUTH_TOKEN: token })).allowed).toBe(true);
+        expect(evaluateReleaseTarget(approvedDeploy({ AZM_DEPLOY_AUTH_TOKEN: token })).allowed).toBe(true);
+
+        expect(evaluateReleaseTarget(approvedDeploy({
+            AZM_DEPLOY_AUTH_TOKEN: token,
+            RENDER_GIT_COMMIT: 'ffffffffffffffffffffffffffffffffffffffff',
+        })).code).toBe('RELEASE_REFUSED_AUTH_COMMIT');
+    });
+
+    test('the signed payload never appears in the verdict', () => {
+        const serialised = JSON.stringify(evaluateReleaseTarget(approvedDeploy()));
+        expect(serialised).not.toContain(AUTH_TOKEN);
+        expect(serialised).not.toContain(TEST_PRIVATE_PEM);
+    });
+});
+
 describe('identity is not authorization: a forged Render tuple cannot release', () => {
     test('the complete forged tuple is refused for want of deploy authorization', () => {
         // Everything Render normally sets, exported by a local shell. The guard
@@ -191,6 +303,7 @@ describe('identity is not authorization: a forged Render tuple cannot release', 
         const attacker = crypto.generateKeyPairSync('ed25519');
         const attackerToken = computeDeployAuthorizationToken(
             attacker.privateKey.export({ type: 'pkcs8', format: 'pem' }),
+            { commit: TEST_COMMIT },
         );
         const v = evaluateReleaseTarget(renderIdentity({ AZM_DEPLOY_AUTH_TOKEN: attackerToken }));
         expect(v.allowed).toBe(false);
@@ -198,10 +311,12 @@ describe('identity is not authorization: a forged Render tuple cannot release', 
     });
 
     test('a token for a DIFFERENT service is not reusable against production', () => {
-        const otherToken = computeDeployAuthorizationToken(TEST_PRIVATE_PEM, { serviceId: 'srv-azaman-new' });
+        const otherToken = computeDeployAuthorizationToken(TEST_PRIVATE_PEM, { serviceId: 'srv-azaman-new', commit: TEST_COMMIT });
         const v = evaluateReleaseTarget(renderIdentity({ AZM_DEPLOY_AUTH_TOKEN: otherToken }));
         expect(v.allowed).toBe(false);
-        expect(v.code).toBe('RELEASE_REFUSED_INVALID_DEPLOY_AUTHORIZATION');
+        // Signed by the real key, but the payload names another service: the
+        // release authorization is refused for exactly that reason.
+        expect(v.code).toBe('RELEASE_REFUSED_AUTH_SERVICE');
     });
 
     test('the real authorization cannot leak into the verdict', () => {

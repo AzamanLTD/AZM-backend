@@ -22,10 +22,14 @@
 #                     is what made the repository disagree with reality
 #   deploys         : manual only
 #   AZM_DEPLOY_AUTH_TOKEN: PROPOSED — the release chain refuses production DDL
-#                     without a signature from the operator-held key (see the
-#                     runbook, "Release authorization"). Set it as a secret; the
-#                     token is never committed. Without it the guard fails closed
-#                     with RELEASE_REFUSED_NO_DEPLOY_AUTHORIZATION.
+#                     without a per-release Ed25519 authorization that binds the
+#                     service, branch, DEPLOY COMMIT (RENDER_GIT_COMMIT) and the
+#                     approved database inside a short validity window (see the
+#                     runbook, "Release authorization"). Mint it per deploy and
+#                     remove it afterwards; it is never committed, and the
+#                     private key never enters the repository or CI. Without it
+#                     the guard fails closed with
+#                     RELEASE_REFUSED_NO_DEPLOY_AUTHORIZATION.
 #
 # WHY THE FULL CHAIN RUNS IN BUILD: the release chain is the only sanctioned
 # production DDL path, and a Build Command completes BEFORE the new version

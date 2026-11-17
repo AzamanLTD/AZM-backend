@@ -54,6 +54,11 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
     const R_DUP_DEPOSITS = ref('dupdeposits');
     const R_DUP_WITNESSES = ref('dupwitnesses');
     const R_PREEXISTING = ref('preexisting');
+    // identity-disambiguation fixtures
+    const R_CONFLICT_OWNER = ref('conflict-owner');
+    const R_CONFLICT_PURPOSE = ref('conflict-purpose');
+    const R_CONFLICT_MALFORMED = ref('conflict-malformed');
+    const identityCases = {};
 
     let prisma;
     let userId;
@@ -218,7 +223,10 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
         const d1 = await settledDeposit(R_DUP_DEPOSITS, { txHash: `${tag}-tx-dup1`, providerRef: R_DUP_DEPOSITS });
         const d2 = await settledDeposit(R_DUP_DEPOSITS, { txHash: `${tag}-tx-dup2`, providerRef: R_DUP_DEPOSITS });
         dupDepositIds = [d1.id, d2.id].sort();
-        await moolreEvent(R_DUP_DEPOSITS, { txHash: `${tag}-tx-dup1`, providerRef: R_DUP_DEPOSITS });
+        // No relatedReference here: two deposits cannot share one txHash, and a
+        // relatedReference would make the second deposit a CONTRADICTION rather
+        // than the same-path duplicate this fixture is about.
+        await moolreEvent(R_DUP_DEPOSITS, { providerRef: R_DUP_DEPOSITS });
 
         // 9b. Same-path duplicate witnesses.
         for (const n of [1, 2]) {
@@ -237,6 +245,77 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
         // 10. An already-existing claim row must not be duplicated or re-owned.
         await settledDeposit(R_PREEXISTING, { txHash: `${tag}-tx-preexist`, providerRef: R_PREEXISTING });
         await moolreEvent(R_PREEXISTING, { txHash: `${tag}-tx-preexist`, providerRef: R_PREEXISTING });
+
+        // 11. IDENTITY DISAMBIGUATION. Each of these is a genuine COMPLETED
+        //     Moolre settlement whose provider evidence either contradicts the
+        //     deposit or is ambiguous. None may ever be claimed, and none may be
+        //     resolved by choosing the first matching event.
+        const identDeposit = async (n, { withSettlementRef = true } = {}) => {
+            const r = ref(n);
+            const txHash = `${tag}-tx-${n}`;
+            if (withSettlementRef) {
+                await settledDeposit(r, { txHash, providerRef: r });
+            } else {
+                await prisma.transactionHistory.create({
+                    data: {
+                        userId, type: 'DEPOSIT_FIAT', status: 'COMPLETED',
+                        amountUsdc: '10.00000000', amountGhs: '120.00', txHash, providerRef: r,
+                        metadata: { provider: 'MTN_MOMO', selectedRoute: 'MOOLRE_MOMO_COLLECTION' },
+                    },
+                });
+            }
+            return { r, txHash };
+        };
+        const ev = (dedupKey, { providerRef = null, relatedReference = null } = {}) =>
+            prisma.fiatProviderEvent.create({
+                data: {
+                    provider: 'MOOLRE', rail: 'MOMO', direction: 'INBOUND', status: 'SUCCESSFUL',
+                    providerRef, dedupKey, amountGhs: '120.00', relatedReference, raw: { status: 1 },
+                },
+            });
+
+        // (i) exact dedupKey, but the event's relatedReference names a different deposit
+        const cExact = await identDeposit('exact-contra');
+        await ev(`event:moolre-collection:${cExact.r}`, { relatedReference: `${cExact.txHash}-different` });
+
+        // (ii) providerRef matches, but the event's dedupKey names another collection
+        const cPRef = await identDeposit('pref-fallback');
+        await ev(`event:moolre-collection:${cPRef.r}-other`, { providerRef: cPRef.r, relatedReference: cPRef.txHash });
+
+        // (iii) relatedReference matches, but the event's dedupKey names another collection
+        const cRel = await identDeposit('rel-fallback');
+        await ev(`event:moolre-collection:${cRel.r}-other`, { relatedReference: cRel.txHash });
+
+        // (iv) TWO distinct events tie to one deposit through its provider reference
+        const cMultiPRef = await identDeposit('multi-pref');
+        await ev(`event:moolre-collection:${cMultiPRef.r}`, { providerRef: cMultiPRef.r, relatedReference: cMultiPRef.txHash });
+        await ev(`event:moolre-collection:${cMultiPRef.r}-second`, { providerRef: cMultiPRef.r });
+
+        // (v) TWO distinct events tie through the same related reference
+        const cMultiRel = await identDeposit('multi-rel');
+        await ev(`event:moolre-collection:${cMultiRel.r}`, { relatedReference: cMultiRel.txHash });
+        await ev(`event:moolre-collection:${cMultiRel.r}-second`, { relatedReference: cMultiRel.txHash });
+
+        // (vi) no settlement reference at all: the ONLY Moolre tie is the
+        //      deposit's own persisted provider reference
+        const cNoRef = await identDeposit('missing-pref', { withSettlementRef: false });
+        await ev(`event:moolre-collection:${cNoRef.r}-x`, { providerRef: cNoRef.r });
+
+        Object.assign(identityCases, {
+            exactContra: cExact, prefFallback: cPRef, relFallback: cRel,
+            multiPref: cMultiPRef, multiRel: cMultiRel, missingPref: cNoRef,
+        });
+
+        // 12. Pre-existing claim conflicts, each on its own genuine settlement.
+        for (const [name, r] of [
+            ['conflictOwner', R_CONFLICT_OWNER],
+            ['conflictPurpose', R_CONFLICT_PURPOSE],
+            ['conflictMalformed', R_CONFLICT_MALFORMED],
+        ]) {
+            const txHash = `${tag}-tx-${name}`;
+            await settledDeposit(r, { txHash, providerRef: r });
+            await moolreEvent(r, { txHash, providerRef: r });
+        }
     }, 120000);
 
     afterAll(async () => {
@@ -279,10 +358,21 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
         const after = await prisma.providerObservationClaim.count({ where: { observationKey: { contains: tag } } });
         expect(after).toBe(before);
 
+        // The report must describe a REPEAT run honestly: candidates split into
+        // "already claimed" and "would insert", and the split must add up.
+        expect(dryReport.wouldInsertDeposits + dryReport.alreadyClaimedDeposits).toBe(dryReport.wouldClaimDeposits);
+        expect(dryReport.wouldInsertWitnesses + dryReport.alreadyClaimedWitnesses).toBe(dryReport.wouldClaimWitnesses);
+        expect(Array.isArray(dryReport.conflicts)).toBe(true);
+
         const real = jsonOf(runInstaller(['--json']).stdout);
         expect(real.wouldClaimDeposits).toBe(dryReport.wouldClaimDeposits);
         expect(real.wouldClaimWitnesses).toBe(dryReport.wouldClaimWitnesses);
         expect(real.wouldQuarantine).toBe(dryReport.wouldQuarantine);
+        expect(real.wouldInsertDeposits).toBe(dryReport.wouldInsertDeposits);
+        expect(real.alreadyClaimedDeposits).toBe(dryReport.alreadyClaimedDeposits);
+        expect(real.depositClaims).toBe(real.wouldInsertDeposits);
+        expect(real.witnessClaims).toBe(real.wouldInsertWitnesses);
+        expect(real.conflicts).toEqual(dryReport.conflicts);
         expect(real.candidates.deposits.map((d) => d.observationKey).sort())
             .toEqual(dryReport.candidates.deposits.map((d) => d.observationKey).sort());
     }, 120000);
@@ -424,27 +514,165 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
         expect(res.stdout).not.toMatch(/installed=true/);
     }, 60000);
 
-    test('re-running is idempotent and never re-owns an existing claim row', async () => {
-        // The key is already claimed by the earlier real run; pin it to a
-        // different owner to prove a re-run never re-owns an existing row.
-        await prisma.providerObservationClaim.upsert({
-            where: { observationKey: key(R_PREEXISTING) },
-            update: { claimedByRef: 'operator-pinned' },
-            create: { observationKey: key(R_PREEXISTING), purpose: 'CUSTOMER_DEPOSIT', claimedByRef: 'operator-pinned', provider: 'moolre' },
-        });
-        const before = await prisma.providerObservationClaim.count({ where: { observationKey: { contains: tag } } });
+    describe('Moolre evidence must agree on EVERY populated identity field', () => {
+        let report;
+        beforeAll(() => {
+            const res = runInstaller(['--json']);
+            expect(res.code).toBe(0);
+            report = jsonOf(res.stdout);
+        }, 180000);
 
-        const second = runInstaller(['--json']);
-        expect(second.code).toBe(0);
-        const report = jsonOf(second.stdout);
-        expect(report.depositClaims).toBe(0);
-        expect(report.witnessClaims).toBe(0);
-        expect(report.quarantined).toBe(0);
+        const contradictionFor = (r) => report.anomalies
+            .find((a) => a.kind === 'CONTRADICTORY_MOOLRE_EVIDENCE' && String(a.observationKey) === key(r));
+        const ambiguityFor = (r) => report.anomalies
+            .find((a) => a.kind === 'AMBIGUOUS_MOOLRE_EVIDENCE' && String(a.observationKey) === key(r));
 
-        const row = await prisma.providerObservationClaim.findUnique({ where: { observationKey: key(R_PREEXISTING) } });
-        expect(row.claimedByRef).toBe('operator-pinned');
+        test('an exact deduplication key with a contradictory relatedReference is refused', async () => {
+            expect(contradictionFor(identityCases.exactContra.r)).toBeDefined();
+            expect(contradictionFor(identityCases.exactContra.r).detail).toMatch(/relatedReference/);
+            expect(await claimsFor([identityCases.exactContra.r])).toHaveLength(0);
+        }, 60000);
 
-        const after = await prisma.providerObservationClaim.count({ where: { observationKey: { contains: tag } } });
-        expect(after).toBe(before);
-    }, 120000);
+        test('a providerRef fallback whose deduplication identity differs is refused', async () => {
+            const anomaly = contradictionFor(identityCases.prefFallback.r);
+            expect(anomaly).toBeDefined();
+            expect(anomaly.detail).toMatch(/dedupKey names/);
+            expect(await claimsFor([identityCases.prefFallback.r])).toHaveLength(0);
+        }, 60000);
+
+        test('a relatedReference fallback whose other populated field contradicts is refused', async () => {
+            const anomaly = contradictionFor(identityCases.relFallback.r);
+            expect(anomaly).toBeDefined();
+            expect(anomaly.detail).toMatch(/dedupKey names/);
+            expect(await claimsFor([identityCases.relFallback.r])).toHaveLength(0);
+        }, 60000);
+
+        test('two events sharing a provider reference are an ambiguity, never a first-match claim', async () => {
+            const anomaly = ambiguityFor(identityCases.multiPref.r);
+            expect(anomaly).toBeDefined();
+            expect(anomaly.detail).toMatch(/2 distinct Moolre events/);
+            expect(await claimsFor([identityCases.multiPref.r])).toHaveLength(0);
+        }, 60000);
+
+        test('two events matching one related reference are an ambiguity', async () => {
+            const anomaly = ambiguityFor(identityCases.multiRel.r);
+            expect(anomaly).toBeDefined();
+            expect(anomaly.detail).toMatch(/2 distinct Moolre events/);
+            expect(await claimsFor([identityCases.multiRel.r])).toHaveLength(0);
+        }, 60000);
+
+        test('a missing settlement reference tied only by the provider reference stays unclassifiable', async () => {
+            const anomaly = report.anomalies.find((a) => a.kind === 'MOOLRE_EVIDENCE_WITHOUT_SETTLEMENT_REFERENCE'
+                && String(a.subject || '') === identityCases.missingPref.txHash);
+            expect(anomaly).toBeDefined();
+            expect(anomaly.detail).toMatch(/providerRef\(/);
+            expect(anomaly.detail).toMatch(/cannot be established/);
+            expect(await claimsFor([identityCases.missingPref.r])).toHaveLength(0);
+        }, 60000);
+
+        test('every ambiguous or contradictory case failed closed, and the genuine ones still claim', async () => {
+            const all = Object.values(identityCases).map((c) => c.r);
+            expect(await claimsFor(all)).toHaveLength(0);
+            // positive control in the same run: real evidence is still claimed
+            const genuine = await claimsFor([R_DIRECT, R_GENERIC]);
+            expect(genuine.map((r) => r.purpose)).toEqual(['CUSTOMER_DEPOSIT', 'CUSTOMER_DEPOSIT']);
+        }, 60000);
+    });
+
+    describe('a pre-existing claim row is verified, not assumed', () => {
+        const ownerRow = () => prisma.providerObservationClaim.findUnique({ where: { observationKey: key(R_PREEXISTING) } });
+
+        test('re-running after a successful installation reports every claim already correct and writes nothing', async () => {
+            const before = await prisma.providerObservationClaim.count({ where: { observationKey: { contains: tag } } });
+            const res = runInstaller(['--json']);
+            expect(res.code).toBe(0);
+            const report = jsonOf(res.stdout);
+            expect(report.depositClaims).toBe(0);
+            expect(report.witnessClaims).toBe(0);
+            expect(report.quarantined).toBe(0);
+            expect(report.alreadyClaimedDeposits).toBeGreaterThanOrEqual(3);
+            expect(report.alreadyClaimedWitnesses).toBeGreaterThanOrEqual(1);
+            expect(report.wouldInsertDeposits).toBe(0);
+            expect(report.wouldInsertWitnesses).toBe(0);
+            expect(report.conflicts).toEqual([]);
+            expect(await prisma.providerObservationClaim.count({ where: { observationKey: { contains: tag } } })).toBe(before);
+        }, 120000);
+
+        test('a correct pre-existing customer-deposit claim is an idempotent replay', async () => {
+            const row = await ownerRow();
+            expect(row.purpose).toBe('CUSTOMER_DEPOSIT');
+            const dry = jsonOf(runInstaller(['--dry-run', '--json']).stdout);
+            expect(dry.conflicts).toEqual([]);
+            expect(dry.alreadyCorrect.deposits.map((d) => d.observationKey)).toContain(key(R_PREEXISTING));
+            const after = await ownerRow();
+            expect(after.claimedByRef).toBe(row.claimedByRef);
+        }, 120000);
+
+        test('a correct pre-existing treasury-witness claim matches, including its account identity', async () => {
+            const row = await prisma.providerObservationClaim.findUnique({ where: { observationKey: key(R_WITNESS) } });
+            expect(row.purpose).toBe('TREASURY_WITNESS');
+            expect(row.claimedByRef).toBe(`${tag}-opening-witness`);
+            // The opening's trusted wallet account is durable, so the claim
+            // records it — and the comparison covers it.
+            expect(row.accountKey).toBe('0244000000');
+            const dry = jsonOf(runInstaller(['--dry-run', '--json']).stdout);
+            expect(dry.alreadyCorrect.witnesses.map((w) => w.observationKey)).toContain(key(R_WITNESS));
+        }, 120000);
+
+        const injectConflict = async (r, data) => {
+            await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(r) } });
+            await prisma.providerObservationClaim.create({
+                data: { observationKey: key(r), purpose: 'CUSTOMER_DEPOSIT', claimedByRef: r, provider: 'moolre', ...data },
+            });
+        };
+
+        test('a pre-existing claim with the WRONG OWNER refuses the run and writes nothing', async () => {
+            await injectConflict(R_CONFLICT_OWNER, { claimedByRef: 'someone-elses-deposit' });
+            const before = await prisma.providerObservationClaim.count({ where: { observationKey: { contains: tag } } });
+
+            const res = runInstaller(['--json']);
+            expect(res.code).toBe(2);
+            expect(res.stderr).toMatch(/PRE-EXISTING CLAIM CONFLICT/);
+            expect(res.stderr).toMatch(/claimedByRef=someone-elses-deposit/);
+            // nothing written: not the conflicting row, not any other claim
+            expect(await prisma.providerObservationClaim.count({ where: { observationKey: { contains: tag } } })).toBe(before);
+            const row = await prisma.providerObservationClaim.findUnique({ where: { observationKey: key(R_CONFLICT_OWNER) } });
+            expect(row.claimedByRef).toBe('someone-elses-deposit');
+
+            // dry run reports the same conflict without writing
+            const dry = jsonOf(runInstaller(['--dry-run', '--json']).stdout);
+            expect(dry.conflicts.map((c) => c.observationKey)).toContain(key(R_CONFLICT_OWNER));
+            expect(dry.conflicts[0].diffs.join(' ')).toMatch(/claimedByRef/);
+
+            await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(R_CONFLICT_OWNER) } });
+        }, 120000);
+
+        test('a pre-existing claim with the WRONG PURPOSE refuses the run', async () => {
+            await injectConflict(R_CONFLICT_PURPOSE, { purpose: 'TREASURY_WITNESS' });
+            const res = runInstaller(['--json']);
+            expect(res.code).toBe(2);
+            expect(res.stderr).toMatch(/purpose=TREASURY_WITNESS/);
+            const row = await prisma.providerObservationClaim.findUnique({ where: { observationKey: key(R_CONFLICT_PURPOSE) } });
+            expect(row.purpose).toBe('TREASURY_WITNESS');
+            await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(R_CONFLICT_PURPOSE) } });
+        }, 120000);
+
+        test('a MALFORMED legacy claimedByRef (the historic {uuid} array binding) refuses the run', async () => {
+            await injectConflict(R_CONFLICT_MALFORMED, { claimedByRef: '{4d0a4d61-0000-4000-8000-000000000000}' });
+            const res = runInstaller(['--json']);
+            expect(res.code).toBe(2);
+            expect(res.stderr).toMatch(/claimedByRef is malformed/);
+            const row = await prisma.providerObservationClaim.findUnique({ where: { observationKey: key(R_CONFLICT_MALFORMED) } });
+            expect(row.claimedByRef).toBe('{4d0a4d61-0000-4000-8000-000000000000}');
+            await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(R_CONFLICT_MALFORMED) } });
+        }, 120000);
+
+        test('the quarantine row of a collision is itself refused as an owner conflict when it is not this claim', async () => {
+            // A QUARANTINE row is neither a replay nor this claim: it must be
+            // reported, never silently accepted as a successful backfill.
+            const dry = jsonOf(runInstaller(['--dry-run', '--json']).stdout);
+            expect(dry.wouldQuarantine).toBeGreaterThanOrEqual(3);
+            expect(dry.quarantined).toBe(0);
+        }, 120000);
+    });
 });

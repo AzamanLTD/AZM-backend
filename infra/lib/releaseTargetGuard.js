@@ -65,27 +65,44 @@ const ALLOWED_URL_PARAMS = Object.freeze([
 ]);
 
 /**
- * Independent deployment authorization.
+ * Independent, per-release deployment authorization.
  *
  * The Render variables (RENDER, IS_PULL_REQUEST, RENDER_GIT_BRANCH,
- * RENDER_SERVICE_ID, DATABASE_URL) are IDENTITY SIGNALS, not attestation: any
- * local process can export the complete tuple. An HMAC would not help either —
- * the key would sit in the same environment as the token, so the same forger
- * could mint one. What a forger cannot do is produce a signature without the
- * private half of a keypair whose PUBLIC half is pinned in this file.
+ * RENDER_SERVICE_ID, RENDER_GIT_COMMIT, DATABASE_URL) are IDENTITY SIGNALS, not
+ * attestation: any local process can export the complete tuple. An HMAC cannot
+ * fix that either — the key would sit in the same environment as the token, so
+ * the same forger could mint one. A forger cannot, however, produce an Ed25519
+ * signature without the private half of a keypair whose PUBLIC half is pinned in
+ * this file.
  *
- *   payload = "release:v1:<approvedServiceId>:<approvedBranch>"
- *   token   = base64( Ed25519-sign(privateKey, payload) )   → AZM_DEPLOY_AUTH_TOKEN
+ * The signature covers ONE release, not a service in general:
  *
- * The private key is held by the operator (and, to mint the token, by whoever
- * performs the approved deploy); it is NEVER committed, never in CI, and never
- * in this repository. This is not attestation that Render started the process —
- * that is not achievable from inside the process. It proves possession of a
- * secret that only the operator holds, and the runbook keeps independent
- * operator authorization for the deploy action itself.
+ *   payload = release:v2|<serviceId>|<branch>|<commit>|<dbHost>|<dbPort>|<dbName>|<issuedAt>|<expiresAt>
+ *   token   = base64url(payload) + "." + base64url(Ed25519-sign(privateKey, payload))
+ *
+ * so a token minted for commit X cannot authorize commit Y, cannot be replayed
+ * against another service, branch or database, and stops working after a short
+ * window. RENDER_GIT_COMMIT is the commit SHA of the deploy being built (Render
+ * documents it as available at build time and runtime), which is what makes the
+ * binding real at the phase where `npm run release` runs.
+ *
+ * REPLAY SCOPE — stated, not hidden: this is NOT single-use authorization. There
+ * is no nonce store, and a genuine one-use mechanism cannot be added here without
+ * either new persistent state in the production database before the guard has
+ * decided the target is production, or an external service the release chain
+ * cannot depend on. The residual capability is therefore: the SAME signed
+ * release authorization can be replayed, but only for the same service, the same
+ * branch, the same commit and the same database, and only until it expires
+ * (15 minutes by default, 60 at most). It cannot authorize any other release.
+ *
+ * The private key is held by the operator and is never committed, never in CI
+ * and never in the application runtime.
  */
 const DEPLOY_AUTH_TOKEN_ENV = 'AZM_DEPLOY_AUTH_TOKEN';
-const DEPLOY_AUTH_CONTEXT = 'release:v1';
+const DEPLOY_AUTH_CONTEXT = 'release:v2';
+const DEPLOY_AUTH_MAX_WINDOW_SECONDS = 60 * 60;
+const DEPLOY_AUTH_CLOCK_SKEW_SECONDS = 120;
+const DEPLOY_COMMIT_ENV = 'RENDER_GIT_COMMIT';
 
 /**
  * Pinned verification key. Rotating it is a deliberate, reviewable code change;
@@ -99,37 +116,135 @@ MCowBQYDK2VwAyEA3Q9g+IPL7HAoD4AgixIBR7KGmi4MQsZoUjvspWyRkYA=
 -----END PUBLIC KEY-----`,
 };
 
-function deployAuthorizationPayload({ serviceId, branch } = {}) {
-    const id = serviceId || APPROVED_PRODUCTION.serviceId;
-    const ref = branch || APPROVED_PRODUCTION.branch;
-    return `${DEPLOY_AUTH_CONTEXT}:${id}:${ref}`;
+const b64url = (buf) => Buffer.from(buf).toString('base64url');
+
+/** The canonical bytes that are signed. Every bound fact is in this string. */
+function deployAuthorizationPayload({
+    serviceId,
+    branch,
+    commit,
+    database,
+    issuedAt,
+    expiresAt,
+} = {}) {
+    const db = database || {
+        host: APPROVED_PRODUCTION.databaseHost,
+        port: APPROVED_PRODUCTION.databasePort,
+        name: APPROVED_PRODUCTION.databaseName,
+    };
+    const fields = [
+        DEPLOY_AUTH_CONTEXT,
+        serviceId || APPROVED_PRODUCTION.serviceId,
+        branch || APPROVED_PRODUCTION.branch,
+        commit || '',
+        db.host || '',
+        db.port || '',
+        db.name || '',
+        issuedAt || '',
+        expiresAt || '',
+    ];
+    return fields.join('|');
 }
 
-/** Operator tooling: sign the payload with the private key to mint a token. */
-function computeDeployAuthorizationToken(privateKeyPem, { serviceId, branch } = {}) {
+/**
+ * Operator tooling: mint one release authorization.
+ * Defaults are the approved service/branch/database and a 15-minute window.
+ */
+function computeDeployAuthorizationToken(privateKeyPem, {
+    serviceId,
+    branch,
+    commit,
+    database,
+    issuedAt,
+    expiresAt,
+    ttlSeconds = 15 * 60,
+} = {}) {
     const crypto = require('crypto');
-    return crypto
-        .sign(null, Buffer.from(deployAuthorizationPayload({ serviceId, branch })), privateKeyPem)
-        .toString('base64');
+    const now = new Date();
+    const issued = issuedAt || now.toISOString();
+    const expires = expiresAt || new Date(new Date(issued).getTime() + ttlSeconds * 1000).toISOString();
+    const payload = deployAuthorizationPayload({ serviceId, branch, commit, database, issuedAt: issued, expiresAt: expires });
+    const signature = crypto.sign(null, Buffer.from(payload), privateKeyPem);
+    return `${b64url(payload)}.${b64url(signature)}`;
 }
 
-function deployAuthorizationValid(env) {
+const AUTH_REFUSALS = Object.freeze({
+    MISSING: 'RELEASE_REFUSED_NO_DEPLOY_AUTHORIZATION',
+    INVALID: 'RELEASE_REFUSED_INVALID_DEPLOY_AUTHORIZATION',
+    SERVICE: 'RELEASE_REFUSED_AUTH_SERVICE',
+    BRANCH: 'RELEASE_REFUSED_AUTH_BRANCH',
+    COMMIT: 'RELEASE_REFUSED_AUTH_COMMIT',
+    DATABASE: 'RELEASE_REFUSED_AUTH_DATABASE',
+    EXPIRED: 'RELEASE_REFUSED_AUTH_EXPIRED',
+    NOT_YET_VALID: 'RELEASE_REFUSED_AUTH_NOT_YET_VALID',
+    WINDOW: 'RELEASE_REFUSED_AUTH_WINDOW_TOO_LONG',
+});
+
+/**
+ * Verify one release authorization against the environment.
+ * Fails closed on every malformed, expired, future-dated or mismatched input.
+ *
+ * @returns {{ok: boolean, code: string|null, detail: object}}
+ */
+function deployAuthorizationVerdict(env) {
+    const deny = (code, detail = {}) => ({ ok: false, code, detail });
     const token = env[DEPLOY_AUTH_TOKEN_ENV];
-    if (typeof token !== 'string' || !token.trim()) return { ok: false, reason: 'missing' };
+    if (typeof token !== 'string' || !token.trim()) return deny(AUTH_REFUSALS.MISSING, { reason: 'absent' });
+
+    const parts = token.trim().split('.');
+    if (parts.length !== 2 || !parts[0] || !parts[1]) return deny(AUTH_REFUSALS.INVALID, { reason: 'malformed token' });
+
+    let payload;
     let signature;
     try {
-        signature = Buffer.from(token.trim(), 'base64');
+        payload = Buffer.from(parts[0], 'base64url').toString('utf8');
+        signature = Buffer.from(parts[1], 'base64url');
     } catch {
-        return { ok: false, reason: 'mismatch' };
+        return deny(AUTH_REFUSALS.INVALID, { reason: 'undecodable token' });
     }
-    if (!signature.length) return { ok: false, reason: 'mismatch' };
+    if (!signature.length || !payload) return deny(AUTH_REFUSALS.INVALID, { reason: 'empty token part' });
+
+    const crypto = require('crypto');
+    let verified = false;
     try {
-        const crypto = require('crypto');
-        const ok = crypto.verify(null, Buffer.from(deployAuthorizationPayload()), DEPLOY_AUTH.publicKeyPem, signature);
-        return { ok, reason: 'mismatch' };
+        verified = crypto.verify(null, Buffer.from(payload), DEPLOY_AUTH.publicKeyPem, signature);
     } catch {
-        return { ok: false, reason: 'mismatch' };
+        verified = false;
     }
+    if (!verified) return deny(AUTH_REFUSALS.INVALID, { reason: 'signature does not verify against the pinned release key' });
+
+    const f = payload.split('|');
+    if (f.length !== 9 || f[0] !== DEPLOY_AUTH_CONTEXT) return deny(AUTH_REFUSALS.INVALID, { reason: 'payload is not a supported release authorization' });
+    const [, serviceId, branch, commit, dbHost, dbPort, dbName, issuedAt, expiresAt] = f;
+
+    const commitEnv = String(env[DEPLOY_COMMIT_ENV] || '').trim();
+    if (!commitEnv) return deny(AUTH_REFUSALS.COMMIT, { reason: `${DEPLOY_COMMIT_ENV} is not set, so the authorization cannot be bound to this deploy` });
+    if (commit !== commitEnv) return deny(AUTH_REFUSALS.COMMIT, { reason: 'the authorization is for a different commit' });
+
+    if (serviceId !== APPROVED_PRODUCTION.serviceId) return deny(AUTH_REFUSALS.SERVICE, { reason: 'the authorization is for a different service' });
+    if (branch !== APPROVED_PRODUCTION.branch) return deny(AUTH_REFUSALS.BRANCH, { reason: 'the authorization is for a different branch' });
+    if (dbHost !== APPROVED_PRODUCTION.databaseHost
+        || dbPort !== APPROVED_PRODUCTION.databasePort
+        || dbName !== APPROVED_PRODUCTION.databaseName) {
+        return deny(AUTH_REFUSALS.DATABASE, { reason: 'the authorization is for a different database identity' });
+    }
+
+    const issued = Date.parse(issuedAt);
+    const expires = Date.parse(expiresAt);
+    if (!Number.isFinite(issued) || !Number.isFinite(expires) || expires <= issued) {
+        return deny(AUTH_REFUSALS.INVALID, { reason: 'issuance or expiry time is malformed' });
+    }
+    const windowSeconds = (expires - issued) / 1000;
+    if (windowSeconds > DEPLOY_AUTH_MAX_WINDOW_SECONDS) {
+        return deny(AUTH_REFUSALS.WINDOW, { reason: `the validity window exceeds ${DEPLOY_AUTH_MAX_WINDOW_SECONDS}s` });
+    }
+    const now = Date.now();
+    if (issued > now + DEPLOY_AUTH_CLOCK_SKEW_SECONDS * 1000) {
+        return deny(AUTH_REFUSALS.NOT_YET_VALID, { reason: 'the authorization is issued in the future' });
+    }
+    if (now >= expires) return deny(AUTH_REFUSALS.EXPIRED, { reason: 'the authorization has expired' });
+
+    return { ok: true, code: null, detail: { commit, expiresAt } };
 }
 
 function normaliseUrl(value) {
@@ -264,13 +379,14 @@ function evaluateReleaseTarget(env = process.env) {
                 'the configured database is not the approved production database (host, port and database name must all match)', { context });
         }
 
-        // 5. Independent authorization. The identity tuple above is forgeable
-        //    by any local process; the token is not, because it needs a secret
-        //    that only the approved service environment holds.
-        const auth = deployAuthorizationValid(env);
+        // 5. Independent authorization for THIS release. The identity tuple
+        //    above is forgeable by any local process; a signature that binds the
+        //    service, branch, commit, database and a short validity window is
+        //    not, because it needs a private key only the operator holds.
+        const auth = deployAuthorizationVerdict(env);
         if (!auth.ok) {
-            return refuse(auth.reason === 'missing' ? 'RELEASE_REFUSED_NO_DEPLOY_AUTHORIZATION' : 'RELEASE_REFUSED_INVALID_DEPLOY_AUTHORIZATION',
-                `production DDL requires a valid ${DEPLOY_AUTH_TOKEN_ENV} signature from the release key; the identity tuple alone is not authorization`,
+            return refuse(auth.code,
+                `production DDL requires a valid per-release ${DEPLOY_AUTH_TOKEN_ENV} for this commit; the identity tuple alone is not authorization (${auth.detail.reason})`,
                 { context, target: 'approved-production' });
         }
 
@@ -321,7 +437,11 @@ module.exports = {
     deployAuthorizationPayload,
     ALLOWED_URL_PARAMS,
     DEPLOY_AUTH_TOKEN_ENV,
+    DEPLOY_COMMIT_ENV,
+    DEPLOY_AUTH_MAX_WINDOW_SECONDS,
     DEPLOY_AUTH,
+    deployAuthorizationVerdict,
+    AUTH_REFUSALS,
     matchesApprovedDatabase,
     isRenderContext,
     APPROVED_PRODUCTION,
