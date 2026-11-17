@@ -7,6 +7,7 @@
 // them) threw "Prisma is not defined" before responding. No test covered this
 // controller, so CI stayed green while the endpoint was broken in production.
 const logger = require('../src/config/logger');
+const { requestAmountExact } = require('../utils/exactAmount');
 const { Prisma } = require('@prisma/client');
 const ledger = require('../services/ledgerService');
 const { consumeStepUp, isStepUpEnforced } = require('../middleware/requireActionStepUp');
@@ -35,6 +36,9 @@ exports.requestWithdrawal = async (req, res) => {
         const { amount, destination, destinationType, networkPref } = req.body;
         const userId = req.user.id;
         const withdrawAmount = parseFloat(amount);
+        // The exact value of what the client sent, kept separately: legacy math
+        // below stays as it is, but a guard must not measure a double.
+        const withdrawAmountExact = requestAmountExact(amount);
 
         // 1. Basic Validation
         // r42: provably pre-economics failures — the claim (if any) is released
@@ -90,6 +94,50 @@ exports.requestWithdrawal = async (req, res) => {
             totalGasFee = detectedNetwork === "ERC20" ? settings.gasFeeErc20 : settings.gasFeeBep20;
         } else if (payoutMethod === "MOMO") {
             totalGasFee = 0.0;
+
+            // DUST-SETTLEMENT GUARD (owner policy on #369): a MoMo payout
+            // is realized in GHS by the payout worker at dispatch time —
+            // if the USDC amount quantizes to 0.00 pesewas at the CURRENT
+            // retail rate, the withdrawal could never pay out, yet the
+            // request path would debit the user NOW and strand the funds
+            // in a PENDING row the worker cannot dispatch. Refuse BEFORE
+            // the debit with the honest verdict (the FX gate has already
+            // demanded a fresh rate for this class, so the rate read here
+            // is gate-vetted; the split verdict mirrors finance.service).
+            const rateExact = new Prisma.Decimal(String(settings?.liveRetailRate ?? 0));
+            // EXACT REQUEST AMOUNT: `String(withdrawAmount)` is the text of a
+            // double, so the pesewa boundary was decided on an approximation.
+            // When the request text cannot be read exactly there is nothing
+            // trustworthy to measure, so it is refused before any debit.
+            if (!withdrawAmountExact) {
+                res.locals.financialClaimRelease = true;
+                return res.status(400).json({ success: false, message: "Invalid amount." });
+            }
+            const payoutGhs = withdrawAmountExact
+                .times(rateExact)
+                .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
+            if (!rateExact.gt(0)) {
+                res.locals.financialClaimRelease = true;
+                return res.status(503).json({
+                    success: false,
+                    code: 'FIAT_RATE_UNAVAILABLE',
+                    message: 'Current USDC/GHS retail exchange rate is unavailable. Nothing was deducted. Please try again shortly.',
+                    retryable: true
+                });
+            }
+            if (!payoutGhs.gt(0)) {
+                const minAmountUsdc = new Prisma.Decimal('0.005')
+                    .div(rateExact)
+                    .toDecimalPlaces(8, Prisma.Decimal.ROUND_CEIL);
+                res.locals.financialClaimRelease = true;
+                return res.status(400).json({
+                    success: false,
+                    code: 'DUST_SETTLEMENT',
+                    message: 'This amount would settle to 0.00 GHS. The minimum withdrawable at the current rate is ' +
+                        minAmountUsdc.toFixed(8) + ' USDC. Nothing was deducted.',
+                    data: { minAmountUsdc: minAmountUsdc.toFixed(8) }
+                });
+            }
         }
 
         // Calculate the 50/50 Split!

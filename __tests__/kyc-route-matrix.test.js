@@ -49,7 +49,11 @@ const ROUTERS = {
 
 // A path is money-moving when it names an economic verb. Deliberately broad:
 // over-inclusion here surfaces as an explicit exemption, never as silence.
-const MONEY_PATH = /(withdraw|deposit|initiate|fund|transfer|pay|contribute|payout|buy|topup|top-up|trade)/i;
+// 'contract' was a genuine blind spot: the susu liability-contract routes accept
+// group terms and the token matched nothing here, so they were never scanned at
+// all. They are now classified, and exempted WITH a reason that a reviewer can
+// disagree with, instead of silently escaping the inventory.
+const MONEY_PATH = /(withdraw|deposit|initiate|fund|transfer|pay|contribute|payout|buy|topup|top-up|trade|contract)/i;
 
 // Routes that match MONEY_PATH but must NOT carry an interactive KYC gate.
 // Each entry is a REASON the reviewer can disagree with, not a blanket skip.
@@ -67,7 +71,6 @@ const EXEMPT = Object.freeze({
     'withdrawalRoutes POST /ghs/quote': 'read-only funding plan; no debit',
     'withdrawalRoutes POST /bank/quote': 'read-only quote; no debit',
     'depositRoutes POST /validate-name': 'read-only MoMo name lookup; no debit',
-    'tradeRoutes POST /accept': 'counterparty accepts an already-authorised trade',
     'tradeRoutes POST /decline': 'counterparty declines; no money moves',
     'tradeRoutes POST /extend': 'changes the deadline of an existing trade',
     'tradeRoutes POST /extend/respond': 'answers an extension request; no money moves',
@@ -75,6 +78,10 @@ const EXEMPT = Object.freeze({
     'tradeRoutes POST /dispute': 'opens a dispute on an existing trade',
     'tradeRoutes POST /review': 'post-completion rating; no money moves',
     'escrowRoutes POST /cancel': 'releases an already-authorised escrow; blocking strands funds',
+    'susuRoutes POST /groups/:id/contract':
+        'records acceptance of group terms; no balance, escrow or ledger write occurs at acceptance',
+    'susuRoutes POST /:id/contract/accept':
+        'records acceptance of group terms; contributions (the money-moving step) are gated separately',
 });
 
 function routeEntries(router) {

@@ -529,6 +529,78 @@ class PayoutBatchWorker {
                 // historical SystemFiatPool pool/threshold policy. SystemFiatPool
                 // is a compatibility / legacy projection ONLY and is never an
                 // authority input.
+                // DUST-SETTLEMENT GUARD (owner policy on #369, defense in
+                // depth): a legacy row converts USDC -> GHS at dispatch with
+                // the SAME pesewa quantization as the request-time guards
+                // (which refuse dust pre-debit for every NEW withdrawal). A
+                // row that predates those guards — or one created by a path
+                // they missed — may quantize to 0.00 GHS here: a payout
+                // that cannot exist. NEVER dispatch it to the provider; park
+                // it for manual resolution so a human decides the refund.
+                // (Authority-recorded rows cannot be dust: the reservation
+                // was only creatable through the guarded service path.)
+                // Exact-rate adaptation: #380 computed this with float arithmetic
+                // (`amount * liveRate`), but this branch deliberately replaced
+                // that with the §r42.2 exact Decimal rate (`liveRateExact`),
+                // because rounding a BINARY product is itself a money defect.
+                // The guard is preserved exactly, on the exact rate the worker
+                // already uses, and `liveRate` is NOT reintroduced.
+                // EXACT-ONLY: computed from `amountExact` (the Decimal column)
+                // and `liveRateExact`. The previous version went through `amount`
+                // — the Number presentation copy — and then through
+                // `Number(...toFixed(2))`, so the dust verdict itself was decided
+                // on a binary product. A guard whose job is to stop an impossible
+                // payout cannot be the one place that loses exactness.
+                let legacyPayoutGhsExact = null;
+                let legacyPayoutFailure = null;
+                if (!liveRateExact || !liveRateExact.isFinite() || liveRateExact.lessThanOrEqualTo(0)) {
+                    legacyPayoutFailure = 'PAYOUT_CALCULATION_NOT_DISPATCHABLE';
+                } else {
+                    try {
+                        legacyPayoutGhsExact = amountExact
+                            .times(liveRateExact)
+                            .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
+                        if (!legacyPayoutGhsExact.isFinite()) {
+                            legacyPayoutGhsExact = null;
+                            legacyPayoutFailure = 'PAYOUT_CALCULATION_NOT_DISPATCHABLE';
+                        }
+                    } catch (_) {
+                        legacyPayoutGhsExact = null;
+                        legacyPayoutFailure = 'PAYOUT_CALCULATION_NOT_DISPATCHABLE';
+                    }
+                }
+
+                // A payout this code cannot MEASURE must never reach the
+                // provider. It is not proven dust (that would mislabel the
+                // failure), so it parks under its own reason and a human decides.
+                if (legacyPayoutFailure) {
+                    const parked = await this._parkForManualReview(withdrawal, legacyPayoutFailure, {
+                        amountExact: amountExact.toString(),
+                        liveRateExact: liveRateExact ? liveRateExact.toString() : null,
+                        message: 'The GHS payout for this row could not be computed exactly (rate unusable or product non-finite); nothing was dispatched.'
+                    });
+                    if (parked) results.flaggedManualReview.push({ id: withdrawal.id, reason: legacyPayoutFailure, amount });
+                    continue;
+                }
+
+                // Only a PROVEN exact zero parks as dust, and the evidence is the
+                // exact decimal product plus the exact rate and amount that made it.
+                if (legacyPayoutGhsExact.lessThanOrEqualTo(0)) {
+                    const parked = await this._parkForManualReview(withdrawal, 'DUST_SETTLEMENT', {
+                        amount,
+                        amountExact: amountExact.toString(),
+                        liveRate: liveRateExact.toString(),
+                        liveRateExact: liveRateExact.toString(),
+                        // `payoutGhs` is the historical evidence key. It now
+                        // carries EXACT text ("0.00") instead of a double, so
+                        // existing readers keep working and lose no precision.
+                        payoutGhs: legacyPayoutGhsExact.toFixed(2),
+                        payoutGhsExact: legacyPayoutGhsExact.toFixed(2),
+                        message: `Dust settlement: ${amountExact.toString()} USDC quantizes to 0.00 GHS at the current rate — never dispatched, parked for manual resolution`
+                    });
+                    if (parked) results.flaggedManualReview.push({ id: withdrawal.id, reason: 'DUST_SETTLEMENT', amount });
+                    continue;
+                }
                 const poolBalanceNow = await ensureLegacyPool();
                 if (poolBalanceNow.lessThan(thresholdExact) || poolBalanceNow.lessThan(amountExact)) {
                     const parked = await this._parkForManualReview(withdrawal, 'INSUFFICIENT_POOL_LIQUIDITY', {

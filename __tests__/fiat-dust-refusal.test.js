@@ -93,7 +93,7 @@ describeOrSkip('fiat payout dust refusal (real PostgreSQL)', () => {
             financeService.processFiatWithdrawal(prisma, userId, DUST_USDC, {
                 reference, payoutMethod: 'MTN_MOMO', network: 'MTN', destination: '0240000000',
             })
-        ).rejects.toMatchObject({ code: 'FIAT_RATE_UNAVAILABLE' });
+        ).rejects.toMatchObject({ code: 'DUST_SETTLEMENT' });
 
         // 1. the customer's USDC balance is untouched
         const afterUser = await prisma.user.findUnique({ where: { id: userId } });
@@ -126,7 +126,7 @@ describeOrSkip('fiat payout dust refusal (real PostgreSQL)', () => {
             financeService.processFiatWithdrawal(prisma, user.id, DUST_USDC, {
                 reference: `DUST2_${Date.now()}`, payoutMethod: 'MTN_MOMO', network: 'MTN', destination: '0240000000',
             })
-        ).rejects.toMatchObject({ code: 'FIAT_RATE_UNAVAILABLE' });
+        ).rejects.toMatchObject({ code: 'DUST_SETTLEMENT' });
         expect(await prisma.withdrawal.count({ where: { userId: user.id } })).toBe(0);
         await prisma.systemFiatPool.update({ where: { id: 1 }, data: { balance: 1_000_000 } });
     });
