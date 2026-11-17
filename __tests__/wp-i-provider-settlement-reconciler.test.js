@@ -42,6 +42,9 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
     const clearFixtureTables = async () => {
         await prisma.fiatProviderEvent.deleteMany({});
         await prisma.providerSettlementWitness.deleteMany({});
+        // The shared observation claim outlives a single operation, so a suite
+        // that reuses provider references must clear it or later cases collide.
+        await prisma.providerObservationClaim.deleteMany({});
         await prisma.fiatLiquidityReceipt.deleteMany({});
     };
 

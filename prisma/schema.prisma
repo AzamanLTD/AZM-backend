@@ -7623,6 +7623,36 @@ model SavedBankBeneficiary {
 /// the reconciliation process under its own database identity; the API runtime
 /// has no write path to this table. Immutable by convention (no update path is
 /// exposed) and single-use per treasury opening.
+/// §WP-I — ONE provider observation, ONE economic use, ACROSS PATHS.
+///
+/// The cross-path guard used to be a READ of the other path's records inside a
+/// different transaction. Two concurrent operations could each read "not used
+/// yet" and both commit, so one Moolre collection could fund a customer deposit
+/// AND a treasury opening. Both paths now INSERT a claim for the same canonical
+/// observation inside their own economic transaction; the unique index is the
+/// only arbiter and the loser's transaction is discarded whole.
+model ProviderObservationClaim {
+  id             String   @id @default(uuid())
+  /// Canonical identity: "<provider>|collection|<provider reference>".
+  /// Derived only from validated provider data — never caller amount/currency.
+  observationKey String   @unique
+  /// CUSTOMER_DEPOSIT | TREASURY_WITNESS
+  purpose        String
+  /// Owner of the claim inside that purpose (deposit id / opening dedup key),
+  /// so a retry of the SAME operation is idempotent and a second use is not.
+  claimedByRef   String?
+  provider       String
+  /// Observed account, when the provider exposed one. Not part of the key
+  /// (references are provider-global); a same-key/different-account collision is
+  /// refused for operator review rather than merged.
+  accountKey     String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([purpose])
+  @@index([provider, createdAt])
+}
+
 model ProviderSettlementWitness {
   id               String   @id @default(uuid())
   openingDedupKey  String   @unique // single-use binding to exactly one opening

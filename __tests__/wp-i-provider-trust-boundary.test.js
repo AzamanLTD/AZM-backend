@@ -48,6 +48,15 @@ function fakeTx({ opening = OPENING } = {}) {
         fiatProviderEvent: {
             findFirst: async () => (global.__depositUseStub ? { dedupKey: global.__depositUseStub, status: 'FUNDED' } : null),
         },
+        // The shared observation claim needs raw SQL (INSERT ... ON CONFLICT) so a
+        // losing racer never poisons its transaction. A stub transaction cannot
+        // enforce that, so it reports the claim as acquired; the real arbitration
+        // is proven against PostgreSQL in
+        // __tests__/wp-i-observation-claim-concurrency.pg.test.js. Without this the
+        // service fails closed, which is the correct behaviour for a client that
+        // genuinely cannot enforce it.
+        $executeRaw: async () => 1,
+        $executeRawUnsafe: async () => 1,
         providerSettlementWitness: {
             create: async ({ data }) => {
                 // Model the schema's @unique(openingDedupKey): one witness, one opening.

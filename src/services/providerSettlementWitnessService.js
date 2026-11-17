@@ -32,6 +32,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const { claimProviderObservation, CLAIM_PURPOSE } = require('./providerObservationClaimService');
 
 /** Currencies this witness layer can prove. GHS only, deliberately. */
 const WITNESS_CURRENCIES = Object.freeze(['GHS']);
@@ -519,6 +520,26 @@ async function recordProviderSettlementWitness(tx, input = {}) {
           );
       }
   }
+
+  // ── THE ARBITER ──────────────────────────────────────────────────────────
+  // Everything above is a READ of the other path's records, which cannot see a
+  // deposit committing in a parallel transaction. This insert, inside THIS
+  // transaction, is the only thing that can arbitrate: the deposit path takes
+  // the same claim for the same canonical observation, and the unique index
+  // decides. A loser throws and its whole transaction — witness included — is
+  // discarded. Same-opening retries converge and are settled by the existing
+  // witness uniqueness below.
+  await claimProviderObservation(tx, {
+    provider,
+    reference: observedReference ?? observedTransactionId ?? null,
+    // The TRUSTED account is the one the opening was configured for, read from
+    // the stored opening — never the account the provider response claims. The
+    // witness's account/currency mapping is already validated against it above,
+    // and this is the identity that must agree across the deposit path too.
+    accountNumber: opening.walletAccount ?? null,
+    purpose: CLAIM_PURPOSE.TREASURY_WITNESS,
+    claimedByRef: openingDedupKey,
+  });
 
   const alreadyUsed = await tx.providerSettlementWitness.findUnique({ where: { observationKey } });
   if (alreadyUsed) {

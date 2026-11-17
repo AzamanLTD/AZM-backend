@@ -30,6 +30,7 @@ const {
 const {
     LATE_DEPOSIT_SETTLEMENT_GRACE_MS,
 } = require('../config/lateDepositSettlement');
+const { claimProviderObservation, CLAIM_PURPOSE } = require('./providerObservationClaimService');
 const fiatLiquidity = require('./fiatLiquidityService');
 const modelBSettlement = require('../../services/modelBSettlementService');
 const nativeGhsSettlement = require('../../src/services/nativeGhsSettlementService'); // GHS-native collection settlement (flag-gated, #369)
@@ -140,6 +141,23 @@ async function settleMoolreDeposit(prisma, {
     }
 
     const result = await prisma.$transaction(async (tx) => {
+    // ── THE ARBITER ──────────────────────────────────────────────────────────
+    // First write of the transaction: claim this provider observation for the
+    // customer-deposit economic use. The treasury-witness path takes the same
+    // claim for the same canonical observation, so PostgreSQL decides which
+    // single use wins. A conflict here aborts everything below — no quote
+    // consumption, no credit, no ledger posting, and the deposit stays PENDING.
+    // A retry of THIS deposit converges (same owner ref) and is then settled by
+    // the existing conditional state transition.
+    const observationClaim = await claimProviderObservation(tx, {
+      provider: providerEvent.provider || 'moolre',
+      reference: externalRef,
+      accountNumber: providerEvent.accountNumber || null,
+      purpose: CLAIM_PURPOSE.CUSTOMER_DEPOSIT,
+      claimedByRef: String(deposit.id),
+    });
+    void observationClaim; // claimed=true, or samePathRetry=true for this deposit
+
     // §271 late-settlement policy (shared by the mounted webhook AND the
     // same-reference status-query recovery): a provider confirmation arriving
     // after the quote's expiry but WITHIN the bounded grace window settles
