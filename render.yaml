@@ -21,6 +21,11 @@
 #   preDeployCommand: absent — Free does not execute it, and declaring it here
 #                     is what made the repository disagree with reality
 #   deploys         : manual only
+#   AZM_DEPLOY_AUTH_TOKEN: PROPOSED — the release chain refuses production DDL
+#                     without a signature from the operator-held key (see the
+#                     runbook, "Release authorization"). Set it as a secret; the
+#                     token is never committed. Without it the guard fails closed
+#                     with RELEASE_REFUSED_NO_DEPLOY_AUTHORIZATION.
 #
 # WHY THE FULL CHAIN RUNS IN BUILD: the release chain is the only sanctioned
 # production DDL path, and a Build Command completes BEFORE the new version

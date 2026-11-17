@@ -208,6 +208,41 @@ describe('the runbook distinguishes the ACTUAL deployment from the PROPOSED one'
     });
 });
 
+describe('every document agrees on the chain and the production schema path', () => {
+    test('the chain is 32 && segments: one guard plus 31 commands', () => {
+        const chain = releaseChain(); // every && segment, guard included
+        expect(chain).toHaveLength(32);
+        expect(chain.filter((c) => !/verify-release-target/.test(c))).toHaveLength(31);
+        expect(JSON.parse(read('package.json')).scripts.release.split('&&')).toHaveLength(32);
+        expect(read('DEPLOY_RUNBOOK.md')).toMatch(/32 `&&` segments/);
+        expect(read('DEPLOY_RUNBOOK.md')).toMatch(/31 commands/);
+    });
+
+    test('migrate deploy is never offered as a production instruction', () => {
+        const wpI = read('docs/wp-i-reconciler-runbook.md');
+        expect(wpI).toMatch(/NON-PRODUCTION/);
+        const offender = wpI.split('\n').filter((l) => /prisma migrate deploy/.test(l))
+            .filter((l) => !/NON-PRODUCTION|non-production|never run|against production/i.test(l));
+        expect(offender).toEqual([]);
+        // And the production schema contract stays stated in the deploy runbook.
+        expect(read('DEPLOY_RUNBOOK.md')).toMatch(/`prisma migrate deploy` is NOT part/);
+    });
+
+    test('the production release chain requires operator-signed authorization', () => {
+        expect(read('DEPLOY_RUNBOOK.md')).toMatch(/Release authorization/);
+        expect(read('DEPLOY_RUNBOOK.md')).toMatch(/AZM_DEPLOY_AUTH_TOKEN/);
+        expect(read('DEPLOY_RUNBOOK.md')).toMatch(/NOT cryptographic proof that Render\s+started the\s+process/);
+        expect(read('render.yaml')).toMatch(/AZM_DEPLOY_AUTH_TOKEN/);
+    });
+
+    test('no workflow runs the production release chain against a non-production database', () => {
+        const bootstrap = read('.github/workflows/bootstrap-azaman-new.yml');
+        const runsRelease = bootstrap.split('\n').some((l) => /^\s*run:\s*(npm run release|node infra\/verify-release-target)/.test(l));
+        expect(runsRelease).toBe(false);
+        expect(bootstrap).toMatch(/separately reviewed, non-production provisioning path/);
+    });
+});
+
 describe('render.yaml is labelled as proposed configuration', () => {
     const yaml = read('render.yaml');
     const header = yaml.slice(0, yaml.indexOf('services:'));

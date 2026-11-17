@@ -55,6 +55,83 @@ const DISPOSABLE_TEST_HOSTS = Object.freeze(['localhost', '127.0.0.1', '::1']);
 
 const RENDER_MARKER = 'RENDER';
 
+/**
+ * Query parameters we understand. Anything else is refused rather than ignored:
+ * a `search_path`, a pooler directive or an unknown switch can change WHERE the
+ * DDL lands without changing the host, so it is part of the target identity.
+ */
+const ALLOWED_URL_PARAMS = Object.freeze([
+    'sslmode', 'sslcert', 'sslrootcert', 'application_name', 'connect_timeout', 'schema',
+]);
+
+/**
+ * Independent deployment authorization.
+ *
+ * The Render variables (RENDER, IS_PULL_REQUEST, RENDER_GIT_BRANCH,
+ * RENDER_SERVICE_ID, DATABASE_URL) are IDENTITY SIGNALS, not attestation: any
+ * local process can export the complete tuple. An HMAC would not help either —
+ * the key would sit in the same environment as the token, so the same forger
+ * could mint one. What a forger cannot do is produce a signature without the
+ * private half of a keypair whose PUBLIC half is pinned in this file.
+ *
+ *   payload = "release:v1:<approvedServiceId>:<approvedBranch>"
+ *   token   = base64( Ed25519-sign(privateKey, payload) )   → AZM_DEPLOY_AUTH_TOKEN
+ *
+ * The private key is held by the operator (and, to mint the token, by whoever
+ * performs the approved deploy); it is NEVER committed, never in CI, and never
+ * in this repository. This is not attestation that Render started the process —
+ * that is not achievable from inside the process. It proves possession of a
+ * secret that only the operator holds, and the runbook keeps independent
+ * operator authorization for the deploy action itself.
+ */
+const DEPLOY_AUTH_TOKEN_ENV = 'AZM_DEPLOY_AUTH_TOKEN';
+const DEPLOY_AUTH_CONTEXT = 'release:v1';
+
+/**
+ * Pinned verification key. Rotating it is a deliberate, reviewable code change;
+ * the matching private key lives with the operator. `DEPLOY_AUTH` is exported so
+ * a test can substitute its own keypair; there is no environment override, so a
+ * forger cannot supply a different verification key at runtime.
+ */
+const DEPLOY_AUTH = {
+    publicKeyPem: `-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA3Q9g+IPL7HAoD4AgixIBR7KGmi4MQsZoUjvspWyRkYA=
+-----END PUBLIC KEY-----`,
+};
+
+function deployAuthorizationPayload({ serviceId, branch } = {}) {
+    const id = serviceId || APPROVED_PRODUCTION.serviceId;
+    const ref = branch || APPROVED_PRODUCTION.branch;
+    return `${DEPLOY_AUTH_CONTEXT}:${id}:${ref}`;
+}
+
+/** Operator tooling: sign the payload with the private key to mint a token. */
+function computeDeployAuthorizationToken(privateKeyPem, { serviceId, branch } = {}) {
+    const crypto = require('crypto');
+    return crypto
+        .sign(null, Buffer.from(deployAuthorizationPayload({ serviceId, branch })), privateKeyPem)
+        .toString('base64');
+}
+
+function deployAuthorizationValid(env) {
+    const token = env[DEPLOY_AUTH_TOKEN_ENV];
+    if (typeof token !== 'string' || !token.trim()) return { ok: false, reason: 'missing' };
+    let signature;
+    try {
+        signature = Buffer.from(token.trim(), 'base64');
+    } catch {
+        return { ok: false, reason: 'mismatch' };
+    }
+    if (!signature.length) return { ok: false, reason: 'mismatch' };
+    try {
+        const crypto = require('crypto');
+        const ok = crypto.verify(null, Buffer.from(deployAuthorizationPayload()), DEPLOY_AUTH.publicKeyPem, signature);
+        return { ok, reason: 'mismatch' };
+    } catch {
+        return { ok: false, reason: 'mismatch' };
+    }
+}
+
 function normaliseUrl(value) {
     if (typeof value !== 'string' || value.trim() === '') return null;
     try {
@@ -64,17 +141,39 @@ function normaliseUrl(value) {
     }
 }
 
-/** Extract {host, port, database} without ever exposing credentials. */
-function identifyTarget(databaseUrl) {
+/**
+ * Extract {host, port, database} without ever exposing credentials, or return
+ * the reason the URL cannot be trusted as a target identity.
+ */
+function inspectTarget(databaseUrl) {
     const url = normaliseUrl(databaseUrl);
-    if (!url) return null;
-    if (!/^postgres(ql)?:$/.test(url.protocol)) return null;
+    if (!url) return { error: 'RELEASE_REFUSED_NO_DATABASE' };
+    if (!/^postgres(ql)?:$/.test(url.protocol)) return { error: 'RELEASE_REFUSED_NO_DATABASE' };
     const host = (url.hostname || '').toLowerCase();
-    if (!host) return null;
-    const port = url.port || '5432';
-    const database = decodeURIComponent((url.pathname || '').replace(/^\//, '')).trim();
-    if (!database) return null;
-    return { host, port, database };
+    if (!host) return { error: 'RELEASE_REFUSED_NO_DATABASE' };
+
+    let database;
+    try {
+        // A malformed percent escape throws here rather than silently decoding
+        // to something we would then compare against the approved name.
+        database = decodeURIComponent((url.pathname || '').replace(/^\//, '')).trim();
+    } catch {
+        return { error: 'RELEASE_REFUSED_NO_DATABASE' };
+    }
+    if (!database) return { error: 'RELEASE_REFUSED_NO_DATABASE' };
+
+    const unexpected = [...new Set(url.searchParams.keys())].filter((k) => !ALLOWED_URL_PARAMS.includes(k));
+    if (unexpected.length) return { error: 'RELEASE_REFUSED_UNEXPECTED_URL_PARAMETERS' };
+    if (url.searchParams.has('schema') && url.searchParams.get('schema') !== 'public') {
+        return { error: 'RELEASE_REFUSED_NON_PUBLIC_SCHEMA' };
+    }
+
+    return { target: { host, port: url.port || '5432', database } };
+}
+
+function identifyTarget(databaseUrl) {
+    const inspected = inspectTarget(databaseUrl);
+    return inspected.target || null;
 }
 
 function matchesApprovedDatabase(target) {
@@ -109,7 +208,8 @@ const allow = (code, reason, extra = {}) => ({
  * Evaluate the release target. Fail-closed: unknown or absent is refused.
  */
 function evaluateReleaseTarget(env = process.env) {
-    const target = identifyTarget(env.DATABASE_URL);
+    const inspected = inspectTarget(env.DATABASE_URL);
+    const target = inspected.target || null;
     const productionDatabase = matchesApprovedDatabase(target);
 
     if (isRenderContext(env)) {
@@ -150,18 +250,32 @@ function evaluateReleaseTarget(env = process.env) {
         }
 
         // 4. Database identity must be the approved one. A remote PostgreSQL
-        //    host is not production merely because it answers on 5432.
+        //    host is not production merely because it answers on 5432, and a
+        //    malformed or parameterised URL is refused rather than read.
         if (!target) {
-            return refuse('RELEASE_REFUSED_NO_DATABASE',
-                'no usable PostgreSQL DATABASE_URL was provided to the build environment', { context });
+            const code = inspected.error === 'RELEASE_REFUSED_NO_DATABASE'
+                ? 'RELEASE_REFUSED_NO_DATABASE'
+                : inspected.error;
+            return refuse(code,
+                'the DATABASE_URL is not a usable, unparameterised PostgreSQL target identity for this build', { context });
         }
         if (!productionDatabase) {
             return refuse('RELEASE_REFUSED_WRONG_DATABASE',
                 'the configured database is not the approved production database (host, port and database name must all match)', { context });
         }
 
+        // 5. Independent authorization. The identity tuple above is forgeable
+        //    by any local process; the token is not, because it needs a secret
+        //    that only the approved service environment holds.
+        const auth = deployAuthorizationValid(env);
+        if (!auth.ok) {
+            return refuse(auth.reason === 'missing' ? 'RELEASE_REFUSED_NO_DEPLOY_AUTHORIZATION' : 'RELEASE_REFUSED_INVALID_DEPLOY_AUTHORIZATION',
+                `production DDL requires a valid ${DEPLOY_AUTH_TOKEN_ENV} signature from the release key; the identity tuple alone is not authorization`,
+                { context, target: 'approved-production' });
+        }
+
         return allow('RELEASE_TARGET_PRODUCTION',
-            'approved production deploy: approved Render service, canonical branch, approved database identity',
+            'approved production deploy: approved Render service, canonical branch, approved database identity, deploy authorization token verified',
             { context, target: 'approved-production' });
     }
 
@@ -176,8 +290,8 @@ function evaluateReleaseTarget(env = process.env) {
             { context, target: 'approved-production' });
     }
     if (!target) {
-        return refuse('RELEASE_REFUSED_NO_DATABASE',
-            'no usable PostgreSQL DATABASE_URL was provided', { context, target: 'unidentified' });
+        return refuse(inspected.error || 'RELEASE_REFUSED_NO_DATABASE',
+            'the DATABASE_URL is not a usable PostgreSQL target identity', { context, target: 'unidentified' });
     }
     if (String(env.NODE_ENV || '').toLowerCase() === 'production') {
         return refuse('RELEASE_REFUSED_PRODUCTION_NODE_ENV',
@@ -202,6 +316,12 @@ function evaluateReleaseTarget(env = process.env) {
 module.exports = {
     evaluateReleaseTarget,
     identifyTarget,
+    inspectTarget,
+    computeDeployAuthorizationToken,
+    deployAuthorizationPayload,
+    ALLOWED_URL_PARAMS,
+    DEPLOY_AUTH_TOKEN_ENV,
+    DEPLOY_AUTH,
     matchesApprovedDatabase,
     isRenderContext,
     APPROVED_PRODUCTION,

@@ -14,8 +14,11 @@
 
 const { spawnSync } = require('child_process');
 const path = require('path');
+const crypto = require('crypto');
 const {
     evaluateReleaseTarget,
+    computeDeployAuthorizationToken,
+    DEPLOY_AUTH,
     APPROVED_PRODUCTION,
     TEST_TARGET_POLICY_ENV,
     TEST_TARGET_POLICY_VALUE,
@@ -29,12 +32,30 @@ const USER = 'neondb_owner';
 /** The approved production target, with credentials that are obviously fake. */
 const PROD_URL = `postgresql://${USER}:${SECRET}@${APPROVED_PRODUCTION.databaseHost}:${APPROVED_PRODUCTION.databasePort}/${APPROVED_PRODUCTION.databaseName}`;
 
-const approvedDeploy = (over = {}) => ({
+// A TEST-ONLY keypair. The pinned production verification key is replaced for
+// the duration of this suite; the real private key is held by the operator and
+// is never in the repository.
+const testKeyPair = crypto.generateKeyPairSync('ed25519');
+const TEST_PRIVATE_PEM = testKeyPair.privateKey.export({ type: 'pkcs8', format: 'pem' });
+const PINNED_PUBLIC_PEM = DEPLOY_AUTH.publicKeyPem;
+const AUTH_TOKEN = computeDeployAuthorizationToken(TEST_PRIVATE_PEM);
+
+beforeAll(() => { DEPLOY_AUTH.publicKeyPem = testKeyPair.publicKey.export({ type: 'spki', format: 'pem' }); });
+afterAll(() => { DEPLOY_AUTH.publicKeyPem = PINNED_PUBLIC_PEM; });
+
+/** The complete identity tuple, exactly as Render would export it. */
+const renderIdentity = (over = {}) => ({
     RENDER: 'true',
     IS_PULL_REQUEST: 'false',
     RENDER_GIT_BRANCH: 'main',
     RENDER_SERVICE_ID: APPROVED_PRODUCTION.serviceId,
     DATABASE_URL: PROD_URL,
+    ...over,
+});
+
+/** The same tuple plus the deploy authorization the approved service holds. */
+const approvedDeploy = (over = {}) => renderIdentity({
+    AZM_DEPLOY_AUTH_TOKEN: AUTH_TOKEN,
     ...over,
 });
 
@@ -153,6 +174,70 @@ describe('refuses every wrong context', () => {
     });
 });
 
+describe('identity is not authorization: a forged Render tuple cannot release', () => {
+    test('the complete forged tuple is refused for want of deploy authorization', () => {
+        // Everything Render normally sets, exported by a local shell. The guard
+        // cannot tell this apart from a real Render build by environment alone,
+        // which is exactly why the authorization token exists.
+        const forged = renderIdentity();
+        const v = evaluateReleaseTarget(forged);
+        expect(v.allowed).toBe(false);
+        expect(v.code).toBe('RELEASE_REFUSED_NO_DEPLOY_AUTHORIZATION');
+    });
+
+    test('a token minted with the wrong key is refused', () => {
+        // A forger can generate its own keypair, but the guard verifies against
+        // the key pinned in code, so the signature does not verify.
+        const attacker = crypto.generateKeyPairSync('ed25519');
+        const attackerToken = computeDeployAuthorizationToken(
+            attacker.privateKey.export({ type: 'pkcs8', format: 'pem' }),
+        );
+        const v = evaluateReleaseTarget(renderIdentity({ AZM_DEPLOY_AUTH_TOKEN: attackerToken }));
+        expect(v.allowed).toBe(false);
+        expect(v.code).toBe('RELEASE_REFUSED_INVALID_DEPLOY_AUTHORIZATION');
+    });
+
+    test('a token for a DIFFERENT service is not reusable against production', () => {
+        const otherToken = computeDeployAuthorizationToken(TEST_PRIVATE_PEM, { serviceId: 'srv-azaman-new' });
+        const v = evaluateReleaseTarget(renderIdentity({ AZM_DEPLOY_AUTH_TOKEN: otherToken }));
+        expect(v.allowed).toBe(false);
+        expect(v.code).toBe('RELEASE_REFUSED_INVALID_DEPLOY_AUTHORIZATION');
+    });
+
+    test('the real authorization cannot leak into the verdict', () => {
+        const serialised = JSON.stringify(evaluateReleaseTarget(approvedDeploy()));
+        expect(serialised).not.toContain(AUTH_TOKEN);
+        expect(serialised).not.toContain(TEST_PRIVATE_PEM);
+    });
+});
+
+describe('malformed and parameterised URLs are refused, not interpreted', () => {
+    test.each([
+        ['empty database path', 'postgresql://u:pw@ep-crimson-cell-ab81e3bp.eu-west-2.aws.neon.tech:5432/'],
+        ['malformed percent escape', 'postgresql://u:pw@ep-crimson-cell-ab81e3bp.eu-west-2.aws.neon.tech:5432/neondb%zz'],
+        ['encoded path separator', 'postgresql://u:pw@ep-crimson-cell-ab81e3bp.eu-west-2.aws.neon.tech:5432/neondb%2Fevil'],
+        ['hostile query parameter', `${PROD_URL}?options=-c%20search_path%3Devil`],
+        ['non-public schema', `${PROD_URL}?schema=evil`],
+        ['unknown pooler directive', `${PROD_URL}?pgbouncer=true`],
+    ])('%s is refused', (_label, url) => {
+        const v = evaluateReleaseTarget(approvedDeploy({ DATABASE_URL: url }));
+        expect(v.allowed).toBe(false);
+        expect([
+            'RELEASE_REFUSED_NO_DATABASE',
+            'RELEASE_REFUSED_WRONG_DATABASE',
+            'RELEASE_REFUSED_UNEXPECTED_URL_PARAMETERS',
+            'RELEASE_REFUSED_NON_PUBLIC_SCHEMA',
+        ]).toContain(v.code);
+        expect(JSON.stringify(v)).not.toContain('://');
+    });
+
+    test('an approved URL is still approved WITH the standard sslmode parameter', () => {
+        const v = evaluateReleaseTarget(approvedDeploy({ DATABASE_URL: `${PROD_URL}?sslmode=require` }));
+        expect(v.allowed).toBe(true);
+        expect(v.code).toBe('RELEASE_TARGET_PRODUCTION');
+    });
+});
+
 describe('allows exactly the legitimate contexts', () => {
     test('the approved production deploy', () => {
         const v = evaluateReleaseTarget(approvedDeploy());
@@ -197,6 +282,7 @@ describe('the guard is in the chain, and refusals are silent about credentials',
         ['wrong service', approvedDeploy({ RENDER_SERVICE_ID: 'srv-other' })],
         ['wrong database', approvedDeploy({ DATABASE_URL: 'postgresql://u:pw@other.host:5432/neondb' })],
         ['missing identity', {}],
+        ['forged Render tuple', renderIdentity()],
     ])('no refusal leaks credentials or a URL (%s)', (_label, env) => {
         const verdict = evaluateReleaseTarget(env);
         expect(verdict.allowed).toBe(false);
@@ -215,12 +301,18 @@ describe('the guard is in the chain, and refusals are silent about credentials',
         }
     });
 
-    test('the CLI exits 0 only for the approved deploy and a permitted disposable target', () => {
-        expect(verify(approvedDeploy()).status).toBe(0);
+    test('the CLI exits 0 for a permitted disposable target and non-zero for a forged tuple', () => {
         expect(verify({
             DATABASE_URL: 'postgresql://postgres:postgres@localhost:5432/azm_test',
             [TEST_TARGET_POLICY_ENV]: TEST_TARGET_POLICY_VALUE,
         }).status).toBe(0);
+
+        // A child process verifies against the PINNED production key, which the
+        // suite deliberately does not hold, so even the complete Render tuple is
+        // refused there. The in-process test above covers the signed case with
+        // this suite's own keypair.
+        expect(verify(renderIdentity()).status).not.toBe(0);
+        expect(verify(approvedDeploy()).status).not.toBe(0);
     });
 });
 

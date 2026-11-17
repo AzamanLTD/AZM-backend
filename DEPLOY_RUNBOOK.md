@@ -63,6 +63,55 @@ too: its service name (`azaman-backend`) does not match the live service
 Treat that file as documentation of the intended state until an operator changes
 the real setting, and never sync it without reading its header.
 
+### Release authorization (independent of the environment tuple)
+
+The Build Command's guard checks the Render identity signals — but a local shell
+can export every one of them, so those variables are identity, not proof. The
+production allow therefore also requires a signature:
+
+| Piece | Where it lives |
+| --- | --- |
+| Ed25519 **private** key | held by the operator; never in the repository, CI or chat |
+| Ed25519 **public** key | pinned in `infra/lib/releaseTargetGuard.js` |
+| `AZM_DEPLOY_AUTH_TOKEN` | the signature, set in the approved service's environment |
+
+Mint the token with the operator key:
+
+```
+node infra/sign-deploy-authorization.js --key /secure/path/azm-release-auth.key
+```
+
+The payload is `release:v1:<approvedServiceId>:<approvedBranch>`, so a token
+minted for another service (for example Azaman-New) does not verify.
+
+**Stated trust assumption, not implied:** this proves the process holds the
+operator's signing key. It is NOT cryptographic proof that Render started the
+process; that cannot be established from inside a process. If the private key
+leaks, the guard is defeated, which is why the deploy action keeps independent
+operator authorization and the key must be rotatable by a reviewed change to the
+pinned public key.
+
+Without a valid token the chain refuses with
+`RELEASE_REFUSED_NO_DEPLOY_AUTHORIZATION` (absent) or
+`RELEASE_REFUSED_INVALID_DEPLOY_AUTHORIZATION` (wrong or foreign signature), and
+no installer runs.
+
+### The release chain is 32 `&&` segments: the guard, then 31 commands
+
+`package.json` `scripts.release` contains 32 `&&` segments — 1 guard
+(`infra/verify-release-target.js`) followed by **31 commands** — so any
+non-zero exit stops the chain before the next step. The last command is
+`infra/verify-authority-boundary.js`; nothing may be appended after it. Every
+document in this repository describes the same count and the same ordering.
+
+### Azaman-New is NOT provisioned by this chain
+
+`bootstrap-azaman-new.yml` previously ran `npm run release` against a different
+database. The guard now refuses that by design, and the workflow step stops with
+an explicit error instead of borrowing production authority. Azaman-New needs its
+own separately reviewed provisioning path; the production guard is not broadened
+to accommodate it.
+
 ### What runs where (once the proposal is applied)
 
 | Path | Installers | Barrier? |

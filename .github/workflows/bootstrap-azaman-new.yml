@@ -150,10 +150,21 @@ jobs:
           DATABASE_URL: postgresql://bootstrap:bootstrap@localhost:5432/azm_bootstrap?schema=public
         run: npx prisma generate
 
-      - name: Apply repository release chain
-        env:
-          DATABASE_URL: ${{ secrets.AZM_NEW_DATABASE_URL }}
-        run: npm run release
+      # The production release chain is NOT a generic provisioning command. It
+      # begins with infra/verify-release-target.js, which requires the approved
+      # Render service, the canonical branch, a non-preview build and the exact
+      # approved production database — Azaman-New is none of those, and the guard
+      # must not be broadened to make it one.
+      #
+      # Azaman-New therefore needs its OWN separately guarded provisioning path,
+      # reviewed on its own terms. Until that exists, this job stops here rather
+      # than borrowing production authority it does not have.
+      - name: Refuse the production release chain (Azaman-New needs its own guard)
+        run: |
+          echo "::error::Azaman-New provisioning must not run 'npm run release'."
+          echo "The production chain is guarded to the approved Render service and database identity."
+          echo "Provide a separately reviewed, non-production provisioning path before enabling this job."
+          exit 1
 
       - name: Apply remaining CI and boot-time overlays
         env:

@@ -38,7 +38,11 @@ wallets with one service per wallet, each with its own credentials.
 ## 3. Database preparation (in this order)
 
 1. **Schema** — apply the migration tree and the release overlays:
-   `prisma migrate deploy` (or `npm run release` in an environment that uses overlays).
+   **PRODUCTION:** `npm run release` (the raw-SQL overlay installers) and nothing
+   else. `prisma migrate deploy` is a NON-PRODUCTION convenience for a local or
+   disposable database only: production has no `_prisma_migrations` table and the
+   repository's migration tree is not a production schema source. Never run
+   `prisma migrate deploy` against production.
    This creates `ProviderSettlementWitness` and adds `FiatLiquidityReceipt.walletAccount`.
 2. **Roles** — create two logins: the API runtime role and the reconciler role. They must be
    different roles and neither may be the table owner.

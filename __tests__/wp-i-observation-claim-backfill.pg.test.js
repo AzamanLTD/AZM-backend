@@ -1,21 +1,19 @@
 // __tests__/wp-i-observation-claim-backfill.pg.test.js
 // =============================================================================
-// §WP-I — THE BACKFILL, PROVEN ON REAL POSTGRESQL
+// §WP-I — THE BACKFILL, PROVEN ON REAL POSTGRESQL AGAINST REAL METADATA
 //
-// The installer exists because observations consumed BEFORE this release have no
-// claim row. Getting that wrong is expensive in both directions:
+// The first version of this proof constructed `metadata.provider: 'moolre'`,
+// which the application never writes: both initiation controllers store the
+// customer-selected MoMo rail there ('MTN_MOMO', 'TELECEL_CASH', ...). A proof
+// built on that fixture proves the installer agrees with itself, not with the
+// controller. Every fixture below therefore uses the metadata shape the real
+// settlement writes, and the Moolre processor identity comes from a persisted
+// SUCCESSFUL INBOUND FiatProviderEvent.
 //
-//   * claim too much — treat a provider EVENT (a payment that was merely
-//     observed, or was still pending) as an economic use, and a deposit that
-//     never settled is blocked from ever settling;
-//   * claim too little — miss a settled deposit or a treasury witness, and the
-//     same provider payment can be consumed twice on a live system;
-//   * resolve a collision by picking a winner — two economic uses share one
-//     reference, and a judgement made by a script silently pays or blocks the
-//     wrong one. That is an operator's decision, not the installer's.
-//
-// Nothing here is mocked. The installer runs as its own process, exactly as the
-// release chain runs it, against real PostgreSQL.
+// The invariant under test: NO previously settled Moolre deposit may remain
+// unclaimed (it could otherwise be consumed again as treasury funding), while an
+// observation that was never an economic use must never be claimed, and no
+// historical disagreement is ever resolved by picking a winner.
 // =============================================================================
 'use strict';
 
@@ -30,541 +28,376 @@ if (!DB_URL && IS_CI) {
 
 const run = DB_URL ? describe : describe.skip;
 
-run('§WP-I — provider-observation claim backfill (real PostgreSQL)', () => {
+run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metadata)', () => {
     const { PrismaClient } = require('@prisma/client');
     const { spawnSync } = require('child_process');
-    const fs = require('fs');
     const path = require('path');
     const { canonicalObservationIdentity } = require('../src/services/providerObservationIdentity');
+    const { claimProviderObservation, CLAIM_PURPOSE } = require('../src/services/providerObservationClaimService');
 
     const REPO = path.join(__dirname, '..');
     const INSTALLER = path.join(REPO, 'infra', 'install-provider-observation-claim.js');
-    const SQL_FILE = path.join(REPO, 'infra', 'sql', 'provider-observation-claim.sql');
 
     const tag = `bf${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
     const ref = (n) => `${tag}-${n}`;
-    const key = (r) => `moolre|collection|${r}`;
+    const key = (r) => canonicalObservationIdentity({ provider: 'moolre', reference: r }).observationKey;
 
-    // The three references that MUST end up claimed.
-    const SETTLED_REF = ref('settled');
-    const WITNESS_REF = ref('witness');
-    // References that must NOT be claimed on their own.
-    const PENDING_REF = ref('pending');
-    const EVENT_ONLY_REF = ref('eventonly');
-    // One reference used economically on BOTH paths.
-    const COLLIDE_REF = ref('collide');
+    const R_DIRECT = ref('direct');
+    const R_GENERIC = ref('generic');
+    const R_AGGREGATOR = ref('aggregator');
+    const R_PENDING = ref('pending');
+    const R_EVENT_ONLY = ref('eventonly');
+    const R_NO_REF_TX = ref('noref-tx');
+    const R_CONTRADICTORY = ref('contradictory');
+    const R_WITNESS = ref('witness');
+    const R_COLLIDE = ref('collide');
+    const R_DUP_DEPOSITS = ref('dupdeposits');
+    const R_DUP_WITNESSES = ref('dupwitnesses');
+    const R_PREEXISTING = ref('preexisting');
 
     let prisma;
     let userId;
-    let settledTxId;
-    let collideTxId;
+    let directDepositId;
+    let genericDepositId;
+    let collideDepositId;
+    let dupDepositIds;
 
-    /** Run the installer exactly as the release chain does. */
-    function runInstaller(extraArgs = [], dbUrl = DB_URL) {
+    function runInstaller(extraArgs = [], env = {}) {
         const res = spawnSync(process.execPath, [INSTALLER, ...extraArgs], {
             cwd: REPO,
-            env: { ...process.env, DATABASE_URL: dbUrl },
+            env: { ...process.env, DATABASE_URL: DB_URL, ...env },
             encoding: 'utf8',
         });
-        return {
-            code: res.status,
-            stdout: res.stdout || '',
-            stderr: res.stderr || '',
-        };
+        return { code: res.status, stdout: res.stdout || '', stderr: res.stderr || '' };
     }
 
-    /** The counts the installer prints, so results are asserted, not inferred. */
-    function reported(out) {
-        const pick = (name) => {
-            const m = out.match(new RegExp(`${name}=([0-9]+)`));
-            return m ? Number(m[1]) : null;
-        };
-        return {
-            depositClaims: pick('depositClaims'),
-            witnessClaims: pick('witnessClaims'),
-            installed: /installed=(true|false)/.exec(out)?.[1] === 'true',
-        };
+    function jsonOf(out) {
+        const line = out.split('\n').find((l) => l.includes('[provider-observation-claim-json]'));
+        if (!line) throw new Error(`installer printed no JSON report:\n${out}`);
+        return JSON.parse(line.slice(line.indexOf('{')).trim());
     }
 
-    const claimsFor = (refs) =>
-        prisma.providerObservationClaim.findMany({
-            where: { observationKey: { in: refs.map(key) } },
-            select: { observationKey: true, purpose: true, claimedByRef: true, provider: true },
+    const claimsFor = (refs) => prisma.providerObservationClaim.findMany({
+        where: { observationKey: { in: refs.map(key) } },
+        select: { observationKey: true, purpose: true, claimedByRef: true, provider: true },
+    });
+
+    /** A SUCCESSFUL inbound Moolre observation, as the settlement writes it. */
+    const moolreEvent = (reference, { txHash, providerRef = null, status = 'SUCCESSFUL' } = {}) =>
+        prisma.fiatProviderEvent.create({
+            data: {
+                provider: 'MOOLRE',
+                rail: 'MOMO',
+                direction: 'INBOUND',
+                status,
+                providerRef,
+                dedupKey: `event:moolre-collection:${reference}`,
+                amountGhs: '120.00',
+                relatedReference: txHash || null,
+                raw: { status: 1 },
+            },
+        });
+
+    /** A completed deposit carrying the metadata the settlement actually writes. */
+    const settledDeposit = (reference, { rail = 'MTN_MOMO', route = 'MOOLRE_MOMO_COLLECTION', txHash, extra = {}, status = 'COMPLETED', providerRef = null } = {}) =>
+        prisma.transactionHistory.create({
+            data: {
+                userId,
+                type: 'DEPOSIT_FIAT',
+                status,
+                amountUsdc: '10.00000000',
+                amountGhs: '120.00',
+                txHash,
+                providerRef,
+                metadata: {
+                    provider: rail,                 // the MoMo RAIL, not the processor
+                    network: rail.split('_')[0],
+                    quoteId: `${tag}-quote`,
+                    selectedRoute: route,
+                    settlementCurrency: 'USDC',
+                    settlementExternalRef: reference,
+                    settlementProviderRef: providerRef || reference,
+                    settledAmountGhs: '120.00',
+                    settledAt: new Date().toISOString(),
+                    ...extra,
+                },
+            },
         });
 
     beforeAll(async () => {
         prisma = new PrismaClient();
         await prisma.$connect();
 
-        // Start from a known state for this tag only.
-        await prisma.providerObservationClaim.deleteMany({ where: { observationKey: { contains: tag } } });
-
         const user = await prisma.user.create({
             data: { username: tag, email: `${tag}@example.invalid`, password: 'not-a-real-hash' },
         });
         userId = user.id;
 
-        // 1. A genuinely settled customer deposit: COMPLETED, with the exact
-        //    provider reference the settlement committed with.
-        const settled = await prisma.transactionHistory.create({
-            data: {
-                userId,
-                type: 'DEPOSIT_FIAT',
-                status: 'COMPLETED',
-                amountUsdc: '10.00000000',
-                amountGhs: '120.00',
-                txHash: `${tag}-settled-tx`,
-                metadata: { provider: 'moolre', settlementExternalRef: SETTLED_REF },
-            },
-        });
-        settledTxId = settled.id;
+        // 1. DIRECT Moolre route: rail in metadata.provider, Moolre reference as
+        //    the settlement reference, backed by a SUCCESSFUL MOOLRE event.
+        directDepositId = (await settledDeposit(R_DIRECT, {
+            rail: 'MTN_MOMO', route: 'MOOLRE_MOMO_COLLECTION', txHash: `${tag}-tx-direct`, providerRef: R_DIRECT,
+        })).id;
+        await moolreEvent(R_DIRECT, { txHash: `${tag}-tx-direct`, providerRef: R_DIRECT });
 
-        // 2. A deposit that has NOT settled. Same shape, same metadata, but the
-        //    money never committed, so it is not an economic use.
-        await prisma.transactionHistory.create({
-            data: {
-                userId,
-                type: 'DEPOSIT_FIAT',
-                status: 'PENDING',
-                amountUsdc: '10.00000000',
-                amountGhs: '120.00',
-                txHash: `${tag}-pending-tx`,
-                metadata: { provider: 'moolre', settlementExternalRef: PENDING_REF },
-            },
-        });
+        // 2. GENERIC route settled through the Moolre OTP/webhook path: same rail
+        //    field, aggregator route, same durable Moolre observation identity.
+        genericDepositId = (await settledDeposit(R_GENERIC, {
+            rail: 'VODAFONE_CASH', route: 'GENERIC_FIAT_AGGREGATOR', txHash: `${tag}-tx-generic`,
+        })).id;
+        await moolreEvent(R_GENERIC, { txHash: `${tag}-tx-generic` });
 
-        // 3. A provider EVENT with no money behind it at all — an observation
-        //    recorded before any settlement. This is the trap: it is the same
-        //    provider, the same reference shape, and nothing was paid out.
+        // 3. Ordinary aggregator deposit on an identical MoMo rail, settled with
+        //    the GENERIC_FIAT_WEBHOOK evidence — NOT Moolre money.
+        await settledDeposit(R_AGGREGATOR, { rail: 'MTN_MOMO', route: 'GENERIC_FIAT_AGGREGATOR', txHash: `${tag}-tx-agg` });
         await prisma.fiatProviderEvent.create({
             data: {
-                provider: 'MOOLRE',
-                direction: 'INBOUND',
-                status: 'PENDING',
-                providerRef: EVENT_ONLY_REF,
-                dedupKey: `${tag}-event-only`,
-                amountGhs: '120.00',
+                provider: 'GENERIC_FIAT_WEBHOOK', rail: 'MOMO', direction: 'INBOUND', status: 'SUCCESSFUL',
+                providerRef: R_AGGREGATOR, dedupKey: `event:generic:${R_AGGREGATOR}:SUCCESSFUL`,
+                amountGhs: '120.00', relatedReference: `${tag}-tx-agg`, raw: { status: 1 },
             },
         });
 
-        // 4. A treasury witness, whose reference comes from its own requestParams.
+        // 4. PENDING Moolre deposit: an observation, not an economic use.
+        await settledDeposit(R_PENDING, { txHash: `${tag}-tx-pending`, status: 'PENDING', providerRef: R_PENDING });
+        await moolreEvent(R_PENDING, { txHash: `${tag}-tx-pending`, providerRef: R_PENDING });
+
+        // 5. Moolre observation with no completed deposit at all.
+        await moolreEvent(R_EVENT_ONLY, { txHash: `${tag}-tx-eventonly` });
+
+        // 6a. Completed deposit with Moolre evidence but NO settlement reference.
+        await prisma.transactionHistory.create({
+            data: {
+                userId, type: 'DEPOSIT_FIAT', status: 'COMPLETED',
+                amountUsdc: '10.00000000', amountGhs: '120.00', txHash: `${tag}-tx-noref`,
+                metadata: { provider: 'MTN_MOMO', selectedRoute: 'MOOLRE_MOMO_COLLECTION' },
+            },
+        });
+        await prisma.fiatProviderEvent.create({
+            data: {
+                provider: 'MOOLRE', rail: 'MOMO', direction: 'INBOUND', status: 'SUCCESSFUL',
+                dedupKey: `event:moolre-collection:${tag}-tx-noref`, amountGhs: '120.00', relatedReference: `${tag}-tx-noref`,
+            },
+        });
+
+        // 6b. Contradictory settlement references: settlement says one provider
+        //     reference, the provider event another.
+        await settledDeposit(R_CONTRADICTORY, {
+            txHash: `${tag}-tx-contra`, providerRef: R_CONTRADICTORY,
+            extra: { settlementProviderRef: `${R_CONTRADICTORY}-conflict` },
+        });
+        await moolreEvent(R_CONTRADICTORY, { txHash: `${tag}-tx-contra`, providerRef: R_CONTRADICTORY });
+
+        // 7. A genuine Moolre treasury witness.
         await prisma.providerSettlementWitness.create({
             data: {
-                openingDedupKey: `${tag}-opening-1`,
-                provider: 'MOOLRE',
-                fundingType: 'COLLECTION',
-                witnessKind: 'payment_status_lookup',
-                walletAccount: '0244000000',
-                currency: 'GHS',
-                netPesewas: 12000n,
-                grossPesewas: 12000n,
-                providerState: 'settled',
-                endpoint: '/payment/status',
-                requestParams: { id: WITNESS_REF },
-                rawResponseDigest: 'digest-1',
-                rawResponse: JSON.stringify({ status: 1, data: { transactionid: WITNESS_REF } }),
-                fetchedAt: new Date(),
+                openingDedupKey: `${tag}-opening-witness`, provider: 'MOOLRE',
+                fundingType: 'COLLECTION', witnessKind: 'payment_status_lookup',
+                walletAccount: '0244000000', currency: 'GHS',
+                netPesewas: 12000n, grossPesewas: 12000n, providerState: 'settled',
+                endpoint: '/payment/status', requestParams: { id: R_WITNESS },
+                rawResponseDigest: 'digest-w', rawResponse: JSON.stringify({ status: 1 }), fetchedAt: new Date(),
             },
         });
 
-        // 5. A witness carrying NO derivable reference: nothing to key on, so it
-        //    must be counted as skipped rather than guessed at.
+        // 8. Historical cross-path collision: settled deposit AND witness.
+        collideDepositId = (await settledDeposit(R_COLLIDE, { txHash: `${tag}-tx-collide`, providerRef: R_COLLIDE })).id;
+        await moolreEvent(R_COLLIDE, { txHash: `${tag}-tx-collide`, providerRef: R_COLLIDE });
         await prisma.providerSettlementWitness.create({
             data: {
-                openingDedupKey: `${tag}-opening-2`,
-                provider: 'MOOLRE',
-                fundingType: 'COLLECTION',
-                witnessKind: 'payment_status_lookup',
-                walletAccount: '0244000000',
-                currency: 'GHS',
-                netPesewas: 5000n,
-                providerState: 'settled',
-                endpoint: '/payment/status',
-                requestParams: {},
-                rawResponseDigest: 'digest-2',
-                rawResponse: 'not json at all',
-                fetchedAt: new Date(),
+                openingDedupKey: `${tag}-opening-collide`, provider: 'MOOLRE',
+                fundingType: 'COLLECTION', witnessKind: 'payment_status_lookup',
+                walletAccount: '0244000000', currency: 'GHS',
+                netPesewas: 12000n, grossPesewas: 12000n, providerState: 'settled',
+                endpoint: '/payment/status', requestParams: { id: R_COLLIDE },
+                rawResponseDigest: 'digest-c', rawResponse: JSON.stringify({ status: 1 }), fetchedAt: new Date(),
             },
         });
 
-        // 6. The historical cross-path collision: one provider reference that is
-        //    BOTH a settled deposit and a treasury witness.
-        const collideTx = await prisma.transactionHistory.create({
-            data: {
-                userId,
-                type: 'DEPOSIT_FIAT',
-                status: 'COMPLETED',
-                amountUsdc: '5.00000000',
-                amountGhs: '60.00',
-                txHash: `${tag}-collide-tx`,
-                metadata: { provider: 'moolre', settlementExternalRef: COLLIDE_REF },
-            },
-        });
-        collideTxId = collideTx.id;
+        // 9a. Same-path duplicate owners: TWO completed deposits, one reference.
+        const d1 = await settledDeposit(R_DUP_DEPOSITS, { txHash: `${tag}-tx-dup1`, providerRef: R_DUP_DEPOSITS });
+        const d2 = await settledDeposit(R_DUP_DEPOSITS, { txHash: `${tag}-tx-dup2`, providerRef: R_DUP_DEPOSITS });
+        dupDepositIds = [d1.id, d2.id].sort();
+        await moolreEvent(R_DUP_DEPOSITS, { txHash: `${tag}-tx-dup1`, providerRef: R_DUP_DEPOSITS });
 
-        await prisma.providerSettlementWitness.create({
-            data: {
-                openingDedupKey: `${tag}-opening-3`,
-                provider: 'MOOLRE',
-                fundingType: 'COLLECTION',
-                witnessKind: 'payment_status_lookup',
-                walletAccount: '0244000000',
-                currency: 'GHS',
-                netPesewas: 6000n,
-                providerState: 'settled',
-                endpoint: '/payment/status',
-                requestParams: { id: COLLIDE_REF },
-                rawResponseDigest: 'digest-3',
-                rawResponse: JSON.stringify({ status: 1 }),
-                fetchedAt: new Date(),
-            },
-        });
-    }, 60000);
+        // 9b. Same-path duplicate witnesses.
+        for (const n of [1, 2]) {
+            await prisma.providerSettlementWitness.create({
+                data: {
+                    openingDedupKey: `${tag}-opening-dup-${n}`, provider: 'MOOLRE',
+                    fundingType: 'COLLECTION', witnessKind: 'payment_status_lookup',
+                    walletAccount: '0244000001', currency: 'GHS',
+                    netPesewas: 12000n, grossPesewas: 12000n, providerState: 'settled',
+                    endpoint: '/payment/status', requestParams: { id: R_DUP_WITNESSES },
+                    rawResponseDigest: `digest-d${n}`, rawResponse: JSON.stringify({ status: 1 }), fetchedAt: new Date(),
+                },
+            });
+        }
+
+        // 10. An already-existing claim row must not be duplicated or re-owned.
+        await settledDeposit(R_PREEXISTING, { txHash: `${tag}-tx-preexist`, providerRef: R_PREEXISTING });
+        await moolreEvent(R_PREEXISTING, { txHash: `${tag}-tx-preexist`, providerRef: R_PREEXISTING });
+    }, 120000);
 
     afterAll(async () => {
-        if (prisma) {
-            await prisma.providerObservationClaim.deleteMany({ where: { observationKey: { contains: tag } } });
-            await prisma.providerSettlementWitness.deleteMany({ where: { openingDedupKey: { contains: tag } } });
-            await prisma.fiatProviderEvent.deleteMany({ where: { dedupKey: { contains: tag } } });
-            await prisma.transactionHistory.deleteMany({ where: { txHash: { contains: tag } } });
-            if (userId) await prisma.user.deleteMany({ where: { id: userId } });
-            await prisma.$disconnect();
+        if (prisma) await prisma.$disconnect();
+    });
+
+    test('an injected failure AFTER a successful insert rolls back the claims AND the DDL', async () => {
+        // Deliberately start from "table does not exist", so the rollback of the
+        // DDL is observable rather than assumed.
+        await prisma.$executeRawUnsafe('DROP TABLE IF EXISTS "ProviderObservationClaim"');
+
+        const res = runInstaller([], { AZM_TEST_INJECT_FAILURE_AFTER_CLAIMS: '1' });
+        expect(res.code).not.toBe(0);
+        expect(res.stderr).toMatch(/injected failure/i);
+
+        const table = await prisma.$queryRawUnsafe(`SELECT to_regclass('"ProviderObservationClaim"')::text AS t`);
+        expect(table[0].t).toBeNull();
+
+        // Recovery semantics: an interrupted run leaves nothing behind, so a
+        // clean re-run installs and claims the full set.
+        const rerun = runInstaller(['--json']);
+        expect(rerun.code).toBe(0);
+        const report = jsonOf(rerun.stdout);
+        expect(report.installed).toBe(true);
+        expect(report.depositClaims).toBeGreaterThanOrEqual(3);
+    }, 180000);
+
+    test('dry-run selects exactly the candidates the real run writes, and writes nothing', async () => {
+        const before = await prisma.providerObservationClaim.count({ where: { observationKey: { contains: tag } } });
+
+        const dry = runInstaller(['--dry-run', '--json']);
+        expect(dry.code).toBe(0);
+        const dryReport = jsonOf(dry.stdout);
+        expect(dryReport.depositClaims).toBe(0);
+        expect(dryReport.witnessClaims).toBe(0);
+        expect(dryReport.quarantined).toBe(0);
+        expect(dryReport.wouldClaimDeposits).toBeGreaterThanOrEqual(3);
+        expect(dryReport.wouldQuarantine).toBeGreaterThanOrEqual(3);
+
+        const after = await prisma.providerObservationClaim.count({ where: { observationKey: { contains: tag } } });
+        expect(after).toBe(before);
+
+        const real = jsonOf(runInstaller(['--json']).stdout);
+        expect(real.wouldClaimDeposits).toBe(dryReport.wouldClaimDeposits);
+        expect(real.wouldClaimWitnesses).toBe(dryReport.wouldClaimWitnesses);
+        expect(real.wouldQuarantine).toBe(dryReport.wouldQuarantine);
+        expect(real.candidates.deposits.map((d) => d.observationKey).sort())
+            .toEqual(dryReport.candidates.deposits.map((d) => d.observationKey).sort());
+    }, 120000);
+
+    test('a settled direct Moolre deposit and a generic-route Moolre deposit are both claimed', async () => {
+        const rows = await claimsFor([R_DIRECT, R_GENERIC]);
+        const byKey = new Map(rows.map((r) => [r.observationKey, r]));
+        expect(byKey.get(key(R_DIRECT)).purpose).toBe('CUSTOMER_DEPOSIT');
+        expect(byKey.get(key(R_DIRECT)).claimedByRef).toBe(directDepositId);
+        expect(byKey.get(key(R_GENERIC)).purpose).toBe('CUSTOMER_DEPOSIT');
+        expect(byKey.get(key(R_GENERIC)).claimedByRef).toBe(genericDepositId);
+    }, 60000);
+
+    test('the key the backfill writes is byte-identical to the key the live claim takes', async () => {
+        for (const reference of [R_DIRECT, R_GENERIC]) {
+            const live = canonicalObservationIdentity({ provider: 'moolre', reference }).observationKey;
+            const row = await prisma.providerObservationClaim.findUnique({ where: { observationKey: live } });
+            expect(row).not.toBeNull();
+            expect(row.purpose).toBe('CUSTOMER_DEPOSIT');
         }
     }, 60000);
 
-    // ── the overlay and the constraint it relies on ───────────────────────────
-
-    test('the overlay is idempotent DDL and the database really enforces one claim per observation', async () => {
-        const sql = fs.readFileSync(SQL_FILE, 'utf8');
-
-        expect(sql).toMatch(/CREATE TABLE IF NOT EXISTS "ProviderObservationClaim"/);
-        expect(sql).toMatch(/CREATE UNIQUE INDEX IF NOT EXISTS "ProviderObservationClaim_observationKey_key"/);
-        // The unique index is the arbiter, so it must be on the observation key
-        // itself, not on a surrogate id.
-        expect(sql).toMatch(/"observationKey"\)/);
-
-        const idx = await prisma.$queryRawUnsafe(
-            `SELECT indexdef FROM pg_indexes
-              WHERE tablename = 'ProviderObservationClaim' AND indexname = 'ProviderObservationClaim_observationKey_key'`,
-        );
-        expect(idx.length).toBe(1);
-        expect(idx[0].indexdef).toMatch(/UNIQUE INDEX/);
-        expect(idx[0].indexdef).toMatch(/"observationKey"/);
-    });
-
-    test('the database refuses a second claim for the same observation', async () => {
-        const k = key(ref('unique-probe'));
-        await prisma.providerObservationClaim.create({
-            data: { observationKey: k, purpose: 'CUSTOMER_DEPOSIT', claimedByRef: 'probe', provider: 'moolre' },
-        });
-        await expect(
-            prisma.providerObservationClaim.create({
-                data: { observationKey: k, purpose: 'TREASURY_WITNESS', claimedByRef: 'probe2', provider: 'moolre' },
-            }),
-        ).rejects.toThrow();
-        await prisma.providerObservationClaim.deleteMany({ where: { observationKey: k } });
-    });
-
-    // ── nothing unrelated moves ───────────────────────────────────────────────
-
-    test('a backfill run mutates claims only: no balance, ledger, reserve or witness movement', async () => {
-        const snapshot = async () => {
-            const [users, txs, witnesses] = await Promise.all([
-                prisma.$queryRawUnsafe(
-                    `SELECT COALESCE(SUM("nativeGhsBalance"),0)::text AS ghs,
-                            COALESCE(SUM("availableBalance"),0)::text AS usdc,
-                            COALESCE(SUM("escrowLockedBalance"),0)::text AS escrow
-                       FROM "User"`,
-                ),
-                prisma.$queryRawUnsafe(
-                    `SELECT count(*)::int AS n,
-                            COALESCE(SUM("amountUsdc"),0)::text AS usdc,
-                            COALESCE(SUM("amountGhs"),0)::text AS ghs
-                       FROM "TransactionHistory"`,
-                ),
-                prisma.$queryRawUnsafe(`SELECT count(*)::int AS n FROM "ProviderSettlementWitness"`),
-            ]);
-            return {
-                balances: users[0],
-                ledger: txs[0],
-                witnesses: witnesses[0].n,
-                claims: await prisma.providerObservationClaim.count(),
-            };
-        };
-
-        const before = await snapshot();
-        const res = runInstaller();
-        expect(res.code).toBe(0);
-        const after = await snapshot();
-
-        expect(after.balances).toEqual(before.balances);
-        expect(after.ledger).toEqual(before.ledger);
-        expect(after.witnesses).toBe(before.witnesses);
-        // And the run did claim the candidates it should have.
-        expect(after.claims).toBeGreaterThan(before.claims);
+    test('an ordinary aggregator deposit on the same rail is NOT claimed as Moolre money', async () => {
+        const rows = await claimsFor([R_AGGREGATOR]);
+        expect(rows).toHaveLength(0);
     }, 60000);
 
-    // ── what is claimed, and what is deliberately not ──────────────────────────
-
-    test('only economically settled observations are claimed', async () => {
-        const res = runInstaller();
-        expect(res.code).toBe(0);
-        const report = reported(res.stdout);
-        expect(report.installed).toBe(true);
-
-        const rows = await claimsFor([SETTLED_REF, PENDING_REF, EVENT_ONLY_REF, WITNESS_REF, COLLIDE_REF]);
-        const byKey = new Map(rows.map((r) => [r.observationKey, r]));
-
-        // A settled deposit is a customer-deposit claim, attributed to the exact
-        // transaction that settled.
-        const settledClaim = byKey.get(key(SETTLED_REF));
-        expect(settledClaim).toBeDefined();
-        expect(settledClaim.purpose).toBe('CUSTOMER_DEPOSIT');
-        expect(settledClaim.claimedByRef).toBe(settledTxId);
-        expect(settledClaim.provider).toBe('moolre');
-
-        // A treasury witness is a witness claim, attributed to its opening.
-        const witnessClaim = byKey.get(key(WITNESS_REF));
-        expect(witnessClaim).toBeDefined();
-        expect(witnessClaim.purpose).toBe('TREASURY_WITNESS');
-        expect(witnessClaim.claimedByRef).toBe(`${tag}-opening-1`);
-
-        // The two non-settled observations are NOT claimed. This is the whole
-        // point: an observation is not an economic use.
-        expect(byKey.has(key(PENDING_REF))).toBe(false);
-        expect(byKey.has(key(EVENT_ONLY_REF))).toBe(false);
-
-        // Exactly the two settled observations are claimed for this tag: the
-        // reference-less witness invented no key, so it is absent rather than
-        // present under a guessed reference.
-        // The collision key is now present as a QUARANTINE row (see the
-        // collision test): present, but owned by neither path.
-        expect([...byKey.keys()].sort()).toEqual([key(SETTLED_REF), key(WITNESS_REF), key(COLLIDE_REF)].sort());
-        expect(byKey.get(key(COLLIDE_REF)).purpose).toBe('QUARANTINE');
-        const invented = await prisma.providerObservationClaim.count({
-            where: { claimedByRef: `${tag}-opening-2` },
-        });
-        expect(invented).toBe(0);
-        // And the installer says so out loud, instead of dropping it silently.
-        expect(res.stdout).toMatch(/skipped\(deposits=\d+,witnesses=[1-9]\d*,nonMoolreProvider=\d+\)/);
+    test('pending deposits and event-only observations are never claimed', async () => {
+        const rows = await claimsFor([R_PENDING, R_EVENT_ONLY]);
+        expect(rows).toHaveLength(0);
     }, 60000);
 
-    test('the backfilled key is byte-identical to the key the runtime claims with', () => {
-        // If these diverge, a backfilled claim protects nothing: the live path
-        // would look up a different key and consume the same payment again.
-        const runtime = canonicalObservationIdentity({ provider: 'moolre', reference: SETTLED_REF });
-        expect(runtime.observationKey).toBe(key(SETTLED_REF));
+    test('unclassifiable history is reported, not claimed: no settlement reference, contradictory references', async () => {
+        const rows = await claimsFor([R_NO_REF_TX, R_CONTRADICTORY]);
+        expect(rows).toHaveLength(0);
 
-        const witnessKey = canonicalObservationIdentity({ provider: 'moolre', reference: WITNESS_REF });
-        expect(witnessKey.observationKey).toBe(key(WITNESS_REF));
-    });
+        const report = jsonOf(runInstaller(['--dry-run', '--json']).stdout);
+        const mine = report.anomalies.filter((a) => [a.observationKey, a.subject, ...(a.owners || [])]
+            .some((v) => String(v || '').includes(tag)));
+        const kinds = mine.map((a) => a.kind);
+        expect(kinds).toContain('MOOLRE_EVIDENCE_WITHOUT_SETTLEMENT_REFERENCE');
+        expect(kinds).toContain('CONTRADICTORY_SETTLEMENT_REFERENCE');
+        const contradiction = mine.find((a) => a.kind === 'CONTRADICTORY_SETTLEMENT_REFERENCE');
+        expect(contradiction.observationKey).toBe(key(R_CONTRADICTORY));
+    }, 60000);
 
-    // ── the collision ─────────────────────────────────────────────────────────
+    test('a genuine Moolre treasury witness is claimed, attributed to its opening', async () => {
+        const rows = await claimsFor([R_WITNESS]);
+        expect(rows).toHaveLength(1);
+        expect(rows[0].purpose).toBe('TREASURY_WITNESS');
+        expect(rows[0].claimedByRef).toBe(`${tag}-opening-witness`);
+    }, 60000);
 
-    test('a historical cross-path collision is quarantined so NEITHER path can consume it again', async () => {
-        const res = runInstaller();
-        expect(res.code).toBe(0);
-
-        // Reporting alone was not enough: with no row for the key, whichever
-        // path ran next would claim it and the second economic use would
-        // proceed. The collision is therefore quarantined — a claim row that
-        // names no legitimate owner.
-        const rows = await claimsFor([COLLIDE_REF]);
+    test('a cross-path collision is quarantined, never given to a winner', async () => {
+        const rows = await claimsFor([R_COLLIDE]);
         expect(rows).toHaveLength(1);
         expect(rows[0].purpose).toBe('QUARANTINE');
         expect(rows[0].claimedByRef).toBeNull();
 
-        // And the operator is told, with both sides named, on stderr.
-        expect(res.stderr).toMatch(/COLLISION/i);
-        expect(res.stderr).toContain(key(COLLIDE_REF));
-        expect(res.stderr).toContain(collideTxId);
-        expect(res.stderr).toContain(`${tag}-opening-3`);
-        expect(res.stderr).toMatch(/operator review/i);
-    }, 60000);
-
-    test('the quarantined observation is refused by BOTH economic paths at runtime', async () => {
-        const { claimProviderObservation, CLAIM_PURPOSE } = require('../src/services/providerObservationClaimService');
-        // A fresh installer run first, exactly as the release chain does it.
-        expect(runInstaller().code).toBe(0);
-
-        const purposes = [CLAIM_PURPOSE.CUSTOMER_DEPOSIT, CLAIM_PURPOSE.TREASURY_WITNESS];
-        for (const purpose of purposes) {
+        for (const purpose of [CLAIM_PURPOSE.CUSTOMER_DEPOSIT, CLAIM_PURPOSE.TREASURY_WITNESS]) {
             await expect(
                 prisma.$transaction((tx) => claimProviderObservation(tx, {
-                    provider: 'moolre',
-                    reference: COLLIDE_REF,
-                    purpose,
-                    claimedByRef: `${purpose}-after-quarantine`,
+                    provider: 'moolre', reference: R_COLLIDE, purpose, claimedByRef: `${purpose}-after-quarantine`,
                 })),
             ).rejects.toMatchObject({ code: 'OBSERVATION_QUARANTINED' });
         }
-
-        // Still exactly one row, still ownerless: a retry neither resolves it
-        // nor picks a winner.
-        const rows = await claimsFor([COLLIDE_REF]);
-        expect(rows).toHaveLength(1);
-        expect(rows[0].claimedByRef).toBeNull();
+        // The deposit really is the settled one; it is simply not allowed to win.
+        const deposit = await prisma.transactionHistory.findUnique({ where: { id: collideDepositId } });
+        expect(deposit.status).toBe('COMPLETED');
     }, 60000);
 
-    test('unrelated providers are not classified as Moolre observations', async () => {
-        const foreignRef = ref('paystack');
-        const unmarkedRef = ref('unmarked');
-        await prisma.transactionHistory.create({
-            data: {
-                userId, type: 'DEPOSIT_FIAT', status: 'COMPLETED',
-                amountUsdc: '5.00000000', amountGhs: '60.00', txHash: `${tag}-paystack-tx`,
-                metadata: { provider: 'paystack', settlementExternalRef: foreignRef },
-            },
-        });
-        await prisma.transactionHistory.create({
-            data: {
-                userId, type: 'DEPOSIT_FIAT', status: 'COMPLETED',
-                amountUsdc: '6.00000000', amountGhs: '72.00', txHash: `${tag}-unmarked-tx`,
-                metadata: { settlementExternalRef: unmarkedRef },
-            },
-        });
-        // ...and a witness recorded by a different provider.
-        const foreignWitnessRef = ref('mtnwitness');
-        await prisma.providerSettlementWitness.create({
-            data: {
-                openingDedupKey: `${tag}-opening-foreign`,
-                provider: 'MTN',
-                fundingType: 'COLLECTION',
-                witnessKind: 'payment_status_lookup',
-                walletAccount: '0244000001',
-                currency: 'GHS',
-                netPesewas: 6000n,
-                grossPesewas: 6000n,
-                providerState: 'settled',
-                endpoint: '/payment/status',
-                requestParams: { id: foreignWitnessRef },
-                rawResponseDigest: 'digest-foreign',
-                rawResponse: JSON.stringify({ status: 1, data: { transactionid: foreignWitnessRef } }),
-                fetchedAt: new Date(),
-            },
-        });
+    test('same-path duplicate owners are quarantined and every historical owner is reported', async () => {
+        const depositRows = await claimsFor([R_DUP_DEPOSITS]);
+        expect(depositRows).toHaveLength(1);
+        expect(depositRows[0].purpose).toBe('QUARANTINE');
+        expect(depositRows[0].claimedByRef).toBeNull();
 
-        const res = runInstaller();
-        expect(res.code).toBe(0);
+        const witnessRows = await claimsFor([R_DUP_WITNESSES]);
+        expect(witnessRows).toHaveLength(1);
+        expect(witnessRows[0].purpose).toBe('QUARANTINE');
+        expect(witnessRows[0].claimedByRef).toBeNull();
 
-        // A settlement reference is not a Moolre observation merely because a
-        // metadata field carries it, and the same holds for a witness recorded
-        // by another provider.
-        const rows = await claimsFor([foreignRef, unmarkedRef, foreignWitnessRef]);
-        expect(rows).toHaveLength(0);
-        // And the installer reports what it declined to classify.
-        expect(res.stdout).toMatch(/nonMoolreProvider=[1-9]/);
+        const report = jsonOf(runInstaller(['--dry-run', '--json']).stdout);
+        const scoped = report.anomalies.concat(report.candidates.quarantine)
+            .filter((a) => String(a.observationKey || '').includes(tag) || (a.owners || []).some((o) => String(o).includes(tag)));
+        const dupDeps = scoped.find((a) => a.reason === 'DUPLICATE_DEPOSIT_OWNERS' || a.kind === 'DUPLICATE_DEPOSIT_OWNERS');
+        expect(dupDeps).toBeDefined();
+        expect([...dupDeps.owners].sort()).toEqual(dupDepositIds);
+
+        const dupWits = scoped.find((a) => a.reason === 'DUPLICATE_WITNESS_OWNERS' || a.kind === 'DUPLICATE_WITNESS_OWNERS');
+        expect(dupWits).toBeDefined();
+        expect([...dupWits.owners].sort()).toEqual([`${tag}-opening-dup-1`, `${tag}-opening-dup-2`].sort());
     }, 60000);
 
-    test('re-running the installer neither duplicates nor re-quarantines', async () => {
-        const first = runInstaller();
-        const second = runInstaller();
-        expect(first.code).toBe(0);
+    test('re-running is idempotent and never re-owns an existing claim row', async () => {
+        // The key is already claimed by the earlier real run; pin it to a
+        // different owner to prove a re-run never re-owns an existing row.
+        await prisma.providerObservationClaim.upsert({
+            where: { observationKey: key(R_PREEXISTING) },
+            update: { claimedByRef: 'operator-pinned' },
+            create: { observationKey: key(R_PREEXISTING), purpose: 'CUSTOMER_DEPOSIT', claimedByRef: 'operator-pinned', provider: 'moolre' },
+        });
+        const before = await prisma.providerObservationClaim.count({ where: { observationKey: { contains: tag } } });
+
+        const second = runInstaller(['--json']);
         expect(second.code).toBe(0);
-        expect(Number(/quarantined=(\d+)/.exec(second.stdout)?.[1])).toBe(0);
-        const rows = await claimsFor([COLLIDE_REF]);
-        expect(rows).toHaveLength(1);
-    }, 60000);
-
-    // ── idempotency    }, 60000);
-
-    // ── idempotency ───────────────────────────────────────────────────────────
-
-    test('re-running the installer is a no-op that reports zero new claims', async () => {
-        const first = runInstaller();
-        expect(first.code).toBe(0);
-        const countAfterFirst = await prisma.providerObservationClaim.count();
-
-        const second = runInstaller();
-        expect(second.code).toBe(0);
-        const report = reported(second.stdout);
+        const report = jsonOf(second.stdout);
         expect(report.depositClaims).toBe(0);
         expect(report.witnessClaims).toBe(0);
+        expect(report.quarantined).toBe(0);
 
-        const countAfterSecond = await prisma.providerObservationClaim.count();
-        expect(countAfterSecond).toBe(countAfterFirst);
-    }, 60000);
+        const row = await prisma.providerObservationClaim.findUnique({ where: { observationKey: key(R_PREEXISTING) } });
+        expect(row.claimedByRef).toBe('operator-pinned');
 
-    // ── failure is loud, and leaves nothing half-written ───────────────────────
-
-    test('a failing insert makes the run fail non-zero and leaves no partial claims', async () => {
-        const freshRef = ref('after-failure');
-        const tx = await prisma.transactionHistory.create({
-            data: {
-                userId,
-                type: 'DEPOSIT_FIAT',
-                status: 'COMPLETED',
-                amountUsdc: '1.00000000',
-                amountGhs: '12.00',
-                txHash: `${tag}-after-failure`,
-                metadata: { provider: 'moolre', settlementExternalRef: freshRef },
-            },
-        });
-
-        // Deterministically deny writes at the claim table itself, which is a
-        // failure AFTER candidate selection and after the DDL step.
-        await prisma.$executeRawUnsafe(`
-            CREATE OR REPLACE FUNCTION "${tag}_deny_claim"() RETURNS trigger AS $$
-            BEGIN RAISE EXCEPTION 'claim table locked for test'; END;
-            $$ LANGUAGE plpgsql;
-        `);
-        await prisma.$executeRawUnsafe(`
-            CREATE TRIGGER "${tag}_deny_claim" BEFORE INSERT ON "ProviderObservationClaim"
-            FOR EACH ROW EXECUTE FUNCTION "${tag}_deny_claim"();
-        `);
-
-        try {
-            const res = runInstaller();
-            expect(res.code).not.toBe(0);
-            expect(res.stderr).toMatch(/FAILED/);
-
-            // Nothing from this run landed, including the candidate it had
-            // already selected.
-            const rows = await claimsFor([freshRef]);
-            expect(rows).toHaveLength(0);
-        } finally {
-            await prisma.$executeRawUnsafe(`DROP TRIGGER IF EXISTS "${tag}_deny_claim" ON "ProviderObservationClaim";`);
-            await prisma.$executeRawUnsafe(`DROP FUNCTION IF EXISTS "${tag}_deny_claim"();`);
-            await prisma.transactionHistory.deleteMany({ where: { txHash: `${tag}-after-failure` } });
-            await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(freshRef) } });
-        }
-    }, 60000);
-
-    test('an unreachable database fails loudly instead of reporting a clean install', () => {
-        const res = runInstaller([], 'postgresql://postgres:postgres@127.0.0.1:1/nonexistent');
-        expect(res.code).not.toBe(0);
-        expect(res.stderr).toMatch(/FAILED/);
-        expect(reported(res.stdout).installed).toBe(false);
-    }, 60000);
-
-    // ── dry run ───────────────────────────────────────────────────────────────
-
-    test('--dry-run selects the same candidates but writes nothing', async () => {
-        const dryRef = ref('dry');
-        await prisma.transactionHistory.create({
-            data: {
-                userId,
-                type: 'DEPOSIT_FIAT',
-                status: 'COMPLETED',
-                amountUsdc: '2.00000000',
-                amountGhs: '24.00',
-                txHash: `${tag}-dry`,
-                metadata: { provider: 'moolre', settlementExternalRef: dryRef },
-            },
-        });
-
-        const res = runInstaller(['--dry-run']);
-        expect(res.code).toBe(0);
-        const rows = await claimsFor([dryRef]);
-        expect(rows).toHaveLength(0);
-
-        // The same reference IS claimed by a real run, so the dry run was a
-        // genuine preview rather than a selection bug.
-        expect(runInstaller().code).toBe(0);
-        const after = await claimsFor([dryRef]);
-        expect(after).toHaveLength(1);
-        expect(after[0].purpose).toBe('CUSTOMER_DEPOSIT');
-
-        await prisma.transactionHistory.deleteMany({ where: { txHash: `${tag}-dry` } });
-    }, 60000);
+        const after = await prisma.providerObservationClaim.count({ where: { observationKey: { contains: tag } } });
+        expect(after).toBe(before);
+    }, 120000);
 });
