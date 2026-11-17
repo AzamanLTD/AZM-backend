@@ -377,6 +377,53 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
         expect([...dupWits.owners].sort()).toEqual([`${tag}-opening-dup-1`, `${tag}-opening-dup-2`].sort());
     }, 60000);
 
+    test('the overlay is idempotent DDL and the database enforces one claim per observation', async () => {
+        // DDL re-runs cleanly (the release chain may run it again on every deploy).
+        const again = runInstaller(['--json']);
+        expect(again.code).toBe(0);
+
+        // The invariant is enforced by PostgreSQL, not only by the installer: a
+        // second claim for one observation is refused even by a direct insert.
+        await expect(prisma.providerObservationClaim.create({
+            data: { observationKey: key(R_DIRECT), purpose: 'TREASURY_WITNESS', claimedByRef: 'intruder', provider: 'moolre' },
+        })).rejects.toMatchObject({ code: 'P2002' });
+    }, 120000);
+
+    test('a backfill run mutates claims only: no balance, ledger, deposit or witness movement', async () => {
+        const snapshot = async () => {
+            const user = await prisma.user.findUnique({ where: { id: userId }, select: { availableBalance: true, nativeGhsBalance: true } });
+            const deposits = await prisma.transactionHistory.findMany({
+                where: { txHash: { contains: tag } },
+                select: { id: true, status: true, amountUsdc: true, amountGhs: true },
+                orderBy: { id: 'asc' },
+            });
+            const witnesses = await prisma.providerSettlementWitness.findMany({
+                where: { openingDedupKey: { contains: tag } },
+                select: { openingDedupKey: true, netPesewas: true, providerState: true },
+                orderBy: { openingDedupKey: 'asc' },
+            });
+            // BigInt columns (witness pesewa counts) are normalised to strings.
+            return JSON.stringify({ user, deposits, witnesses }, (_k, v) => (typeof v === 'bigint' ? v.toString() : v));
+        };
+
+        const before = await snapshot();
+        const run1 = runInstaller(['--json']);
+        expect(run1.code).toBe(0);
+        const after = await snapshot();
+        expect(after).toBe(before);
+    }, 120000);
+
+    test('an unreachable database fails loudly instead of reporting a clean install', () => {
+        const res = spawnSync(process.execPath, [INSTALLER, '--json'], {
+            cwd: REPO,
+            env: { ...process.env, DATABASE_URL: 'postgresql://postgres:postgres@127.0.0.1:59999/nope' },
+            encoding: 'utf8',
+        });
+        expect(res.status).not.toBe(0);
+        expect(`${res.stdout}${res.stderr}`).toMatch(/FAILED:/);
+        expect(res.stdout).not.toMatch(/installed=true/);
+    }, 60000);
+
     test('re-running is idempotent and never re-owns an existing claim row', async () => {
         // The key is already claimed by the earlier real run; pin it to a
         // different owner to prove a re-run never re-owns an existing row.
