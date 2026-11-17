@@ -26,10 +26,13 @@
 #                     service, branch, DEPLOY COMMIT (RENDER_GIT_COMMIT) and the
 #                     approved database inside a short validity window (see the
 #                     runbook, "Release authorization"). Mint it per deploy and
-#                     remove it afterwards; it is never committed, and the
-#                     private key never enters the repository or CI. Without it
-#                     the guard fails closed with
-#                     RELEASE_REFUSED_NO_DEPLOY_AUTHORIZATION.
+#                     remove it afterwards with "Save only" (which does not
+#                     rebuild); it is never committed, and the private key never
+#                     enters the repository or CI. Render exposes environment
+#                     variables at runtime too, so the token is bounded by its own
+#                     expiry rather than by being build-only, and every later
+#                     deploy needs its own token. Without one the guard fails
+#                     closed with RELEASE_REFUSED_NO_DEPLOY_AUTHORIZATION.
 #
 # WHY THE FULL CHAIN RUNS IN BUILD: the release chain is the only sanctioned
 # production DDL path, and a Build Command completes BEFORE the new version

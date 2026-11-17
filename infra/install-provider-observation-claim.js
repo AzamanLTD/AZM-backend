@@ -200,6 +200,63 @@ function claimMismatches(existing, expected) {
     return { diffs, notes, malformedOwner };
 }
 
+/**
+ * An insert lost the uniqueness race. Re-read the committed winner and compare
+ * it with the claim this run would have written. Being inside one transaction is
+ * NOT a serializability guarantee: with READ COMMITTED each statement takes a
+ * fresh snapshot, so a competing row committed between our read and our insert is
+ * invisible to the read and makes ON CONFLICT DO NOTHING return zero.
+ *
+ * @returns {{outcome: 'inserted'|'replay', notes: string[]}}
+ * @throws {PreexistingClaimConflict} when the winner is not this claim.
+ */
+async function insertClaimOrVerify(tx, { key, purpose, claimedByRef, accountKey, kind }) {
+    const n = await tx.$executeRawUnsafe(
+        `INSERT INTO "ProviderObservationClaim" ("id","observationKey","purpose","claimedByRef","provider","accountKey","createdAt","updatedAt")
+         VALUES (gen_random_uuid()::text,$1,$2,$3,'moolre',$4, now(), now())
+         ON CONFLICT ("observationKey") DO NOTHING`, key, purpose, claimedByRef, accountKey ?? null);
+    if (n === 1) return { outcome: 'inserted', notes: [] };
+
+    const rows = await tx.$queryRawUnsafe(
+        `SELECT "observationKey","purpose","claimedByRef","provider","accountKey"
+         FROM "ProviderObservationClaim" WHERE "observationKey" = $1`, key);
+    if (!rows.length) {
+        // ON CONFLICT reported a conflict but no row is visible: the state cannot
+        // be explained, so fail closed rather than count a phantom as success.
+        throw new PreexistingClaimConflict([{
+            kind,
+            observationKey: key,
+            expected: { purpose, claimedByRef, provider: 'moolre', accountKey: accountKey ?? null },
+            existing: null,
+            diffs: ['the insert conflicted but no committed claim row is visible'],
+            notes: [],
+            duringInsertRace: true,
+        }]);
+    }
+    const row = rows[0];
+    const { diffs, notes, malformedOwner } = claimMismatches(row, {
+        purpose, claimedByRef, provider: 'moolre', accountKey: accountKey ?? null,
+    });
+    if (diffs.length) {
+        throw new PreexistingClaimConflict([{
+            kind,
+            observationKey: key,
+            malformedOwner,
+            expected: { purpose, claimedByRef, provider: 'moolre', accountKey: accountKey ?? null },
+            existing: {
+                purpose: row.purpose,
+                claimedByRef: row.claimedByRef,
+                provider: row.provider,
+                accountKey: row.accountKey,
+            },
+            diffs,
+            notes,
+            duringInsertRace: true,
+        }]);
+    }
+    return { outcome: 'replay', notes };
+}
+
 class PreexistingClaimConflict extends Error {
     constructor(conflicts) {
         super(`[provider-observation-claim] ${conflicts.length} pre-existing claim(s) disagree with the expected claim; nothing was written`);
@@ -262,11 +319,28 @@ async function selectCandidates(db) {
     }
 
     /**
-     * Every populated identity field on the event must agree with this deposit's
-     * persisted settlement identity. Returns the list of contradictions (empty
-     * means the event is a usable candidate).
+     * Every populated identity field on the event must agree with the SAME KIND
+     * of identifier persisted on the deposit. The two reference families are
+     * distinct and are never compared across kinds:
+     *
+     *   MERCHANT identity  — the external reference Azaman issues and sends to
+     *                        Moolre. Persisted as metadata.settlementExternalRef;
+     *                        it is the canonical claim identity, and it is what
+     *                        the event's dedupKey names.
+     *   PROVIDER identity  — the reference Moolre returns for the collection.
+     *                        Persisted on TransactionHistory.providerRef (stamped
+     *                        at initiation from the adapter's providerRef and
+     *                        reconciled from the event) and, when a settlement
+     *                        recorded it, metadata.settlementProviderRef.
+     *
+     * The adapter sends the external reference but returns a DIFFERENT provider
+     * reference (the mock returns `mock-prov-...`), so requiring
+     * `event.providerRef === settlementExternalRef` would reject every genuine
+     * settlement.
+     *
+     * @returns {string[]} contradictions — empty means a usable candidate.
      */
-    const eventContradictions = (event, ref, txHash) => {
+    const eventContradictions = (event, ref, txHash, depositProviderRef) => {
         const out = [];
         const dedup = String(event.dedupKey || '').trim();
         if (dedup) {
@@ -278,7 +352,15 @@ async function selectCandidates(db) {
             }
         }
         const providerRef = String(event.providerRef || '').trim();
-        if (providerRef && !sameReference(providerRef, ref)) out.push(`providerRef=${providerRef}`);
+        if (providerRef) {
+            if (!depositProviderRef) {
+                // Never guessed: without a persisted provider reference there is
+                // nothing this value can be checked against.
+                out.push(`providerRef=${providerRef} cannot be verified (deposit records no provider reference)`);
+            } else if (!sameReference(providerRef, depositProviderRef)) {
+                out.push(`providerRef=${providerRef} does not match the deposit's provider reference`);
+            }
+        }
         const related = String(event.relatedReference || '').trim();
         if (related) {
             if (!txHash) out.push(`relatedReference=${related} cannot be verified (deposit records no txHash)`);
@@ -294,11 +376,14 @@ async function selectCandidates(db) {
      * @returns {{status: 'none'|'ok'|'contradictory'|'ambiguous', event: object|null,
      *            candidates: object[], contradictions: string[]}}
      */
-    const eventEvidence = (ref, txHash) => {
+    const eventEvidence = (ref, txHash, depositProviderRef) => {
         const seen = new Map();
         const consider = (list) => { for (const e of list || []) seen.set(String(e.id), e); };
         consider(eventsByDedupKey.get(`${MOOLRE_EVENT_PREFIX}${ref}`));
-        consider(eventsByProviderRef.get(ref));
+        // Discovery by provider reference must use the deposit's persisted
+        // PROVIDER reference (TransactionHistory.providerRef /
+        // metadata.settlementProviderRef) — never the merchant external reference.
+        if (depositProviderRef) consider(eventsByProviderRef.get(depositProviderRef));
         if (txHash) consider(eventsByRelatedReference.get(txHash));
 
         const candidates = [...seen.values()];
@@ -312,7 +397,7 @@ async function selectCandidates(db) {
             return { status: 'ambiguous', event: null, candidates, contradictions: [] };
         }
         const only = candidates[0];
-        const contradictions = eventContradictions(only, ref, txHash);
+        const contradictions = eventContradictions(only, ref, txHash, depositProviderRef);
         if (contradictions.length) {
             return { status: 'contradictory', event: null, candidates, contradictions };
         }
@@ -333,7 +418,21 @@ async function selectCandidates(db) {
     for (const d of deposits) {
         const ref = String(d.ref || '').trim();
         const txHash = d.txHash ? String(d.txHash).trim() : null;
-        const depositProviderRef = String(d.provider_ref || '').trim();
+        const persistedProviderRef = String(d.provider_ref || '').trim();
+        const metadataProviderRef = String(d.settlement_provider_ref || '').trim();
+
+        // The PROVIDER identity must agree with itself before it can verify
+        // anything: a column that names one provider reference while the
+        // settlement metadata names another is a historical disagreement about
+        // WHICH provider collection this was. Fail closed, claim nothing.
+        if (persistedProviderRef && metadataProviderRef && !sameReference(persistedProviderRef, metadataProviderRef)) {
+            report.skipped.unclassifiableDeposits += 1;
+            anomaly('CONTRADICTORY_PROVIDER_REFERENCE', keyFor(ref), [String(d.id)],
+                `the deposit's provider references disagree: TransactionHistory.providerRef=${persistedProviderRef} vs metadata.settlementProviderRef=${metadataProviderRef}`,
+                ref || null);
+            continue;
+        }
+        const depositProviderRef = persistedProviderRef || metadataProviderRef || null;
 
         if (!ref) {
             // We cannot name the canonical key the live path uses, so this is
@@ -341,10 +440,9 @@ async function selectCandidates(db) {
             // including the deposit's own persisted provider reference. The
             // reference is never invented from the link.
             const ties = [];
-            if (txHash) {
-                if (eventsByDedupKey.get(`${MOOLRE_EVENT_PREFIX}${txHash}`)) ties.push(`dedupKey(${MOOLRE_EVENT_PREFIX}${txHash})`);
-                if (eventsByRelatedReference.get(txHash)) ties.push(`relatedReference(${txHash})`);
-            }
+            // A dedupKey names the MERCHANT external reference, so the txHash is
+            // never used to guess one; only same-kind ties may report evidence.
+            if (txHash && eventsByRelatedReference.get(txHash)) ties.push(`relatedReference(${txHash})`);
             if (depositProviderRef && eventsByProviderRef.get(depositProviderRef)) {
                 ties.push(`providerRef(${depositProviderRef})`);
             }
@@ -359,7 +457,7 @@ async function selectCandidates(db) {
             continue;
         }
 
-        const evidence = eventEvidence(ref, txHash);
+        const evidence = eventEvidence(ref, txHash, depositProviderRef);
         if (evidence.status === 'none') {
             // Completed, but no Moolre processor evidence: an ordinary aggregator
             // settlement on the same MoMo rail. Never claimed as Moolre money.
@@ -382,18 +480,9 @@ async function selectCandidates(db) {
         }
         const event = evidence.event;
 
-        const claimedRefs = [
-            String(d.settlement_provider_ref || '').trim(),
-            String(d.provider_ref || '').trim(),
-            String(event.providerRef || '').trim(),
-        ].filter(Boolean);
-        if (new Set(claimedRefs).size > 1) {
-            report.skipped.unclassifiableDeposits += 1;
-            anomaly('CONTRADICTORY_SETTLEMENT_REFERENCE', keyFor(ref), [String(d.id)],
-                `settlement/provider references disagree: ${JSON.stringify(claimedRefs)}`, ref);
-            continue;
-        }
-
+        // The event's provider reference has already been checked against the
+        // deposit's provider identity by eventContradictions(); nothing here may
+        // compare it to the merchant external reference.
         addOwner(report.depositOwners, keyFor(ref), String(d.id));
     }
 
@@ -470,8 +559,8 @@ async function selectCandidates(db) {
  *    conflict is never overwritten and never counted as a successful backfill.
  */
 function partitionAgainstExisting(selection, existing) {
-    const alreadyCorrect = { deposits: [], witnesses: [] };
-    const toInsert = { deposits: [], witnesses: [] };
+    const alreadyCorrect = { deposits: [], witnesses: [], quarantine: [] };
+    const toInsert = { deposits: [], witnesses: [], quarantine: [] };
     const conflicts = [];
 
     const classify = (kind, key, expected) => {
@@ -494,7 +583,8 @@ function partitionAgainstExisting(selection, existing) {
                 notes,
             });
         } else {
-            alreadyCorrect[kind === 'deposit' ? 'deposits' : 'witnesses'].push({ observationKey: key, owner: expected.claimedByRef, notes });
+            const bucket = kind === 'deposit' ? 'deposits' : (kind === 'witness' ? 'witnesses' : 'quarantine');
+            alreadyCorrect[bucket].push({ observationKey: key, owner: expected.claimedByRef, notes });
         }
         return true;
     };
@@ -518,6 +608,21 @@ function partitionAgainstExisting(selection, existing) {
         if (!classify('witness', key, expected)) toInsert.witnesses.push([key, owners]);
     }
 
+    // A quarantine key is a claim row like any other: an existing QUARANTINE row
+    // with NO owner is the idempotent replay, and anything else — a
+    // CUSTOMER_DEPOSIT, a TREASURY_WITNESS, a malformed quarantine or any other
+    // mismatch — is a pre-existing claim conflict, never a successful
+    // quarantine. ON CONFLICT DO NOTHING must not launder that away.
+    for (const q of selection.quarantine || []) {
+        const expected = {
+            purpose: CLAIM_PURPOSE_QUARANTINE,
+            claimedByRef: null,
+            provider: 'moolre',
+            accountKey: null,
+        };
+        if (!classify('quarantine', q.observationKey, expected)) toInsert.quarantine.push(q);
+    }
+
     return { alreadyCorrect, toInsert, conflicts };
 }
 
@@ -538,8 +643,12 @@ async function main() {
         quarantined: 0,
         wouldInsertDeposits: 0,
         wouldInsertWitnesses: 0,
+        wouldInsertQuarantine: 0,
         alreadyClaimedDeposits: 0,
         alreadyClaimedWitnesses: 0,
+        alreadyQuarantined: 0,
+        racedReplays: 0,
+        raceReplays: [],
         conflicts: [],
         candidates: { deposits: [], witnesses: [], quarantine: [] },
         anomalies: [],
@@ -554,8 +663,10 @@ async function main() {
             const partition = partitionAgainstExisting(selection, existing);
             out.wouldInsertDeposits = partition.toInsert.deposits.length;
             out.wouldInsertWitnesses = partition.toInsert.witnesses.length;
+            out.wouldInsertQuarantine = partition.toInsert.quarantine.length;
             out.alreadyClaimedDeposits = partition.alreadyCorrect.deposits.length;
             out.alreadyClaimedWitnesses = partition.alreadyCorrect.witnesses.length;
+            out.alreadyQuarantined = partition.alreadyCorrect.quarantine.length;
             out.conflicts = partition.conflicts;
             out.alreadyCorrect = partition.alreadyCorrect;
             out.wouldClaimDeposits = selection.claimDeposits.length;
@@ -589,8 +700,10 @@ async function main() {
                 const partition = partitionAgainstExisting(selection, await readExistingClaims(tx));
                 out.wouldInsertDeposits = partition.toInsert.deposits.length;
                 out.wouldInsertWitnesses = partition.toInsert.witnesses.length;
+                out.wouldInsertQuarantine = partition.toInsert.quarantine.length;
                 out.alreadyClaimedDeposits = partition.alreadyCorrect.deposits.length;
                 out.alreadyClaimedWitnesses = partition.alreadyCorrect.witnesses.length;
+                out.alreadyQuarantined = partition.alreadyCorrect.quarantine.length;
                 out.alreadyCorrect = partition.alreadyCorrect;
                 if (partition.conflicts.length) throw new PreexistingClaimConflict(partition.conflicts);
 
@@ -614,25 +727,27 @@ async function main() {
                     }
                 };
 
-                for (const q of selection.quarantine) {
-                    const n = await tx.$executeRawUnsafe(
-                        `INSERT INTO "ProviderObservationClaim" ("id","observationKey","purpose","claimedByRef","provider","accountKey","createdAt","updatedAt")
-                         VALUES (gen_random_uuid()::text,$1,'QUARANTINE',NULL,'moolre',NULL, now(), now())
-                         ON CONFLICT ("observationKey") DO NOTHING`, q.observationKey);
-                    out.quarantined += n;
-                    writes += n;
+                for (const q of partition.toInsert.quarantine) {
+                    const r = await insertClaimOrVerify(tx, {
+                        key: q.observationKey,
+                        purpose: CLAIM_PURPOSE_QUARANTINE,
+                        claimedByRef: null,
+                        accountKey: null,
+                        kind: 'quarantine',
+                    });
+                    if (r.outcome === 'inserted') { out.quarantined += 1; writes += 1; }
+                    else { out.racedReplays += 1; out.raceReplays.push({ kind: 'quarantine', observationKey: q.observationKey, notes: r.notes }); }
                     maybeFault();
                 }
                 for (const [key, owners] of partition.toInsert.deposits) {
                     // owners is the list used to DETECT duplicates; only a single
                     // owner survives to here (multi-owner keys are quarantined).
                     const depositId = owners[0];
-                    const n = await tx.$executeRawUnsafe(
-                        `INSERT INTO "ProviderObservationClaim" ("id","observationKey","purpose","claimedByRef","provider","accountKey","createdAt","updatedAt")
-                         VALUES (gen_random_uuid()::text,$1,'CUSTOMER_DEPOSIT',$2,'moolre',NULL, now(), now())
-                         ON CONFLICT ("observationKey") DO NOTHING`, key, depositId);
-                    out.depositClaims += n;
-                    writes += n;
+                    const r = await insertClaimOrVerify(tx, {
+                        key, purpose: CLAIM_PURPOSE_CUSTOMER_DEPOSIT, claimedByRef: depositId, accountKey: null, kind: 'deposit',
+                    });
+                    if (r.outcome === 'inserted') { out.depositClaims += 1; writes += 1; }
+                    else { out.racedReplays += 1; out.raceReplays.push({ kind: 'deposit', observationKey: key, notes: r.notes }); }
                     maybeFault();
                 }
                 for (const [key, owners] of partition.toInsert.witnesses) {
@@ -641,12 +756,11 @@ async function main() {
                     // witness claim records the same account identity the runtime
                     // claim does instead of leaving it null.
                     const accountKey = selection.witnessAccountKeys.get(key) ?? null;
-                    const n = await tx.$executeRawUnsafe(
-                        `INSERT INTO "ProviderObservationClaim" ("id","observationKey","purpose","claimedByRef","provider","accountKey","createdAt","updatedAt")
-                         VALUES (gen_random_uuid()::text,$1,'TREASURY_WITNESS',$2,'moolre',$3, now(), now())
-                         ON CONFLICT ("observationKey") DO NOTHING`, key, openingKey, accountKey);
-                    out.witnessClaims += n;
-                    writes += n;
+                    const r = await insertClaimOrVerify(tx, {
+                        key, purpose: CLAIM_PURPOSE_TREASURY_WITNESS, claimedByRef: openingKey, accountKey, kind: 'witness',
+                    });
+                    if (r.outcome === 'inserted') { out.witnessClaims += 1; writes += 1; }
+                    else { out.racedReplays += 1; out.raceReplays.push({ kind: 'witness', observationKey: key, notes: r.notes }); }
                     maybeFault();
                 }
                 out.installed = true;
@@ -656,8 +770,9 @@ async function main() {
         const summary = `[provider-observation-claim] installed=${out.installed} dryRun=${out.dryRun} `
             + `wouldClaimDeposits=${out.wouldClaimDeposits} wouldClaimWitnesses=${out.wouldClaimWitnesses} wouldQuarantine=${out.wouldQuarantine} `
             + `candidates(deposits=${out.wouldClaimDeposits},witnesses=${out.wouldClaimWitnesses}) `
-            + `wouldInsert(deposits=${out.wouldInsertDeposits},witnesses=${out.wouldInsertWitnesses}) `
-            + `alreadyClaimed(deposits=${out.alreadyClaimedDeposits},witnesses=${out.alreadyClaimedWitnesses}) `
+            + `wouldInsert(deposits=${out.wouldInsertDeposits},witnesses=${out.wouldInsertWitnesses},quarantine=${out.wouldInsertQuarantine}) `
+            + `alreadyClaimed(deposits=${out.alreadyClaimedDeposits},witnesses=${out.alreadyClaimedWitnesses},quarantine=${out.alreadyQuarantined}) `
+            + `racedReplays=${out.racedReplays} `
             + `conflicts=${out.conflicts.length} `
             + `depositClaims=${out.depositClaims} witnessClaims=${out.witnessClaims} quarantined=${out.quarantined} `
             + `skipped(deposits=${out.skipped.deposits},witnesses=${out.skipped.witnesses},nonMoolreProvider=${out.skipped.nonMoolreProvider},`

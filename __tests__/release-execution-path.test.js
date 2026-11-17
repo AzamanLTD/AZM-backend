@@ -239,6 +239,20 @@ describe('every document agrees on the chain and the production schema path', ()
         // The replay scope must be stated, and must not be overstated.
         expect(runbook).toMatch(/NOT single-use authorization/);
         expect(runbook).not.toMatch(/one-time authorization/i);
+        // The operator procedure must be one coherent order, and must account
+        // for Render's save semantics and the runtime exposure of the token.
+        for (const step of ['Select and verify the exact commit', 'Mint the authorization',
+            'Stage the token in Render', 'Trigger the deployment of exactly the signed commit',
+            'Verify the release result', 'Remove the token']) {
+            expect(runbook).toContain(step);
+        }
+        expect(runbook).toMatch(/Save only/);
+        expect(runbook).toMatch(/Save and deploy/);
+        expect(runbook).toMatch(/Save, rebuild and deploy/);
+        expect(runbook).toMatch(/runtime exposure/i);
+        expect(runbook).toMatch(/at both build time and runtime/i);
+        expect(runbook).not.toMatch(/build-only secret that/i);
+        expect(runbook).toMatch(/must never be treated as\s+one/i);
         expect(read('render.yaml')).toMatch(/AZM_DEPLOY_AUTH_TOKEN/);
         expect(read('render.yaml')).toMatch(/RENDER_GIT_COMMIT/);
     });

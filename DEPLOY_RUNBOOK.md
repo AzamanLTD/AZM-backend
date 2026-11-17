@@ -82,24 +82,68 @@ documents it under default environment variables as available at build time and
 runtime. That is what makes the binding real at the phase where `npm run release`
 runs.
 
-**Operator workflow for one manual release**
+**Operator procedure for one release — six steps, in this order**
 
-1. Deploy the exact commit you intend to release (commit `C`).
-2. On your own machine, mint a token for that commit, in the repository checkout
-   that is at `C` (never in CI, never in an agent workspace, never in chat):
+Render's own semantics decide the order, because saving an environment variable
+and deploying are separate actions:
+
+| Render action | What it does |
+| --- | --- |
+| **Save only** | Stores the changed environment. Does **not** build or deploy; the running instance keeps its current environment. |
+| **Save and deploy** | Stores the change **and** starts a deploy immediately, using the newest commit on the tracked branch. |
+| **Save, rebuild and deploy** | Stores the change, then rebuilds and deploys the current commit. |
+
+1. **Select and verify the exact commit.** Decide the SHA to release and confirm
+   it is the commit you mean: it is on `main` after your approved merge, its CI
+   lanes are green on that SHA, and its tree is the one you reviewed. Convert to
+   the full 40-character SHA; that is what the authorization will name.
+2. **Mint the authorization on an operator-controlled machine.** The private key
+   lives outside the repository, outside CI, outside chat and outside any agent
+   workspace; it is never copied into Render.
 
    ```
-   node infra/sign-deploy-authorization.js --key /secure/offline/azm-release-auth.key --commit C --ttl-minutes 10
+   node infra/sign-deploy-authorization.js --key /secure/offline/azm-release-auth.key --commit <full-sha> --ttl-minutes 10
    ```
 
-   The tool prints the token on stdout and the signed payload, commit and
-   validity window on stderr.
-3. Put the token in the approved service's environment as
-   `AZM_DEPLOY_AUTH_TOKEN` for that deploy, and remove it afterwards. The
-   environment variable is short-lived by design; nothing depends on a
-   long-lived static token.
-4. Trigger the deploy. The chain refuses before any installer if the token is
-   absent, expired, minted for another commit, service, branch or database.
+   The token is printed on stdout, and the signed payload, commit and validity
+   window on stderr. One token authorizes one commit; a second release needs its
+   own token.
+3. **Stage the token in Render without starting an unauthorized build.** The
+   approved service has auto-deploy off, so use **Save only** when adding
+   `AZM_DEPLOY_AUTH_TOKEN`. Nothing is built, and the running instance keeps its
+   previous environment until the next deploy. Do not use Save and deploy here:
+   that path deploys whatever the branch head is, which may not be the commit you
+   signed.
+4. **Trigger the deployment of exactly the signed commit.** Start a manual deploy
+   of that commit. Render runs the Build Command
+   (`npm install && npm run build && npm run release`); because the token is
+   available at build time, the guard can compare the signed commit with
+   `RENDER_GIT_COMMIT` for *this* build. A mismatch fails the build before any
+   installer runs, so no partial DDL is possible.
+5. **Verify the release result.** In the build log confirm the guard's
+   `RELEASE_TARGET_PRODUCTION` line, the installer summary
+   (`installed=true`, `depositClaims`/`witnessClaims`/`quarantined`, `conflicts=0`)
+   and a zero exit. In the dashboard confirm the deployed commit is the SHA you
+   signed.
+6. **Remove the token, and expect the next deploy to need its own.** Delete
+   `AZM_DEPLOY_AUTH_TOKEN` and use **Save only**. That stops future builds from
+   inheriting it, without triggering a deploy and therefore without running the
+   release chain a second time.
+
+**Runtime exposure of the token is real, and bounded.** Render makes environment
+variables available at both build time and runtime, so for the lifetime of the
+instance built in step 4 the token is in the process environment, and a deploy
+that reuses the saved environment would carry it forward. Two things bound the
+exposure: the token expires on its own (10 minutes in the command above, 60 at
+most), and step 6 removes it from the saved environment so later builds do not
+inherit it. It is **not** a build-only secret, and it must never be treated as
+one. Because the value expires, a later deploy on the same service must be
+authorized with a freshly minted token: a build without one fails closed at the
+guard, which is the intended behaviour, not a misconfiguration.
+
+**Replay scope, restated.** A token that is still inside its window can be
+replayed, but only for the same service, branch, commit and database. It cannot
+authorize a different release. It is not single-use.
 
 **Failure behaviour (fail closed, every case).**
 

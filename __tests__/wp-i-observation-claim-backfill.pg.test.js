@@ -30,7 +30,7 @@ const run = DB_URL ? describe : describe.skip;
 
 run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metadata)', () => {
     const { PrismaClient } = require('@prisma/client');
-    const { spawnSync } = require('child_process');
+    const { spawnSync, spawn } = require('child_process');
     const path = require('path');
     const { canonicalObservationIdentity } = require('../src/services/providerObservationIdentity');
     const { claimProviderObservation, CLAIM_PURPOSE } = require('../src/services/providerObservationClaimService');
@@ -54,11 +54,27 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
     const R_DUP_DEPOSITS = ref('dupdeposits');
     const R_DUP_WITNESSES = ref('dupwitnesses');
     const R_PREEXISTING = ref('preexisting');
+    // provider-vs-external identity fixtures (part 1)
+    const R_SEP_OK = ref('sep-ok');
+    const R_SEP_CONTRA = ref('sep-contra');
+    const R_SEP_NOPROV = ref('sep-noprov');
+    const R_SEP_LEGACY = ref('sep-legacy');
+    const R_SEP_META = ref('sep-meta');
+    const R_SEP_GENERIC = ref('sep-generic');
+    // quarantine-verification fixtures (part 2)
+    const R_Q_DEP = ref('q-dep');
+    const R_Q_WIT = ref('q-wit');
+    const R_Q_OK = ref('q-ok');
+    const R_Q_BAD = ref('q-bad');
+    // insert-race fixtures (part 3)
+    const R_RACE_CONFLICT = ref('race-conflict');
+    const R_RACE_OK = ref('race-ok');
     // identity-disambiguation fixtures
     const R_CONFLICT_OWNER = ref('conflict-owner');
     const R_CONFLICT_PURPOSE = ref('conflict-purpose');
     const R_CONFLICT_MALFORMED = ref('conflict-malformed');
     const identityCases = {};
+    const crossIdentity = {};
 
     let prisma;
     let userId;
@@ -74,6 +90,40 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
             encoding: 'utf8',
         });
         return { code: res.status, stdout: res.stdout || '', stderr: res.stderr || '' };
+    }
+
+    /** Async installer run, for tests that must interleave with a second connection. */
+    function runInstallerAsync(extraArgs = []) {
+        return new Promise((resolve) => {
+            const child = spawn(process.execPath, [INSTALLER, ...extraArgs], {
+                cwd: REPO,
+                env: { ...process.env, DATABASE_URL: DB_URL },
+            });
+            let stdout = '';
+            let stderr = '';
+            child.stdout.on('data', (d) => { stdout += d; });
+            child.stderr.on('data', (d) => { stderr += d; });
+            child.on('close', (code) => resolve({ code, stdout, stderr }));
+        });
+    }
+
+    /**
+     * Wait until some backend is WAITING on a row lock in the claim table.
+     * This observes the interleaving (the installer is blocked on the competing
+     * uncommitted row) instead of guessing it with a sleep.
+     */
+    async function waitForRelationLockWait(maxIterations = 240) {
+        for (let i = 0; i < maxIterations; i += 1) {
+            const rows = await prisma.$queryRawUnsafe(`
+                SELECT count(*)::int AS n
+                FROM pg_locks l
+                JOIN pg_class c ON c.oid = l.relation
+                WHERE NOT l.granted AND c.relname = 'ProviderObservationClaim'
+            `);
+            if (rows[0].n > 0) return true;
+            await new Promise((r) => setTimeout(r, 50));
+        }
+        return false;
     }
 
     function jsonOf(out) {
@@ -306,6 +356,118 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
             multiPref: cMultiPRef, multiRel: cMultiRel, missingPref: cNoRef,
         });
 
+        // 11b. PROVIDER vs MERCHANT identity. The adapter sends Azaman's external
+        //      reference and returns a DIFFERENT provider reference, so these
+        //      fixtures use genuinely distinct values (external-A / provider-P).
+        const sepDeposit = async (name, { externalRef, txHash, providerRefColumn = null, metadataProviderRef = 'absent', route = 'MOOLRE_MOMO_COLLECTION' } = {}) => {
+            const ext = externalRef || ref(name);
+            const th = txHash || `${tag}-tx-${name}`;
+            const metadata = {
+                provider: 'MTN_MOMO',
+                network: 'MTN',
+                selectedRoute: route,
+                settlementCurrency: 'USDC',
+                settledAmountGhs: '120.00',
+                settledAt: new Date().toISOString(),
+            };
+            if (externalRef !== null) metadata.settlementExternalRef = ext;
+            if (metadataProviderRef !== 'absent') metadata.settlementProviderRef = metadataProviderRef;
+            const row = await prisma.transactionHistory.create({
+                data: {
+                    userId, type: 'DEPOSIT_FIAT', status: 'COMPLETED',
+                    amountUsdc: '10.00000000', amountGhs: '120.00',
+                    txHash: th, providerRef: providerRefColumn, metadata,
+                },
+            });
+            return { r: ext, txHash: th, id: row.id };
+        };
+        const sepEvent = (externalRef, { providerRef = null, relatedReference = null, dedupKey = null } = {}) =>
+            prisma.fiatProviderEvent.create({
+                data: {
+                    provider: 'MOOLRE', rail: 'MOMO', direction: 'INBOUND', status: 'SUCCESSFUL',
+                    providerRef, dedupKey: dedupKey || `event:moolre-collection:${externalRef}`,
+                    amountGhs: '120.00', relatedReference, raw: { status: 1 },
+                },
+            });
+
+        // (i) the shape the adapter actually produces: external-A / provider-P
+        const sepOk = await sepDeposit('sep-ok', {
+            externalRef: R_SEP_OK, txHash: `${tag}-tx-sep-ok`, providerRefColumn: `${tag}-provider-P`, metadataProviderRef: `${tag}-provider-P`,
+        });
+        await sepEvent(R_SEP_OK, { providerRef: `${tag}-provider-P`, relatedReference: sepOk.txHash });
+
+        // (ii) event provider reference contradicts the persisted one
+        const sepContra = await sepDeposit('sep-contra', {
+            externalRef: R_SEP_CONTRA, txHash: `${tag}-tx-sep-contra`, providerRefColumn: `${tag}-provider-C`, metadataProviderRef: `${tag}-provider-C`,
+        });
+        await sepEvent(R_SEP_CONTRA, { providerRef: `${tag}-provider-Q`, relatedReference: sepContra.txHash });
+
+        // (iii) no persisted provider reference to verify against
+        const sepNoProv = await sepDeposit('sep-noprov', {
+            externalRef: R_SEP_NOPROV, txHash: `${tag}-tx-sep-noprov`, providerRefColumn: null, metadataProviderRef: 'absent',
+        });
+        await sepEvent(R_SEP_NOPROV, { providerRef: `${tag}-provider-X`, relatedReference: sepNoProv.txHash });
+
+        // (iv) direct Moolre callback: the provider echoed the merchant reference
+        const sepLegacy = await sepDeposit('sep-legacy', {
+            externalRef: R_SEP_LEGACY, txHash: `${tag}-tx-sep-legacy`, providerRefColumn: R_SEP_LEGACY, metadataProviderRef: R_SEP_LEGACY,
+        });
+        await sepEvent(R_SEP_LEGACY, { providerRef: R_SEP_LEGACY, relatedReference: sepLegacy.txHash });
+
+        // (v) generic OTP/Moolre callback: provider identity only in settlement metadata
+        const sepMeta = await sepDeposit('sep-meta', {
+            externalRef: R_SEP_META, txHash: `${tag}-tx-sep-meta`, providerRefColumn: null, metadataProviderRef: `${tag}-provider-M`,
+        });
+        await sepEvent(R_SEP_META, { providerRef: `${tag}-provider-M`, relatedReference: sepMeta.txHash });
+
+        // (vi) ordinary generic aggregator deposit on the same MoMo rail
+        const sepGeneric = await sepDeposit('sep-generic', {
+            externalRef: null, txHash: `${tag}-tx-sep-generic`, providerRefColumn: `${tag}-provider-G`, route: 'GENERIC_FIAT_AGGREGATOR',
+        });
+        await prisma.fiatProviderEvent.create({
+            data: {
+                provider: 'GENERIC_FIAT_WEBHOOK', rail: 'MOMO', direction: 'INBOUND', status: 'SUCCESSFUL',
+                providerRef: `${tag}-provider-G`, dedupKey: `event:generic:${R_SEP_GENERIC}:SUCCESSFUL`,
+                amountGhs: '120.00', relatedReference: sepGeneric.txHash, raw: { status: 1 },
+            },
+        });
+        Object.assign(crossIdentity, { sepOk, sepContra, sepNoProv, sepLegacy, sepMeta, sepGeneric });
+
+        // 11c. Cross-path collisions (deposit AND witness, same reference) whose
+        //      pre-existing claim row has to be VERIFIED, not assumed.
+        const crossPath = async (r, name) => {
+            const d = await settledDeposit(r, { txHash: `${tag}-tx-${name}`, providerRef: `${tag}-provider-${name}` });
+            await moolreEvent(r, { txHash: `${tag}-tx-${name}`, providerRef: `${tag}-provider-${name}` });
+            await prisma.providerSettlementWitness.create({
+                data: {
+                    openingDedupKey: `${tag}-opening-${name}`, provider: 'MOOLRE',
+                    fundingType: 'COLLECTION', witnessKind: 'payment_status_lookup',
+                    walletAccount: '0244000000', currency: 'GHS',
+                    netPesewas: 12000n, grossPesewas: 12000n, providerState: 'settled',
+                    endpoint: '/payment/status', requestParams: { id: r },
+                    rawResponseDigest: `digest-${name}`, rawResponse: JSON.stringify({ status: 1 }), fetchedAt: new Date(),
+                },
+            });
+            return { r, depositId: d.id, openingKey: `${tag}-opening-${name}` };
+        };
+        Object.assign(crossIdentity, {
+            qDep: await crossPath(R_Q_DEP, 'qdep'),
+            qWit: await crossPath(R_Q_WIT, 'qwit'),
+            qOk: await crossPath(R_Q_OK, 'qok'),
+            qBad: await crossPath(R_Q_BAD, 'qbad'),
+        });
+
+        // 11d. Insert-race fixtures: one conflicting, one consistent competitor.
+        const raceDeposit = async (r, name) => {
+            const d = await settledDeposit(r, { txHash: `${tag}-tx-${name}`, providerRef: `${tag}-provider-${name}` });
+            await moolreEvent(r, { txHash: `${tag}-tx-${name}`, providerRef: `${tag}-provider-${name}` });
+            return { r, depositId: d.id };
+        };
+        Object.assign(crossIdentity, {
+            raceConflict: await raceDeposit(R_RACE_CONFLICT, 'race-conflict'),
+            raceOk: await raceDeposit(R_RACE_OK, 'race-ok'),
+        });
+
         // 12. Pre-existing claim conflicts, each on its own genuine settlement.
         for (const [name, r] of [
             ['conflictOwner', R_CONFLICT_OWNER],
@@ -362,6 +524,7 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
         // "already claimed" and "would insert", and the split must add up.
         expect(dryReport.wouldInsertDeposits + dryReport.alreadyClaimedDeposits).toBe(dryReport.wouldClaimDeposits);
         expect(dryReport.wouldInsertWitnesses + dryReport.alreadyClaimedWitnesses).toBe(dryReport.wouldClaimWitnesses);
+        expect(dryReport.wouldInsertQuarantine + dryReport.alreadyQuarantined).toBe(dryReport.wouldQuarantine);
         expect(Array.isArray(dryReport.conflicts)).toBe(true);
 
         const real = jsonOf(runInstaller(['--json']).stdout);
@@ -414,8 +577,8 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
             .some((v) => String(v || '').includes(tag)));
         const kinds = mine.map((a) => a.kind);
         expect(kinds).toContain('MOOLRE_EVIDENCE_WITHOUT_SETTLEMENT_REFERENCE');
-        expect(kinds).toContain('CONTRADICTORY_SETTLEMENT_REFERENCE');
-        const contradiction = mine.find((a) => a.kind === 'CONTRADICTORY_SETTLEMENT_REFERENCE');
+        expect(kinds).toContain('CONTRADICTORY_PROVIDER_REFERENCE');
+        const contradiction = mine.find((a) => a.kind === 'CONTRADICTORY_PROVIDER_REFERENCE');
         expect(contradiction.observationKey).toBe(key(R_CONTRADICTORY));
     }, 60000);
 
@@ -673,6 +836,268 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
             const dry = jsonOf(runInstaller(['--dry-run', '--json']).stdout);
             expect(dry.wouldQuarantine).toBeGreaterThanOrEqual(3);
             expect(dry.quarantined).toBe(0);
+        }, 120000);
+    });
+
+    describe('the provider reference is a SEPARATE identity from the merchant external reference', () => {
+        let report;
+        beforeAll(() => {
+            const res = runInstaller(['--json']);
+            expect(res.code).toBe(0);
+            report = jsonOf(res.stdout);
+        }, 180000);
+
+        const anomalyFor = (r, kind) => report.anomalies
+            .find((a) => a.kind === kind && String(a.observationKey) === key(r));
+        const claimFor = async (r) => (await claimsFor([r]))[0];
+
+        test('external-A / provider-P is CLAIMED under the external reference', async () => {
+            const row = await claimFor(R_SEP_OK);
+            expect(row).toBeDefined();
+            expect(row.purpose).toBe('CUSTOMER_DEPOSIT');
+            expect(row.claimedByRef).toBe(crossIdentity.sepOk.id);
+            // the canonical key is the merchant reference, never the provider's
+            expect(row.observationKey).toBe(key(R_SEP_OK));
+            expect(row.observationKey).not.toBe(key(`${tag}-provider-P`));
+        }, 60000);
+
+        test('a contradicting event provider reference is refused, not claimed', async () => {
+            expect(anomalyFor(R_SEP_CONTRA, 'CONTRADICTORY_MOOLRE_EVIDENCE')).toBeDefined();
+            expect(anomalyFor(R_SEP_CONTRA, 'CONTRADICTORY_MOOLRE_EVIDENCE').detail)
+                .toMatch(/providerRef=.*does not match the deposit's provider reference/);
+            expect(await claimsFor([R_SEP_CONTRA])).toHaveLength(0);
+        }, 60000);
+
+        test('a populated provider reference with nothing to verify it against is unclassifiable', async () => {
+            const anomaly = anomalyFor(R_SEP_NOPROV, 'CONTRADICTORY_MOOLRE_EVIDENCE');
+            expect(anomaly).toBeDefined();
+            expect(anomaly.detail).toMatch(/cannot be verified \(deposit records no provider reference\)/);
+            expect(await claimsFor([R_SEP_NOPROV])).toHaveLength(0);
+        }, 60000);
+
+        test('a direct Moolre callback that echoed the external reference is still claimed', async () => {
+            const row = await claimFor(R_SEP_LEGACY);
+            expect(row).toBeDefined();
+            expect(row.claimedByRef).toBe(crossIdentity.sepLegacy.id);
+        }, 60000);
+
+        test('provider identity recorded only in settlement metadata is enough to verify', async () => {
+            const row = await claimFor(R_SEP_META);
+            expect(row).toBeDefined();
+            expect(row.claimedByRef).toBe(crossIdentity.sepMeta.id);
+        }, 60000);
+
+        test('an ordinary generic aggregator deposit on the same rail stays unclaimed', async () => {
+            expect(await claimsFor([R_SEP_GENERIC])).toHaveLength(0);
+            expect(typeof report.skipped.nonMoolreProvider).toBe('number');
+            expect(report.skipped.nonMoolreProvider).toBeGreaterThanOrEqual(1);
+        }, 60000);
+
+        test('the two identity families are never compared across kinds', async () => {
+            // external-A and provider-P are both present on the same deposit and
+            // DIFFER; the claim key was built from the external one and the run
+            // reported no contradiction for that deposit.
+            expect(key(R_SEP_OK)).not.toBe(key(`${tag}-provider-P`));
+            expect(anomalyFor(R_SEP_OK, 'CONTRADICTORY_MOOLRE_EVIDENCE')).toBeUndefined();
+            expect(anomalyFor(R_SEP_OK, 'CONTRADICTORY_PROVIDER_REFERENCE')).toBeUndefined();
+        }, 60000);
+    });
+
+    describe('a quarantine row is verified like any other claim', () => {
+        const quarantineRow = (r) => prisma.providerObservationClaim.findUnique({ where: { observationKey: key(r) } });
+        const inject = async (r, data) => {
+            await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(r) } });
+            await prisma.providerObservationClaim.create({
+                data: { observationKey: key(r), purpose: 'QUARANTINE', claimedByRef: null, provider: 'moolre', ...data },
+            });
+        };
+
+        test('a pre-existing CUSTOMER_DEPOSIT on a cross-path collision is a conflict', async () => {
+            await inject(R_Q_DEP, { purpose: 'CUSTOMER_DEPOSIT', claimedByRef: crossIdentity.qDep.depositId });
+            try {
+                const before = await prisma.providerObservationClaim.count({ where: { observationKey: { contains: tag } } });
+                const res = runInstaller(['--json']);
+                expect(res.code).toBe(2);
+                expect(res.stderr).toMatch(/PRE-EXISTING CLAIM CONFLICT/);
+                expect(res.stderr).toMatch(/purpose=CUSTOMER_DEPOSIT/);
+                expect(await prisma.providerObservationClaim.count({ where: { observationKey: { contains: tag } } })).toBe(before);
+                const row = await quarantineRow(R_Q_DEP);
+                expect(row.purpose).toBe('CUSTOMER_DEPOSIT');
+            } finally {
+                await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(R_Q_DEP) } });
+            }
+        }, 120000);
+
+        test('a pre-existing TREASURY_WITNESS on a cross-path collision is a conflict', async () => {
+            await inject(R_Q_WIT, { purpose: 'TREASURY_WITNESS', claimedByRef: crossIdentity.qWit.openingKey });
+            try {
+                const res = runInstaller(['--json']);
+                expect(res.code).toBe(2);
+                expect(res.stderr).toMatch(/purpose=TREASURY_WITNESS/);
+                const row = await quarantineRow(R_Q_WIT);
+                expect(row.purpose).toBe('TREASURY_WITNESS');
+            } finally {
+                await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(R_Q_WIT) } });
+            }
+        }, 120000);
+
+        test('a correct ownerless QUARANTINE row is an idempotent replay', async () => {
+            await inject(R_Q_OK, {});
+            try {
+                const res = runInstaller(['--json']);
+                expect(res.code).toBe(0);
+                const report = jsonOf(res.stdout);
+                expect(report.alreadyQuarantined).toBeGreaterThanOrEqual(1);
+                expect(report.conflicts).toEqual([]);
+                const rows = await prisma.providerObservationClaim.count({ where: { observationKey: key(R_Q_OK) } });
+                expect(rows).toBe(1);
+                const row = await quarantineRow(R_Q_OK);
+                expect(row.purpose).toBe('QUARANTINE');
+                expect(row.claimedByRef).toBeNull();
+            } finally {
+                await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(R_Q_OK) } });
+            }
+        }, 120000);
+
+        test('a MALFORMED quarantine row (owner present) is a conflict', async () => {
+            await inject(R_Q_BAD, { claimedByRef: 'a-owner-on-a-quarantine-row' });
+            try {
+                const res = runInstaller(['--json']);
+                expect(res.code).toBe(2);
+                expect(res.stderr).toMatch(/claimedByRef=a-owner-on-a-quarantine-row/);
+                const row = await quarantineRow(R_Q_BAD);
+                expect(row.claimedByRef).toBe('a-owner-on-a-quarantine-row');
+                // dry run reports the same conflict and writes nothing
+                const dry = jsonOf(runInstaller(['--dry-run', '--json']).stdout);
+                expect(dry.conflicts.map((c) => c.observationKey)).toContain(key(R_Q_BAD));
+                expect(dry.quarantined).toBe(0);
+            } finally {
+                await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(R_Q_BAD) } });
+            }
+        }, 120000);
+
+        test('no existing row is ever counted as a successful quarantine', async () => {
+            // With every quarantine key already present and correct, a repeat run
+            // must report replays — never new quarantine writes.
+            const first = runInstaller(['--json']);
+            expect(first.code).toBe(0);
+            const second = runInstaller(['--json']);
+            expect(second.code).toBe(0);
+            const report = jsonOf(second.stdout);
+            expect(report.quarantined).toBe(0);
+            expect(report.wouldInsertQuarantine).toBe(0);
+            expect(report.alreadyQuarantined).toBeGreaterThanOrEqual(3);
+        }, 180000);
+    });
+
+    describe('a competing claim is verified, never assumed', () => {
+        const otherClient = () => new PrismaClient();
+
+        /**
+         * The installer's DDL takes a ShareLock on the claim table, which is
+         * compatible with a concurrent RowExclusive but NOT with an ALREADY-OPEN
+         * uncommitted writer. So the first reachable ordering is: a writer is open
+         * when the installer starts, the installer blocks in its DDL, and once the
+         * writer commits the installer's read sees the winner and reports a
+         * pre-write conflict. Observed via pg_locks, never by sleeping.
+         */
+        test('an ALREADY-OPEN writer that commits mid-run is caught by the pre-write comparison', async () => {
+            const other = otherClient();
+            await other.$connect();
+            try {
+                await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(R_RACE_CONFLICT) } });
+                await other.$executeRawUnsafe('BEGIN');
+                await other.$executeRawUnsafe(
+                    `INSERT INTO "ProviderObservationClaim" ("id","observationKey","purpose","claimedByRef","provider","accountKey","createdAt","updatedAt")
+                     VALUES (gen_random_uuid()::text,$1,'CUSTOMER_DEPOSIT',$2,'moolre',NULL, now(), now())`,
+                    key(R_RACE_CONFLICT), 'some-other-owner');
+
+                const running = runInstallerAsync(['--json']);
+                // The installer's DDL is waiting on our uncommitted row.
+                expect(await waitForRelationLockWait()).toBe(true);
+                await other.$executeRawUnsafe('COMMIT');
+
+                const res = await running;
+                expect(res.code).toBe(2);
+                expect(res.stderr).toMatch(/PRE-EXISTING CLAIM CONFLICT/);
+                const row = await prisma.providerObservationClaim.findUnique({ where: { observationKey: key(R_RACE_CONFLICT) } });
+                expect(row.claimedByRef).toBe('some-other-owner');
+                // and every other affect of that refused run is gone
+                expect(res.stdout).not.toContain('"depositClaims":1');
+            } finally {
+                await other.$disconnect();
+                await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(R_RACE_CONFLICT) } });
+            }
+        }, 240000);
+
+        const RACE_TRIGGER = `
+            CREATE OR REPLACE FUNCTION azm_race_claim() RETURNS trigger AS $$
+            BEGIN
+                IF pg_trigger_depth() > 1 THEN RETURN NEW; END IF;
+                IF NEW."observationKey" = TG_ARGV[0] THEN
+                    INSERT INTO "ProviderObservationClaim"
+                        ("id","observationKey","purpose","claimedByRef","provider","accountKey","createdAt","updatedAt")
+                    VALUES (gen_random_uuid()::text, NEW."observationKey", 'CUSTOMER_DEPOSIT', TG_ARGV[1], 'moolre', NULL, now(), now());
+                END IF;
+                RETURN NEW;
+            END $$ LANGUAGE plpgsql;
+        `;
+
+        const withRaceTrigger = async (targetKey, owner, fn) => {
+            await prisma.$executeRawUnsafe(RACE_TRIGGER);
+            await prisma.$executeRawUnsafe(`DROP TRIGGER IF EXISTS azm_race_claim_trg ON "ProviderObservationClaim"`);
+            await prisma.$executeRawUnsafe(
+                `CREATE TRIGGER azm_race_claim_trg BEFORE INSERT ON "ProviderObservationClaim"
+                 FOR EACH ROW EXECUTE FUNCTION azm_race_claim('${targetKey}', '${owner}')`);
+            try {
+                return await fn();
+            } finally {
+                await prisma.$executeRawUnsafe(`DROP TRIGGER IF EXISTS azm_race_claim_trg ON "ProviderObservationClaim"`);
+            }
+        };
+
+        /**
+         * The second reachable ordering is the true lost race: a competing row is
+         * written immediately before the installer's own INSERT, so the insert
+         * returns ZERO rows. A BEFORE INSERT trigger places the competitor exactly
+         * there — after the installer's read, before its write — with no timing
+         * assumption at all.
+         */
+        test('an insert that returns ZERO rows re-reads the winner and REFUSES a conflicting one', async () => {
+            await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(R_RACE_CONFLICT) } });
+            const res = await withRaceTrigger(key(R_RACE_CONFLICT), 'trigger-competitor', () => runInstallerAsync(['--json']));
+
+            expect(res.code).toBe(2);
+            expect(res.stderr).toMatch(/"duringInsertRace":true/);
+            expect(res.stderr).toMatch(/claimedByRef=trigger-competitor/);
+            // the refused run is fully rolled back, including the injected competitor
+            const row = await prisma.providerObservationClaim.findUnique({ where: { observationKey: key(R_RACE_CONFLICT) } });
+            expect(row).toBeNull();
+        }, 240000);
+
+        test('an insert that returns ZERO rows accepts a CONSISTENT winner as an idempotent replay', async () => {
+            await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(R_RACE_OK) } });
+            const res = await withRaceTrigger(key(R_RACE_OK), crossIdentity.raceOk.depositId, () => runInstallerAsync(['--json']));
+
+            expect(res.code).toBe(0);
+            const report = jsonOf(res.stdout);
+            expect(report.racedReplays).toBeGreaterThanOrEqual(1);
+            expect(report.conflicts).toEqual([]);
+            expect(typeof report.depositClaims).toBe('number');
+            const rows = await prisma.providerObservationClaim.findMany({ where: { observationKey: key(R_RACE_OK) } });
+            expect(rows).toHaveLength(1);
+            expect(rows[0].claimedByRef).toBe(crossIdentity.raceOk.depositId);
+        }, 240000);
+
+        test('the unique invariant is still enforced by the database itself', async () => {
+            await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(R_RACE_OK) } });
+            await prisma.providerObservationClaim.create({
+                data: { observationKey: key(R_RACE_OK), purpose: 'CUSTOMER_DEPOSIT', claimedByRef: crossIdentity.raceOk.depositId, provider: 'moolre' },
+            });
+            await expect(prisma.providerObservationClaim.create({
+                data: { observationKey: key(R_RACE_OK), purpose: 'CUSTOMER_DEPOSIT', claimedByRef: 'second-writer', provider: 'moolre' },
+            })).rejects.toThrow();
+            expect(await prisma.providerObservationClaim.count({ where: { observationKey: key(R_RACE_OK) } })).toBe(1);
         }, 120000);
     });
 });
