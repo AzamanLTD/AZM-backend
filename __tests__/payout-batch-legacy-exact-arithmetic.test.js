@@ -56,6 +56,17 @@ describe('payoutBatchWorker legacy fiat dispatch — exact 2-dp GHS', () => {
         const initiateTransfer = jest.fn().mockResolvedValue({
             _provider: 'mtn', provider: 'MTN_MOMO_DISBURSEMENT', status: 'ACCEPTED',
         });
+        // ONE row object, shared by the preflight scan and the claim's own
+        // in-transaction re-read. The claim resolves the canonical transaction on
+        // its own snapshot and needs the same identity the preflight row carried
+        // (amount, userId, createdAt); a stub returning only {id,status} makes that
+        // resolution fail and parks the row as MISSING_TRANSACTION_REFERENCE.
+        const row = {
+            id: 91, userId: 7, amount: usdcAmount, destination: '0240000000', network: 'MTN',
+            payoutMethod: 'MTN_MOMO', settlementCurrency: null, status: 'PENDING',
+            createdAt: new Date('2026-08-30T10:00:00.000Z'),
+        };
+
         const prisma = {
             globalSettings: { findUnique: jest.fn().mockResolvedValue({ ...settings, liveRetailRate }) },
             fiatLiquidityState: { findUnique: jest.fn().mockResolvedValue({ availableGhs: 500000 }) },
@@ -63,11 +74,8 @@ describe('payoutBatchWorker legacy fiat dispatch — exact 2-dp GHS', () => {
             fiatLiquidityReservation: { findUnique: jest.fn().mockResolvedValue(reservation) },
             withdrawal: {
                 // The claim re-reads the row INSIDE the claim transaction.
-                findUnique: jest.fn(async (args) => ({ id: args && args.where ? args.where.id : 91, status: 'PENDING' })),
-                findMany: jest.fn().mockResolvedValue([{
-                    id: 91, userId: 7, amount: usdcAmount, destination: '0240000000', network: 'MTN',
-                    payoutMethod: 'MTN_MOMO', createdAt: new Date('2026-08-30T10:00:00.000Z'),
-                }]),
+                findUnique: jest.fn(async () => row),
+                findMany: jest.fn().mockResolvedValue([row]),
                 update: jest.fn().mockResolvedValue({}),
                 updateMany: jest.fn().mockResolvedValue({ count: 1 }),
             },
@@ -134,6 +142,15 @@ describe('payoutBatchWorker legacy fiat dispatch — exact 2-dp GHS', () => {
             const initiateTransfer = jest.fn().mockResolvedValue({
                 _provider: 'mtn', provider: 'MTN_MOMO_DISBURSEMENT', status: 'ACCEPTED',
             });
+            // Same identity for the preflight scan and the claim's in-transaction
+            // re-read, including status: the guard reads it and an absent status is
+            // indistinguishable from a row already claimed.
+            const row77 = {
+                id: 77, userId: 7, amount: usdcAmount, destination: '0240000000', network: 'MTN',
+                payoutMethod: 'MTN_MOMO', settlementCurrency: null, status: 'PENDING',
+                createdAt: new Date('2026-08-30T10:00:00.000Z'),
+            };
+
             const prisma = {
                 globalSettings: { findUnique: jest.fn().mockResolvedValue(settings) },
                 fiatLiquidityState: { findUnique: jest.fn().mockResolvedValue(null) },
@@ -141,11 +158,8 @@ describe('payoutBatchWorker legacy fiat dispatch — exact 2-dp GHS', () => {
                 fiatLiquidityReservation: { findUnique: jest.fn().mockResolvedValue(null) },
                 withdrawal: {
                 // The claim re-reads the row INSIDE the claim transaction.
-                findUnique: jest.fn(async (args) => ({ id: args && args.where ? args.where.id : 91, status: 'PENDING' })),
-                    findMany: jest.fn().mockResolvedValue([{
-                        id: 77, userId: 7, amount: usdcAmount, destination: '0240000000', network: 'MTN',
-                        payoutMethod: 'MTN_MOMO', createdAt: new Date('2026-08-30T10:00:00.000Z'),
-                    }]),
+                findUnique: jest.fn(async () => row77),
+                findMany: jest.fn().mockResolvedValue([row77]),
                     update: jest.fn().mockResolvedValue({}),
                     updateMany: jest.fn().mockResolvedValue({ count: 1 }),
                 },
@@ -230,7 +244,11 @@ describe('payoutBatchWorker legacy fiat dispatch — exact 2-dp GHS', () => {
         const dispatched = await dispatch({
             usdcAmount: new Prisma.Decimal('1'),
             liveRetailRate: '20', // deliberately different from the reservation
-            reservation: { amountGhs: new Prisma.Decimal('12.34') },
+            // A reservation authorises a payout only when its reference IS the
+            // canonical transaction's reference ('ref-1' in this fixture) and its
+            // amount is a positive finite decimal. A fixture without the reference
+            // is not a valid reservation and the claim is right to park it.
+            reservation: { id: 'res-1', reference: 'ref-1', amountGhs: new Prisma.Decimal('12.34') },
         });
         expect(dispatched.amountGhs).toBe('12.34');
     });
