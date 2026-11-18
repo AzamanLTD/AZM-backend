@@ -41,7 +41,19 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
         fiatLiquidityReservation: { findUnique: jest.fn().mockResolvedValue(null) },
             withdrawal: {
                 // The claim re-reads the row INSIDE the claim transaction.
-                findUnique: jest.fn(async (args) => ({ id: args && args.where ? args.where.id : 91, status: 'PENDING' })),
+                // A real Prisma read honours `select`; the claim transaction re-reads the
+                // immutable identity it needs to re-resolve the canonical row, so the fake
+                // returns a faithful row rather than an id+status stub.
+                findUnique: jest.fn(async (args) => ({
+                    id: args && args.where ? args.where.id : 91,
+                    status: 'PENDING',
+                    userId: 7,
+                    amount: 50,
+                    destination: '0240000000',
+                    network: 'TELECEL',
+                    settlementCurrency: 'USDC',
+                    createdAt: new Date('2026-08-30T10:00:00.000Z'),
+                })),
                 findMany: jest.fn().mockResolvedValue([{
                     id: 91, userId: 7, amount: 50, destination: '0240000000', network: 'TELECEL',
                     payoutMethod: 'MTN_MOMO', createdAt: new Date('2026-08-30T10:00:00.000Z'),
@@ -80,7 +92,19 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
         fiatLiquidityReservation: { findUnique: jest.fn().mockResolvedValue(null) },
             withdrawal: {
                 // The claim re-reads the row INSIDE the claim transaction.
-                findUnique: jest.fn(async (args) => ({ id: args && args.where ? args.where.id : 91, status: 'PENDING' })),
+                // A real Prisma read honours `select`; the claim transaction re-reads the
+                // immutable identity it needs to re-resolve the canonical row, so the fake
+                // returns a faithful row rather than an id+status stub.
+                findUnique: jest.fn(async (args) => ({
+                    id: args && args.where ? args.where.id : 91,
+                    status: 'PENDING',
+                    userId: 7,
+                    amount: 50,
+                    destination: '0240000000',
+                    network: 'TELECEL',
+                    settlementCurrency: 'USDC',
+                    createdAt: new Date('2026-08-30T10:00:00.000Z'),
+                })),
                 findMany: jest.fn().mockResolvedValue([{
                     id: 93, userId: 7, amount: 50, destination: '0240000000', network: 'MTN',
                     payoutMethod: 'MTN_MOMO', createdAt: new Date('2026-08-30T10:00:00.000Z'),
@@ -114,7 +138,19 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
         fiatLiquidityReservation: { findUnique: jest.fn().mockResolvedValue(null) },
             withdrawal: {
                 // The claim re-reads the row INSIDE the claim transaction.
-                findUnique: jest.fn(async (args) => ({ id: args && args.where ? args.where.id : 91, status: 'PENDING' })),
+                // A real Prisma read honours `select`; the claim transaction re-reads the
+                // immutable identity it needs to re-resolve the canonical row, so the fake
+                // returns a faithful row rather than an id+status stub.
+                findUnique: jest.fn(async (args) => ({
+                    id: args && args.where ? args.where.id : 91,
+                    status: 'PENDING',
+                    userId: 7,
+                    amount: 50,
+                    destination: '0240000000',
+                    network: 'TELECEL',
+                    settlementCurrency: 'USDC',
+                    createdAt: new Date('2026-08-30T10:00:00.000Z'),
+                })),
                 findMany: jest.fn().mockResolvedValue([{
                     id: 92, userId: 7, amount: 50, destination: '0240000000', network: 'AIRTELTIGO',
                     payoutMethod: 'MTN_MOMO', createdAt: new Date('2026-08-30T10:00:00.000Z'),
@@ -167,7 +203,19 @@ describe('PayoutBatchWorker provider outcome classification', () => {
         // withdrawal; the legacy SystemFiatPool policy applies.
         fiatLiquidityReservation: { findUnique: jest.fn().mockResolvedValue(null) },
         withdrawal: {
-                findUnique: jest.fn(async (args) => ({ id: args && args.where ? args.where.id : 91, status: 'PENDING' })),
+                // A real Prisma read honours `select`; the claim transaction re-reads the
+                // immutable identity it needs to re-resolve the canonical row, so the fake
+                // returns a faithful row rather than an id+status stub.
+                findUnique: jest.fn(async (args) => ({
+                    id: args && args.where ? args.where.id : 91,
+                    status: 'PENDING',
+                    userId: 7,
+                    amount: 50,
+                    destination: '0240000000',
+                    network: 'TELECEL',
+                    settlementCurrency: 'USDC',
+                    createdAt: new Date('2026-08-30T10:00:00.000Z'),
+                })),
             findMany: jest.fn().mockResolvedValue([withdrawal]),
             update,
             updateMany,

@@ -148,16 +148,19 @@ class PayoutBatchWorker {
      * migration exists. Fall back only when exactly one PENDING fiat transaction
      * matches the withdrawal identity. Ambiguity is never auto-dispatched.
      */
-    async _findCanonicalTransaction(withdrawal) {
-        if (typeof this.prisma.$queryRawUnsafe === 'function') {
+    async _findCanonicalTransaction(withdrawal, client = null) {
+        // `client` lets the durable claim transaction RE-RESOLVE the canonical
+        // row on its own snapshot instead of trusting a preflight read.
+        const db = client || this.prisma;
+        if (typeof db.$queryRawUnsafe === 'function') {
             try {
-                const linkedRows = await this.prisma.$queryRawUnsafe(
+                const linkedRows = await db.$queryRawUnsafe(
                     'SELECT "transactionHistoryId" FROM "Withdrawal" WHERE "id" = $1 LIMIT 1',
                     withdrawal.id
                 );
                 const linkedId = linkedRows?.[0]?.transactionHistoryId;
                 if (linkedId) {
-                    const linked = await this.prisma.transactionHistory.findUnique({ where: { id: linkedId } });
+                    const linked = await db.transactionHistory.findUnique({ where: { id: linkedId } });
                     if (linked) return { row: linked, ambiguous: false };
                 }
             } catch (err) {
@@ -177,12 +180,12 @@ class PayoutBatchWorker {
         // reservation path) has its own economic identity and must never
         // adopt — let alone dispatch — a fiat canonical reservation that
         // belongs to a different withdrawal. Refuse the guess.
-        const ownObligation = await restrictedObligations.findActiveForSource(this.prisma, 'withdrawal', withdrawal.id);
+        const ownObligation = await restrictedObligations.findActiveForSource(db, 'withdrawal', withdrawal.id);
         if (ownObligation) {
             return { row: null, ambiguous: false };
         }
 
-        const txRowsRaw = await this.prisma.transactionHistory.findMany({
+        const txRowsRaw = await db.transactionHistory.findMany({
             where: {
                 userId: withdrawal.userId,
                 type: 'WITHDRAWAL_FIAT',
@@ -221,7 +224,7 @@ class PayoutBatchWorker {
         // proceeding toward provider dispatch under a canonical another
         // withdrawal durably owns.
         const candidate = txRows[0];
-        const claim = await withdrawalBridge.claimOrphanCanonical(this.prisma, withdrawal.id, candidate.id);
+        const claim = await withdrawalBridge.claimOrphanCanonical(db, withdrawal.id, candidate.id);
         if (!claim.won) {
             logger.warn({
                 withdrawalId: withdrawal.id,
@@ -465,11 +468,14 @@ class PayoutBatchWorker {
             // pool policy even when the flag is ON. The flag never
             // converts a historical row into an authority reservation and
             // the worker NEVER creates a reservation itself.
-            const referenceId = String(canonical.row.txHash);
-            const reservation = await this.prisma.fiatLiquidityReservation.findUnique({
+            // These start as the PREFLIGHT SCAN's view and are OVERWRITTEN from
+            // the durable claim transaction below. The scan is an optimisation;
+            // nothing decided here authorises provider I/O.
+            let referenceId = String(canonical.row.txHash);
+            let reservation = await this.prisma.fiatLiquidityReservation.findUnique({
                 where: { reference: referenceId }
             });
-            const authorityRecorded = reservation != null;
+            let authorityRecorded = reservation != null;
 
             if (authorityRecorded) {
                 // Authority regime: the payout's exact GHS was ALREADY
@@ -556,26 +562,125 @@ class PayoutBatchWorker {
             let claimOutcome;
             try {
                 claimOutcome = await this.prisma.$transaction(async (tx) => {
+                    // ── THE CLAIM TRANSACTION MAKES THE AUTHORISATION DECISION ──
+                    // The preflight scan above is an optimisation. Everything that
+                    // authorises provider I/O is decided here, on this transaction's
+                    // own reads, under the canonical shared authority lock that the
+                    // activation path takes exclusively. A regime or reservation that
+                    // changed after the scan cannot leak into the dispatch.
                     await authorityState.lockAuthorityShared(tx);
-                    // The canonical regime reader: tri-state refuses UNKNOWN,
-                    // legacy answers from the flag/latch. Same reader the money
-                    // paths use, so a claim can never outrun the regime decision.
+                    // Tri-state: UNKNOWN throws AUTHORITY_STATE_UNAVAILABLE, which the
+                    // caller turns into "park nothing, dispatch nothing".
                     const mode = await fiatLiquidityActivation.readMode(tx);
+
                     const fresh = await tx.withdrawal.findUnique({
                         where: { id: withdrawal.id },
-                        select: { id: true, status: true },
+                        select: {
+                            id: true, status: true, amount: true, destination: true,
+                            network: true, userId: true, settlementCurrency: true, createdAt: true,
+                        },
                     });
                     if (!fresh || !['PENDING', 'APPROVED'].includes(fresh.status)) {
                         return { claimed: false, reason: 'WITHDRAWAL_ALREADY_CLAIMED' };
                     }
+
+                    // (4)(5) Re-resolve the canonical linked transaction and the
+                    // EXACT reservation on this snapshot. The preflight objects are
+                    // never used to authorise money.
+                    const freshCanonical = await this._findCanonicalTransaction(fresh, tx);
+                    if (!freshCanonical.row) {
+                        const reason = freshCanonical.claimLost
+                            ? 'ORPHAN_ADOPTION_CLAIM_LOST'
+                            : freshCanonical.ambiguous
+                                ? 'AMBIGUOUS_TRANSACTION_REFERENCE'
+                                : 'MISSING_TRANSACTION_REFERENCE';
+                        const parkedNow = await this._parkWithinTransaction(tx, fresh.id, reason, { canonicalResolution: reason });
+                        return { claimed: false, parkReason: reason, parked: parkedNow };
+                    }
+                    const freshReferenceId = String(freshCanonical.row.txHash);
+                    const freshReservation = await tx.fiatLiquidityReservation.findUnique({
+                        where: { reference: freshReferenceId },
+                    });
+
+                    // (8) AUTHORITY ACTIVE + NO VALID GHS RESERVATION ⇒ NEVER legacy-dispatch.
+                    // This is the race the preflight scan could not see: the regime
+                    // flipped to ACTIVE after the scan read it as legacy. Paying this
+                    // row through the legacy pool would spend USDC-derived value for a
+                    // payout the authority regime has not reserved.
+                    if (mode.active && !freshReservation) {
+                        const parkedNow = await this._parkWithinTransaction(tx, fresh.id, 'AUTHORITY_ACTIVE_WITHOUT_RESERVATION', {
+                            referenceId: freshReferenceId,
+                            canonicalTransactionId: String(freshCanonical.row.id),
+                            authorityMode: 'ACTIVE',
+                            message: 'Authority became active after the preflight scan; a row without a GHS reservation must not be dispatched through the legacy pool.',
+                        });
+                        return { claimed: false, parkReason: 'AUTHORITY_ACTIVE_WITHOUT_RESERVATION', parked: parkedNow };
+                    }
+
+                    if (freshReservation) {
+                        // (9) The reservation must be internally valid before it
+                        // authorises anything, and its ORIGINAL reserved GHS is the
+                        // amount paid — never a later FX rate.
+                        let reservedExact = null;
+                        try {
+                            reservedExact = new Prisma.Decimal(String(freshReservation.amountGhs));
+                        } catch (_) {
+                            reservedExact = null;
+                        }
+                        const reservationInvalid = !freshReservation.reference
+                            || String(freshReservation.reference) !== freshReferenceId
+                            || !reservedExact
+                            || !reservedExact.isFinite()
+                            || reservedExact.lessThanOrEqualTo(0);
+                        if (reservationInvalid) {
+                            const parkedNow = await this._parkWithinTransaction(tx, fresh.id, 'AUTHORITY_RESERVATION_INVALID', {
+                                referenceId: freshReferenceId,
+                                reservationId: freshReservation.id,
+                                reservedAmountGhs: freshReservation.amountGhs == null ? null : String(freshReservation.amountGhs),
+                            });
+                            return { claimed: false, parkReason: 'AUTHORITY_RESERVATION_INVALID', parked: parkedNow };
+                        }
+                    }
+
+                    // (11) single-winner claim, in the same commit as the decision.
                     const claim = await tx.withdrawal.updateMany({
-                        // P0 (APPROVED dead-end): claim admin-approved rows too —
-                        // the CAS is the single-winner guard against a concurrent
-                        // admin reject (which also claims from APPROVED).
                         where: { id: fresh.id, status: { in: ['PENDING', 'APPROVED'] } },
                         data: { status: 'PROCESSING' },
                     });
-                    return { claimed: claim.count === 1, authorityActive: mode.active };
+                    if (claim.count !== 1) {
+                        return { claimed: false, reason: 'WITHDRAWAL_ALREADY_CLAIMED' };
+                    }
+
+                    // (12) immutable dispatch descriptor: everything downstream
+                    // (provider call, IN_TRANSIT, gauges) is driven by THIS, not by
+                    // the preflight objects.
+                    const regime = freshReservation ? 'AUTHORITY' : 'LEGACY';
+                    const amountGhsExact = freshReservation
+                        ? new Prisma.Decimal(String(freshReservation.amountGhs))
+                            .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP)
+                        : new Prisma.Decimal(String(fresh.amount))
+                            .times(liveRateExact)
+                            .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
+
+                    return {
+                        claimed: true,
+                        descriptor: {
+                            regime,
+                            authorityMode: mode.active ? 'ACTIVE' : 'INACTIVE',
+                            referenceId: freshReferenceId,
+                            canonicalTransactionId: String(freshCanonical.row.id),
+                            destination: fresh.destination,
+                            network: fresh.network || 'MTN',
+                            amountGhsExact,
+                            reservation: freshReservation
+                                ? {
+                                    id: freshReservation.id,
+                                    reference: freshReservation.reference,
+                                    amountGhs: freshReservation.amountGhs,
+                                }
+                                : null,
+                        },
+                    };
                 });
             } catch (claimErr) {
                 if (claimErr && claimErr.code === 'AUTHORITY_STATE_UNAVAILABLE') {
@@ -588,9 +693,38 @@ class PayoutBatchWorker {
                 throw claimErr;
             }
             if (!claimOutcome.claimed) {
+                if (claimOutcome.parkReason) {
+                    // Refused BY THE CLAIM TRANSACTION. `parked` is false only when a
+                    // concurrent worker or an admin already moved the row, in which
+                    // case the evidence rolled back with the losing CAS.
+                    if (claimOutcome.parked) {
+                        results.flaggedManualReview.push({ id: withdrawal.id, reason: claimOutcome.parkReason, amount });
+                        if (this.notificationService) {
+                            await this.notificationService.sendNotification({
+                                userId: withdrawal.userId,
+                                title: 'Withdrawal Under Review',
+                                message: 'Your withdrawal is being reviewed by our team. This usually takes less than 24 hours.',
+                                type: 'WITHDRAWAL_REVIEW',
+                                category: 'GENERAL',
+                            }).catch(() => {});
+                        }
+                        logger.info(`[payoutBatchWorker] flagged withdrawal #${withdrawal.id} → NEEDS_MANUAL_REVIEW (${claimOutcome.parkReason})`);
+                    } else {
+                        results.errors.push({ id: withdrawal.id, reason: `${claimOutcome.parkReason}:ROW_OWNED_BY_CONCURRENT_TRANSITION` });
+                    }
+                    continue;
+                }
                 results.errors.push({ id: withdrawal.id, reason: claimOutcome.reason || 'WITHDRAWAL_ALREADY_CLAIMED' });
                 continue;
             }
+
+            // ── THE COMMIT IS THE AUTHORISATION ────────────────────────────────
+            // Adopt the descriptor's regime, reference and reservation. The
+            // preflight values above are never consulted again, so a regime flip or
+            // a cancelled reservation between scan and commit cannot reach the wire.
+            referenceId = claimOutcome.descriptor.referenceId;
+            authorityRecorded = claimOutcome.descriptor.regime === 'AUTHORITY';
+            reservation = claimOutcome.descriptor.reservation;
 
             try {
                 // §P.5-D EXACT RESERVED AMOUNT: for an authority-recorded
@@ -604,12 +738,10 @@ class PayoutBatchWorker {
                 // amount is never turned back into a JS double on its way out.
                 // Rounding is ROUND_HALF_UP on the decimal value, which is the
                 // intent the old binary toFixed(2) was approximating.
-                const amountGhsExact = authorityRecorded
-                    ? new Prisma.Decimal(reservation.amountGhs)
-                        .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP)
-                    : new Prisma.Decimal(String(withdrawal.amount))
-                        .times(liveRateExact)
-                        .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
+                // Computed INSIDE the claim transaction from the fresh rows: an
+                // authority reservation keeps the GHS it durably reserved (never a
+                // later FX rate), a legacy row converts as it always did.
+                const amountGhsExact = claimOutcome.descriptor.amountGhsExact;
                 const amountGhs = amountGhsExact.toFixed(2);
 
                 const dispatchResult = await this.mtn.initiateTransfer({
@@ -969,6 +1101,32 @@ class PayoutBatchWorker {
     // or it reached any other state, this parking does NOTHING (no
     // notification either — the user's withdrawal is being handled by its
     // real owner, and a stale reviewer must not tell them otherwise).
+    /**
+     * §WP-H AUTHORITY AUTHORISATION — park INSIDE the caller's transaction.
+     *
+     * The claim transaction must be able to refuse a row and durably park it in
+     * the SAME commit that would otherwise have released it for dispatch. A park
+     * that ran in a second transaction could lose to a concurrent worker that
+     * claims the row in between, leaving evidence for a park that never happened
+     * (or a park whose evidence vanished). Evidence and the conditional status
+     * transition therefore travel together, under the authority lock the caller
+     * already holds. No provider I/O, no notification inside the transaction.
+     */
+    async _parkWithinTransaction(tx, withdrawalId, reason, metadata = {}, claimableStatuses = ['PENDING', 'APPROVED']) {
+        await recordReconciliationException(tx, {
+            entityType: 'WITHDRAWAL',
+            entityId: String(withdrawalId),
+            reference: metadata.referenceId || null,
+            reason,
+            details: { ...metadata, phase: 'PRE_DISPATCH', claimedFrom: claimableStatuses, authoritativeClaimTransaction: true },
+        });
+        const claim = await tx.withdrawal.updateMany({
+            where: { id: withdrawalId, status: { in: claimableStatuses } },
+            data: { status: 'NEEDS_MANUAL_REVIEW' },
+        });
+        return claim.count === 1;
+    }
+
     async _parkForManualReview(withdrawal, reason, metadata = {}) {
         // PENDING and APPROVED are both pre-dispatch states (the dispatch
         // claim is the only writer of PROCESSING before provider I/O), so an
