@@ -242,7 +242,7 @@ router.get('/pool-withdrawal-preview', protect, async (req, res) => {
 // at or above that magnitude is refused with USDC_AMOUNT_STRING_REQUIRED
 // rather than silently rounded, because JSON.parse may already have destroyed
 // the last digit. Over-precision (>8dp) is USDC_AMOUNT_PRECISION.
-router.post('/internal-transfer', protectActive, requireKyc('p2p'), require2FA(),
+router.post('/internal-transfer', protectActive, requireKyc('p2p'), require2FA(), whenStepUpEnforced(requireActionStepUp({ actionType: 'INTERNAL_TRANSFER' })),
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), async (req, res) => {
     const prisma = req.app.get('prisma');
     const emitBalanceUpdate = req.app.get('emitBalanceUpdate');

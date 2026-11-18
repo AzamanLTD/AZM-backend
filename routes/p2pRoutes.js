@@ -4,6 +4,7 @@
 // Mounted at /api/p2p. All routes are protected AND gated by the V2 ban guard.
 // =============================================================================
 
+const { requireActionStepUp, whenStepUpEnforced } = require('../middleware/requireActionStepUp');
 const logger = require('../src/config/logger');
 const express              = require('express');
 const router               = express.Router();
@@ -29,7 +30,7 @@ router.post('/overpayment',  protectActive, idempotency(), p2pController.flagOve
 // an IN_PROGRESS claim after a 4xx is durable proof of rollback — the key
 // is safely releasable (releaseOn4xx). 5xx stays RETAIN (default): a
 // post-commit failure must never re-settle a trade.
-router.post('/complete',     protectActive, require2FA(), idempotency({ releaseOn4xx: true }), p2pController.completeTrade);
+router.post('/complete',     protectActive, require2FA(), whenStepUpEnforced(requireActionStepUp({ actionType: 'P2P_TRADE_COMPLETE' })), idempotency({ releaseOn4xx: true }), p2pController.completeTrade);
 
 // B-9: Action-required indicator — returns pending items needing user attention.
 router.get('/action-required', protectActive, p2pController.getActionRequired);
