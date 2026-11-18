@@ -696,21 +696,26 @@ async function inspectEnforcement(db) {
     // moment, so the boundary is not proved. An unprovable session identity
     // fails closed as UNKNOWN rather than being assumed benign.
     const sessionLogin = identity.session_login == null ? null : String(identity.session_login);
+    // NOT an early return. Returning here truncated the problem list at the FIRST
+    // identity finding, so the release-chain verifier never saw TABLE_MISSING /
+    // TRIGGER_FUNCTION_MISSING / ACTIVATION_FUNCTION_MISSING and classified a
+    // never-provisioned database as DRIFT instead of NOT_PROVISIONED. That is a
+    // false alarm that blocks a deploy for the wrong reason (measured in CI on
+    // df1998e7). The identity verdict is recorded, and discovery continues.
+    let identityProven = true;
     if (!sessionLogin) {
         problems.push(PROBLEM.SESSION_IDENTITY_UNPROVABLE);
-        return { established: false, problems, diagnostics, row: null };
-    }
-    if (sessionLogin !== String(identity.runtime_role)) {
+        identityProven = false;
+    } else if (sessionLogin !== String(identity.runtime_role)) {
         problems.push(PROBLEM.RUNTIME_IDENTITY_ASSUMED);
-        return { established: false, problems, diagnostics, row: null };
-    }
-    if (identity.session_superuser === true
+        identityProven = false;
+    } else if (identity.session_superuser === true
         || identity.session_createrole === true
         || identity.session_createdb === true
         || identity.session_replication === true
         || identity.session_bypassrls === true) {
         problems.push(PROBLEM.SESSION_IDENTITY_PRIVILEGED);
-        return { established: false, problems, diagnostics, row: null };
+        identityProven = false;
     }
     if (!diagnostics.tableExists) {
         problems.push(PROBLEM.TABLE_MISSING);
@@ -744,12 +749,18 @@ async function inspectEnforcement(db) {
     // Ownership is enough on its own: a member can SET ROLE and then drop or
     // rewrite anything the owner can, whatever the direct privileges say.
     if (acl.member_of_owner === true) problems.push(PROBLEM.RUNTIME_CAN_SET_ROLE_TO_OWNER);
-    if (acl.can_select !== true) problems.push(PROBLEM.RUNTIME_CANNOT_READ);
-    if (acl.can_insert === true) problems.push(PROBLEM.RUNTIME_CAN_INSERT);
-    if (acl.can_update === true) problems.push(PROBLEM.RUNTIME_CAN_UPDATE);
-    if (acl.can_delete === true) problems.push(PROBLEM.RUNTIME_CAN_DELETE);
-    if (acl.can_truncate === true) problems.push(PROBLEM.RUNTIME_CAN_TRUNCATE);
-    if (acl.can_trigger === true) problems.push(PROBLEM.RUNTIME_CAN_CREATE_TRIGGER);
+    // Direct-privilege readings describe `current_user`. When the connection
+    // identity is unproven those readings describe a mask, so they are recorded in
+    // diagnostics but not asserted as problems: the identity problem above is the
+    // finding, and duplicating it per privilege would bury it.
+    if (identityProven) {
+        if (acl.can_select !== true) problems.push(PROBLEM.RUNTIME_CANNOT_READ);
+        if (acl.can_insert === true) problems.push(PROBLEM.RUNTIME_CAN_INSERT);
+        if (acl.can_update === true) problems.push(PROBLEM.RUNTIME_CAN_UPDATE);
+        if (acl.can_delete === true) problems.push(PROBLEM.RUNTIME_CAN_DELETE);
+        if (acl.can_truncate === true) problems.push(PROBLEM.RUNTIME_CAN_TRUNCATE);
+        if (acl.can_trigger === true) problems.push(PROBLEM.RUNTIME_CAN_CREATE_TRIGGER);
+    }
 
     // Defence in depth must actually be present and enabled.
     try {
