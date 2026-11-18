@@ -19,11 +19,26 @@
 // because the release chain would then report a provisioned column that does not
 // exist.
 //
-// NOT REGISTERED IN THE RELEASE CHAIN YET. The hand-off requests position 15
-// (immediately after install-fiat-liquidity-overlay.js, which creates the table,
-// and before install-provider-observation-claim.js, which will read the column).
-// Registration is deliberately a separate change: it edits the release path, and
-// the schema change must first be coordinated with the shared Prisma model.
+// RELEASE CHAIN: segment 15 of the `&&` chain (step 14 in DEPLOY_RUNBOOK's
+// guard-excluded command numbering), immediately after
+// install-fiat-liquidity-overlay.js, which creates the table.
+//
+// NOTHING READS THIS COLUMN YET, and this comment must not pretend otherwise:
+// install-provider-observation-claim.js selects walletAccount from
+// ProviderSettlementWitness, a different column on a different table. The
+// FiatProviderEvent column is evidence for the wallet-scoped identity described in
+// the hand-off §6, which is a separate all-or-nothing cut-over. Its position ahead
+// of that backfill is a forward guarantee (the slot a future wallet-scoped reader
+// needs), not a present dependency.
+//
+// The column is deliberately NOT declared in prisma/schema.prisma yet. Declaring
+// it makes Prisma select it on every FiatProviderEvent read, so any database
+// without the column fails all of those reads. Measured: the p5d authority suite
+// re-provisions this table through install-fiat-liquidity-overlay.js, which
+// recreates it without this column, so with the field declared that suite failed
+// with 500s and the column was gone afterwards; without the field the same path
+// passes 63/63. The model field lands together with a wallet-scoped reader and
+// with provisioning that creates the column everywhere, not before.
 //
 // Idempotent: re-running is a no-op. Mirrors install-business-currency-overlay.js.
 
