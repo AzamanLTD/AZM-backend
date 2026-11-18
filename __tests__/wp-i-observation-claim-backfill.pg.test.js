@@ -113,21 +113,13 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
         return spawnInstaller(extraArgs).done;
     }
 
-    /** The installer is parked on the advisory gate: observed, never assumed. */
-    async function waitForAdvisoryWait(maxIterations = 240) {
-        for (let i = 0; i < maxIterations; i += 1) {
-            const rows = await prisma.$queryRawUnsafe(
-                `SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted`);
-            if (rows[0].n > 0) return true;
-            await new Promise((r) => setTimeout(r, 50));
-        }
-        return false;
-    }
-
     /**
-     * Wait until some backend is WAITING on a row lock in the claim table.
-     * This observes the interleaving (the installer is blocked on the competing
-     * uncommitted row) instead of guessing it with a sleep.
+     * Wait until some backend is WAITING on the claim table's RELATION lock.
+     *
+     * It observes an ungranted `relation` lock in pg_locks — the installer
+     * blocked inside `CREATE UNIQUE INDEX` — never a row lock: with an
+     * already-open writer it is the DDL that waits, not the INSERT. The
+     * interleaving is observed, never guessed with a sleep.
      */
     async function waitForRelationLockWait(maxIterations = 240) {
         for (let i = 0; i < maxIterations; i += 1) {
@@ -1070,12 +1062,16 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
         const otherClient = () => new PrismaClient();
 
         /**
-         * The installer's DDL takes a ShareLock on the claim table, which is
-         * compatible with a concurrent RowExclusive but NOT with an ALREADY-OPEN
-         * uncommitted writer. So the first reachable ordering is: a writer is open
-         * when the installer starts, the installer blocks in its DDL, and once the
-         * writer commits the installer's read sees the winner and reports a
-         * pre-write conflict. Observed via pg_locks, never by sleeping.
+         * The installer's DDL takes a ShareLock on the claim table and holds it
+         * until COMMIT. PostgreSQL's ShareLock CONFLICTS with the
+         * RowExclusiveLock that every INSERT takes, so while the DDL is held no
+         * session can insert into the claim table at all — including a writer that
+         * opens afterwards. Consequently the reachable ordering is: a writer is
+         * already open when the installer starts, the installer blocks in its
+         * DDL, and once that writer commits the installer's read sees the winner
+         * and reports a pre-write conflict. Observed via pg_locks, never by
+         * sleeping. See the installer header for the operational consequence of
+         * holding that lock for the whole backfill.
          */
         test('an ALREADY-OPEN writer that commits mid-run is caught by the pre-write comparison', async () => {
             const other = otherClient();
