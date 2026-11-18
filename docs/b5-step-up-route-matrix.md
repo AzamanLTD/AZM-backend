@@ -152,3 +152,68 @@ or if the mandatory action baseline is narrowed by configuration. It passes
   first.
 - Do not describe step-up as covering all financial mutations. It covers
   `POST /api/withdraw` only.
+
+## Measured inventory (2026-11-18, PR #405 working branch `feat/wp-h-payout-authority-closure`)
+
+This section records what was MEASURED from the mounted route definitions, not what
+the matrix above asserts. It exists because the matrix says only `POST /api/withdraw`
+consumes the action-bound grant, and that claim needed checking.
+
+**Method.** Parsed `router.<verb>('<path>')` declarations across `routes/*.js` and
+counted every route in a money-bearing router or with a money-bearing path segment
+(withdraw, deposit, transfer, trade, escrow, susu, vendor, payout, contribute,
+fulfil/fulfill, send). `grep -rn requireActionStepUp routes/` gives the consumption
+side directly.
+
+**Measured: 101 financial mutation routes across 21 routers.**
+
+| Router | Mutations | Consumes action-bound step-up |
+| --- | --- | --- |
+| susuRoutes | 13 | no |
+| adminRoutes | 10 | no (operator surface) |
+| tradeRoutes | 8 | no |
+| depositRoutes | 7 | no |
+| withdrawalRoutes | 6 | no |
+| escrowRoutes | 5 | no |
+| p2pRoutes | 5 | no |
+| walletRoutes | 5 | **yes, 1 of 5** (`POST /api/withdraw`, `FIAT_WITHDRAWAL`) |
+| friendRoutes | 4 | no |
+| businessOSRoutes | 3 | no |
+| conversationRoutes | 3 | no |
+| crossBorderSusuRoutes | 3 | no |
+| groupChatRoutes | 3 | no |
+| paymentRequestRoutes | 3 | no |
+| financeRoutes | 2 | no |
+| savingsRoutes | 2 | no |
+| tradeAccountRoutes | 2 | no |
+| other (5 routers) | 2 each | no |
+
+**So the coverage figure is 1 of 101, not "1 route and that is the complete set".**
+`STEP_UP_ENFORCEMENT` remains OFF and no production flag was touched; the grant is
+prepared but not activated.
+
+### Deliberate exclusions (must never be gated by customer step-up)
+
+- `POST /api/deposit/fiat/webhook`, `/api/deposit/fiat/webhook/moolre`, `/api/deposit/webhook/tatum`
+  — provider callbacks. They authenticate as the provider. A customer grant here
+  would make settlement depend on a customer action.
+- Operator-only routes (`adminRoutes` withdrawal approve/reject/resolve-review,
+  payout batch-process, payouts/settings, dispute assign/resolve). These need
+  operator authorization, not customer step-up; they are out of scope for B5.
+
+### What this inventory does NOT establish
+
+- **Per-route KYC and 2FA classification is not measured.** A middleware-name grep
+  is not evidence: the routers use several different guards and a zero hit can mean
+  "different name" rather than "no gate". The KYC/2FA columns of the matrix above
+  remain unverified until each router is read.
+- **No route has been wired.** Nothing in this section changes behaviour; it
+  records the size of the gap so the wiring work is not scoped from an
+  understatement.
+- **No route tests were written for the challenge -> proof -> grant -> retry ->
+  consumption flow**, and the wrong-amount/recipient/currency/route/resource/
+  operation/user/idempotency, expiry, concurrent consumption, rollback and
+  lost-response cases in the brief are all still owed.
+- `P2P fulfil` and `trade acceptance` were NOT reviewed. If fulfil performs a payer
+  debit and recipient credit, it is a financial mutation that currently has no
+  action-bound step-up, and that remains an open finding rather than a decision.
