@@ -255,6 +255,23 @@ class PayoutBatchWorker {
         return candidates.filter((c) => !linkedSet.has(c.id));
     }
 
+    /**
+     * §WP-H: an unprovable authority regime is reported by TWO typed errors,
+     * depending on which regime the database is in:
+     *   AUTHORITY_STATE_UNAVAILABLE — tri-state (authorityState.requireAuthorityState)
+     *   AUTHORITY_MODE_UNKNOWN      — default regime (fiatLiquidityActivation.readMode)
+     * Both mean the same thing for money: the unit of the pool is unknown, so no
+     * row may be claimed and no provider may be called. Handling only the
+     * tri-state code let the default-regime error escape _processBatch entirely,
+     * aborting the whole batch instead of recording a refusal per row (measured:
+     * wp-h-authority-unknown-at-claim). One predicate, both sites.
+     */
+    static _isAuthorityUnknown(err) {
+        return Boolean(err) && (
+            err.code === 'AUTHORITY_STATE_UNAVAILABLE' || err.code === 'AUTHORITY_MODE_UNKNOWN'
+        );
+    }
+
     async _processBatch(settings, { isManualTrigger = false } = {}) {
         // §WP-H UNKNOWN: resolve the authority regime BEFORE any other work.
         // An unprovable state parks the batch: no row is claimed, no provider
@@ -262,7 +279,7 @@ class PayoutBatchWorker {
         try {
             await fiatLiquidityActivation.isAuthorityModeActive(this.prisma);
         } catch (authorityErr) {
-            if (authorityErr && authorityErr.code === 'AUTHORITY_STATE_UNAVAILABLE') {
+            if (PayoutBatchWorker._isAuthorityUnknown(authorityErr)) {
                 logger.error(
                     { code: authorityErr.code, reason: authorityErr.reason || null, problems: authorityErr.problems || null },
                     '[payoutBatchWorker] authority state UNAVAILABLE — batch PARKED, zero dispatch',
@@ -755,7 +772,7 @@ class PayoutBatchWorker {
                     };
                 });
             } catch (claimErr) {
-                if (claimErr && claimErr.code === 'AUTHORITY_STATE_UNAVAILABLE') {
+                if (PayoutBatchWorker._isAuthorityUnknown(claimErr)) {
                     // UNKNOWN: claim nothing, create no provider identity.
                     results.errors.push({ id: withdrawal.id, reason: claimErr.code });
                     results.parked = true;
