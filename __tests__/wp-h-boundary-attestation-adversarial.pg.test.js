@@ -342,6 +342,28 @@ run('WP-H boundary attestation — adversarial (real PostgreSQL)', () => {
         () => admin.$executeRawUnsafe(`REVOKE EXECUTE ON FUNCTION ${ACTIVATE_FN} FROM PUBLIC`),
     );
 
+    // ── activation function search_path ──────────────────────────────────────
+    // The activation function is SECURITY DEFINER: it writes the protected record
+    // as its owner. Its body resolves names through search_path, so an unpinned
+    // path lets any role that can create a schema shadow those names and run code
+    // as the owner. The probe demands EXACTLY pg_catalog. Neither case below was
+    // attacked by any suite before: the check existed with no adversarial test.
+    mutates(
+        'the activation function search_path is reset (unpinned)',
+        () => admin.$executeRawUnsafe(`ALTER FUNCTION ${ACTIVATE_FN} RESET search_path`),
+        'ACTIVATION_FUNCTION_SEARCH_PATH_UNPINNED',
+        () => admin.$executeRawUnsafe(`ALTER FUNCTION ${ACTIVATE_FN} SET search_path = pg_catalog`),
+    );
+
+    mutates(
+        'the activation function search_path is pinned to public,pg_catalog',
+        () => admin.$executeRawUnsafe(`ALTER FUNCTION ${ACTIVATE_FN} SET search_path = public, pg_catalog`),
+        // "contains pg_catalog" is not enough: a leading writable schema still wins
+        // name resolution, so the check must require EXACTLY pg_catalog.
+        'ACTIVATION_FUNCTION_SEARCH_PATH_UNPINNED',
+        () => admin.$executeRawUnsafe(`ALTER FUNCTION ${ACTIVATE_FN} SET search_path = pg_catalog`),
+    );
+
     mutates(
         'the configured operator loses EXECUTE',
         () => admin.$executeRawUnsafe(`REVOKE EXECUTE ON FUNCTION ${ACTIVATE_FN} FROM ${el(ROLE.operator)}`),
