@@ -106,6 +106,10 @@ describe('WP-D packaging — the claim table is installed by the real release pa
             // table has to come from this chain.
             'infra/install-wp-i-settlement-witness.js',
             'infra/install-fiat-liquidity-overlay.js',
+            // WP-I: the trusted-wallet column extends the table the previous
+            // installer creates, so it must follow it. Nothing reads the column
+            // yet; it is evidence for the wallet-scoped identity cut-over.
+            'infra/install-wp-i-observation-wallet-overlay.js',
             'infra/install-model-b-settlement-overlay.js',
             'infra/install-ghs-wallet-overlay.js',
             'infra/install-native-ghs-settlement-overlay.js',
