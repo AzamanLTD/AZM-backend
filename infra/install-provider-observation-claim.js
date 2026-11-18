@@ -471,6 +471,10 @@ async function selectCandidates(db) {
     };
 
     // ── completed customer deposits ──────────────────────────────────────
+    // FAIT ONLY. A crypto deposit is never a Moolre collection, so including
+    // DEPOSIT_CRYPTO here could only ever misclassify a cross-rail row that
+    // happens to carry a settlementExternalRef and a matching event. The claim
+    // identity is about a provider collection of GHS, not about the row's shape.
     const deposits = await db.$queryRawUnsafe(`
         SELECT "id", "txHash",
                COALESCE("metadata"->>'settlementExternalRef', '')  AS ref,
@@ -478,7 +482,7 @@ async function selectCandidates(db) {
                COALESCE("providerRef", '')                         AS provider_ref,
                COALESCE("metadata"->>'provider', '')               AS rail
         FROM "TransactionHistory"
-        WHERE "type" IN ('DEPOSIT_FIAT', 'DEPOSIT_CRYPTO') AND "status" = 'COMPLETED'
+        WHERE "type" = 'DEPOSIT_FIAT' AND "status" = 'COMPLETED'
     `);
 
     for (const d of deposits) {

@@ -70,6 +70,7 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
     // insert-race fixtures (part 3)
     const R_RACE_CONFLICT = ref('race-conflict');
     const R_RACE_OK = ref('race-ok');
+    const R_CRYPTO_ROW = ref('crypto-row');
     // identity-disambiguation fixtures
     const R_CONFLICT_OWNER = ref('conflict-owner');
     const R_CONFLICT_PURPOSE = ref('conflict-purpose');
@@ -304,6 +305,23 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
         // 10. An already-existing claim row must not be duplicated or re-owned.
         await settledDeposit(R_PREEXISTING, { txHash: `${tag}-tx-preexist`, providerRef: R_PREEXISTING });
         await moolreEvent(R_PREEXISTING, { txHash: `${tag}-tx-preexist`, providerRef: R_PREEXISTING });
+
+        // 10b. A COMPLETED CRYPTO deposit that happens to carry a settlement
+        //      reference and a matching Moolre event. A crypto row can never be a
+        //      provider collection of GHS, so it is out of scope whatever its
+        //      metadata looks like.
+        await prisma.transactionHistory.create({
+            data: {
+                userId, type: 'DEPOSIT_CRYPTO', status: 'COMPLETED',
+                amountUsdc: '10.00000000', amountGhs: '120.00',
+                txHash: `${tag}-tx-crypto`, providerRef: R_CRYPTO_ROW,
+                metadata: {
+                    provider: 'MTN_MOMO', selectedRoute: 'MOOLRE_MOMO_COLLECTION',
+                    settlementExternalRef: R_CRYPTO_ROW, settledAmountGhs: '120.00',
+                },
+            },
+        });
+        await moolreEvent(R_CRYPTO_ROW, { txHash: `${tag}-tx-crypto`, providerRef: R_CRYPTO_ROW });
 
         // 11. IDENTITY DISAMBIGUATION. Each of these is a genuine COMPLETED
         //     Moolre settlement whose provider evidence either contradicts the
@@ -566,6 +584,10 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
             expect(row.purpose).toBe('CUSTOMER_DEPOSIT');
         }
     }, 60000);
+
+    test('a COMPLETED crypto deposit is out of scope even with a matching Moolre event', async () => {
+        expect(await claimsFor([R_CRYPTO_ROW])).toHaveLength(0);
+    });
 
     test('an ordinary aggregator deposit on the same rail is NOT claimed as Moolre money', async () => {
         const rows = await claimsFor([R_AGGREGATOR]);
