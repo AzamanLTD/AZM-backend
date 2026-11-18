@@ -2207,4 +2207,8 @@ module.exports = {
   bankRevalidationCapability,
   enquiryBankDestination,
   reconcileNativeGhsWithdrawals,
+  // §WP-H: exported so the park/dispatch race can be driven through the REAL
+  // hold (PENDING -> NEEDS_MANUAL_REVIEW CAS) instead of a re-implementation of
+  // it in a test. Same precedent as the §7 provider-echo binding above.
+  recordPreDispatchRefusal,
 };
