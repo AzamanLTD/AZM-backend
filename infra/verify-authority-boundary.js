@@ -32,7 +32,17 @@ const NEVER_INSTALLED = [PROBLEM.TRIGGER_FUNCTION_MISSING, PROBLEM.ACTIVATION_FU
 // a superuser or the table owner, enforcement is impossible by construction, so
 // "not provisioned" is the honest verdict and the deploy must not be blocked.
 // Once the split lands these two go false and every missing object becomes drift.
-const UNSPLIT = [PROBLEM.RUNTIME_IS_SUPERUSER, PROBLEM.RUNTIME_OWNS_TABLE];
+// The SESSION identity belongs in this family for the same reason: a privileged
+// login that merely assumed the runtime role is the connection split NOT having
+// happened, which is "not provisioned", not "present and wrong". Without this the
+// release-chain verifier reported DRIFT for a database that was never split
+// (measured in CI on df1998e7).
+const UNSPLIT = [
+    PROBLEM.RUNTIME_IS_SUPERUSER,
+    PROBLEM.RUNTIME_OWNS_TABLE,
+    PROBLEM.SESSION_IDENTITY_PRIVILEGED,
+    PROBLEM.RUNTIME_IDENTITY_ASSUMED,
+];
 
 async function verifyAuthorityBoundary(prisma, { strict = false, log = () => {} } = {}) {
     const result = await inspectEnforcement(prisma);
