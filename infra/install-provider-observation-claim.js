@@ -343,6 +343,7 @@ async function selectCandidates(db) {
         witnessOwners: new Map(),
         witnessAccountKeys: new Map(),
         anomalies: [],
+        unresolvedEvidenceCases: [],
         skipped: {
             nonMoolreDeposits: 0,
             nonMoolreWitnesses: 0,
@@ -518,6 +519,22 @@ async function selectCandidates(db) {
             }
             if (ties.length) {
                 report.skipped.unclassifiableDeposits += 1;
+                // CASE B: no canonical key can be established, and inventing one
+                // from the txHash or a provider ref would name an observation the
+                // economic paths never use — so nothing is claimed. Instead the
+                // evidence becomes a durable case an operator can act on.
+                report.unresolvedEvidenceCases.push({
+                    depositId: String(d.id),
+                    reason: 'PROVIDER_EVIDENCE_WITHOUT_CANONICAL_REFERENCE',
+                    ties,
+                    providerRef: depositProviderRef || null,
+                    txHash: txHash || null,
+                    evidenceIds: [
+                        ...((txHash && eventsByRelatedReference.get(txHash)) || []).map((e) => String(e.id)),
+                        ...((depositProviderRef && eventsByProviderRef.get(depositProviderRef)) || []).map((e) => String(e.id)),
+                    ],
+                    amountMinor: null,
+                });
                 anomaly('MOOLRE_EVIDENCE_WITHOUT_SETTLEMENT_REFERENCE', null, [String(d.id)],
                     `Moolre evidence is tied to this completed deposit (${ties.join(', ')}) but the settlement committed no settlementExternalRef, so the canonical claim key cannot be established`,
                     txHash || depositProviderRef || null);
@@ -616,6 +633,10 @@ async function selectCandidates(db) {
         claimWitnesses,
         witnessAccountKeys: report.witnessAccountKeys,
         quarantine: [...quarantine].map(([key, v]) => ({ observationKey: key, ...v })),
+        // CASE B — no trustworthy canonical reference exists. No key is invented;
+        // the durable reconciliation case below is the only artifact, and it is
+        // tied to the real deposit and the real persisted provider events.
+        unresolvedEvidenceCases: report.unresolvedEvidenceCases,
     };
 }
 
@@ -717,11 +738,15 @@ async function main() {
         alreadyClaimedDeposits: 0,
         alreadyClaimedWitnesses: 0,
         alreadyQuarantined: 0,
+        unresolvedCasesEnsured: 0,
+        unresolvedCasesSkippedNoCaseTable: 0,
+        wouldCreateUnresolvedCases: 0,
         racedReplays: 0,
         raceReplays: [],
         conflicts: [],
         candidates: { deposits: [], witnesses: [], quarantine: [] },
         anomalies: [],
+        unresolvedEvidenceCases: [],
         skipped: { deposits: 0, witnesses: 0, nonMoolreProvider: 0, unclassifiableDeposits: 0, unclassifiableWitnesses: 0 },
     };
 
@@ -742,6 +767,7 @@ async function main() {
             out.wouldClaimDeposits = selection.claimDeposits.length;
             out.wouldClaimWitnesses = selection.claimWitnesses.length;
             out.wouldQuarantine = selection.quarantine.length;
+            out.wouldCreateUnresolvedCases = selection.unresolvedEvidenceCases.length;
             out.candidates.deposits = selection.claimDeposits.map(([key, owner]) => ({ observationKey: key, owner }));
             out.candidates.witnesses = selection.claimWitnesses.map(([key, owner]) => ({ observationKey: key, owner }));
             out.candidates.quarantine = selection.quarantine;
@@ -809,6 +835,42 @@ async function main() {
                     else { out.racedReplays += 1; out.raceReplays.push({ kind: 'quarantine', observationKey: q.observationKey, notes: r.notes }); }
                     maybeFault();
                 }
+                // ── CASE B: durable unresolved-evidence cases ────────────────
+                // No claim key is invented here. Each case names the REAL
+                // completed deposit and the REAL persisted provider-event ids, so
+                // an operator can investigate, and so the witness path can refuse
+                // this payment rather than treat the evidence as free money.
+                // The case table is created earlier in the release chain
+                // (install-payout-reconciliation-infra.js) and is deliberately NOT
+                // duplicated here. A database without it cannot hold the case, so
+                // the count is reported instead of silently pretending the
+                // evidence was recorded.
+                let caseTablePresent = true;
+                if (selection.unresolvedEvidenceCases.length > 0) {
+                    const probe = await tx.$queryRawUnsafe(`SELECT to_regclass('"ReconciliationException"')::text AS t`);
+                    caseTablePresent = !!(Array.isArray(probe) && probe[0] && probe[0].t);
+                    if (!caseTablePresent) {
+                        out.unresolvedCasesSkippedNoCaseTable = selection.unresolvedEvidenceCases.length;
+                    }
+                }
+                for (const c of caseTablePresent ? selection.unresolvedEvidenceCases : []) {
+                    const details = JSON.stringify({
+                        ties: c.ties,
+                        providerRef: c.providerRef,
+                        txHash: c.txHash,
+                        evidenceIds: c.evidenceIds,
+                        note: 'Moolre evidence is tied to this completed deposit but no canonical observation key can be established. No claim was created and no owner was chosen; resolve with independent evidence.',
+                    });
+                    await tx.$executeRawUnsafe(
+                        `INSERT INTO "ReconciliationException" ("entityType","entityId","reference","reason","status","details")
+                         VALUES ('DEPOSIT_FIAT',$1,$2,$3,'OPEN',$4::jsonb)
+                         ON CONFLICT ("entityType","entityId","reason") WHERE "status" = 'OPEN'
+                         DO UPDATE SET "lastSeenAt" = now(), "details" = EXCLUDED."details"`,
+                        c.depositId, c.providerRef, c.reason, details,
+                    );
+                    out.unresolvedCasesEnsured += 1;
+                }
+
                 for (const [key, owners] of partition.toInsert.deposits) {
                     // owners is the list used to DETECT duplicates; only a single
                     // owner survives to here (multi-owner keys are quarantined).

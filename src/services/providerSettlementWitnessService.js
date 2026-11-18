@@ -290,7 +290,54 @@ function settledAmountFromProviderPayload(payload) {
  * @param input.amounts          { netPesewas, grossPesewas }
  * @param input.fetchedAt        Date of the provider call
  */
+/**
+ * §WP-I CASE B — EVIDENCE THAT COULD BELONG TO AN UNRESOLVED DEPOSIT.
+ *
+ * The claim backfill refuses to invent a canonical key when a completed customer
+ * deposit is tied to Moolre evidence but committed no settlement reference. That
+ * evidence is not free money: an OPEN unresolved-evidence case naming the same
+ * provider reference (or the deposit's related reference) blocks a treasury
+ * witness until an operator resolves it with independent evidence.
+ *
+ * The guard reads only persisted reconciliation state. It never consults the raw
+ * provider payload for identity and never picks an owner.
+ */
+async function assertNoUnresolvedEvidenceCase(tx, identifiers) {
+  const ids = [...new Set((identifiers || []).filter((v) => typeof v === 'string' && v.trim() !== ''))];
+  if (ids.length === 0) return;
+  if (typeof tx.$queryRawUnsafe !== 'function') return;
+
+  const table = await tx.$queryRawUnsafe(`SELECT to_regclass('"ReconciliationException"')::text AS t`);
+  const present = Array.isArray(table) && table[0] && table[0].t;
+  if (!present) return;
+
+  const rows = await tx.$queryRawUnsafe(
+    `SELECT "entityId", "reason", "details"
+       FROM "ReconciliationException"
+      WHERE "status" = 'OPEN'
+        AND "reason" = 'PROVIDER_EVIDENCE_WITHOUT_CANONICAL_REFERENCE'
+        AND ("reference" = ANY($1::text[]) OR "details"->>'txHash' = ANY($1::text[]))
+      LIMIT 1`,
+    ids,
+  );
+  if (Array.isArray(rows) && rows.length > 0) {
+    throw new WitnessError(
+      'WITNESS_EVIDENCE_UNDER_RECONCILIATION',
+      '[wp-i] Moolre evidence tied to a completed customer deposit has no canonical observation key and is under operator reconciliation; a treasury witness cannot be recorded from it until that case is resolved',
+      { depositId: rows[0].entityId, reason: rows[0].reason },
+    );
+  }
+}
+
 async function recordProviderSettlementWitness(tx, input = {}) {
+  // §WP-I CASE B, before anything else: unresolved evidence cannot fund a witness.
+  await assertNoUnresolvedEvidenceCase(tx, [
+    input.externalref,
+    input.reference,
+    input.requestParams && input.requestParams.externalref,
+    input.openingDedupKey,
+  ]);
+
   assertReconcilerContext();
 
   const {
