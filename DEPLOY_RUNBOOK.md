@@ -54,7 +54,7 @@ it is not one.
 | Build Command | `npm install && npm run build && npm run release` |
 | Pre-Deploy Command | none (the Free plan does not execute one) |
 | Deploy trigger | manual only |
-| Chain position | the full 31-step release chain (`npm run release`) runs in the Build Command, after `npm run build` and before the new version receives traffic |
+| Chain position | the full 32-step release chain (`npm run release`) runs in the Build Command, after `npm run build` and before the new version receives traffic |
 | Guard | `npm run release` begins with `infra/verify-release-target.js` |
 
 Nothing in this section is live. `render.yaml` is **proposed** configuration
@@ -175,10 +175,10 @@ operator authorization, the key lives outside the repository and outside any
 agent workspace, and rotation is a reviewed change to the public key pinned in
 `infra/lib/releaseTargetGuard.js`.
 
-### The release chain is 32 `&&` segments: the guard, then 31 commands
+### The release chain is 33 `&&` segments: the guard, then 32 commands
 
-`package.json` `scripts.release` contains 32 `&&` segments — 1 guard
-(`infra/verify-release-target.js`) followed by **31 commands** — so any
+`package.json` `scripts.release` contains 33 `&&` segments — 1 guard
+(`infra/verify-release-target.js`) followed by **32 commands** — so any
 non-zero exit stops the chain before the next step. The last command is
 `infra/verify-authority-boundary.js`; nothing may be appended after it. Every
 document in this repository describes the same count and the same ordering.
@@ -195,18 +195,22 @@ to accommodate it.
 
 | Path | Installers | Barrier? |
 | --- | --- | --- |
-| Build (manual deploy of `main`) | target guard + all 31 release steps | YES — completes before traffic |
+| Build (manual deploy of `main`) | target guard + all 32 release steps | YES — completes before traffic |
 | Pre-Deploy | none (Free plan) | n/a |
 | Boot (`infra/autoRelease.js`) | its own smaller subset, non-fatal | NO |
 
 **Not provisioned at boot, ever:** `ProviderSettlementWitness` (release step 12),
-`ProviderObservationClaim` (step 29), `AppUnlockTotpClaim` (step 30) and
-`ActionStepUpGrant` (step 28). These exist only if a release chain ran. The boot
+`ProviderObservationClaim` (step 30), `AppUnlockTotpClaim` (step 31) and
+`ActionStepUpGrant` (step 29). These exist only if a release chain ran. The boot
 path must not be given them: `server.js` calls `bootTreasury` without awaiting
 it and every boot installer failure is non-fatal, so it cannot be the barrier
 money paths depend on.
 
 ### Release-chain ordering that must not drift
+
+Step numbers below count COMMANDS, with the guard excluded: segment 15 of the
+`&&` chain is step 14 here. The two conventions differ by one, so a step number
+quoted without saying which convention it uses is ambiguous — say which.
 
 1. `infra/verify-release-target.js` — proves the context: approved Render
    service, canonical branch, no preview, and the exact approved database
@@ -214,14 +218,35 @@ money paths depend on.
    the first installer.
 2. `infra/install-wp-i-settlement-witness.js` (step 12) — creates
    `ProviderSettlementWitness`.
-3. `infra/install-provider-observation-claim.js` (step 29) — creates
+3. `infra/install-wp-i-observation-wallet-overlay.js` (step 14) — adds
+   `FiatProviderEvent.walletAccount`. It must follow step 13
+   (`install-fiat-liquidity-overlay.js`, which creates the table). No step reads
+   this column yet: the backfill at step 30 reads `walletAccount` from
+   `ProviderSettlementWitness`, a different table. Keeping the column ahead of
+   step 30 reserves the slot a wallet-scoped reader will need, and that
+   wallet-scoped identity is a separate all-or-nothing cut-over, not this change.
+4. `infra/install-provider-observation-claim.js` (step 30) — creates
    `ProviderObservationClaim` and backfills it, so it must follow step 12.
-4. `infra/install-app-unlock-totp-claim.js` (step 30).
-5. `infra/verify-authority-boundary.js` (step 31) — the final gate; nothing may
+5. `infra/install-app-unlock-totp-claim.js` (step 31).
+6. `infra/verify-authority-boundary.js` (step 32) — the final gate; nothing may
    be appended after it.
 
 Schema provisioning activates no authority and starts no provider
 reconciliation. It only creates tables, indexes and constraints.
+
+**One ordering hazard that is not a chain step, and a decision already taken.**
+The column installed by step 14 is deliberately NOT declared in
+`prisma/schema.prisma` yet. Declaring it makes the Prisma client select it on
+EVERY `FiatProviderEvent` read, so any database where the column is absent fails
+all of those reads, not just a future wallet feature. That is measured, not
+theoretical: the p5d authority suite re-provisions the table through
+`install-fiat-liquidity-overlay.js`, which recreates it without the new column, so
+with the field declared that suite's reads returned 500 and `walletAccount` was
+gone from the database afterwards; with the field removed the same provisioning
+path passes 63/63. A model field is added only together with a wallet-scoped
+reader AND with the provisioning that creates the column in every environment,
+including the test suites and the CI installer sequence. Nothing reads the column
+today, so declaring it now would buy nothing and break that path.
 
 ### Operations that stay separate DBA / operator procedures
 
@@ -292,7 +317,7 @@ paths are:
   — `prisma generate` plus three overlays. It does NOT include the release
   chain, so no release-provisioned table exists because of a deploy.
 - **Build Command — PROPOSED (not applied):** `npm install && npm run build && npm run release`
-  — the full 31-step chain, once, after the build. Until an operator applies
+  — the full 32-step chain, once, after the build. Until an operator applies
   this, production schema comes from nothing automatic.
 - **Pre-Deploy Command:** configured as `npm run release` but NOT executed on
   the Free plan, so it is dead configuration today and must be removed rather

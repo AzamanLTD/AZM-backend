@@ -77,7 +77,7 @@ describe('the four money and security authorities are provisioned by the chain',
 
     test('a failing installer stops the chain, because it is one && sequence', () => {
         const release = JSON.parse(read('package.json')).scripts.release;
-        expect(release.split('&&').length).toBe(32);
+        expect(release.split('&&').length).toBe(33);
         expect(release).not.toMatch(/\|\||;/);
     });
 });
@@ -187,7 +187,7 @@ describe('the runbook distinguishes the ACTUAL deployment from the PROPOSED one'
     });
 
     test('it documents the 31-step chain and the four authorities boot does not provision', () => {
-        expect(runbook).toMatch(/31-step release chain/);
+        expect(runbook).toMatch(/32-step release chain/);
         for (const table of ['ProviderSettlementWitness', 'ProviderObservationClaim', 'AppUnlockTotpClaim', 'ActionStepUpGrant']) {
             expect(runbook).toContain(table);
         }
@@ -201,21 +201,41 @@ describe('the runbook distinguishes the ACTUAL deployment from the PROPOSED one'
 
     test('the documented step count matches the real chain', () => {
         const steps = releaseChain().filter((c) => !/verify-release-target/.test(c));
-        expect(steps).toHaveLength(31);
-        expect(steps.filter((c) => /infra\/install-/.test(c))).toHaveLength(29);
+        expect(steps).toHaveLength(32);
+        expect(steps.filter((c) => /infra\/install-/.test(c))).toHaveLength(30);
         expect(steps.filter((c) => /seed-susu-foundation/.test(c))).toHaveLength(1);
         expect(steps.filter((c) => /verify-authority-boundary/.test(c))).toHaveLength(1);
     });
 });
 
 describe('every document agrees on the chain and the production schema path', () => {
-    test('the chain is 32 && segments: one guard plus 31 commands', () => {
+    test('the chain is 33 && segments: one guard plus 32 commands', () => {
         const chain = releaseChain(); // every && segment, guard included
-        expect(chain).toHaveLength(32);
-        expect(chain.filter((c) => !/verify-release-target/.test(c))).toHaveLength(31);
-        expect(JSON.parse(read('package.json')).scripts.release.split('&&')).toHaveLength(32);
-        expect(read('DEPLOY_RUNBOOK.md')).toMatch(/32 `&&` segments/);
-        expect(read('DEPLOY_RUNBOOK.md')).toMatch(/31 commands/);
+        expect(chain).toHaveLength(33);
+        expect(chain.filter((c) => !/verify-release-target/.test(c))).toHaveLength(32);
+        expect(JSON.parse(read('package.json')).scripts.release.split('&&')).toHaveLength(33);
+        expect(read('DEPLOY_RUNBOOK.md')).toMatch(/33 `&&` segments/);
+        expect(read('DEPLOY_RUNBOOK.md')).toMatch(/32 commands/);
+    });
+
+    test('the trusted-wallet overlay sits between the table it extends and the backfill that reads it', () => {
+        const chain = releaseChain();
+        const at = (name) => chain.findIndex((c) => c.includes(name));
+        const createsTable = at('install-fiat-liquidity-overlay.js');
+        const wallet = at('install-wp-i-observation-wallet-overlay.js');
+        const backfill = at('install-provider-observation-claim.js');
+        // Exactly one registration, not zero and not duplicated.
+        expect(chain.filter((c) => /install-wp-i-observation-wallet-overlay/.test(c))).toHaveLength(1);
+        // A column cannot precede the table that owns it.
+        expect(wallet).toBeGreaterThan(createsTable);
+        // No step reads FiatProviderEvent.walletAccount yet (the backfill at this
+        // position reads ProviderSettlementWitness.walletAccount instead), so this is
+        // a forward guarantee, not a present dependency: the slot stays ahead of the
+        // backfill so a wallet-scoped reader can never be scheduled before the
+        // evidence column exists.
+        expect(wallet).toBeLessThan(backfill);
+        // Segment 15 of the && chain, which is what the hand-off requested.
+        expect(wallet).toBe(14);
     });
 
     test('migrate deploy is never offered as a production instruction', () => {
