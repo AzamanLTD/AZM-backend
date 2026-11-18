@@ -89,6 +89,15 @@ const PROBLEM = Object.freeze({
     TRIGGER_MISSING: 'TRIGGER_MISSING',
     TRIGGER_DISABLED: 'TRIGGER_DISABLED',
     ENFORCEMENT_PROBE_FAILED: 'ENFORCEMENT_PROBE_FAILED',
+    // §WP-H B3 — the CONNECTION's login identity, not just the effective one.
+    // `current_user` is whatever SET ROLE last assumed; a privileged login that
+    // assumes a restricted role passes every current_user check while the real
+    // connection can RESET ROLE at any moment. The boundary is only proved when
+    // the authenticated session identity IS the runtime identity and is itself
+    // unprivileged.
+    RUNTIME_IDENTITY_ASSUMED: 'RUNTIME_IDENTITY_ASSUMED',
+    SESSION_IDENTITY_PRIVILEGED: 'SESSION_IDENTITY_PRIVILEGED',
+    SESSION_IDENTITY_UNPROVABLE: 'SESSION_IDENTITY_UNPROVABLE',
     // §WP-H B3 — the activation function is its own boundary. An installer
     // success flag is not a runtime proof.
     ACTIVATION_FUNCTION_MISSING: 'ACTIVATION_FUNCTION_MISSING',
@@ -655,8 +664,14 @@ async function inspectEnforcement(db) {
     let identity;
     try {
         const [row] = await db.$queryRawUnsafe(`
-            SELECT current_user AS runtime_role,
-                   (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) AS runtime_superuser,
+            SELECT current_user  AS runtime_role,
+                   session_user  AS session_login,
+                   (SELECT rolsuper FROM pg_roles WHERE rolname = current_user)  AS runtime_superuser,
+                   (SELECT rolsuper FROM pg_roles WHERE rolname = session_user)  AS session_superuser,
+                   (SELECT rolcreaterole FROM pg_roles WHERE rolname = session_user) AS session_createrole,
+                   (SELECT rolcreatedb  FROM pg_roles WHERE rolname = session_user) AS session_createdb,
+                   (SELECT rolreplication FROM pg_roles WHERE rolname = session_user) AS session_replication,
+                   (SELECT rolbypassrls FROM pg_roles WHERE rolname = session_user) AS session_bypassrls,
                    to_regclass('${QUALIFIED_TABLE}') IS NOT NULL AS table_exists
         `);
         identity = row || null;
@@ -669,9 +684,34 @@ async function inspectEnforcement(db) {
     }
 
     diagnostics.runtimeRole = identity.runtime_role;
+    diagnostics.sessionLogin = identity.session_login == null ? null : String(identity.session_login);
     diagnostics.tableExists = identity.table_exists === true;
 
     if (identity.runtime_superuser === true) problems.push(PROBLEM.RUNTIME_IS_SUPERUSER);
+
+    // ── THE CONNECTION IDENTITY ─────────────────────────────────────────────
+    // Everything below this point inspects privileges of `current_user`. If the
+    // session logged in as someone else and assumed the runtime role, those
+    // privileges describe a mask: `RESET ROLE` restores the real identity at any
+    // moment, so the boundary is not proved. An unprovable session identity
+    // fails closed as UNKNOWN rather than being assumed benign.
+    const sessionLogin = identity.session_login == null ? null : String(identity.session_login);
+    if (!sessionLogin) {
+        problems.push(PROBLEM.SESSION_IDENTITY_UNPROVABLE);
+        return { established: false, problems, diagnostics, row: null };
+    }
+    if (sessionLogin !== String(identity.runtime_role)) {
+        problems.push(PROBLEM.RUNTIME_IDENTITY_ASSUMED);
+        return { established: false, problems, diagnostics, row: null };
+    }
+    if (identity.session_superuser === true
+        || identity.session_createrole === true
+        || identity.session_createdb === true
+        || identity.session_replication === true
+        || identity.session_bypassrls === true) {
+        problems.push(PROBLEM.SESSION_IDENTITY_PRIVILEGED);
+        return { established: false, problems, diagnostics, row: null };
+    }
     if (!diagnostics.tableExists) {
         problems.push(PROBLEM.TABLE_MISSING);
         return { established: false, problems, diagnostics, row: null };
