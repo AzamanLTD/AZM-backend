@@ -15,6 +15,12 @@
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 const logger = require('../src/config/logger');
+const ledger = require('../services/ledgerService');
+const {
+    Decimal,
+    parseUserAmount,
+    toWireString,
+} = require('../services/settlementScale');
 
 // ── Create ──────────────────────────────────────────────────────────────────
 async function create(req, res) {
@@ -23,6 +29,22 @@ async function create(req, res) {
 
   if (!name || !targetAmountUsdc) {
     return res.status(400).json({ success: false, message: 'Name and target amount are required.' });
+  }
+
+  // SETTLEMENT SCALE (Blocker B): the vault target is a USDC money amount
+  // persisted to a Decimal(20, 8) column. parseUserAmount validates it
+  // (positive, finite, within the storage envelope, at most 8 dp) and
+  // settles the exact Decimal — the previous parseFloat silently wrote a
+  // JS double and accepted zero/negative/over-precision input.
+  const targetParse = parseUserAmount(targetAmountUsdc, 'USDC');
+  if (!targetParse.ok) {
+    return res.status(400).json({
+      success: false,
+      code: targetParse.code,
+      message: targetParse.code === 'AMOUNT_PRECISION_EXCEEDED'
+        ? 'Target amount exceeds USDC settlement precision.'
+        : 'Invalid target amount.',
+    });
   }
 
   try {
@@ -38,7 +60,7 @@ async function create(req, res) {
       data: {
         name,
         emoji,
-        targetAmountUsdc: parseFloat(targetAmountUsdc),
+        targetAmountUsdc: targetParse.amount, // exact settled Decimal
         maturityDate: maturityDate ? new Date(maturityDate) : null,
         creatorId,
         members: {
@@ -200,11 +222,23 @@ async function deposit(req, res) {
   const { amountUsdc } = req.body;
   const userId = req.user.id;
 
-  if (!amountUsdc || parseFloat(amountUsdc) <= 0) {
-    return res.status(400).json({ success: false, message: 'Invalid amount.' });
+  // SETTLEMENT SCALE (Blocker B): a deposit is a real debit against
+  // User.availableBalance. The request amount must settle EXACTLY at the
+  // USDC scale — over-precision input is refused (never silently rounded
+  // into a debit), and the exact Decimal (not a parseFloat double) flows
+  // into the conditional debit, vault increment, member increment and
+  // ledger lines.
+  const amountParse = parseUserAmount(amountUsdc, 'USDC');
+  if (!amountParse.ok) {
+    return res.status(400).json({
+      success: false,
+      code: amountParse.code,
+      message: amountParse.code === 'AMOUNT_PRECISION_EXCEEDED'
+        ? 'Amount exceeds USDC settlement precision.'
+        : 'Invalid amount.',
+    });
   }
-
-  const amount = parseFloat(amountUsdc);
+  const amount = amountParse.amount;
 
   try {
     const vault = await prisma.sharedVault.findUnique({
@@ -213,54 +247,128 @@ async function deposit(req, res) {
     });
 
     if (!vault) return res.status(404).json({ success: false, message: 'Vault not found.' });
-    if (vault.status !== 'ACTIVE') return res.status(400).json({ success: false, message: 'Vault is not active.' });
 
+    // NOTE: there is deliberately NO vault-status check on this stale
+    // snapshot. The ACTIVE predicate lives INSIDE the transaction on the
+    // vault increment itself (see below) — an outside check is exactly
+    // the TOCTOU window the review flagged, and would only ever return a
+    // verdict about the PAST. Membership is structurally stable, so the
+    // membership 403 stays here.
     const membership = vault.members.find(m => m.userId === userId);
     if (!membership) return res.status(403).json({ success: false, message: 'Not a member of this vault.' });
 
-    // Check wallet balance
-    const wallet = await prisma.wallet.findUnique({ where: { userId } });
-    if (!wallet || parseFloat(wallet.balanceUsdc) < amount) {
-      return res.status(400).json({ success: false, message: 'Insufficient wallet balance.' });
-    }
+    // Money authority repair: this flow previously referenced a
+    // `prisma.wallet` model that DOES NOT EXIST in the current schema (the
+    // unified-ledger migration moved spendable USDC onto User.availableBalance
+    // — the same authority every other money path uses). The deposit now
+    // debits User.availableBalance with a CONDITIONAL (single-winner) update:
+    // two concurrent deposits can never spend the same stale balance twice.
+    const operation = res.locals?.financialOperation || null;
+    const idemKey = operation
+        ? `fo_${operation.id}`
+        : `srv_sharedvault_${userId}_${id}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
 
-    // Atomic: debit wallet + credit vault + credit membership
-    const [updatedWallet, updatedVault, updatedMember] = await prisma.$transaction([
-      prisma.wallet.update({
-        where: { userId },
-        data: { balanceUsdc: { decrement: amount } },
-      }),
-      prisma.sharedVault.update({
-        where: { id },
-        data: { currentAmountUsdc: { increment: amount } },
-      }),
-      prisma.sharedVaultMember.update({
-        where: { id: membership.id },
-        data: { contributedUsdc: { increment: amount } },
-      }),
-    ]);
+    let data;
+    await prisma.$transaction(async (tx) => {
+        // Single-winner conditional debit — the DB nonneg CHECK is a
+        // secondary invariant, never the guard.
+        const debit = await tx.user.updateMany({
+            where: { id: userId, availableBalance: { gte: amount } },
+            data: {
+                availableBalance: { decrement: amount },
+                escrowLockedBalance: { increment: amount },
+            },
+        });
+        if (debit.count !== 1) {
+            const err = new Error('Insufficient balance.');
+            err.code = 'INSUFFICIENT_FUNDS';
+            throw err;
+        }
 
-    // Check if vault target reached
-    const newTotal = parseFloat(updatedVault.currentAmountUsdc);
-    if (newTotal >= parseFloat(updatedVault.targetAmountUsdc) && vault.status === 'ACTIVE') {
-      await prisma.sharedVault.update({
-        where: { id },
-        data: { status: 'COMPLETED', completedAt: new Date() },
-      });
-      // TODO: Send celebration notification to all members
-    }
+        // RACE FIX: the ACTIVE check above ran OUTSIDE the transaction
+        // against a stale snapshot; the writes below could land AFTER a
+        // concurrent cancel had already flipped the vault (and refunded
+        // its members), silently locking funds into a cancelled vault.
+        // The vault increment is now a CONDITIONAL single-winner write on
+        // `status: 'ACTIVE'` INSIDE this transaction: a deposit racing a
+        // cancel either wins the row lock while the vault is still
+        // ACTIVE (then the cancel refunds the new contribution too —
+        // cancel re-reads members in ITS transaction), or finds the vault
+        // no longer ACTIVE, refuses, and the whole transaction —
+        // including the user debit — rolls back.
+        const vaultBump = await tx.sharedVault.updateMany({
+            where: { id, status: 'ACTIVE' },
+            data: { currentAmountUsdc: { increment: amount } },
+        });
+        if (vaultBump.count !== 1) {
+            const err = new Error('Vault is not active.');
+            err.code = 'VAULT_NOT_ACTIVE';
+            throw err;
+        }
+
+        const [updatedVault, updatedMember] = await Promise.all([
+            tx.sharedVault.findUnique({ where: { id } }),
+            tx.sharedVaultMember.update({
+                where: { id: membership.id },
+                data: { contributedUsdc: { increment: amount } },
+            }),
+        ]);
+
+        // Target reached → guarded completion transition (single-winner:
+        // a concurrent second deposit cannot double-flip COMPLETED).
+        // SETTLEMENT SCALE (Blocker B): the threshold is an EXACT Decimal
+        // comparison. Decimal(20, 8) values carry up to 20 significant
+        // digits — a JS double cannot represent them, so the previous
+        // parseFloat >= comparison could misjudge completion at the
+        // boundary (e.g. 10,000,000.00000001 vs 10,000,000.00000002 are
+        // the SAME double).
+        if (new Decimal(updatedVault.currentAmountUsdc.toString())
+            .gte(new Decimal(updatedVault.targetAmountUsdc.toString()))) {
+            await tx.sharedVault.updateMany({
+                where: { id, status: 'ACTIVE' },
+                data: { status: 'COMPLETED', completedAt: new Date() },
+            });
+        }
+
+        // §P.4 AUTHORITATIVE LEDGER — same transaction, idempotent on the
+        // durable operation key:
+        //   D user:{userId}:liability        — spendable liability down
+        //   C escrow:shared-vault-{id}:locked — vault restriction up
+        await ledger.post(tx, {
+            idempotencyKey: `ledger:shared-vault:deposit:${idemKey}`,
+            entryType: 'SHARED_VAULT_DEPOSIT',
+            description: 'Shared vault deposit — spendable balance locked into vault restriction',
+            userId,
+            relatedEntity: 'sharedVault',
+            relatedEntityId: id,
+            lines: [
+                { account: `user:${userId}:liability`, debit: toWireString(amount, 'USDC') },
+                { account: `escrow:shared-vault-${id}:locked`, credit: toWireString(amount, 'USDC') },
+            ],
+        });
+
+        // SETTLEMENT SCALE (Blocker B): exact decimal strings, fixed
+        // notation — the same values the database just persisted (a
+        // parseFloat could not represent a 20-digit Decimal(20, 8) row).
+        data = {
+            newVaultTotal: toWireString(updatedVault.currentAmountUsdc, 'USDC'),
+            myContribution: toWireString(updatedMember.contributedUsdc, 'USDC'),
+        };
+    });
 
     logger.info({ vaultId: id, userId, amount }, '[sharedVault] Deposit');
     return res.status(200).json({
       success: true,
       message: 'Deposit successful.',
-      data: {
-        newVaultTotal: parseFloat(updatedVault.currentAmountUsdc),
-        myContribution: parseFloat(updatedMember.contributedUsdc),
-        walletBalance: parseFloat(updatedWallet.balanceUsdc),
-      },
+      data,
     });
   } catch (err) {
+    if (err?.code === 'INSUFFICIENT_FUNDS') {
+      return res.status(400).json({ success: false, message: err.message });
+    }
+    if (err?.code === 'VAULT_NOT_ACTIVE') {
+      return res.status(409).json({ success: false, code: 'VAULT_NOT_ACTIVE', message: err.message });
+    }
     logger.error({ err: err.message, vaultId: id, userId }, '[sharedVault] Deposit failed');
     return res.status(500).json({ success: false, message: 'Deposit failed.' });
   }
@@ -332,20 +440,86 @@ async function cancel(req, res) {
       return res.status(403).json({ success: false, message: 'Only the owner can cancel.' });
     }
 
-    // Refund all contributors to their wallets
-    await prisma.$transaction([
-      ...vault.members.map(m =>
-        prisma.wallet.update({
-          where: { userId: m.userId },
-          data: { balanceUsdc: { increment: parseFloat(m.contributedUsdc) } },
-        })
-      ),
-      prisma.sharedVault.update({
-        where: { id },
+    // Cancellation is a REVERSAL of already-authorized deposits: it stays
+    // available during an FX outage (documented settlement-protection
+    // exception — see docs/native-ghs-fx-audit.md §4.1). Its integrity
+    // requirements are SINGLE-WINNER and TRANSACTION-CONSISTENT SNAPSHOT
+    // (review fix): the CANCELLED transition flips FIRST, on an EXPLICIT
+    // eligible state (ACTIVE only — a COMPLETED vault's funds are already
+    // spent on the goal and must never be "refunded"; the old
+    // `not: CANCELLED` predicate would cancel a COMPLETED vault), inside
+    // the same interactive transaction as the refunds. Members are
+    // re-read INSIDE that transaction after the claim is won — never from
+    // the stale pre-transaction snapshot, which could omit a deposit that
+    // raced in after the outer read and strand that member's funds.
+    let cancelled = false;
+    let refundState = 'NOT_CANCELLABLE';
+    await prisma.$transaction(async (tx) => {
+      const transition = await tx.sharedVault.updateMany({
+        where: { id, status: 'ACTIVE' },
         data: { status: 'CANCELLED', cancelledAt: new Date() },
-      }),
-    ]);
+      });
+      if (transition.count !== 1) {
+        // Honest refusal: distinguish an already-cancelled replay from a
+        // vault that is not in a cancellable state at all.
+        const current = await tx.sharedVault.findUnique({
+          where: { id },
+          select: { status: true },
+        });
+        refundState = current?.status === 'CANCELLED' ? 'ALREADY_CANCELLED' : 'NOT_CANCELLABLE';
+        return;
+      }
 
+      // Refunds derive from the TRANSACTION-CONSISTENT member rows: read
+      // them here, after the claim won the row lock, so a deposit that
+      // committed before our claim is included in the refunds.
+      const members = await tx.sharedVaultMember.findMany({
+        where: { sharedVaultId: id },
+      });
+
+      // Refund each contributor to the REAL money authority
+      // (User.availableBalance) and release the matching escrow
+      // restriction, with the §P.4 ledger reversal of the deposit legs.
+      for (const m of members) {
+        // SETTLEMENT SCALE (Blocker B): the refund moves the EXACT
+        // persisted Decimal. The previous parseFloat(m.contributedUsdc)
+        // demoted the Decimal(20, 8) row to a JS double — for
+        // 20-significant-digit balances the refund then moved a
+        // DIFFERENT amount than the member actually deposited (and the
+        // ledger line re-serialized the already-lossy double). The
+        // refund, the balance write and the ledger lines now all carry
+        // the exact stored value.
+        const contributed = new Decimal(m.contributedUsdc.toString());
+        if (contributed.lte(0)) continue;
+        await tx.user.update({
+          where: { id: m.userId },
+          data: {
+            availableBalance: { increment: contributed },
+            escrowLockedBalance: { decrement: contributed },
+          },
+        });
+        await ledger.post(tx, {
+          idempotencyKey: `ledger:shared-vault:refund:${id}:${m.userId}`,
+          entryType: 'SHARED_VAULT_REFUND',
+          description: 'Shared vault cancelled — vault restriction released back to spendable balance',
+          userId: m.userId,
+          relatedEntity: 'sharedVault',
+          relatedEntityId: id,
+          lines: [
+            { account: `escrow:shared-vault-${id}:locked`, debit: toWireString(contributed, 'USDC') },
+            { account: `user:${m.userId}:liability`, credit: toWireString(contributed, 'USDC') },
+          ],
+        });
+      }
+      cancelled = true;
+    });
+
+    if (!cancelled) {
+      if (refundState === 'ALREADY_CANCELLED') {
+        return res.status(409).json({ success: false, code: 'VAULT_ALREADY_CANCELLED', message: 'This shared vault has already been cancelled.' });
+      }
+      return res.status(409).json({ success: false, code: 'VAULT_NOT_CANCELLABLE', message: 'Only an active vault can be cancelled.' });
+    }
     return res.status(200).json({ success: true, message: 'Vault cancelled. Funds returned to contributors.' });
   } catch (err) {
     logger.error({ err: err.message, vaultId: id }, '[sharedVault] Cancel failed');

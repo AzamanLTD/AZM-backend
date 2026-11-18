@@ -1,49 +1,82 @@
 # =============================================================================
-# Render Blueprint — azaman-backend
+# Render Blueprint — AZM backend
 #
-# This file version-controls the deploy configuration so the migrate + seed
-# step is never lost to dashboard drift. If the service is currently
-# configured manually in the Render dashboard, mirror these commands there
-# (Settings → Build & Deploy):
+# STATUS: PROPOSED CONFIGURATION — NOT APPLIED. Nothing in this file is a live
+# setting. It records the configuration we WANT, so it can be reviewed and then
+# applied by an operator. The live service is described in DEPLOY_RUNBOOK.md
+# under "ACTUAL live configuration".
 #
-#   Build Command:       npm install && npm run build
-#   Pre-Deploy Command:  npm run release      (Render "Pre-Deploy Command")
-#   Start Command:       npm start
+# ACTUAL live state, verified read-only via the Render API on 2026-11-17:
+#   plan            : free
+#   autoDeploy      : no  (autoDeployTrigger: off — deploys are manual)
+#   branch          : main
+#   buildCommand    : npm install && npm run build && three overlay installers
+#                     (it does NOT run the release chain)
+#   preDeployCommand: npm run release — CONFIGURED BUT NOT EXECUTED on Free
+#   startCommand    : node index.js
+#   live commit     : 48c17ab10248 (deployed 2026-10-15T16:59:51Z)
 #
-# `npm run release` = additive overlay installers + seed (all idempotent,
-# safe to re-run). SCHEMA AUTHORITY (r15 follow-up): production schema
-# changes are deployed EXCLUSIVELY by the infra/install-*-overlay.js raw-SQL
-# installers — `prisma migrate deploy` is NOT part of the release step and
-# the production database intentionally has no _prisma_migrations table.
-# Never add a prisma/migrations file for an invariant that the overlays own:
-# the overlays are the single source of truth for production DDL.
-#   - seed-susu-foundation.js → idempotently seeds the azaman-treasury wallet
-#                               and the v1.0 liability contract
+# PROPOSED (this file):
+#   buildCommand    : npm install && npm run build && npm run release
+#   preDeployCommand: absent — Free does not execute it, and declaring it here
+#                     is what made the repository disagree with reality
+#   deploys         : manual only
+#   AZM_DEPLOY_AUTH_TOKEN: PROPOSED — the release chain refuses production DDL
+#                     without a per-release Ed25519 authorization that binds the
+#                     service, branch, DEPLOY COMMIT (RENDER_GIT_COMMIT) and the
+#                     approved database inside a short validity window (see the
+#                     runbook, "Release authorization"). Mint it per deploy and
+#                     remove it afterwards with "Save only" (which does not
+#                     rebuild); it is never committed, and the private key never
+#                     enters the repository or CI. Render exposes environment
+#                     variables at runtime too, so the token is bounded by its own
+#                     expiry rather than by being build-only, and every later
+#                     deploy needs its own token. Without one the guard fails
+#                     closed with RELEASE_REFUSED_NO_DEPLOY_AUTHORIZATION.
 #
-# Every installer is idempotent, so re-running the release step is safe.
+# WHY THE FULL CHAIN RUNS IN BUILD: the release chain is the only sanctioned
+# production DDL path, and a Build Command completes BEFORE the new version
+# receives traffic — the barrier Pre-Deploy would have provided. It must be the
+# whole chain (31 steps, dependency-ordered, authority verification last), not a
+# hand-picked subset.
 #
-# IMPORTANT: the Pre-Deploy Command runs once, after build and BEFORE the new
-# version receives traffic. This guarantees the DB is migrated + seeded before
-# server.js boots. Even if it is omitted, server.js is resilient: it logs a
-# warning and disables only the Susu escrow/cycle features (the rest of the
-# backend stays up) until the seed is applied.
+# WHY THE GUARD COMES FIRST: `npm run release` begins with
+# `infra/verify-release-target.js`, which requires the approved Render service
+# id, the canonical branch, a non-preview build and the exact approved database
+# identity — an allow-list, so an unexpected host, database or branch is refused
+# before any installer runs.
+#
+# SCHEMA AUTHORITY: production schema changes are deployed EXCLUSIVELY by the
+# `infra/install-*` raw-SQL installers. `prisma migrate deploy` is not part of
+# any deploy path and production intentionally has no `_prisma_migrations`
+# table. Never add a `prisma/migrations` file for an invariant an installer
+# owns: the installers are the single source of truth for production DDL.
+#
+# NOTE ON IDENTITY (preserved deliberately): the live service is named
+# "AZM-backend"; the `name` below is historical. Do NOT sync this blueprint into
+# Render blindly — it would propose creating a differently-named service. Treat
+# it as documentation of the intended configuration, not a provisioning source.
 # =============================================================================
 services:
   - type: web
     name: azaman-backend
     runtime: node
-    plan: starter
+    plan: free
     branch: main
-    buildCommand: npm install && npm run build
-    preDeployCommand: npm run release
-    startCommand: npm start
+    # Full release chain, after the build, before traffic. See above.
+    buildCommand: npm install && npm run build && npm run release
+    # Deliberately absent: `preDeployCommand`. The Free plan does not execute
+    # it, and declaring it here is what made the repo disagree with reality.
+    # If this service ever moves to a paid plan, put `npm run release` in
+    # preDeployCommand and drop it from buildCommand — never both.
+    startCommand: node index.js
     healthCheckPath: /health
-    autoDeploy: true
+    # Deploys are manual: nothing reaches production just because main moved.
+    autoDeploy: false
     envVars:
-      # Runtime contract (r15 follow-up): CI (.github/workflows/test.yml),
-      # this blueprint, .nvmrc and package.json engines all pin Node 24 — the
-      # only major version the full serial test battery has been verified
-      # against. Future AWS deployment should use the same contract.
+      # CI (.github/workflows/test.yml), .nvmrc and package.json engines all
+      # pin Node 24 — the only major version the full serial test battery has
+      # been verified against.
       - key: NODE_VERSION
         value: "24"
       - key: NODE_ENV

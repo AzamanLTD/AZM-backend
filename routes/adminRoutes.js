@@ -11,6 +11,13 @@
 const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client');
 const ledger = require('../services/ledgerService');
+const {
+    verifyAndClaimTotp,
+    sendTotpFailure,
+    sendTotpUnavailable,
+    TOTP_CODES,
+} = require('../src/services/totpStepClaimService');
+
 const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 const express = require('express');
 const router = express.Router();
@@ -81,6 +88,19 @@ const adminSettingsController = require('../controllers/adminSettingsController'
 router.get('/settings',              requireEffectivePermission('platform.settings'), adminSettingsController.getSettings);
 router.put('/settings',              requireEffectivePermission('platform.settings'), adminSettingsController.updateSettings);
 router.post('/users/:id/risk-tier',  requireEffectivePermission('users.risk_tier'), adminSettingsController.setUserRiskTier);
+
+// ─── MONEY SETTINGS (exact values, revisioned, isolated from /settings) ──────
+// Deliberately NOT part of the legacy /settings surface above: that path coerces
+// with Number(...) and overwrites a singleton with no history. These routes read
+// and append revisions, validate exact decimal strings, and refuse the
+// owner-resolved headline mode outright.
+// `money.settings.view` / `.write` are declared in the ADMIN_ROLES catalog
+// (controllers/adminRbacController.js); a permission absent from every
+// specialized role is reserved to SUPER_ADMIN, so the catalog entry IS the grant.
+const adminMoneySettingsController = require('../controllers/adminMoneySettingsController');
+router.get('/money-settings',            requireEffectivePermission('money.settings.view'),  adminMoneySettingsController.getSettings);
+router.get('/money-settings/:key/history', requireEffectivePermission('money.settings.view'), adminMoneySettingsController.getHistory);
+router.put('/money-settings/:key',       requireEffectivePermission('money.settings.write'), adminMoneySettingsController.updateSetting);
 
 // ─── USER DETAIL DRAWER (Phase 3) ────────────────────────────────────────────
 router.get("/users/:id/detail", requireEffectivePermission('users.view'), async (req, res) => {
@@ -579,15 +599,15 @@ router.post('/2fa/verify', async (req, res) => {
             return res.status(400).json({ success: false, message: '2FA is already enabled.' });
         }
 
-        const verified = speakeasy.totp.verify({
+        const verdict = await verifyAndClaimTotp({
+            prisma,
+            userId,
             secret: user.twoFactorSecret,
-            encoding: 'base32',
             token,
-            window: 1,
         });
 
-        if (!verified) {
-            return res.status(400).json({ success: false, message: 'Invalid token. Please try again.' });
+        if (!verdict.ok) {
+            return sendTotpFailure(res, verdict, { invalidStatus: 400, invalidMessage: 'Invalid token. Please try again.' });
         }
 
         await prisma.user.update({
@@ -597,6 +617,7 @@ router.post('/2fa/verify', async (req, res) => {
 
         res.json({ success: true, message: '2FA enabled successfully.' });
     } catch (err) {
+        if (err && err.code === TOTP_CODES.UNAVAILABLE) return sendTotpUnavailable(res);
         logger.error('[AdminRoutes] 2FA verify error:', err);
         res.status(500).json({ success: false, message: err.message });
     }
@@ -622,15 +643,15 @@ router.post('/2fa/disable', async (req, res) => {
             return res.status(400).json({ success: false, message: '2FA is not enabled.' });
         }
 
-        const verified = speakeasy.totp.verify({
+        const verdict = await verifyAndClaimTotp({
+            prisma,
+            userId,
             secret: user.twoFactorSecret,
-            encoding: 'base32',
             token,
-            window: 1,
         });
 
-        if (!verified) {
-            return res.status(400).json({ success: false, message: 'Invalid token.' });
+        if (!verdict.ok) {
+            return sendTotpFailure(res, verdict, { invalidStatus: 400, invalidMessage: 'Invalid token.' });
         }
 
         await prisma.user.update({
@@ -640,6 +661,7 @@ router.post('/2fa/disable', async (req, res) => {
 
         res.json({ success: true, message: '2FA disabled.' });
     } catch (err) {
+        if (err && err.code === TOTP_CODES.UNAVAILABLE) return sendTotpUnavailable(res);
         logger.error('[AdminRoutes] 2FA disable error:', err);
         res.status(500).json({ success: false, message: err.message });
     }

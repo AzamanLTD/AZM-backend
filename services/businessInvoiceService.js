@@ -47,8 +47,18 @@ const _invoiceRef = () => {
 
 const createInvoice = async (prisma, {
   businessProfileId, customerId, locationId, tableId,
-  lineItems, taxLines, businessNote, idempotencyKey,
+  lineItems, taxLines, businessNote, idempotencyKey, currency = null,
 }) => {
+  // `currency` is explicit: 'GHS' bills the customer in cedis at exact 2dp and
+  // writes NO USDC amount; null keeps the historical untagged-USDC bill.
+  const requestedCurrency = currency == null || currency === '' ? null : String(currency).trim().toUpperCase();
+  if (requestedCurrency !== null && !['GHS', 'USDC'].includes(requestedCurrency)) {
+    throw new Error('currency must be GHS or USDC.');
+  }
+  const isGhs = requestedCurrency === 'GHS';
+  // A cedi bill settles to the pesewa: quantize every stored figure to 2dp
+  // BEFORE persistence, so the invoice, its lines and its taxes agree exactly.
+  const q = (d) => (isGhs ? new Prisma.Decimal(d).toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP) : d);
   if (!Array.isArray(lineItems) || lineItems.length === 0)
     throw new Error('At least one line item is required.');
   if (lineItems.length > 50)
@@ -74,9 +84,26 @@ const createInvoice = async (prisma, {
       throw new Error(`Tax value for '${t.name}' supports at most 4 decimal places (Decimal(10,4) column).`);
     }
   }
-  const { subtotal: subtotalUsdc, lineItems: cleanLineItems } = computeLineItemsExact(lineItems);
-  const { taxTotal: taxTotalUsdc, taxLines: cleanTaxLines } = computeTaxLinesExact(effectiveTaxLines, subtotalUsdc);
-  const billTotalUsdc = subtotalUsdc.plus(taxTotalUsdc);
+  const { subtotal: subtotalRaw, lineItems: cleanLineItemsRaw } = computeLineItemsExact(lineItems);
+  const { taxTotal: taxTotalRaw, taxLines: cleanTaxLinesRaw } = computeTaxLinesExact(effectiveTaxLines, subtotalRaw);
+  const billTotalRaw = subtotalRaw.plus(taxTotalRaw);
+
+  const subtotal = q(subtotalRaw);
+  const taxTotal = q(taxTotalRaw);
+  const billTotal = q(billTotalRaw);
+
+  // Legacy USDC bills keep their historical fields untouched. A GHS bill carries
+  // its money ONLY in the cedi columns, with the USDC columns at zero (they are
+  // NOT NULL), and its lines/taxes likewise.
+  const subtotalUsdc = isGhs ? new Prisma.Decimal(0) : subtotal;
+  const taxTotalUsdc = isGhs ? new Prisma.Decimal(0) : taxTotal;
+  const billTotalUsdc = isGhs ? new Prisma.Decimal(0) : billTotal;
+  const cleanLineItems = isGhs
+    ? cleanLineItemsRaw.map((l) => ({ ...l, unitPriceGhs: q(l.unitPrice), lineTotalGhs: q(l.lineTotal) }))
+    : cleanLineItemsRaw;
+  const cleanTaxLines = isGhs
+    ? cleanTaxLinesRaw.map((t) => ({ ...t, computedAmountGhs: q(t.computedAmount) }))
+    : cleanTaxLinesRaw;
 
   const customer = await prisma.user.findUnique({
     where: { id: customerId },
@@ -99,6 +126,10 @@ const createInvoice = async (prisma, {
       invoiceRef,
       idempotencyKey: idempotencyKey || null,
       status: 'DRAFT',
+      currency: isGhs ? 'GHS' : (requestedCurrency === 'USDC' ? 'USDC' : null),
+      ...(isGhs
+        ? { subtotalGhs: subtotal, taxTotalGhs: taxTotal, billTotalGhs: billTotal }
+        : {}),
       subtotalUsdc, taxTotalUsdc, billTotalUsdc,
       businessNote: businessNote ? String(businessNote).slice(0, 500) : null,
       lineItems: { create: cleanLineItems },
@@ -111,7 +142,8 @@ const createInvoice = async (prisma, {
     invoiceId: invoice.id,
     invoiceRef: invoice.invoiceRef,
     customerId,
-    billTotal: invoice.billTotalUsdc,
+    currency: invoice.currency || null,
+    billTotal: isGhs ? invoice.billTotalGhs : invoice.billTotalUsdc,
     status: invoice.status,
   });
 
@@ -220,6 +252,17 @@ const payInvoice = async (prisma, {
   });
   if (!invoice) throw new Error('Invoice not found.');
   if (invoice.customerId !== customerId) throw new Error('Not authorized to pay this invoice.');
+
+  // A cedi bill has no USDC amount to debit, and this rail moves USDC. Charging
+  // it would have to invent a rate and then record cedis as dollars, so it is
+  // refused with a typed code instead. Cash handed to the merchant settles
+  // through the dine-in cash-close path, which records native cedis; a GHS
+  // platform rail is a separate piece of work.
+  if (invoice.currency === 'GHS') {
+    const refusal = new Error('This invoice is in cedis; there is no GHS invoice payment rail yet.');
+    refusal.code = 'GHS_PAYMENT_RAIL_UNAVAILABLE';
+    throw refusal;
+  }
 
   if (invoice.payTxHash) {
     return { invoice, customerPays: Number(invoice.customerPaidUsdc.toFixed(8)), alreadyPaid: true };

@@ -91,6 +91,67 @@ const fingerprintOf = (req) => crypto
 const isUniqueViolation = (err) =>
     err?.code === 'P2002' || /unique constraint/i.test(err?.message || '');
 
+// ── claim RELEASE robustness ────────────────────────────────────────────────
+//
+// A release is a conditional primary-key delete (id + IN_PROGRESS) that must
+// finish BEFORE the response leaves. If it fails — deadlock victim,
+// serialization conflict, pool timeout, dropped connection — the row stays
+// IN_PROGRESS while the client already saw its 400, so the corrected retry
+// carrying the SAME key is refused with 409 by a phantom identity. That is
+// exactly what made transit-booking-identity T9 flaky in CI.
+//
+// Only VERIFIED TRANSIENT failures are retried: a constraint/predicate error
+// is not a reason to try again, and retrying everything would multiply load
+// on a genuinely broken database. The budget is fixed, with a short linear
+// backoff, so the client-visible cost stays in the tens of milliseconds.
+// Exhausting it does NOT change the fail-closed disposition (the claim keeps
+// IN_PROGRESS and replays refuse), but it is never silent.
+const CLAIM_RELEASE_MAX_ATTEMPTS = 3;
+const CLAIM_RELEASE_RETRY_DELAY_MS = 20;
+
+// Prisma codes describing a RETRIABLE infrastructure condition: refused or
+// closed connections, pool/transaction timeouts, transaction conflicts.
+const TRANSIENT_PRISMA_CODES = new Set([
+    'P1001', 'P1002', 'P1008', 'P1017',
+    'P2024', 'P2028', 'P2034',
+]);
+
+// The equivalent PostgreSQL SQLSTATEs. P2010 ($queryRaw failures) carries the
+// SQLSTATE inside meta.message, hence the parse in _errorCodes below.
+const TRANSIENT_SQLSTATES = new Set([
+    '40001',                  // serialization_failure
+    '40P01',                  // deadlock_detected
+    '55P03',                  // lock_not_available
+    '57014',                  // query_canceled (statement_timeout)
+    '57P01', '57P02', '57P03', // admin shutdown / crash / cannot connect now
+    '08000', '08001', '08003', '08006', // connection exceptions
+    '53300', '53301',         // too many connections (for role)
+]);
+
+// Every place a driver may hide the real code: Prisma puts it on the error,
+// pg on cause, and a raw-query failure buries the SQLSTATE in the message.
+const _errorCodes = (err) => {
+    const codes = [];
+    const push = (v) => {
+        if (typeof v === 'string' && v.trim()) codes.push(v.trim().toUpperCase());
+    };
+    push(err?.code);
+    push(err?.originalCode);
+    push(err?.errno);
+    push(err?.meta?.code);
+    push(err?.cause?.code);
+    push(err?.cause?.originalCode);
+    const text = `${err?.meta?.message || ''} ${err?.message || ''}`;
+    const m = text.match(/code:\s*[`'"]([0-9A-Za-z]{5})[`'"]/i);
+    if (m) push(m[1]);
+    return codes;
+};
+
+const isTransientDbError = (err) => {
+    if (!err) return false;
+    return _errorCodes(err).some((c) => TRANSIENT_SQLSTATES.has(c) || TRANSIENT_PRISMA_CODES.has(c));
+};
+
 // ── middleware factory ──────────────────────────────────────────────────────
 
 /**
@@ -111,6 +172,15 @@ const isUniqueViolation = (err) =>
  */
 function idempotency(options = {}) {
     const failurePolicy = options.failurePolicy === RELEASE ? RELEASE : RETAIN;
+    // Release-retry policy. Production runs the bounded defaults above; tests
+    // inject a fixed policy so they can prove the bound without sleeping.
+    const releasePolicy = options.claimReleaseRetry || {};
+    const releaseMaxAttempts = Number.isInteger(releasePolicy.attempts) && releasePolicy.attempts > 0
+        ? releasePolicy.attempts
+        : CLAIM_RELEASE_MAX_ATTEMPTS;
+    const releaseDelayMs = Number.isFinite(releasePolicy.delayMs) && releasePolicy.delayMs >= 0
+        ? releasePolicy.delayMs
+        : CLAIM_RELEASE_RETRY_DELAY_MS;
     // r42 review P0-2: a financial mutation mounted under this authority
     // REQUIRES a client Idempotency-Key. Without one, every network retry is a
     // brand-new operation and can move money twice. Opt out ONLY where an
@@ -271,9 +341,54 @@ function idempotency(options = {}) {
         // primary-key deleteMany before the send; if the release itself
         // fails, the claim stays IN_PROGRESS and replays still refuse
         // safely — the response is delivered either way.
-        const releaseClaim = () => prisma.financialOperation.deleteMany({
-            where: { id: claim.id, status: OPERATION_IN_PROGRESS },
-        });
+        // Durable, bounded release. The SAME conditional predicate runs on
+        // every attempt — id + IN_PROGRESS — so a concurrent transition to
+        // COMMITTED inside the service's economic transaction can never be
+        // deleted: that is a no-op (count 0), not a failure.
+        const releaseClaim = async () => {
+            for (let attempt = 1; attempt <= releaseMaxAttempts; attempt += 1) {
+                try {
+                    const result = await prisma.financialOperation.deleteMany({
+                        where: { id: claim.id, status: OPERATION_IN_PROGRESS },
+                    });
+                    if (attempt > 1) {
+                        logger.info({ operationId: claim.id, attempt },
+                            '[idempotency] claim release succeeded after retry');
+                    }
+                    return { released: (result?.count ?? 0) > 0, attempts: attempt, error: null, exhausted: false };
+                } catch (err) {
+                    const transient = isTransientDbError(err);
+                    const lastAttempt = attempt >= releaseMaxAttempts;
+                    if (transient && !lastAttempt) {
+                        logger.warn(
+                            { operationId: claim.id, attempt, errCode: err?.code ?? null, err: err?.message },
+                            '[idempotency] claim release hit a transient database error — retrying'
+                        );
+                        if (releaseDelayMs > 0) {
+                            await new Promise((resolve) => setTimeout(resolve, releaseDelayMs * attempt));
+                        }
+                        continue;
+                    }
+                    // Fail closed and LOUD: the claim keeps IN_PROGRESS, so
+                    // replays refuse with a deterministic 409 and no second
+                    // execution is possible — but the operator must see it.
+                    const failure = {
+                        code: 'IDEMPOTENCY_CLAIM_RELEASE_FAILED',
+                        operationId: claim.id,
+                        attempts: attempt,
+                        transient,
+                        exhausted: transient && lastAttempt,
+                        errCode: err?.code ?? null,
+                        message: err?.message || 'claim release failed',
+                    };
+                    logger.error({ ...failure, err: err?.message },
+                        '[idempotency] claim release FAILED — key remains IN_PROGRESS; replays refuse safely');
+                    res.locals.financialClaimReleaseFailure = failure;
+                    return { released: false, attempts: attempt, error: err, exhausted: failure.exhausted };
+                }
+            }
+            return { released: false, attempts: releaseMaxAttempts, error: null, exhausted: false };
+        };
 
         const originalJson = res.json.bind(res);
         res.json = function (body) {
@@ -288,10 +403,7 @@ function idempotency(options = {}) {
             // IN_PROGRESS claim proves the transaction rolled back).
             if (statusCode >= 400 && statusCode < 500) {
                 if (res.locals.financialClaimRelease === true || releaseOn4xx) {
-                    releaseClaim().catch((e) => logger.warn(
-                        { err: e.message, operationId: claim.id },
-                        '[idempotency] claim release failed — replays refuse safely (IN_PROGRESS)'
-                    )).finally(() => originalJson(body));
+                    releaseClaim().finally(() => originalJson(body));
                     return res;
                 }
                 // RETAIN (no explicit disposition): the key stays poisoned —
@@ -301,10 +413,7 @@ function idempotency(options = {}) {
                 if (failurePolicy === RELEASE) {
                     // The route declared its service state-convergent /
                     // provably rolled back on 5xx: release for retry.
-                    releaseClaim().catch((e) => logger.warn(
-                        { err: e.message, operationId: claim.id },
-                        '[idempotency] claim release failed — replays refuse safely (IN_PROGRESS)'
-                    )).finally(() => originalJson(body));
+                    releaseClaim().finally(() => originalJson(body));
                     return res;
                 }
                 // RETAIN: a 5xx may follow a committed mutation. The claim
@@ -392,4 +501,7 @@ module.exports = {
     endpointOf,
     fingerprintOf,
     canonical,
+    isTransientDbError,
+    CLAIM_RELEASE_MAX_ATTEMPTS,
+    CLAIM_RELEASE_RETRY_DELAY_MS,
 };

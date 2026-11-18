@@ -7,8 +7,17 @@
 // them) threw "Prisma is not defined" before responding. No test covered this
 // controller, so CI stayed green while the endpoint was broken in production.
 const logger = require('../src/config/logger');
+const { requestAmountExact } = require('../utils/exactAmount');
 const { Prisma } = require('@prisma/client');
 const ledger = require('../services/ledgerService');
+const { consumeStepUp, isStepUpEnforced } = require('../middleware/requireActionStepUp');
+const {
+    verifyAndClaimTotp,
+    sendTotpFailure,
+    sendTotpUnavailable,
+    TOTP_CODES,
+} = require('../src/services/totpStepClaimService');
+
 const restrictedObligations = require('../services/restrictedObligationService');
 const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 
@@ -20,10 +29,16 @@ exports.requestWithdrawal = async (req, res) => {
     const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
     
     try {
-        // We now look for 'destination' (which handles IDs, Wallets, and Phone Numbers)
-        const { amount, destination, networkPref } = req.body;
+        // We now look for 'destination' plus the explicit 'destinationType'
+        // (owner-approved contract, 2026-10-27): numeric destinations are
+        // ambiguous between MoMo numbers and Binance Pay IDs and are never
+        // digit-length-guessed.
+        const { amount, destination, destinationType, networkPref } = req.body;
         const userId = req.user.id;
         const withdrawAmount = parseFloat(amount);
+        // The exact value of what the client sent, kept separately: legacy math
+        // below stays as it is, but a guard must not measure a double.
+        const withdrawAmountExact = requestAmountExact(amount);
 
         // 1. Basic Validation
         // r42: provably pre-economics failures — the claim (if any) is released
@@ -37,6 +52,24 @@ exports.requestWithdrawal = async (req, res) => {
             return res.status(400).json({ success: false, message: "Destination address or number is required." });
         }
 
+        // Destination resolution is the SINGLE shared contract
+        // (services/payoutDestinationClassification.js): the FX
+        // authorization gate and this dispatch read the SAME resolution
+        // so they can never disagree (financial-core blocker A). An
+        // unresolvable destination (numeric without a type, format
+        // mismatch, unknown format) is refused BEFORE any economics —
+        // the same code and message the gate produces.
+        const {
+            resolvePayoutDestination,
+            payoutDestinationRefusal,
+        } = require('../services/payoutDestinationClassification');
+        const resolution = resolvePayoutDestination(destination, destinationType, networkPref);
+        if (resolution.status !== 'RESOLVED') {
+            const refusal = payoutDestinationRefusal(resolution);
+            res.locals.financialClaimRelease = true;
+            return res.status(400).json({ success: false, code: refusal.code, message: refusal.message });
+        }
+
         // 2. Fetch Global Settings for Live Gas Prices
         const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
         if (!settings) throw new Error("Global settings offline.");
@@ -46,37 +79,65 @@ exports.requestWithdrawal = async (req, res) => {
         const platformFeeUsdc = parseFloat((withdrawAmount * cryptoPlatformFeePct).toFixed(6));
         const netAfterPlatformFee = withdrawAmount - platformFeeUsdc;
 
-        // --- THE BACKEND DETECTIVE ---
-        let payoutMethod = "UNKNOWN";
-        let detectedNetwork = networkPref || "UNKNOWN";
+        // --- PAYOUT CLASSIFICATION (resolved above; no silent guessing) ---
         let totalGasFee = 0.0;
 
         const cleanDest = destination.trim();
-        const isNumeric = /^\d+$/.test(cleanDest);
-
-        if (isNumeric && cleanDest.length >= 8 && cleanDest.length <= 12) {
-            // 8 to 12 digits is the standard length of a Binance Pay ID
-            payoutMethod = "BINANCE_ID";
-            detectedNetwork = "BINANCE_PAY";
+        const { payoutMethod, detectedNetwork } = resolution;
+        // Gas-fee resolution per classification (unchanged semantics):
+        if (payoutMethod === "BINANCE_ID") {
             totalGasFee = 0.0; // ZERO FEES!
-        } 
-        else if (cleanDest.startsWith('T') && cleanDest.length === 34) {
-            // Tron (TRC20) addresses always start with 'T' and are 34 chars long
-            payoutMethod = "EXTERNAL_WALLET";
-            detectedNetwork = "TRC20";
+        } else if (payoutMethod === "EXTERNAL_WALLET" && detectedNetwork === "TRC20") {
             totalGasFee = settings.gasFeeTrc20;
-        } 
-        else if (cleanDest.startsWith('0x') && cleanDest.length === 42) {
-            // Ethereum (ERC20) or Binance Smart Chain (BEP20)
-            payoutMethod = "EXTERNAL_WALLET";
-            detectedNetwork = networkPref || "BEP20"; // Default to cheaper BEP20 if not specified
+        } else if (payoutMethod === "EXTERNAL_WALLET") {
+            // ERC20 or BEP20 — detectedNetwork already defaulted by the classifier
             totalGasFee = detectedNetwork === "ERC20" ? settings.gasFeeErc20 : settings.gasFeeBep20;
-        } 
-        else if (isNumeric && cleanDest.length >= 9) {
-            // Looks like an MTN/Telecel phone number
-            payoutMethod = "MOMO";
-            detectedNetwork = networkPref || "MTN";
-            totalGasFee = 0.0; 
+        } else if (payoutMethod === "MOMO") {
+            totalGasFee = 0.0;
+
+            // DUST-SETTLEMENT GUARD (owner policy on #369): a MoMo payout
+            // is realized in GHS by the payout worker at dispatch time —
+            // if the USDC amount quantizes to 0.00 pesewas at the CURRENT
+            // retail rate, the withdrawal could never pay out, yet the
+            // request path would debit the user NOW and strand the funds
+            // in a PENDING row the worker cannot dispatch. Refuse BEFORE
+            // the debit with the honest verdict (the FX gate has already
+            // demanded a fresh rate for this class, so the rate read here
+            // is gate-vetted; the split verdict mirrors finance.service).
+            const rateExact = new Prisma.Decimal(String(settings?.liveRetailRate ?? 0));
+            // EXACT REQUEST AMOUNT: `String(withdrawAmount)` is the text of a
+            // double, so the pesewa boundary was decided on an approximation.
+            // When the request text cannot be read exactly there is nothing
+            // trustworthy to measure, so it is refused before any debit.
+            if (!withdrawAmountExact) {
+                res.locals.financialClaimRelease = true;
+                return res.status(400).json({ success: false, message: "Invalid amount." });
+            }
+            const payoutGhs = withdrawAmountExact
+                .times(rateExact)
+                .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
+            if (!rateExact.gt(0)) {
+                res.locals.financialClaimRelease = true;
+                return res.status(503).json({
+                    success: false,
+                    code: 'FIAT_RATE_UNAVAILABLE',
+                    message: 'Current USDC/GHS retail exchange rate is unavailable. Nothing was deducted. Please try again shortly.',
+                    retryable: true
+                });
+            }
+            if (!payoutGhs.gt(0)) {
+                const minAmountUsdc = new Prisma.Decimal('0.005')
+                    .div(rateExact)
+                    .toDecimalPlaces(8, Prisma.Decimal.ROUND_CEIL);
+                res.locals.financialClaimRelease = true;
+                return res.status(400).json({
+                    success: false,
+                    code: 'DUST_SETTLEMENT',
+                    message: 'This amount would settle to 0.00 GHS. The minimum withdrawable at the current rate is ' +
+                        minAmountUsdc.toFixed(8) + ' USDC. Nothing was deducted.',
+                    data: { minAmountUsdc: minAmountUsdc.toFixed(8) }
+                });
+            }
         }
 
         // Calculate the 50/50 Split!
@@ -85,6 +146,18 @@ exports.requestWithdrawal = async (req, res) => {
 
         // 3. Execute the Transaction
         const result = await prisma.$transaction(async (tx) => {
+            // §WP-H G — the grant is spent INSIDE the economic transaction, so a
+            // grant and the money move together or not at all. Throwing here rolls
+            // back the debit, the ledger reservation and the fee realisation, and
+            // the capability survives for a retry of the corrected action.
+            if (isStepUpEnforced()) {
+                const verdict = await consumeStepUp(tx, req);
+                if (!verdict || !verdict.ok) {
+                    const rejected = new Error('Step-up verification does not authorise this exact action.');
+                    rejected.code = 'STEP_UP_REJECTED';
+                    throw rejected;
+                }
+            }
             // r25 — ATOMIC BALANCE CLAIM: a conditional decrement makes the
             // insufficient-balance race deterministic (a concurrent debit from
             // another financial endpoint can consume funds between the read
@@ -238,6 +311,17 @@ exports.requestWithdrawal = async (req, res) => {
         if (emitBalanceUpdate) await emitBalanceUpdate(userId);
 
     } catch (error) {
+        if (error && error.code === 'STEP_UP_REJECTED') {
+            // 4xx releases the idempotency claim so the user can retry with a fresh
+            // grant; nothing was executed, because the throw rolled the whole
+            // transaction back.
+            res.locals.financialClaimRelease = true;
+            return res.status(409).json({
+                success: false,
+                code: 'STEP_UP_REJECTED',
+                message: 'This verification does not match this action or was already used. Nothing was executed.',
+            });
+        }
         res.status(400).json({ success: false, message: error.message });
     }
 };
@@ -331,7 +415,6 @@ exports.addSavedWallet = async (req, res) => {
         // who has access to a logged-in session from quietly seeding a
         // withdrawal address.
         const bcrypt = require('bcryptjs');
-        const speakeasy = require('speakeasy');
         const userRow = await prisma.user.findUnique({
             where: { id: userId },
             select: { password: true, isTwoFactorEnabled: true, twoFactorSecret: true },
@@ -344,13 +427,15 @@ exports.addSavedWallet = async (req, res) => {
                     message: 'Two-factor token required to save a payout address.',
                 });
             }
-            const ok = speakeasy.totp.verify({
+            const verdict = await verifyAndClaimTotp({
+                prisma,
+                userId,
                 secret: userRow.twoFactorSecret,
-                encoding: 'base32',
                 token: totpToken,
-                window: 1,
             });
-            if (!ok) return res.status(401).json({ success: false, message: 'Invalid 2FA token.' });
+            if (!verdict.ok) {
+                return sendTotpFailure(res, verdict, { invalidStatus: 401, invalidMessage: 'Invalid 2FA token.' });
+            }
         } else {
             if (!password) {
                 return res.status(401).json({
@@ -447,6 +532,7 @@ exports.addSavedWallet = async (req, res) => {
 
         res.status(201).json({ success: true, wallet: newWallet, message: "Account verified and saved!" });
     } catch (error) {
+        if (error && error.code === TOTP_CODES.UNAVAILABLE) return sendTotpUnavailable(res);
         logger.error("Save Wallet Error:", error);
         res.status(500).json({ success: false, message: "Server error saving account." });
     }

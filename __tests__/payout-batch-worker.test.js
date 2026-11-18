@@ -1,4 +1,10 @@
+jest.mock('../src/services/fiatLiquidityActivationService', () => ({
+    isAuthorityModeActive: jest.fn().mockResolvedValue(false),
+    readMode: jest.fn().mockResolvedValue({ active: false, latched: false, flagged: false }),
+}));
+
 const PayoutBatchWorker = require('../workers/payoutBatchWorker');
+const { withTransactions } = require('./helpers/mockTransaction');
 
 // §P.5-D: the worker records dispatch evidence through the liquidity
 // authority collaborator before/around every dispatch — stub the boundary.
@@ -28,11 +34,14 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
         }]);
         const prisma = {
             globalSettings: { findUnique: jest.fn().mockResolvedValue(settings) },
+            fiatLiquidityState: { findUnique: jest.fn().mockResolvedValue(null) },
             systemFiatPool: { findUnique: jest.fn().mockResolvedValue({ balance: 1000 }) },
         // §P.5-D per-row regime: no reservation row → this is a LEGACY
         // withdrawal; the legacy SystemFiatPool policy applies.
         fiatLiquidityReservation: { findUnique: jest.fn().mockResolvedValue(null) },
             withdrawal: {
+                // The claim re-reads the row INSIDE the claim transaction.
+                findUnique: jest.fn(async (args) => ({ id: args && args.where ? args.where.id : 91, status: 'PENDING' })),
                 findMany: jest.fn().mockResolvedValue([{
                     id: 91, userId: 7, amount: 50, destination: '0240000000', network: 'TELECEL',
                     payoutMethod: 'MTN_MOMO', createdAt: new Date('2026-08-30T10:00:00.000Z'),
@@ -44,7 +53,7 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
             $queryRawUnsafe: jest.fn().mockResolvedValue([]), // r18: no bridge link, no bridge-linked exclusions
             $executeRawUnsafe: jest.fn().mockResolvedValue(1), // r18: bridge claim wins (one affected row)
         };
-        const worker = new PayoutBatchWorker(prisma, null, { initiateTransfer }, null);
+        const worker = new PayoutBatchWorker(withTransactions(prisma), null, { initiateTransfer }, null);
         const result = await worker._processBatch(settings, { isManualTrigger: true });
 
         expect(result.processed).toBe(1);
@@ -64,11 +73,14 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
         const initiateTransfer = jest.fn();
         const prisma = {
             globalSettings: { findUnique: jest.fn().mockResolvedValue(settings) },
+            fiatLiquidityState: { findUnique: jest.fn().mockResolvedValue(null) },
             systemFiatPool: { findUnique: jest.fn().mockResolvedValue({ balance: 1000 }) },
         // §P.5-D per-row regime: no reservation row → this is a LEGACY
         // withdrawal; the legacy SystemFiatPool policy applies.
         fiatLiquidityReservation: { findUnique: jest.fn().mockResolvedValue(null) },
             withdrawal: {
+                // The claim re-reads the row INSIDE the claim transaction.
+                findUnique: jest.fn(async (args) => ({ id: args && args.where ? args.where.id : 91, status: 'PENDING' })),
                 findMany: jest.fn().mockResolvedValue([{
                     id: 93, userId: 7, amount: 50, destination: '0240000000', network: 'MTN',
                     payoutMethod: 'MTN_MOMO', createdAt: new Date('2026-08-30T10:00:00.000Z'),
@@ -82,7 +94,7 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
             $queryRawUnsafe: jest.fn().mockResolvedValue([]), // r18: no bridge link, no bridge-linked exclusions
             $executeRawUnsafe: jest.fn().mockResolvedValue(1), // r18: bridge claim wins (one affected row)
         };
-        const worker = new PayoutBatchWorker(prisma, null, { initiateTransfer }, null);
+        const worker = new PayoutBatchWorker(withTransactions(prisma), null, { initiateTransfer }, null);
         const result = await worker._processBatch(settings, { isManualTrigger: true });
 
         expect(result.processed).toBe(0);
@@ -95,11 +107,14 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
         const initiateTransfer = jest.fn();
         const prisma = {
             globalSettings: { findUnique: jest.fn().mockResolvedValue(settings) },
+            fiatLiquidityState: { findUnique: jest.fn().mockResolvedValue(null) },
             systemFiatPool: { findUnique: jest.fn().mockResolvedValue({ balance: 1000 }) },
         // §P.5-D per-row regime: no reservation row → this is a LEGACY
         // withdrawal; the legacy SystemFiatPool policy applies.
         fiatLiquidityReservation: { findUnique: jest.fn().mockResolvedValue(null) },
             withdrawal: {
+                // The claim re-reads the row INSIDE the claim transaction.
+                findUnique: jest.fn(async (args) => ({ id: args && args.where ? args.where.id : 91, status: 'PENDING' })),
                 findMany: jest.fn().mockResolvedValue([{
                     id: 92, userId: 7, amount: 50, destination: '0240000000', network: 'AIRTELTIGO',
                     payoutMethod: 'MTN_MOMO', createdAt: new Date('2026-08-30T10:00:00.000Z'),
@@ -118,7 +133,7 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
             $queryRawUnsafe: jest.fn().mockResolvedValue([]), // r18: no bridge link, no bridge-linked exclusions
             $executeRawUnsafe: jest.fn().mockResolvedValue(1), // r18: bridge claim wins (one affected row)
         };
-        const worker = new PayoutBatchWorker(prisma, null, { initiateTransfer }, null);
+        const worker = new PayoutBatchWorker(withTransactions(prisma), null, { initiateTransfer }, null);
         const result = await worker._processBatch(settings, { isManualTrigger: true });
 
         expect(result.processed).toBe(0);
@@ -130,6 +145,54 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
             // r271e: pre-dispatch parking claims PENDING/APPROVED (both are
             // provably undispatched states).
             where: { id: 92, status: { in: ['PENDING', 'APPROVED'] } },
+            data: { status: 'NEEDS_MANUAL_REVIEW' },
+        });
+    });
+
+    // ── DUST-SETTLEMENT GUARD (owner policy on #369, defense in depth) ─────
+    // A legacy row whose USDC amount quantizes to 0.00 GHS at the current
+    // rate is a payout that cannot exist: NEVER dispatched to the provider.
+    // Parked pre-claim for manual resolution. New withdrawals are refused
+    // at request time (wallet/direct-fiat guards); this catches rows that
+    // predate those guards or slip past them.
+    test('a legacy dust withdrawal is parked, never dispatched as 0.00 GHS', async () => {
+        const initiateTransfer = jest.fn().mockResolvedValue({ _provider: 'mtn', provider: 'MTN_MOMO_DISBURSEMENT', status: 'ACCEPTED' });
+        const prisma = {
+            globalSettings: { findUnique: jest.fn().mockResolvedValue({ ...settings, liveRetailRate: 13 }) },
+            systemFiatPool: { findUnique: jest.fn().mockResolvedValue({ balance: 1000 }) },
+            fiatLiquidityReservation: { findUnique: jest.fn().mockResolvedValue(null) }, // legacy regime
+            withdrawal: {
+                findMany: jest.fn().mockResolvedValue([{
+                    id: 94, userId: 7, amount: 0.0001, destination: '0240000000', network: 'MTN',
+                    payoutMethod: 'MTN_MOMO', createdAt: new Date('2026-08-30T10:00:00.000Z'),
+                }]),
+                update: jest.fn().mockResolvedValue({}),
+                updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+            },
+            transactionHistory: {
+                findMany: jest.fn().mockResolvedValue([
+                    { id: 'tx-dust-1', txHash: 'dust-ref-1', status: 'PENDING', userId: 7, amountUsdc: 0.0001 },
+                ]),
+                findUnique: jest.fn(),
+            },
+            $queryRawUnsafe: jest.fn().mockResolvedValue([]),
+            $executeRawUnsafe: jest.fn().mockResolvedValue(1),
+        };
+        // §WP-H D2: parking is ONE transaction — evidence write + status CAS
+        // under the authority lock. The harness must model that transaction,
+        // otherwise _claimForManualReview catches its own TypeError, returns
+        // false, and the guard looks like it never fired.
+        prisma.$transaction = jest.fn(async (cb) => cb(prisma));
+        const worker = new PayoutBatchWorker(prisma, null, { initiateTransfer }, null);
+        const result = await worker._processBatch({ ...settings, liveRetailRate: 13 }, { isManualTrigger: true });
+
+        // 0.0001 USDC * 13 = 0.0013 GHS -> 0.00 at pesewa precision: dust.
+        expect(result.processed).toBe(0);
+        expect(result.flagged).toBe(1);
+        expect(result.details.flaggedManualReview[0]).toMatchObject({ id: 94, reason: 'DUST_SETTLEMENT' });
+        expect(initiateTransfer).not.toHaveBeenCalled();
+        expect(prisma.withdrawal.updateMany).toHaveBeenCalledWith({
+            where: { id: 94, status: { in: ['PENDING', 'APPROVED'] } },
             data: { status: 'NEEDS_MANUAL_REVIEW' },
         });
     });
@@ -146,11 +209,13 @@ describe('PayoutBatchWorker provider outcome classification', () => {
 
     const buildPrisma = ({ withdrawal, update, updateMany }) => ({
         globalSettings: { findUnique: jest.fn().mockResolvedValue({ ...settings, liveRetailRate: 13 }) },
+        fiatLiquidityState: { findUnique: jest.fn().mockResolvedValue(null) },
         systemFiatPool: { findUnique: jest.fn().mockResolvedValue({ balance: 1000 }) },
         // §P.5-D per-row regime: no reservation row → this is a LEGACY
         // withdrawal; the legacy SystemFiatPool policy applies.
         fiatLiquidityReservation: { findUnique: jest.fn().mockResolvedValue(null) },
         withdrawal: {
+                findUnique: jest.fn(async (args) => ({ id: args && args.where ? args.where.id : 91, status: 'PENDING' })),
             findMany: jest.fn().mockResolvedValue([withdrawal]),
             update,
             updateMany,
@@ -177,7 +242,7 @@ describe('PayoutBatchWorker provider outcome classification', () => {
         const prisma = buildPrisma({ withdrawal: baseWithdrawal, update, updateMany });
         const io = { emit: jest.fn() };
 
-        const worker = new PayoutBatchWorker(prisma, io, { initiateTransfer }, null);
+        const worker = new PayoutBatchWorker(withTransactions(prisma), io, { initiateTransfer }, null);
         const result = await worker._processBatch(settings, { isManualTrigger: true });
 
         // claim happened before dispatch (r271e: PENDING/APPROVED claim)
@@ -203,7 +268,7 @@ describe('PayoutBatchWorker provider outcome classification', () => {
         const updateMany = jest.fn().mockResolvedValue({ count: 1 });
         const prisma = buildPrisma({ withdrawal: baseWithdrawal, update, updateMany });
 
-        const worker = new PayoutBatchWorker(prisma, { emit: jest.fn() }, { initiateTransfer }, null);
+        const worker = new PayoutBatchWorker(withTransactions(prisma), { emit: jest.fn() }, { initiateTransfer }, null);
         const result = await worker._processBatch(settings, { isManualTrigger: true });
 
         expect(update).not.toHaveBeenCalled();
@@ -220,7 +285,7 @@ describe('PayoutBatchWorker provider outcome classification', () => {
         const updateMany = jest.fn().mockResolvedValue({ count: 1 });
         const prisma = buildPrisma({ withdrawal: baseWithdrawal, update, updateMany });
 
-        const worker = new PayoutBatchWorker(prisma, { emit: jest.fn() }, { initiateTransfer }, null);
+        const worker = new PayoutBatchWorker(withTransactions(prisma), { emit: jest.fn() }, { initiateTransfer }, null);
         const result = await worker._processBatch(settings, { isManualTrigger: true });
 
         // §r41: post-dispatch exception parking is a CONDITIONAL
@@ -241,7 +306,7 @@ describe('PayoutBatchWorker provider outcome classification', () => {
         const updateMany = jest.fn().mockResolvedValue({ count: 1 });
         const prisma = buildPrisma({ withdrawal: baseWithdrawal, update, updateMany });
 
-        const worker = new PayoutBatchWorker(prisma, { emit: jest.fn() }, { initiateTransfer }, null);
+        const worker = new PayoutBatchWorker(withTransactions(prisma), { emit: jest.fn() }, { initiateTransfer }, null);
         const result = await worker._processBatch(settings, { isManualTrigger: true });
 
         expect(updateMany).toHaveBeenCalledWith({

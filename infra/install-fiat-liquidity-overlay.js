@@ -70,6 +70,14 @@ const STATEMENTS = [
   `CREATE UNIQUE INDEX IF NOT EXISTS "FiatLiquidityReceipt_dedupKey_key"
      ON "FiatLiquidityReceipt"("dedupKey");`,
   `CREATE INDEX IF NOT EXISTS "FiatLiquidityReceipt_status_idx" ON "FiatLiquidityReceipt"("status");`,
+  // WP-I: the wallet account an opening's money lands in, as a real column.
+  // Nullable so existing rows survive; the reconciler refuses a null rather
+  // than guessing, and the backfill below fills it from witnessed evidence.
+  `ALTER TABLE "FiatLiquidityReceipt" ADD COLUMN IF NOT EXISTS "walletAccount" TEXT`,
+  `CREATE INDEX IF NOT EXISTS "FiatLiquidityReceipt_walletAccount_idx" ON "FiatLiquidityReceipt"("walletAccount")`,
+  `UPDATE "FiatLiquidityReceipt" r SET "walletAccount" = w."walletAccount"
+     FROM "ProviderSettlementWitness" w
+    WHERE w."openingDedupKey" = r."dedupKey" AND r."walletAccount" IS NULL`,
   `CREATE INDEX IF NOT EXISTS "FiatLiquidityReceipt_provider_providerRef_idx"
      ON "FiatLiquidityReceipt"("provider", "providerRef");`,
   `CREATE INDEX IF NOT EXISTS "FiatLiquidityReceipt_relatedTransactionId_idx"
@@ -133,6 +141,7 @@ const STATEMENTS = [
     "inTransitGhs" DECIMAL(20,2) NOT NULL DEFAULT 0,
     "paidOutGhs" DECIMAL(20,2) NOT NULL DEFAULT 0,
     "reconciliationHeldGhs" DECIMAL(20,2) NOT NULL DEFAULT 0,
+    "authorityActivatedAt" TIMESTAMP(3),
     "updatedAt" TIMESTAMP(3) NOT NULL,
     CONSTRAINT "FiatLiquidityState_pkey" PRIMARY KEY ("id")
   );`,
@@ -143,6 +152,14 @@ const STATEMENTS = [
   // Existing deployments (pre-blocker-5 DBs) gain the new bucket column.
   `ALTER TABLE "FiatLiquidityState"
      ADD COLUMN IF NOT EXISTS "reconciliationHeldGhs" DECIMAL(20,2) NOT NULL DEFAULT 0;`,
+
+  // §P.5-D one-way latch. Nullable and additive: NULL means "never activated".
+  // This installer must produce the CURRENT table shape, because a first
+  // install (and any re-provision after a dropped table) is exactly where a
+  // magazine-only column silently disappears — and a missing latch column makes
+  // every later reader fail closed with "the regime could not be read".
+  `ALTER TABLE "FiatLiquidityState"
+     ADD COLUMN IF NOT EXISTS "authorityActivatedAt" TIMESTAMP(3);`,
 
   // Singleton zero-state row (deterministic id=1). No financial data.
   `INSERT INTO "FiatLiquidityState" ("id", "availableGhs", "reservedGhs", "inTransitGhs", "paidOutGhs", "reconciliationHeldGhs", "updatedAt")

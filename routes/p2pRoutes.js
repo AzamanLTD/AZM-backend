@@ -14,7 +14,8 @@ const { require2FA }    = require('../middleware/require2FA');
 
 // Ping system
 router.post('/ping',         protectActive, p2pController.pingVendor);
-router.post('/ping/accept',  protectActive, idempotency(), p2pController.acceptPing);
+router.post('/ping/accept',  protectActive,
+    idempotency(), p2pController.acceptPing);
 
 // P2P Ads listing (public — no auth required for browsing marketplace)
 router.get('/ads', p2pController.getAds);

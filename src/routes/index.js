@@ -50,8 +50,11 @@ function mountRoutes(app, {
     app.use('/api/withdraw', financialLimiter, require('../../routes/withdrawalRoutes'));
     app.use('/api/trade-accounts', generalLimiter, require('../../routes/tradeAccountRoutes'));
     app.use('/api/payout-destinations', generalLimiter, require('../../routes/payoutDestinationRoutes'));
+    app.use('/api/bank-beneficiaries', financialLimiter, require('../../routes/bankBeneficiaryRoutes'));
     app.use('/api/admin/chat', generalLimiter, require('../../routes/adminChatRoutes'));
     app.use('/api/security', generalLimiter, require('../../routes/securityRoutes'));
+    // §WP-H G: action-bound step-up capability (challenge + grant issuance).
+    app.use('/api/step-up', financialLimiter, require('../../routes/stepUpRoutes'));
     app.use('/api/users', generalLimiter, require('../../routes/userRoutes'));
     app.use('/api/stories', generalLimiter, require('../../routes/storyRoutes'));
     app.use('/api/stories', generalLimiter, require('../../routes/storyHighlightRoutes'));
@@ -115,6 +118,7 @@ function mountRoutes(app, {
     app.use('/api/smart-routes', financialLimiter, require('../../routes/smartRouteRoutes'));
     app.use('/api/azm-auction', generalLimiter, require('../../routes/azmAuctionRoutes'));
     app.use('/api/saved-momo', financialLimiter, require('../../routes/savedMomoRoutes'));
+    app.use('/api/bills', generalLimiter, require('../../routes/billsRoutes'));
     app.use('/api/transit', generalLimiter, require('../../routes/transitRoutes'));
 
     app.use('/api/quotes', financialLimiter, require('../../routes/transactionQuoteRoutes'));

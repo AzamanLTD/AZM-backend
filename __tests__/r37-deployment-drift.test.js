@@ -36,6 +36,15 @@ run('r37/P0 — production deployment drift repair', () => {
         stdio: 'pipe',
     });
 
+    // The ledger's currency contract (2026-11-16) is a separate installer, so a
+    // REPAIR must run it too. Installing the table without its money invariants
+    // would restore a shape that rejects nothing: this overlay is what turns
+    // "amount" from a nominal-USDC column into a currency-tagged one.
+    const runCurrencyOverlay = () => execFileSync('node', [path.join(__dirname, '..', 'infra', 'install-dine-in-currency-overlay.js')], {
+        env: { ...process.env, DATABASE_URL: url },
+        stdio: 'pipe',
+    });
+
     const columnsOf = async (table) =>
         (await db.$queryRawUnsafe(
             `SELECT column_name FROM information_schema.columns WHERE table_name = $1 ORDER BY column_name`,
@@ -71,6 +80,7 @@ run('r37/P0 — production deployment drift repair', () => {
 
     test('overlay repairs the drift: every object created with full shape', async () => {
         runOverlay();
+        runCurrencyOverlay();
 
         expect(await tableExists('BusinessLedgerEntry')).toBe(true);
         expect(await tableExists('ConversationMoneyTicket')).toBe(true);
@@ -80,8 +90,20 @@ run('r37/P0 — production deployment drift repair', () => {
         // (the model is append-only: no updatedAt — matched exactly)
         expect(await columnsOf('BusinessLedgerEntry')).toEqual([
             'amount', 'amountGhs', 'businessProfileId', 'category', 'createdAt',
+            'currency', // 2026-11-16 currency contract
             'description', 'id', 'metadata', 'reversalOfId', 'sourceId',
             'sourceType', 'type',
+        ]);
+
+        // A repair that restored the table but not its money invariant would be a
+        // silent drift, so the contract itself is asserted here.
+        const contract = await db.$queryRawUnsafe(
+            `SELECT conname FROM pg_constraint
+             WHERE conrelid = '"BusinessLedgerEntry"'::regclass AND contype = 'c' ORDER BY 1`);
+        expect(contract.map((r) => r.conname)).toEqual([
+            'ck_businessledgerentry_amount_present',
+            'ck_businessledgerentry_currency_allowed',
+            'ck_businessledgerentry_currency_shape',
         ]);
         expect(await columnsOf('ConversationMoneyTicket')).toEqual([
             'amount', 'clientRequestId', 'conversationId', 'counterpartyId',
@@ -156,6 +178,7 @@ run('r37/P0 — production deployment drift repair', () => {
 
     test('overlay rerun is idempotent (no-op on a repaired database)', async () => {
         expect(() => runOverlay()).not.toThrow();
+        expect(() => runCurrencyOverlay()).not.toThrow();
         expect(await tableExists('BusinessLedgerEntry')).toBe(true);
         expect(await tableExists('ConversationMoneyTicket')).toBe(true);
     });

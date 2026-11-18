@@ -62,12 +62,22 @@ function checkoutFingerprint(body) {
 // Single-item /order fingerprint — same discipline as the cart fingerprint:
 // every parameter that determines the created order, as sent by the client.
 function orderFingerprint(body) {
-  return sha256(stableJson({
+  const material = {
     productId: body.productId,
     quantity: body.quantity,
     customerNotes: body.customerNotes ?? null,
     deliveryNotes: body.deliveryNotes ?? null,
-  }));
+  };
+  // Currency is material to the money, so it belongs to the durable identity:
+  // without it, a retry that switched currency would be read as an exact replay
+  // and the customer would silently receive the original order's currency.
+  //
+  // Included ONLY when the caller actually chose one, which keeps the hash of a
+  // legacy (currency-less) request byte-identical: an in-flight retry issued
+  // before this change still converges instead of failing closed with a 409.
+  const currency = body.currency == null ? null : String(body.currency).trim().toUpperCase();
+  if (currency !== null) material.currency = currency;
+  return sha256(stableJson(material));
 }
 
 // Find the order that owns this durable identity (business + customer +

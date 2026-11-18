@@ -165,6 +165,24 @@ async function autoRelease(prisma, opts = {}) {
       alreadySeeded = false;
     }
 
+    // WORKSTREAM D (PR #366) — offeredCategories column. Same exported-
+    // function convention as the other boot-time installers; idempotent and
+    // additive (ADD COLUMN IF NOT EXISTS), fail-closed on drift.
+    //
+    // ORDERING (fixed): this is a SCHEMA overlay, so it runs BEFORE the
+    // seed-convergence early return below. It used to sit after that return,
+    // which meant it never ran again once the treasury existed — on any real
+    // production database, i.e. from the second boot onwards.
+    try {
+      const { installBusinessOfferedCategoriesOverlay } = require('./install-business-offered-categories-overlay');
+      const r = await installBusinessOfferedCategoriesOverlay(prisma);
+      releaseStatus.offeredCategoriesOverlay = r;
+      log(`offered-categories overlay: ${r.ok} ok, ${r.failed} failed`);
+    } catch (e) {
+      releaseStatus.offeredCategoriesOverlay = { error: e.message };
+      log(`offered-categories overlay failed (non-fatal): ${e.message}`);
+    }
+
     if (alreadySeeded && !force) {
       releaseStatus.skipped = true;
       releaseStatus.finishedAt = new Date().toISOString();
@@ -192,21 +210,6 @@ async function autoRelease(prisma, opts = {}) {
       log(`idNumber backfill: scanned=${r.scanned} encrypted=${r.encrypted} skipped=${r.skipped}`);
     } catch (e) {
       log(`idNumber backfill failed (non-fatal): ${e.message}`);
-    }
-
-    // WORKSTREAM D (PR #366) — offeredCategories column. Same exported-
-    // function convention as the other boot-time installers; idempotent
-    // and additive (ADD COLUMN IF NOT EXISTS), fail-closed on drift.
-    // This is the REAL production path on the Render Free plan, where the
-    // pre-deploy command does not run and boot-time provisioning applies.
-    try {
-      const { installBusinessOfferedCategoriesOverlay } = require('./install-business-offered-categories-overlay');
-      const r = await installBusinessOfferedCategoriesOverlay(prisma);
-      releaseStatus.offeredCategoriesOverlay = r;
-      log(`offered-categories overlay: ${r.ok} ok, ${r.failed} failed`);
-    } catch (e) {
-      releaseStatus.offeredCategoriesOverlay = { error: e.message };
-      log(`offered-categories overlay failed (non-fatal): ${e.message}`);
     }
 
     releaseStatus.finishedAt = new Date().toISOString();
