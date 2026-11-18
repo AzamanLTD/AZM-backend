@@ -179,6 +179,25 @@ describe('WP-I provider trust boundary', () => {
             expect(tx.witnesses).toHaveLength(0);
         });
 
+        test('13c. a payload with no externalref never reaches a claim, so it cannot be keyed on a substitute identifier', async () => {
+            // The claim reference must be the provider's externalref. If it were
+            // ever allowed to fall back to data.transactionid, this payment would
+            // be claimed under a SECOND identity while the deposit path holds the
+            // canonical one — one payment, two economic uses. The parser refuses
+            // the payload; this test also proves no claim is attempted, which is
+            // what keeps that true if the parser is loosened.
+            const tx = fakeTx();
+            let claimAttempts = 0;
+            tx.$executeRawUnsafe = async () => { claimAttempts += 1; return 1; };
+            const payload = { txstatus: 1, accountnumber: '0244000000', value: '250.00', amount: '252.50' };
+            await expect(recordProviderSettlementWitness(tx, witnessInput({
+                rawResponse: JSON.stringify({ status: '1', data: payload }),
+                providerPayload: payload,
+            }))).rejects.toMatchObject({ code: 'WITNESS_IDENTITY_FIELDS_REQUIRED' });
+            expect(claimAttempts).toBe(0);
+            expect(tx.witnesses).toHaveLength(0);
+        });
+
         test('14. a non-settled provider state cannot witness funding', async () => {
             const tx = fakeTx();
             await expect(recordProviderSettlementWitness(tx, witnessInput({

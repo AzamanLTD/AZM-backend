@@ -493,8 +493,28 @@ async function recordProviderSettlementWitness(tx, input = {}) {
   // (src/services/moolreDepositSettlement.js), so that key is the evidence that
   // the observation is spent. Absence of the model on a stub client is treated
   // as "cannot prove", which refuses rather than allows.
-  const collectionKey = observedReference ? `event:moolre-collection:${observedReference}` : null;
-  if (collectionKey) {
+  // The canonical reference is the provider's externalref, and nothing else.
+  // This is the THIRD check, not the first: parseDocumentedStatusBytes refuses a
+  // payload without externalref (WITNESS_IDENTITY_FIELDS_REQUIRED) and the
+  // opening binding above refuses one that cannot be tied to a payment. It is
+  // kept here because the invariant belongs at the claim site: the unique index
+  // is only an arbiter when both economic paths file the SAME key, so nothing in
+  // this function may ever invent a substitute identifier for it.
+  //
+  // There is deliberately NO fallback to data.transactionid. That fallback was
+  // unreachable in practice (two upstream refusals precede it), so removing it
+  // changes no behaviour today; it exists so a future loosening of those checks
+  // cannot silently reopen a second identity for one payment. If Moolre is ever
+  // shown to omit externalref, the answer is to establish the mapping from
+  // provider evidence, not to guess an identifier.
+  if (!observedReference) {
+      throw new WitnessError(
+          'WITNESS_OBSERVATION_REFERENCE_MISSING',
+          '[wp-i] the provider response names no external reference, so this observation has no canonical identity to claim',
+      );
+  }
+  const collectionKey = `event:moolre-collection:${observedReference}`;
+  {
       // A client that cannot see fiatProviderEvent cannot prove the collection is
       // UNSPENT, so it must not fund anything. This is a typed refusal rather
       // than a TypeError: the first version of this guard called .findFirst on an
@@ -531,7 +551,10 @@ async function recordProviderSettlementWitness(tx, input = {}) {
   // witness uniqueness below.
   await claimProviderObservation(tx, {
     provider,
-    reference: observedReference ?? observedTransactionId ?? null,
+    // No transactionid fallback: the claim must be filed under the same
+    // canonical reference the deposit path uses, or the unique index cannot
+    // arbitrate between the two economic uses.
+    reference: observedReference,
     // The TRUSTED account is the one the opening was configured for, read from
     // the stored opening — never the account the provider response claims. The
     // witness's account/currency mapping is already validated against it above,
