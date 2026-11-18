@@ -241,6 +241,29 @@ reconciliation. It only creates tables, indexes and constraints.
   the overlay does not remove the window. The installer header records the measured
   behaviour and what a redesign would cost; none is implemented. Schedule it as a
   maintenance-window operation until production wait times have been measured.
+- **Known weaknesses in WP-I, with the decision each one needs.** Recorded from
+  an adversarial review of the claim path on 2026-11-18, so they are not
+  rediscovered as new.
+  - *Doubtful evidence is left unclaimed, not blocked.* A deposit whose Moolre
+    evidence is contradictory or ambiguous is reported and skipped; its
+    observation stays free, so the treasury path can still spend it. The safer
+    money default is to quarantine the key, but that must not happen until an
+    operator surface exists (next bullet), or a false positive becomes
+    unbreakable. **Decision required before the backfill runs on production.**
+  - *No operator surface for quarantine.* Nothing in the app reads
+    `QUARANTINE` claim rows, and the recovery sweep rethrows a refused claim, so
+    a paid deposit can sit `PENDING` with only a log line. Needs a parked
+    terminal state, a read-only admin listing and a periodic count.
+  - *The signature protects the release chain, not the database.* Any process
+    holding the production `DATABASE_URL` and DDL rights can run these
+    installers directly, including a compromised dependency. Needs a migration
+    role with DDL and a runtime role without it before the guard can be called
+    the only barrier.
+  - *Moolre reference uniqueness is unproven.* The claim key
+    `moolre|collection|<ref>` has no account dimension, while the service
+    refuses a reference seen against a different account. If references are only
+    unique per account, one legitimate payment can be refused. Needs a provider
+    answer or a trusted dimension in the key (a schema decision).
 - **WP-I provenance role grants.** A least-privilege database role provisioned
   by an operator, never by the application boot path.
 - **WP-H / WP-I authority activation.** Explicitly not enabled by any installer.
