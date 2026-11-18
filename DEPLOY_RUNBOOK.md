@@ -232,6 +232,15 @@ reconciliation. It only creates tables, indexes and constraints.
   whose money was used on both paths: it writes a claim with no legitimate
   owner, so both economic paths fail closed (`OBSERVATION_QUARANTINED`) until an
   operator resolves the history by hand. The installer never picks a winner.
+- **The backfill blocks claim-table writers, so give it a window.** The claim
+  overlay runs inside the same transaction as the claim writes, and PostgreSQL
+  takes a `ShareLock` for its `CREATE INDEX` statements, which conflicts with the
+  `RowExclusiveLock` every `INSERT`/`UPDATE`/`DELETE` takes. Live provider-claim
+  traffic waits for the whole backfill. `IF NOT EXISTS` does not help: the lock is
+  taken before the existing index can make the statement a no-op, so pre-installing
+  the overlay does not remove the window. The installer header records the measured
+  behaviour and what a redesign would cost; none is implemented. Schedule it as a
+  maintenance-window operation until production wait times have been measured.
 - **WP-I provenance role grants.** A least-privilege database role provisioned
   by an operator, never by the application boot path.
 - **WP-H / WP-I authority activation.** Explicitly not enabled by any installer.

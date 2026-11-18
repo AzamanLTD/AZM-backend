@@ -33,12 +33,20 @@
 //        * dedupKey 'event:moolre-collection:<reference>'  (the durable Moolre
 //          observation the OTP-confirmation path enriches and the recovery
 //          service settles under),
-//        * providerRef = <reference>,
+//        * providerRef = the PROVIDER's own reference for that collection. The
+//          adapter sends Azaman's externalRef to Moolre and receives back a
+//          DIFFERENT provider reference, which the initiation controller
+//          persists on TransactionHistory.providerRef. It is compared with the
+//          deposit's persisted provider reference, never with the external one,
 //        * relatedReference = the deposit's txHash.
-//   4. nothing contradicts: metadata.settlementProviderRef, the deposit's
-//      providerRef and the event's providerRef, where present, must agree, AND
-//      every populated identity field ON THE EVENT must agree with the deposit's
-//      persisted settlement identity.
+//   4. TWO IDENTITY FAMILIES, EACH CHECKED AGAINST ITS OWN MEMBER. The external
+//      family (settlementExternalRef, event dedupKey, event relatedReference) and
+//      the provider family (TransactionHistory.providerRef,
+//      metadata.settlementProviderRef, event providerRef) are never compared
+//      across families. Within the provider family the deposit's two persisted
+//      values must agree with each other where both exist, and the event's
+//      providerRef must match the deposit's; a provider reference that cannot be
+//      verified against persisted evidence is unclassifiable, never assumed.
 //
 // A generic aggregator settlement writes its evidence under provider
 // 'GENERIC_FIAT_WEBHOOK', so an identical MoMo rail without a Moolre event is
@@ -94,6 +102,46 @@
 // always safe. If the write volume ever makes one transaction impractical, the
 // replacement must keep the invariant "a key is either claimed for its one
 // legitimate owner, quarantined, or untouched" — never a partial claim set.
+//
+// OPERATIONAL: THE BACKFILL BLOCKS CLAIM-TABLE WRITERS WHILE IT RUNS
+//
+// The overlay (infra/sql/provider-observation-claim.sql) runs inside the same
+// transaction as every claim write, and it contains CREATE TABLE IF NOT EXISTS,
+// CREATE UNIQUE INDEX IF NOT EXISTS and two CREATE INDEX IF NOT EXISTS.
+//
+// PostgreSQL takes a ShareLock for a plain CREATE INDEX, and ShareLock CONFLICTS
+// with the RowExclusiveLock that INSERT, UPDATE and DELETE take. The lock is held
+// until the transaction ends. Measured in this repository on 2026-11-18: with the
+// index already present, `CREATE UNIQUE INDEX IF NOT EXISTS` still blocked behind
+// an open writer until lock_timeout fired. IF NOT EXISTS suppresses the
+// duplicate-name error; it does NOT avoid the lock. Pre-installing the overlay
+// beforehand therefore does not remove the window - the statements still run here.
+//
+// So, while this installer is running:
+//   * live provider-claim traffic (the deposit and treasury-witness claim paths)
+//     WAITS on this transaction, for as long as the backfill takes;
+//   * a writer already open when the installer starts blocks the installer in its
+//     DDL, and the installer waits for that writer to finish;
+//   * a long enough wait can surface as a statement or transaction timeout on
+//     either side. Nothing is deemed to have succeeded: an interrupted run rolls
+//     back to exactly its starting state, per the atomicity contract above.
+//
+// Nobody has measured that wait on production volumes. Until someone does, treat
+// this as a MAINTENANCE-WINDOW step, not as ordinary traffic-time work, and read
+// the dry-run and the operator procedure before running it against production.
+//
+// WHAT REMOVING THE WINDOW WOULD COST (none of this is implemented, by decision)
+//   * A no-DDL fast path (skip the overlay when every table, index and constraint
+//     already matches) would avoid the ShareLock, but it must PROVE the complete
+//     schema contract before skipping; an index that is merely present is not
+//     evidence that it is the right index.
+//   * Moving the DDL out of the claims transaction weakens the atomicity
+//     contract: the DDL would then survive a later claims failure. The economic
+//     claim set could still be atomic, but that is a DIFFERENT guarantee and
+//     needs its own failure and recovery proofs.
+//   * CREATE INDEX CONCURRENTLY is not a drop-in fix: it cannot run inside a
+//     transaction block and needs its own operational procedure and failure
+//     handling (an invalid index must be dropped and rebuilt).
 // =============================================================================
 
 const fs = require('fs');

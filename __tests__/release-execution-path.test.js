@@ -286,3 +286,38 @@ describe('render.yaml is labelled as proposed configuration', () => {
         expect(flat).toMatch(/preDeployCommand: npm run release — CONFIGURED BUT NOT EXECUTED on Free/);
     });
 });
+
+// =============================================================================
+// The backfill's write-blocking window is an OPERATOR-FACING fact, and it has
+// already drifted once: a report claimed the installer header recorded it when
+// the commit had only touched the test file. These assertions make the warning
+// part of the contract instead of something a reviewer has to re-check by hand.
+// =============================================================================
+describe('the backfill write-blocking window is documented where operators read', () => {
+    const installer = read('infra/install-provider-observation-claim.js');
+    const runbook = read('DEPLOY_RUNBOOK.md');
+
+    test('the installer header records the lock conflict and who waits', () => {
+        expect(installer).toMatch(/ShareLock/);
+        expect(installer).toMatch(/RowExclusiveLock/);
+        expect(installer).toMatch(/BLOCKS CLAIM-TABLE WRITERS/);
+        expect(installer).toMatch(/MAINTENANCE-WINDOW/);
+    });
+
+    test('it states that IF NOT EXISTS does not avoid the lock, so pre-installing does not help', () => {
+        expect(installer).toMatch(/IF NOT EXISTS suppresses the\s*\n?\/?\/?\s*duplicate-name error; it does NOT avoid the lock|it does NOT avoid the lock/);
+        expect(installer).toMatch(/Pre-installing the overlay[^.]*does not remove the window/);
+    });
+
+    test('it names the redesign options and refuses to adopt one silently', () => {
+        expect(installer).toMatch(/CREATE INDEX CONCURRENTLY is not a drop-in fix/);
+        expect(installer).toMatch(/none of this is implemented, by decision/);
+        expect(installer).toMatch(/survive a later claims failure/);
+    });
+
+    test('the runbook carries the maintenance-window instruction', () => {
+        expect(runbook).toMatch(/backfill blocks claim-table writers/);
+        expect(runbook).toMatch(/pre-installing\s*\n?\/?\s*the overlay does not remove the window|pre-installing[^.]*does not remove the window/);
+        expect(runbook).toMatch(/maintenance-window/);
+    });
+});
