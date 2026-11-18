@@ -56,6 +56,19 @@ describe('§WP-H payout claim races (real PostgreSQL, two backends)', () => {
             INSERT INTO "FiatLiquidityState" (id, "authorityActivatedAt", "updatedAt")
             VALUES (1, NULL, now())
             ON CONFLICT (id) DO UPDATE SET "authorityActivatedAt" = NULL, "updatedAt" = now()`);
+        // The regime is a LATCH over two independent signals — `active` is
+        // (GlobalSettings.fiatLiquidityAuthorityEnabled || FiatLiquidityState.
+        // authorityActivatedAt != null) — and both suites must own BOTH halves.
+        // Clearing only the timestamp left this suite reading whatever flag an
+        // earlier suite in the same database had set, so under the full CI battery
+        // the legacy rows parked as LEGACY_ROW_UNDER_AUTHORITY_REGIME and the
+        // provider was never called (observed: expected 1 dispatch, got 0). That
+        // was ambient state, not a defect in the code under test; the suite now
+        // sets the regime it means to exercise.
+        await admin.$executeRawUnsafe(`
+            INSERT INTO "GlobalSettings" (id, "fiatLiquidityAuthorityEnabled", "updatedAt")
+            VALUES (1, false, now())
+            ON CONFLICT (id) DO UPDATE SET "fiatLiquidityAuthorityEnabled" = false, "updatedAt" = now()`);
         await admin.$executeRawUnsafe(`
             INSERT INTO "SystemFiatPool" (id, balance, "updatedAt")
             VALUES (1, 100000, now())
