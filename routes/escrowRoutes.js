@@ -5,6 +5,7 @@
 // pure reads/term edits use protect.
 // =============================================================================
 
+const { requireActionStepUp, whenStepUpEnforced } = require('../middleware/requireActionStepUp');
 const logger = require('../src/config/logger');
 const { requireKyc } = require('../middleware/requireKyc');
 const router = require('express').Router();
@@ -21,8 +22,8 @@ router.get('/ticket/:ticketId', protect, ctrl.getEscrowForTicket);
 // IN_PROGRESS claim after a 4xx is durable proof of rollback — the key is
 // safely releasable (releaseOn4xx). 5xx stays RETAIN (default): a post-
 // commit failure must never re-arm a funded escrow.
-router.post('/fund', protectActive, requireKyc('pay'), require2FA(), idempotency({ releaseOn4xx: true }), validate(fundEscrowSchema), ctrl.fundEscrow);
-router.post('/satisfy', protectActive, idempotency(), ctrl.markSatisfied);
+router.post('/fund', protectActive, requireKyc('pay'), require2FA(), whenStepUpEnforced(requireActionStepUp({ actionType: 'ESCROW_FUND', resource: (req) => req.body.escrowId || req.body.tradeId || null })), idempotency({ releaseOn4xx: true }), validate(fundEscrowSchema), ctrl.fundEscrow);
+router.post('/satisfy', protectActive, whenStepUpEnforced(requireActionStepUp({ actionType: 'ESCROW_RELEASE', resource: (req) => req.body.escrowId || null })), idempotency(), ctrl.markSatisfied);
 router.post('/dispute', protectActive, idempotency(), validate(raiseDisputeSchema), ctrl.raiseDispute);
 router.post('/update-terms', protect, ctrl.updateTerms);
 router.post('/cancel', protectActive, idempotency(), ctrl.cancelEscrow);

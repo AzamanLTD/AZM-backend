@@ -7,6 +7,7 @@
 // The legacy POST /api/trades/release route has been removed.
 // =============================================================================
 
+const { requireActionStepUp, whenStepUpEnforced } = require('../middleware/requireActionStepUp');
 const logger = require('../src/config/logger');
 const { requireKyc } = require('../middleware/requireKyc');
 const express             = require('express');
@@ -47,11 +48,11 @@ router.get('/:id',     protect, getTradeDetails);
 // controller's explicit pre-economics guards mark the claim releasable
 // (res.locals.financialClaimRelease), and those provably run before the
 // economic transaction.
-router.post('/initiate', protectActive, requireKyc('trade'), require2FA(),
+router.post('/initiate', protectActive, requireKyc('trade'), require2FA(), whenStepUpEnforced(requireActionStepUp({ actionType: 'TRADE_INITIATE', resource: (req) => req.body.tradeId || req.body.listingId || null })),
     idempotency(), initiateTrade);
 
 // ── Vendor approval actions ──────────────────────────────────────────────────
-router.post('/accept',  protectActive, requireKyc('trade'),
+router.post('/accept',  protectActive, requireKyc('trade'), whenStepUpEnforced(requireActionStepUp({ actionType: 'TRADE_ACCEPT', resource: (req) => req.body.tradeId || req.params.tradeId || null })),
     idempotency(), acceptTrade);
 router.post('/decline', protectActive, declineTrade);
 
