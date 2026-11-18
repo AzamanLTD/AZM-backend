@@ -343,6 +343,7 @@ async function selectCandidates(db) {
         witnessOwners: new Map(),
         witnessAccountKeys: new Map(),
         anomalies: [],
+        quarantineAnomalies: [],
         unresolvedEvidenceCases: [],
         skipped: {
             nonMoolreDeposits: 0,
@@ -501,6 +502,15 @@ async function selectCandidates(db) {
             anomaly('CONTRADICTORY_PROVIDER_REFERENCE', keyFor(ref), [String(d.id)],
                 `the deposit's provider references disagree: TransactionHistory.providerRef=${persistedProviderRef} vs metadata.settlementProviderRef=${metadataProviderRef}`,
                 ref || null);
+            // CASE A — a trustworthy canonical key exists, so the observation is
+            // quarantined under it rather than left free for a second use.
+            if (ref) {
+                report.quarantineAnomalies.push({
+                    observationKey: keyFor(ref),
+                    reason: 'CONTRADICTORY_PROVIDER_REFERENCE',
+                    owners: [String(d.id)],
+                });
+            }
             continue;
         }
         const depositProviderRef = persistedProviderRef || metadataProviderRef || null;
@@ -556,6 +566,11 @@ async function selectCandidates(db) {
             anomaly('CONTRADICTORY_MOOLRE_EVIDENCE', keyFor(ref), [String(d.id)],
                 `Moolre event(s) matched a link on this deposit but their other identity fields contradict it: ${JSON.stringify(evidence.contradictions)}`,
                 ref);
+            report.quarantineAnomalies.push({
+                observationKey: keyFor(ref),
+                reason: 'CONTRADICTORY_MOOLRE_EVIDENCE',
+                owners: [String(d.id)],
+            });
             continue;
         }
         if (evidence.status === 'ambiguous') {
@@ -563,6 +578,11 @@ async function selectCandidates(db) {
             anomaly('AMBIGUOUS_MOOLRE_EVIDENCE', keyFor(ref), [String(d.id)],
                 `${evidence.candidates.length} distinct Moolre events tie to this deposit (${JSON.stringify(evidence.candidates.map((e) => ({ id: e.id, dedupKey: e.dedupKey, providerRef: e.providerRef, relatedReference: e.relatedReference })))}) — a single settlement cannot have two provider observations, so no candidate is chosen`,
                 ref);
+            report.quarantineAnomalies.push({
+                observationKey: keyFor(ref),
+                reason: 'AMBIGUOUS_MOOLRE_EVIDENCE',
+                owners: [String(d.id)],
+            });
             continue;
         }
         const event = evidence.event;
@@ -621,6 +641,15 @@ async function selectCandidates(db) {
                 reason: 'CROSS_PATH_COLLISION',
                 owners: [...report.depositOwners.get(key), ...report.witnessOwners.get(key)],
             });
+        }
+    }
+
+    // CASE A — quarantine keys whose evidence is trustworthy in identity but
+    // contradictory or ambiguous in content. Never a winner: no owner is chosen
+    // and the row is written with claimedByRef NULL.
+    for (const a of report.quarantineAnomalies) {
+        if (!quarantine.has(a.observationKey)) {
+            quarantine.set(a.observationKey, { reason: a.reason, owners: a.owners });
         }
     }
 
@@ -739,7 +768,6 @@ async function main() {
         alreadyClaimedWitnesses: 0,
         alreadyQuarantined: 0,
         unresolvedCasesEnsured: 0,
-        unresolvedCasesSkippedNoCaseTable: 0,
         wouldCreateUnresolvedCases: 0,
         racedReplays: 0,
         raceReplays: [],
@@ -845,15 +873,22 @@ async function main() {
                 // duplicated here. A database without it cannot hold the case, so
                 // the count is reported instead of silently pretending the
                 // evidence was recorded.
-                let caseTablePresent = true;
                 if (selection.unresolvedEvidenceCases.length > 0) {
                     const probe = await tx.$queryRawUnsafe(`SELECT to_regclass('"ReconciliationException"')::text AS t`);
-                    caseTablePresent = !!(Array.isArray(probe) && probe[0] && probe[0].t);
+                    const caseTablePresent = !!(Array.isArray(probe) && probe[0] && probe[0].t);
                     if (!caseTablePresent) {
-                        out.unresolvedCasesSkippedNoCaseTable = selection.unresolvedEvidenceCases.length;
+                        // A REAL run that cannot persist a required case must abort
+                        // and roll back. An observation left "reported" but
+                        // unrecorded is the invisible state this work exists to
+                        // close, so a skipped counter is not an acceptable outcome.
+                        throw new Error(
+                            'CASE_TABLE_MISSING: the backfill must record '
+                            + `${selection.unresolvedEvidenceCases.length} unresolved-evidence case(s) but `
+                            + '"ReconciliationException" does not exist. Run infra/install-payout-reconciliation-infra.js first; refusing to leave evidence invisible.'
+                        );
                     }
                 }
-                for (const c of caseTablePresent ? selection.unresolvedEvidenceCases : []) {
+                for (const c of selection.unresolvedEvidenceCases) {
                     const details = JSON.stringify({
                         ties: c.ties,
                         providerRef: c.providerRef,

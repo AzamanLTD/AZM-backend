@@ -144,8 +144,25 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
 
     const claimsFor = (refs) => prisma.providerObservationClaim.findMany({
         where: { observationKey: { in: refs.map(key) } },
-        select: { observationKey: true, purpose: true, claimedByRef: true, provider: true },
+        select: { observationKey: true, purpose: true, claimedByRef: true, provider: true, accountKey: true },
     });
+    // CASE A — an ownerless QUARANTINE row is a claim like any other: it is what
+    // stops one observation being used twice. Split owned claims from quarantine
+    // so the historical "no claim" assertions become the stronger "no OWNED
+    // claim, exactly one ownerless quarantine".
+    const ownedFor = async (refs) => (await claimsFor(refs)).filter((r) => r.purpose !== 'QUARANTINE');
+    const quarantineFor = async (refs) => (await claimsFor(refs)).filter((r) => r.purpose === 'QUARANTINE');
+    const expectQuarantine = async (refs) => {
+        const q = await quarantineFor(refs);
+        expect(q).toHaveLength(refs.length);
+        for (const row of q) {
+            expect(row.purpose).toBe('QUARANTINE');
+            expect(row.claimedByRef).toBeNull();
+            expect(row.provider).toBe('moolre');
+            expect(row.accountKey).toBeNull();
+        }
+        expect(await ownedFor(refs)).toHaveLength(0);
+    };
 
     /** A SUCCESSFUL inbound Moolre observation, as the settlement writes it. */
     const moolreEvent = (reference, { txHash, providerRef = null, status = 'SUCCESSFUL' } = {}) =>
@@ -192,6 +209,18 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
     beforeAll(async () => {
         prisma = new PrismaClient();
         await prisma.$connect();
+
+        // The release chain creates "ReconciliationException" (install-payout-
+        // reconciliation-infra.js) BEFORE the WP-I claim installer, because a
+        // real backfill run now aborts rather than leave unresolved evidence
+        // unrecorded. The harness models that ordering instead of letting the
+        // installer run against a database production would never present.
+        const { execFileSync } = require('child_process');
+        execFileSync(process.execPath, ['infra/install-payout-reconciliation-infra.js'], {
+            cwd: require('path').resolve(__dirname, '..'),
+            env: { ...process.env },
+            stdio: 'pipe',
+        });
 
         const user = await prisma.user.create({
             data: { username: tag, email: `${tag}@example.invalid`, password: 'not-a-real-hash' },
@@ -600,8 +629,11 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
     }, 60000);
 
     test('unclassifiable history is reported, not claimed: no settlement reference, contradictory references', async () => {
-        const rows = await claimsFor([R_NO_REF_TX, R_CONTRADICTORY]);
-        expect(rows).toHaveLength(0);
+        // No trustworthy canonical reference -> no claim key is invented
+        // (Case B). The contradictory row DOES have a reference, so it is
+        // quarantined under it (Case A).
+        expect(await claimsFor([R_NO_REF_TX])).toHaveLength(0);
+        await expectQuarantine([R_CONTRADICTORY]);
 
         const report = jsonOf(runInstaller(['--dry-run', '--json']).stdout);
         const mine = report.anomalies.filter((a) => [a.observationKey, a.subject, ...(a.owners || [])]
@@ -708,7 +740,8 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
         expect(res.stdout).not.toMatch(/installed=true/);
     }, 60000);
 
-    describe('Moolre evidence must agree on EVERY populated identity field', () => {
+    
+describe('Moolre evidence must agree on EVERY populated identity field', () => {
         let report;
         beforeAll(() => {
             const res = runInstaller(['--json']);
@@ -724,35 +757,35 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
         test('an exact deduplication key with a contradictory relatedReference is refused', async () => {
             expect(contradictionFor(identityCases.exactContra.r)).toBeDefined();
             expect(contradictionFor(identityCases.exactContra.r).detail).toMatch(/relatedReference/);
-            expect(await claimsFor([identityCases.exactContra.r])).toHaveLength(0);
+            await expectQuarantine([identityCases.exactContra.r]);
         }, 60000);
 
         test('a providerRef fallback whose deduplication identity differs is refused', async () => {
             const anomaly = contradictionFor(identityCases.prefFallback.r);
             expect(anomaly).toBeDefined();
             expect(anomaly.detail).toMatch(/dedupKey names/);
-            expect(await claimsFor([identityCases.prefFallback.r])).toHaveLength(0);
+            await expectQuarantine([identityCases.prefFallback.r]);
         }, 60000);
 
         test('a relatedReference fallback whose other populated field contradicts is refused', async () => {
             const anomaly = contradictionFor(identityCases.relFallback.r);
             expect(anomaly).toBeDefined();
             expect(anomaly.detail).toMatch(/dedupKey names/);
-            expect(await claimsFor([identityCases.relFallback.r])).toHaveLength(0);
+            await expectQuarantine([identityCases.relFallback.r]);
         }, 60000);
 
         test('two events sharing a provider reference are an ambiguity, never a first-match claim', async () => {
             const anomaly = ambiguityFor(identityCases.multiPref.r);
             expect(anomaly).toBeDefined();
             expect(anomaly.detail).toMatch(/2 distinct Moolre events/);
-            expect(await claimsFor([identityCases.multiPref.r])).toHaveLength(0);
+            await expectQuarantine([identityCases.multiPref.r]);
         }, 60000);
 
         test('two events matching one related reference are an ambiguity', async () => {
             const anomaly = ambiguityFor(identityCases.multiRel.r);
             expect(anomaly).toBeDefined();
             expect(anomaly.detail).toMatch(/2 distinct Moolre events/);
-            expect(await claimsFor([identityCases.multiRel.r])).toHaveLength(0);
+            await expectQuarantine([identityCases.multiRel.r]);
         }, 60000);
 
         test('a missing settlement reference tied only by the provider reference stays unclassifiable', async () => {
@@ -766,7 +799,15 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
 
         test('every ambiguous or contradictory case failed closed, and the genuine ones still claim', async () => {
             const all = Object.values(identityCases).map((c) => c.r);
-            expect(await claimsFor(all)).toHaveLength(0);
+            // Case B rows (no trustworthy reference) carry no claim at all;
+            // every key-bearing contradictory or ambiguous row is quarantined.
+            expect(await ownedFor(all)).toHaveLength(0);
+            const quarantined = await quarantineFor(all);
+            expect(quarantined.length).toBeGreaterThan(0);
+            for (const row of quarantined) {
+                expect(row.claimedByRef).toBeNull();
+                expect(row.accountKey).toBeNull();
+            }
             // positive control in the same run: real evidence is still claimed
             const genuine = await claimsFor([R_DIRECT, R_GENERIC]);
             expect(genuine.map((r) => r.purpose)).toEqual(['CUSTOMER_DEPOSIT', 'CUSTOMER_DEPOSIT']);
@@ -870,6 +911,37 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
         }, 120000);
     });
 
+    describe('CASE A §4.2 — an owned claim is never overwritten by a quarantine', () => {
+        test('a contradictory candidate meeting a CUSTOMER_DEPOSIT claim refuses the whole run', async () => {
+            // Seed the stronger state: the observation is already owned by a
+            // real deposit claim. A later backfill that now reads the same
+            // evidence as contradictory must NOT rewrite that row into a
+            // quarantine and must NOT pick a winner.
+            await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(R_SEP_CONTRA) } });
+            try {
+                await prisma.providerObservationClaim.create({
+                    data: {
+                        observationKey: key(R_SEP_CONTRA), purpose: 'CUSTOMER_DEPOSIT',
+                        claimedByRef: crossIdentity.sepContra.id, provider: 'moolre', accountKey: null,
+                    },
+                });
+                const res = runInstaller(['--json']);
+                // The installer's own pre-existing-claim check is the arbiter:
+                // it refuses the whole run and writes nothing, rather than
+                // rewriting an owned claim into a quarantine.
+                expect(res.code).not.toBe(0);
+                expect(String(res.stdout) + String(res.stderr)).toMatch(/PRE-EXISTING CLAIM CONFLICT/);
+
+                const rows = await claimsFor([R_SEP_CONTRA]);
+                expect(rows).toHaveLength(1);
+                expect(rows[0].purpose).toBe('CUSTOMER_DEPOSIT');
+                expect(rows[0].claimedByRef).toBe(crossIdentity.sepContra.id);
+            } finally {
+                await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(R_SEP_CONTRA) } });
+            }
+        }, 120000);
+    });
+
     describe('the provider reference is a SEPARATE identity from the merchant external reference', () => {
         let report;
         beforeAll(() => {
@@ -896,14 +968,18 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
             expect(anomalyFor(R_SEP_CONTRA, 'CONTRADICTORY_MOOLRE_EVIDENCE')).toBeDefined();
             expect(anomalyFor(R_SEP_CONTRA, 'CONTRADICTORY_MOOLRE_EVIDENCE').detail)
                 .toMatch(/providerRef=.*does not match the deposit's provider reference/);
-            expect(await claimsFor([R_SEP_CONTRA])).toHaveLength(0);
+            // A trustworthy canonical key exists, so the observation is
+            // quarantined under it rather than left free for a second use.
+            await expectQuarantine([R_SEP_CONTRA]);
         }, 60000);
 
         test('a populated provider reference with nothing to verify it against is unclassifiable', async () => {
             const anomaly = anomalyFor(R_SEP_NOPROV, 'CONTRADICTORY_MOOLRE_EVIDENCE');
             expect(anomaly).toBeDefined();
             expect(anomaly.detail).toMatch(/cannot be verified \(deposit records no provider reference\)/);
-            expect(await claimsFor([R_SEP_NOPROV])).toHaveLength(0);
+            // The settlement external reference IS a trustworthy canonical key,
+            // so unverifiable evidence against it is quarantined, not skipped.
+            await expectQuarantine([R_SEP_NOPROV]);
         }, 60000);
 
         test('a direct Moolre callback that echoed the external reference is still claimed', async () => {
