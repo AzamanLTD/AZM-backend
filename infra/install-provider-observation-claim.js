@@ -163,7 +163,18 @@ async function readExistingClaims(db) {
  * Compare a persisted claim with the claim this run would insert.
  * Empty `diffs` means the row is an exact idempotent replay.
  */
-function claimMismatches(existing, expected) {
+/**
+ * Compare a pre-existing claim row with the claim this run would write.
+ *
+ * @param opts.strictAccountKey the claim kind owns its account key outright, so a
+ *        populated one is MALFORMED rather than merely unverifiable. This is the
+ *        QUARANTINE contract: every row this installer writes for it is
+ *        purpose=QUARANTINE, claimedByRef=NULL, provider=moolre, accountKey=NULL.
+ *        It is deliberately NOT applied to customer deposits, whose trusted
+ *        account is not durable in a column the backfill can read — there a
+ *        populated accountKey stays a reported note, as documented.
+ */
+function claimMismatches(existing, expected, opts = {}) {
     const diffs = [];
     const notes = [];
 
@@ -191,10 +202,17 @@ function claimMismatches(existing, expected) {
         const actual = existing.accountKey == null ? '' : String(existing.accountKey).trim();
         if (actual !== expected.accountKey) diffs.push(`accountKey=${actual || '(none)'}`);
     } else if (existing.accountKey != null && String(existing.accountKey).trim()) {
-        // The deposit path's trusted account is not durable in a column the
-        // backfill can read, so a populated accountKey here is reported and not
-        // verified rather than being called a match or a conflict.
-        notes.push(`accountKey=${String(existing.accountKey).trim()} not verifiable by the backfill`);
+        const actual = String(existing.accountKey).trim();
+        if (opts.strictAccountKey) {
+            // This claim kind never carries an account key, so a populated one is
+            // a malformed row: a conflict, never an idempotent replay.
+            diffs.push(`accountKey=${actual} (this claim kind is written with no account key)`);
+        } else {
+            // The deposit path's trusted account is not durable in a column the
+            // backfill can read, so a populated accountKey here is reported and not
+            // verified rather than being called a match or a conflict.
+            notes.push(`accountKey=${actual} not verifiable by the backfill`);
+        }
     }
 
     return { diffs, notes, malformedOwner };
@@ -236,7 +254,7 @@ async function insertClaimOrVerify(tx, { key, purpose, claimedByRef, accountKey,
     const row = rows[0];
     const { diffs, notes, malformedOwner } = claimMismatches(row, {
         purpose, claimedByRef, provider: 'moolre', accountKey: accountKey ?? null,
-    });
+    }, { strictAccountKey: kind === 'quarantine' });
     if (diffs.length) {
         throw new PreexistingClaimConflict([{
             kind,
@@ -566,7 +584,7 @@ function partitionAgainstExisting(selection, existing) {
     const classify = (kind, key, expected) => {
         const row = existing.get(key);
         if (!row) return false;
-        const { diffs, notes, malformedOwner } = claimMismatches(row, expected);
+        const { diffs, notes, malformedOwner } = claimMismatches(row, expected, { strictAccountKey: kind === 'quarantine' });
         if (diffs.length) {
             conflicts.push({
                 kind,
@@ -811,6 +829,8 @@ if (require.main === module) {
 }
 
 module.exports = {
+    insertClaimOrVerify,
+    PreexistingClaimConflict,
     referenceFromWitness,
     selectCandidates,
     keyFor,

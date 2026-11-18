@@ -31,6 +31,7 @@ const run = DB_URL ? describe : describe.skip;
 run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metadata)', () => {
     const { PrismaClient } = require('@prisma/client');
     const { spawnSync, spawn } = require('child_process');
+    const { insertClaimOrVerify, PreexistingClaimConflict, readExistingClaims } = require('../infra/install-provider-observation-claim');
     const path = require('path');
     const { canonicalObservationIdentity } = require('../src/services/providerObservationIdentity');
     const { claimProviderObservation, CLAIM_PURPOSE } = require('../src/services/providerObservationClaimService');
@@ -93,18 +94,34 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
     }
 
     /** Async installer run, for tests that must interleave with a second connection. */
-    function runInstallerAsync(extraArgs = []) {
-        return new Promise((resolve) => {
-            const child = spawn(process.execPath, [INSTALLER, ...extraArgs], {
-                cwd: REPO,
-                env: { ...process.env, DATABASE_URL: DB_URL },
-            });
-            let stdout = '';
-            let stderr = '';
-            child.stdout.on('data', (d) => { stdout += d; });
-            child.stderr.on('data', (d) => { stderr += d; });
+    function spawnInstaller(extraArgs = []) {
+        const child = spawn(process.execPath, [INSTALLER, ...extraArgs], {
+            cwd: REPO,
+            env: { ...process.env, DATABASE_URL: DB_URL },
+        });
+        let stdout = '';
+        let stderr = '';
+        child.stdout.on('data', (d) => { stdout += d; });
+        child.stderr.on('data', (d) => { stderr += d; });
+        const done = new Promise((resolve) => {
             child.on('close', (code) => resolve({ code, stdout, stderr }));
         });
+        return { child, done };
+    }
+
+    function runInstallerAsync(extraArgs = []) {
+        return spawnInstaller(extraArgs).done;
+    }
+
+    /** The installer is parked on the advisory gate: observed, never assumed. */
+    async function waitForAdvisoryWait(maxIterations = 240) {
+        for (let i = 0; i < maxIterations; i += 1) {
+            const rows = await prisma.$queryRawUnsafe(
+                `SELECT count(*)::int AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted`);
+            if (rows[0].n > 0) return true;
+            await new Promise((r) => setTimeout(r, 50));
+        }
+        return false;
     }
 
     /**
@@ -941,6 +958,65 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
             }
         }, 120000);
 
+        test('an ownerless quarantine row with a NULL account key is the replay', async () => {
+            await inject(R_Q_OK, { accountKey: null });
+            try {
+                const res = runInstaller(['--json']);
+                expect(res.code).toBe(0);
+                const report = jsonOf(res.stdout);
+                expect(report.alreadyQuarantined).toBeGreaterThanOrEqual(1);
+                expect(report.conflicts).toEqual([]);
+                expect(await prisma.providerObservationClaim.count({ where: { observationKey: key(R_Q_OK) } })).toBe(1);
+            } finally {
+                await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(R_Q_OK) } });
+            }
+        }, 120000);
+
+        test('an ownerless quarantine row with a NON-NULL account key is a conflict, not a replay', async () => {
+            await inject(R_Q_OK, { accountKey: 'some-account' });
+            try {
+                const before = await prisma.providerObservationClaim.count({ where: { observationKey: { contains: tag } } });
+                const res = runInstaller(['--json']);
+                expect(res.code).toBe(2);
+                expect(res.stderr).toMatch(/accountKey=some-account/);
+                // never counted as a successful quarantine, and nothing mutated
+                const after = await prisma.providerObservationClaim.count({ where: { observationKey: { contains: tag } } });
+                expect(after).toBe(before);
+                const row = await quarantineRow(R_Q_OK);
+                expect(row.accountKey).toBe('some-account');
+                // the dry run reports the same conflict and writes nothing
+                const dry = jsonOf(runInstaller(['--dry-run', '--json']).stdout);
+                expect(dry.conflicts.map((c) => c.observationKey)).toContain(key(R_Q_OK));
+                expect(dry.quarantined).toBe(0);
+            } finally {
+                await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(R_Q_OK) } });
+            }
+        }, 120000);
+
+        test('a quarantine row with the WRONG PROVIDER is a conflict', async () => {
+            await inject(R_Q_OK, { provider: 'generic_fiat_webhook' });
+            try {
+                const res = runInstaller(['--json']);
+                expect(res.code).toBe(2);
+                expect(res.stderr).toMatch(/provider=generic_fiat_webhook/);
+                expect((await quarantineRow(R_Q_OK)).provider).toBe('generic_fiat_webhook');
+            } finally {
+                await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(R_Q_OK) } });
+            }
+        }, 120000);
+
+        test('a quarantine row with the WRONG PURPOSE is a conflict', async () => {
+            await inject(R_Q_OK, { purpose: 'TREASURY_WITNESS', claimedByRef: null });
+            try {
+                const res = runInstaller(['--json']);
+                expect(res.code).toBe(2);
+                expect(res.stderr).toMatch(/purpose=TREASURY_WITNESS/);
+                expect((await quarantineRow(R_Q_OK)).purpose).toBe('TREASURY_WITNESS');
+            } finally {
+                await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(R_Q_OK) } });
+            }
+        }, 120000);
+
         test('a correct ownerless QUARANTINE row is an idempotent replay', async () => {
             await inject(R_Q_OK, {});
             try {
@@ -1088,6 +1164,136 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
             expect(rows).toHaveLength(1);
             expect(rows[0].claimedByRef).toBe(crossIdentity.raceOk.depositId);
         }, 240000);
+
+        /**
+         * The zero-row verification against a SEPARATE PostgreSQL session.
+         *
+         * Why not a gate inside the installer process: the installer's DDL takes a
+         * ShareLock on the claim table and holds it for the whole transaction, and
+         * ShareLock CONFLICTS WITH RowExclusiveLock — so while an installer
+         * transaction is open no other session can insert at all (attempting it
+         * deadlocks). That is a property worth knowing: in the current shape a
+         * separate writer can only commit BEFORE the installer's DDL (caught by the
+         * pre-write comparison, proven above) or AFTER its commit. The zero-row
+         * branch is therefore defence in depth, and it is proven here by driving the
+         * real primitive in one transaction while another connection commits the
+         * competitor between the read and the insert.
+         */
+        describe('the zero-row verification against a SEPARATE session', () => {
+            const insertRow = (client, observationKey, purpose, owner) => client.$executeRawUnsafe(
+                `INSERT INTO "ProviderObservationClaim" ("id","observationKey","purpose","claimedByRef","provider","accountKey","createdAt","updatedAt")
+                 VALUES (gen_random_uuid()::text,$1,$2,$3,'moolre',NULL, now(), now())`,
+                observationKey, purpose, owner);
+
+            test('a CONFLICTING winner committed by another session is reported and rolls back this transaction', async () => {
+                const competitor = new PrismaClient();
+                await competitor.$connect();
+                const sentinel = key(`${tag}-rollback-sentinel`);
+                try {
+                    await prisma.providerObservationClaim.deleteMany({ where: { observationKey: { in: [key(R_RACE_CONFLICT), sentinel] } } });
+
+                    let caught = null;
+                    await prisma.$transaction(async (tx) => {
+                        // 1. this transaction writes an earlier claim and reads the
+                        //    existing claim set, exactly as the installer does
+                        await insertRow(tx, sentinel, 'QUARANTINE', null);
+                        await readExistingClaims(tx);
+                        // 2. a SEPARATE connection inserts and COMMITS the competitor
+                        await insertRow(competitor, key(R_RACE_CONFLICT), 'CUSTOMER_DEPOSIT', 'separate-session-owner');
+                        // 3. this transaction now inserts the same key
+                        try {
+                            await insertClaimOrVerify(tx, {
+                                key: key(R_RACE_CONFLICT),
+                                purpose: 'CUSTOMER_DEPOSIT',
+                                claimedByRef: crossIdentity.raceConflict.depositId,
+                                accountKey: null,
+                                kind: 'deposit',
+                            });
+                        } catch (e) {
+                            caught = e;
+                            throw e;
+                        }
+                    }).catch((e) => {
+                        expect(e).toBeInstanceOf(PreexistingClaimConflict);
+                        expect(e.code).toBe('PREEXISTING_CLAIM_CONFLICT');
+                    });
+
+                    expect(caught).not.toBeNull();
+                    // 4. ON CONFLICT inserted zero rows, and the follow-up SELECT
+                    //    DID see the other session's committed row
+                    expect(caught.conflicts[0].duringInsertRace).toBe(true);
+                    expect(caught.conflicts[0].existing.claimedByRef).toBe('separate-session-owner');
+                    expect(caught.conflicts[0].diffs.join(' ')).toMatch(/claimedByRef=separate-session-owner/);
+                    // 5. nothing this transaction wrote survives
+                    expect(await prisma.providerObservationClaim.findUnique({ where: { observationKey: sentinel } })).toBeNull();
+                    const winner = await prisma.providerObservationClaim.findUnique({ where: { observationKey: key(R_RACE_CONFLICT) } });
+                    expect(winner.claimedByRef).toBe('separate-session-owner');
+                } finally {
+                    await competitor.$disconnect();
+                    await prisma.providerObservationClaim.deleteMany({ where: { observationKey: { in: [key(R_RACE_CONFLICT), sentinel] } } });
+                }
+            }, 120000);
+
+            test('an EXACT winner committed by another session is accepted as a raced replay', async () => {
+                const competitor = new PrismaClient();
+                await competitor.$connect();
+                try {
+                    await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(R_RACE_OK) } });
+
+                    let outcome = null;
+                    await prisma.$transaction(async (tx) => {
+                        await readExistingClaims(tx);
+                        await insertRow(competitor, key(R_RACE_OK), 'CUSTOMER_DEPOSIT', crossIdentity.raceOk.depositId);
+                        outcome = await insertClaimOrVerify(tx, {
+                            key: key(R_RACE_OK),
+                            purpose: 'CUSTOMER_DEPOSIT',
+                            claimedByRef: crossIdentity.raceOk.depositId,
+                            accountKey: null,
+                            kind: 'deposit',
+                        });
+                    });
+
+                    expect(outcome.outcome).toBe('replay');
+                    const rows = await prisma.providerObservationClaim.findMany({ where: { observationKey: key(R_RACE_OK) } });
+                    expect(rows).toHaveLength(1);
+                    expect(rows[0].claimedByRef).toBe(crossIdentity.raceOk.depositId);
+                } finally {
+                    await competitor.$disconnect();
+                    await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(R_RACE_OK) } });
+                }
+            }, 120000);
+
+            test('a QUARANTINE row losing the race to a non-null account key is a conflict', async () => {
+                const competitor = new PrismaClient();
+                await competitor.$connect();
+                const quarantineKey = key(`${tag}-race-quarantine`);
+                try {
+                    await prisma.providerObservationClaim.deleteMany({ where: { observationKey: quarantineKey } });
+                    let caught = null;
+                    await prisma.$transaction(async (tx) => {
+                        await readExistingClaims(tx);
+                        await competitor.$executeRawUnsafe(
+                            `INSERT INTO "ProviderObservationClaim" ("id","observationKey","purpose","claimedByRef","provider","accountKey","createdAt","updatedAt")
+                             VALUES (gen_random_uuid()::text,$1,'QUARANTINE',NULL,'moolre','late-account', now(), now())`,
+                            quarantineKey);
+                        try {
+                            await insertClaimOrVerify(tx, {
+                                key: quarantineKey, purpose: 'QUARANTINE', claimedByRef: null, accountKey: null, kind: 'quarantine',
+                            });
+                        } catch (e) {
+                            caught = e;
+                            throw e;
+                        }
+                    }).catch((e) => expect(e).toBeInstanceOf(PreexistingClaimConflict));
+
+                    expect(caught.conflicts[0].duringInsertRace).toBe(true);
+                    expect(caught.conflicts[0].diffs.join(' ')).toMatch(/accountKey=late-account/);
+                } finally {
+                    await competitor.$disconnect();
+                    await prisma.providerObservationClaim.deleteMany({ where: { observationKey: quarantineKey } });
+                }
+            }, 120000);
+        });
 
         test('the unique invariant is still enforced by the database itself', async () => {
             await prisma.providerObservationClaim.deleteMany({ where: { observationKey: key(R_RACE_OK) } });
