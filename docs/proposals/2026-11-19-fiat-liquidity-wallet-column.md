@@ -1,5 +1,22 @@
 # Proposal: make every provisioning path preserve `FiatProviderEvent.walletAccount`
 
+> **LANDED 2026-11-19 — applied as written, not paraphrased.** Agent 1 took the patch
+> unmodified: `9a54a586` on `feat/wp-h-payout-authority-closure`, cherry-picked with `-x`
+> as `f8f3f846` onto `wp-i/step-up-closure`. Verified here from the pushed trees: the commit
+> touches exactly one file, `"walletAccount" TEXT` is inside the `CREATE TABLE` body,
+> `statementsFromSqlFile()` strips comments before splitting, and the loop applies
+> `[...STATEMENTS, ...statementsFromSqlFile(WALLET_COLUMN_SQL)]`.
+>
+> **Numbering note.** The overlay is segment 14 of 28 on #403's chain and 15 of 33 on #405's.
+> #405 carries three installers #403 does not, so the step number differs while the relative
+> position does not: immediately after the installer that creates the table, and ahead of
+> everything that reads or grants it. Quote the relative position, not the number, when
+> discussing this across branches.
+>
+> The guarantee is now structural: the creator owns the column, so a recreated table is born
+> with it and the overlay has nothing left to add.
+
+
 **Ownership: `infra/install-fiat-liquidity-overlay.js` belongs to Agent 1. This proposal
 is NOT applied.** The patch is `docs/proposals/2026-11-19-fiat-liquidity-wallet-column.patch`
 and it applies cleanly (`git apply --check`) to the file as it exists on Agent 1's

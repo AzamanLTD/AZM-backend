@@ -195,3 +195,15 @@ configured wallet per collection API Service":
 
 Until answered, the supported scope is: **type-1 collection status for a single configured
 wallet**, with the wallet carried explicitly and unknown wallets refused.
+
+### 2026-11-19 — the creator now owns the column
+
+The proposal was accepted and landed (`9a54a586`, cherry-picked `f8f3f846`), so
+`install-fiat-liquidity-overlay.js` now produces `walletAccount` and its index from the
+`CREATE TABLE` body and re-applies the shared SQL file. The overlay at the next segment is a
+no-op for that column, and a table recreated by any path that runs the creator keeps it.
+
+That removes the provisioning blocker on declaring `walletAccount` in the Prisma model. The
+field is still **not added**: the gate agreed with Agent 1 is the p5d authority suite passing
+63/63 on a re-provisioned database *with the field declared*, because the original measurement
+that argued for deferring it was taken without the creator owning the column.
