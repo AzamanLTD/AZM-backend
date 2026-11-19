@@ -108,7 +108,11 @@ describe('WP-I reconciler operator entrypoint', () => {
 
     test('with a complete environment the process actually starts and reports per-opening truth', () => {
         const r = runCli(['OPENING-DOES-NOT-EXIST'], COMPLETE_ENV);
-        expect(r.code).toBe(0);
+        // §6 exit contract: an opening that did not receive a witness is NOT a
+        // successful reconciliation. This assertion used to expect 0, which is
+        // precisely the defect — a scheduler read "nothing witnessed" as success.
+        expect(r.code).toBe(3);
+        expect(r.stderr).toMatch(/were NOT witnessed/);
         const out = JSON.parse(r.stdout);
         expect(Array.isArray(out.results)).toBe(true);
         expect(out.results[0].witnessed).toBe(false);

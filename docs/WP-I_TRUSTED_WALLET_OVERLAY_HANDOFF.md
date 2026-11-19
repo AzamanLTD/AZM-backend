@@ -1,12 +1,42 @@
 # WP-I trusted-wallet overlay — hand-off to Agent 1 (release-chain integration)
 
-**Status: SPEC ONLY. The overlay file does not exist yet.** Nothing in this document has
+**Status: superseded by the UPDATE below — the overlay now exists and is registered.** Nothing in this document has
 been added to `package.json`, and no release-chain edit was made by Agent 4. Agent 1 owns
 release-command integration; this is the request, with the exact command and the ordering
 constraints that make it safe.
 
 Branch: `wp-i/observation-closure` (based on #405 head `a1741ee3`).
 Related commit: `6d7c6411` — wallet-scoped observation identity (v2), not yet cut over.
+
+## UPDATE 2026-11-19 — this document is now history, not a request
+
+**The overlay exists and is registered.** `f19c2c7b` built `infra/install-wp-i-observation-wallet-overlay.js`
+(applying `prisma/sql/2026-11-18-fiat-provider-event-wallet-account.sql`), and Agent 1's
+integration candidate `993a6a14` registered it as chain segment 15, exactly the slot requested
+in §4. `DEPLOY_RUNBOOK.md` and `release-execution-path.test.js` were updated to pin the position.
+Nothing below needs doing by Agent 1.
+
+**§3 was wrong, and Agent 1 proved it by measurement.** I asked for the Prisma field to land with
+the overlay. Agent 1 added it, measured, and removed it: declaring a scalar makes Prisma select
+`walletAccount` on every `FiatProviderEvent` read, and `install-fiat-liquidity-overlay.js`
+**recreates that table without the column**, so on any database provisioned through the chain
+(`db push`, then the installers) those reads fail. Measured: the p5d authority suite went to 500s
+with the field declared and passed 63/63 without it. The correct rule is therefore the reverse of
+what §3 says:
+
+- the SQL column is safe to add now, because nothing selects it;
+- the Prisma field may only be declared once **every** provisioning path creates the column,
+  including any installer that drops and recreates `FiatProviderEvent`;
+- until then the column is evidence in the database, not a field any writer can read or set.
+
+**Consequence for the cut-over (§6): the overlay does not survive re-provisioning by itself.**
+A database rebuilt by the fiat-liquidity installer loses `walletAccount` until segment 15 runs
+again. The chain does run it after, so a chain-provisioned database is correct; a database
+rebuilt by a single installer is not. Any wallet-scoped reader must therefore treat a missing
+column as "unknown wallet" and refuse, never as "no wallet needed".
+
+**What is still true from §6:** the cut-over remains all-or-nothing. The overlay adds the evidence
+and nothing else — no writer supplies a wallet and no reader consumes one.
 
 ---
 

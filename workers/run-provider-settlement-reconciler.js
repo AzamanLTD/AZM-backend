@@ -21,8 +21,20 @@
  *   WITNESS_DATABASE_URL               reconciler DB login (INSERT on the witness only)
  *   WITNESS_ACCOUNT_CURRENCY_MAP       {"WALLET-ACCOUNT":"GHS", ...}
  *
- * Exit codes: 0 all requested openings processed (witnessed or truthfully
- * refused), 1 usage/credential failure, 2 fatal error.
+ * EXIT CONTRACT (machine-readable, because a scheduler reads the code, not the
+ * log). A refused opening is NOT a reconciliation: exiting 0 while an opening
+ * went unwitnessed would report a successful run over money never proved.
+ *
+ *   0  every requested opening was witnessed, or was already authoritatively
+ *      witnessed, in this run
+ *   1  usage or credential refusal - nothing was attempted
+ *   2  fatal error - the run could not complete
+ *   3  one or more requested openings did NOT receive a witness (refused,
+ *      parked, not found, not eligible, provider not settled, transport
+ *      unknown). Per-opening reasons are in the JSON on stdout.
+ *
+ * 3 is deliberately distinct from 2: a refusal is a truthful answer about the
+ * provider, not a broken run, and an alert triager must tell them apart.
  */
 
 const { reconcileTreasuryOpenings } = require('./providerSettlementReconciler');
@@ -32,6 +44,13 @@ const { reconcileTreasuryOpenings } = require('./providerSettlementReconciler');
 // was always undefined and this entrypoint could never start. The old test could
 // not see it: deleting a name that is not set is a no-op, so every deletion
 // "proved" a refusal.
+const EXIT = Object.freeze({
+    OK: 0,
+    USAGE: 1,
+    FATAL: 2,
+    NOT_WITNESSED: 3,
+});
+
 const REQUIRED_ENV = [
     'AZM_RECONCILER_MODE',
     'AZM_RECONCILER_PROVIDER_USER',
@@ -44,14 +63,14 @@ function main(argv) {
     const openingDedupKeys = argv.slice(2).filter((a) => a && !a.startsWith('-'));
     if (openingDedupKeys.length === 0) {
         process.stderr.write('usage: node workers/run-provider-settlement-reconciler.js <openingDedupKey> [...]\n');
-        return 1;
+        return EXIT.USAGE;
     }
     const missing = REQUIRED_ENV.filter((name) => !process.env[name]);
     if (missing.length > 0) {
         // Fail closed and say exactly what is missing. Running with a partial
         // credential set would mean guessing at authority.
         process.stderr.write(`[wp-i reconciler] refusing to run: missing ${missing.join(', ')}\n`);
-        return 1;
+        return EXIT.USAGE;
     }
     // Presence is not consent: AZM_RECONCILER_MODE=0 or "true" must not open the
     // writer guard, so the VALUE is checked here and again in the worker.
@@ -59,7 +78,7 @@ function main(argv) {
         process.stderr.write(
             `[wp-i reconciler] refusing to run: AZM_RECONCILER_MODE must be exactly 1, got ${JSON.stringify(process.env.AZM_RECONCILER_MODE)}\n`
         );
-        return 1;
+        return EXIT.USAGE;
     }
 
     return reconcileTreasuryOpenings({ openingDedupKeys })
@@ -71,11 +90,20 @@ function main(argv) {
             // precision is lost on the way to the operator.
             const json = JSON.stringify({ results }, (_k, v) => (typeof v === 'bigint' ? v.toString() : v), 2);
             process.stdout.write(`${json}\n`);
-            return results.every((r) => r.witnessed) ? 0 : 0;
+            const unwitnessed = results.filter((r) => r.witnessed !== true);
+            if (unwitnessed.length > 0) {
+                // Also on stderr: an operator tailing the log must not have to
+                // parse JSON to learn that nothing was reconciled.
+                process.stderr.write(
+                    `[wp-i reconciler] ${unwitnessed.length} of ${results.length} opening(s) were NOT witnessed; this run is not a successful reconciliation\n`
+                );
+                return EXIT.NOT_WITNESSED;
+            }
+            return EXIT.OK;
         })
         .catch((err) => {
             process.stderr.write(`[wp-i reconciler] fatal: ${err?.message || err}\n`);
-            return 2;
+            return EXIT.FATAL;
         });
 }
 
@@ -83,4 +111,4 @@ if (require.main === module) {
     Promise.resolve(main(process.argv)).then((code) => process.exit(code));
 }
 
-module.exports = { REQUIRED_ENV, main };
+module.exports = { REQUIRED_ENV, EXIT, main };
