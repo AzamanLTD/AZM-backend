@@ -15,6 +15,8 @@
 const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client');
 const ledger = require('../services/ledgerService');
+const { buildStepUpContext } = require('../middleware/requireActionStepUp');
+const { consumeStepUpOrThrow, isStepUpEnforced } = require('../src/services/actionStepUpService');
 const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 const { sendPushNotification } = require('../utils/firebaseService');
 const gamification = require('../services/vendorGamificationService');
@@ -218,7 +220,12 @@ exports.initiateTrade = async (req, res) => {
         // CRITICAL-7: Both the capacity check AND the trade creation happen in a
         // single atomic transaction to prevent race conditions where two requests
         // both pass the capacity check simultaneously.
+        const stepUpInitiate = buildStepUpContext(req);
         const tradeResult = await prisma.$transaction(async (tx) => {
+            if (isStepUpEnforced()) {
+                await consumeStepUpOrThrow(tx, stepUp);
+            }
+
             // Count active trades INSIDE the transaction (prevents race condition)
             const activeTradeCount = await tx.trade.count({
                 where: {
@@ -429,7 +436,12 @@ exports.acceptTrade = async (req, res) => {
             return res.status(400).json({ success: false, message: 'Invalid trade id.' });
         }
 
+        const stepUpAccept = buildStepUpContext(req);
         const updatedTrade = await prisma.$transaction(async (tx) => {
+            if (isStepUpEnforced()) {
+                await consumeStepUpOrThrow(tx, stepUpAccept);
+            }
+
             const trade = await tx.trade.findUnique({
                 where: { id: tradeIdInt },
                 include: {

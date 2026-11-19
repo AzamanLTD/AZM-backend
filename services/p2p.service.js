@@ -17,6 +17,7 @@
 
 const logger = require('../src/config/logger');
 const { commitOperation } = require('../middleware/idempotency');
+const { consumeStepUpOrThrow, isStepUpEnforced } = require('../src/services/actionStepUpService');
 
 const gamification = require('./vendorGamificationService');
 const { calculateFeeSplit } = require('../utils/feeMath');
@@ -178,6 +179,11 @@ const acceptPing = async (prisma, { tradeId, vendorId, topUpAmount }) => {
         throw new Error(`Cannot accept ping: trade status is ${trade.status}.`);
 
     const result = await prisma.$transaction(async (tx) => {
+            // §B5 — the grant is spent INSIDE this transaction, so a refusal
+            // rolls the whole economic write back and a rollback releases it.
+            if (isStepUpEnforced()) {
+                await consumeStepUpOrThrow(tx, stepUp);
+            }
         // Re-validate the trade lifecycle inside the same transaction as the
         // balance move. The row lock serializes this top-up against a
         // concurrent terminal transition; whichever transition acquires the
@@ -710,7 +716,7 @@ const flagOverpayment = async (prisma, { tradeId, buyerId, overpaidAmountUsdc })
  *   releasedByUserId: number   // must be vendorId for SELL ad, userId for BUY ad
  * }} params
  */
-const completeTrade = async (prisma, { tradeId, releasedByUserId, adminOverride = false, financialOperation = null }) => {
+const completeTrade = async (prisma, { tradeId, releasedByUserId, adminOverride = false, financialOperation = null, stepUp = null }) => {
     // Pre-fetch outside the transaction (read-only checks)
     const trade = await prisma.trade.findUnique({
         where:  { id: tradeId },

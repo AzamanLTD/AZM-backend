@@ -136,8 +136,41 @@ async function consumeGrant(tx, { token, userId, action, actionType }) {
     return { ok: false, reason: REASON.INVALID };
 }
 
+/**
+ * Is step-up enforcement switched on for this process? One canonical answer.
+ * The middleware and every economic handler must agree, or a route would gate
+ * without consuming (or consume without gating).
+ */
+function isStepUpEnforced() {
+    return String(process.env.STEP_UP_ENFORCEMENT || '').toLowerCase() === 'on';
+}
+
+/**
+ * Consume the grant inside the caller's ECONOMIC transaction, or throw.
+ *
+ * This is the single consumption contract for every protected economic action.
+ * It must be called with the transaction client that performs the money write:
+ *   • a refusal throws, so the economic write rolls back with it;
+ *   • a rollback un-consumes the grant, because the consumedAt UPDATE rolls back;
+ *   • two concurrent consumers cannot both win (conditional UPDATE, one row).
+ */
+async function consumeStepUpOrThrow(tx, stepUp) {
+    const rejection = (reason) => {
+        const error = new Error('Step-up verification does not authorise this exact action.');
+        error.code = 'STEP_UP_REJECTED';
+        error.reason = reason;
+        return error;
+    };
+    if (!stepUp || !stepUp.token) throw rejection('MISSING_GRANT');
+    const verdict = await consumeGrant(tx, stepUp);
+    if (!verdict || !verdict.ok) throw rejection(verdict && verdict.reason);
+    return verdict;
+}
+
 module.exports = {
     STEP_UP_TTL_SECONDS,
+    isStepUpEnforced,
+    consumeStepUpOrThrow,
     REASON,
     canonicalAction,
     actionDigest,

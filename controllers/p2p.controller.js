@@ -20,6 +20,7 @@
 
 const logger = require('../src/config/logger');
 const p2pService = require('../services/p2p.service');
+const { buildStepUpContext } = require('../middleware/requireActionStepUp');
 const { audit } = require('../utils/audit');
 
 /**
@@ -452,6 +453,7 @@ exports.completeTrade = async (req, res) => {
 
         // §r42.1 wired claim: committed INSIDE the settlement transaction.
         const data = await p2pService.completeTrade(prisma, {
+            stepUp: buildStepUpContext(req),
             tradeId, releasedByUserId,
             financialOperation: res.locals?.financialOperation || null,
         });

@@ -69,6 +69,22 @@ function requireActionStepUp(spec) {
     };
 }
 
+/**
+ * The minimal, typed context an economic handler passes into a service that owns
+ * its own transaction. Deliberately NOT the request: a service must not be able
+ * to reach into the request to re-derive (or bypass) the authorised action.
+ */
+function buildStepUpContext(req) {
+    const stepUp = req && req.stepUp;
+    if (!stepUp || !stepUp.token) return null;
+    return {
+        token: stepUp.token,
+        userId: String(req.user.id),
+        actionType: stepUp.actionType,
+        action: stepUp.action,
+    };
+}
+
 async function consumeStepUp(tx, req) {
     const stepUp = req && req.stepUp;
     if (!stepUp || !stepUp.token) return { ok: false, reason: 'MISSING_GRANT' };
@@ -94,4 +110,4 @@ function whenStepUpEnforced(middleware) {
     return (req, res, next) => (isStepUpEnforced() ? middleware(req, res, next) : next());
 }
 
-module.exports = { requireActionStepUp, consumeStepUp, actionForRequest, isStepUpEnforced, whenStepUpEnforced, GRANT_HEADER };
+module.exports = { requireActionStepUp, consumeStepUp, buildStepUpContext, actionForRequest, isStepUpEnforced, whenStepUpEnforced, GRANT_HEADER };

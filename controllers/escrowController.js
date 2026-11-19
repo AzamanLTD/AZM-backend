@@ -16,6 +16,7 @@
 
 const logger = require('../src/config/logger');
 const escrowService = require('../services/escrowService');
+const { buildStepUpContext } = require('../middleware/requireActionStepUp');
 const bizNotificationService = require('../services/bizNotificationService');
 const { audit } = require('../utils/audit');
 
@@ -124,6 +125,7 @@ exports.fundEscrow = async (req, res) => {
         const result = await escrowService.fundEscrow(prisma, {
             escrowId, payerId: userId,
             financialOperation: res.locals?.financialOperation || null,
+            stepUp: buildStepUpContext(req),
         });
         const escrow = result.escrow;
 
@@ -181,7 +183,7 @@ exports.markSatisfied = async (req, res) => {
         const loaded = await _loadEscrowForParticipant(prisma, escrowId, userId);
         if (!loaded.ok) return res.status(loaded.code).json({ success: false, message: loaded.message });
 
-        const result = await escrowService.markSatisfied(prisma, { escrowId, userId });
+        const result = await escrowService.markSatisfied(prisma, { escrowId, userId, stepUp: buildStepUpContext(req) });
         const escrow = result.escrow;
 
         const actor = await prisma.user.findUnique({

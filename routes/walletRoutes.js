@@ -107,7 +107,8 @@ const { protect }              = require('../middleware/authMiddleware');
 const { idempotency } = require('../middleware/idempotency');
 const { require2FA } = require('../middleware/require2FA');
 const { protectActive }        = require('../middleware/banGuardMiddleware');
-const { requireActionStepUp, whenStepUpEnforced, isStepUpEnforced } = require('../middleware/requireActionStepUp');
+const { requireActionStepUp, whenStepUpEnforced, isStepUpEnforced, buildStepUpContext } = require('../middleware/requireActionStepUp');
+const { consumeStepUpOrThrow } = require('../src/services/actionStepUpService');
 
 // Route-specific FX gate (AZM-Planning #75 — PROPOSED, pending owner
 // approval): the wallet withdrawal is FX-dependent exactly when the
@@ -291,7 +292,11 @@ router.post('/internal-transfer', protectActive, requireKyc('p2p'), require2FA()
             // SAME transaction as the history row and the ledger posting —
             // a racing wallet spend loses the CAS cleanly instead of driving
             // the balance negative.
+            const stepUp = buildStepUpContext(req);
             const committedBody = await prisma.$transaction(async (tx) => {
+            if (isStepUpEnforced()) {
+                await consumeStepUpOrThrow(tx, stepUp);
+            }
                 const claim = await tx.user.updateMany({
                     where: { id: userId, availableBalance: { gte: amountExact } },
                     data: {

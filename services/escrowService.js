@@ -27,6 +27,7 @@
 const logger = require('../src/config/logger');
 const { randomUUID } = require('crypto');
 const { runDoubleCheck } = require('../utils/securityCheck');
+const { consumeStepUpOrThrow, isStepUpEnforced } = require('../src/services/actionStepUpService');
 const { commitOperation } = require('../middleware/idempotency');
 
 // Socket.IO is wired once at bootstrap by src/sockets/socketServices.js.
@@ -159,7 +160,7 @@ const createEscrow = async (prisma, { ticketId, payerId, payeeId, amountUsdc, de
 // =============================================================================
 // 2. FUND ESCROW — payer locks USDC. The critical financial step.
 // =============================================================================
-const fundEscrow = async (prisma, { escrowId, payerId, financialOperation = null }) => {
+const fundEscrow = async (prisma, { escrowId, payerId, financialOperation = null, stepUp = null }) => {
     const escrow = await prisma.smartEscrow.findUnique({
         where: { id: escrowId },
         include: { ticket: true }
@@ -192,6 +193,11 @@ const fundEscrow = async (prisma, { escrowId, payerId, financialOperation = null
     const reference = randomUUID();
 
     const updatedEscrow = await prisma.$transaction(async (tx) => {
+            // §B5 — the grant is spent INSIDE this transaction, so a refusal
+            // rolls the whole economic write back and a rollback releases it.
+            if (isStepUpEnforced()) {
+                await consumeStepUpOrThrow(tx, stepUp);
+            }
         // r25 P0 — ATOMIC FUNDING CLAIM (the single-winner boundary for the
         // ENTIRE economic operation): the DRAFT→FUNDED transition is claimed
         // by an exact-lifecycle CAS on the durable escrow identity. The
@@ -364,7 +370,7 @@ const fundEscrow = async (prisma, { escrowId, payerId, financialOperation = null
 // =============================================================================
 // 3. MARK SATISFIED — a party signals completion. Both true → auto-settle.
 // =============================================================================
-const markSatisfied = async (prisma, { escrowId, userId }) => {
+const markSatisfied = async (prisma, { escrowId, userId, stepUp = null }) => {
     const escrow = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
     if (!escrow) throw new Error('Escrow not found.');
     if (escrow.status === 'SETTLED') {
@@ -523,6 +529,11 @@ const markSatisfied = async (prisma, { escrowId, userId }) => {
 // =============================================================================
 const raiseDispute = async (prisma, { escrowId, raisedById, reason, evidenceUrls }) => {
     const result = await prisma.$transaction(async (tx) => {
+            // §B5 — the grant is spent INSIDE this transaction, so a refusal
+            // rolls the whole economic write back and a rollback releases it.
+            if (isStepUpEnforced()) {
+                await consumeStepUpOrThrow(tx, stepUp);
+            }
         // Authoritative read — INSIDE the transaction that claims the escrow,
         // so the authorization decision is made against the row this
         // transaction will mutate (no TOCTOU window between check and claim).
