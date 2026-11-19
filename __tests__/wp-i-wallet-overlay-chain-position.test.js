@@ -27,9 +27,12 @@ test('the trusted-wallet overlay precedes every settlement installer', () => {
     }
 });
 
-test('the overlay installer exists and is idempotent-shaped', () => {
-    const p = path.join(ROOT, 'infra', 'install-wp-i-observation-wallet-overlay.js');
-    expect(fs.existsSync(p)).toBe(true);
-    const src = fs.readFileSync(p, 'utf8');
-    expect(src).toMatch(/IF NOT EXISTS|ADD COLUMN IF NOT EXISTS/i);
+test('the overlay applies idempotent DDL from the single SQL source of truth', () => {
+    const installer = path.join(ROOT, 'infra', 'install-wp-i-observation-wallet-overlay.js');
+    const ddl = path.join(ROOT, 'prisma', 'sql', '2026-11-18-fiat-provider-event-wallet-account.sql');
+    expect(fs.existsSync(installer)).toBe(true);
+    expect(fs.existsSync(ddl)).toBe(true);
+    // The installer must not restate the DDL; it applies this file.
+    expect(fs.readFileSync(installer, 'utf8')).toMatch(/prisma\/sql\/2026-11-18-fiat-provider-event-wallet-account\.sql/);
+    expect(fs.readFileSync(ddl, 'utf8')).toMatch(/ADD COLUMN IF NOT EXISTS/i);
 });
