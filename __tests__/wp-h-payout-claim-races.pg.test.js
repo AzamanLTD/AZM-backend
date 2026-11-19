@@ -52,10 +52,14 @@ describe('§WP-H payout claim races (real PostgreSQL, two backends)', () => {
         // Legacy regime for these races: the authority decision is proved in
         // wp-h-payout-authority-race / -claim-authorisation. Here the question is
         // which worker wins the CAS.
+        // Headroom is part of the regime this suite means to exercise: without
+        // it the claim parks at HEADROOM_BELOW_THRESHOLD before reaching the
+        // reservation question, and the suite only passed when an earlier
+        // suite happened to leave availableGhs populated. Own it here.
         await admin.$executeRawUnsafe(`
-            INSERT INTO "FiatLiquidityState" (id, "authorityActivatedAt", "updatedAt")
-            VALUES (1, NULL, now())
-            ON CONFLICT (id) DO UPDATE SET "authorityActivatedAt" = NULL, "updatedAt" = now()`);
+            INSERT INTO "FiatLiquidityState" (id, "availableGhs", "authorityActivatedAt", "updatedAt")
+            VALUES (1, 100000, NULL, now())
+            ON CONFLICT (id) DO UPDATE SET "availableGhs" = 100000, "authorityActivatedAt" = NULL, "updatedAt" = now()`);
         // The regime is a LATCH over two independent signals — `active` is
         // (GlobalSettings.fiatLiquidityAuthorityEnabled || FiatLiquidityState.
         // authorityActivatedAt != null) — and both suites must own BOTH halves.

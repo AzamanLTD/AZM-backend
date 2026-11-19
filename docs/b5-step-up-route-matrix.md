@@ -1,219 +1,223 @@
 # B5 — action-bound step-up and KYC route coverage (current state)
 
-**Commit basis:** release candidate `6acc42f` (`merge(#403): the declared final tip fe73a9cb`)
-plus the changes on this branch. Every row below was **generated from the route
-source** (`routes/*.js`), not written from memory: a small scanner split each
-router file on `router.<method>(` boundaries and read the middleware chain of
-each route. `—` means the route carries no KYC and no step-up.
+**Generated from source** by `node scripts/step-up-route-inventory.js --write-doc`
+(`scripts/step-up-route-inventory.js` is the single source of truth; the static
+guard `__tests__/b5-step-up-route-coverage.test.js` imports the same module).
+Do not hand-edit this file — regenerate it.
 
-**This document deliberately describes the state as it IS, not as it should be.**
-It exists because the release brief requires proof per alias: the real-route
-step-up proof only establishes `POST /api/withdraw`, and claiming broader
-coverage is forbidden until a matrix proves it.
+**This document describes the state as it IS, not as it should be.** Scope is
+every mutation route (POST/PUT/PATCH/DELETE) in `routes/*.js` whose path
+matches a money term, plus an explicit list of value-moving routes whose paths
+carry no money term (`/ghs`, `/fiat`, `/initiate`, `/satisfy`, `/pay`…).
 
-## 1. Step-up: what is actually mounted
+**Measured population: 135 in-scope routes.**
 
-Only **one** route in the entire backend consumes the action-bound grant:
+| class | count | meaning |
+|---|---|---|
+| GATED | 7 | carries `whenStepUpEnforced(requireActionStepUp(...))` |
+| CUSTOMER_GAP | 30 | moves customer value, no gate — recorded gap, may only shrink |
+| CUSTOMER_EXEMPT | 3 | moves value; step-up not required, economic reason recorded |
+| BUSINESS | 11 | KYB-scoped business operator on their own business |
+| OPERATOR | 20 | admin/operator action — separate operator authorisation, never customer step-up |
+| NON_VALUE | 60 | matches a money term, moves no value |
+| WEBHOOK | 4 | provider callback; never customer-gated |
 
-```
-routes/walletRoutes.js:143  const stepUpGate = whenStepUpEnforced(
-                                requireActionStepUp({ actionType: 'FIAT_WITHDRAWAL',
-                                                     routeScope: 'POST /api/withdraw' }));
-routes/walletRoutes.js:148  router.post('/withdraw', ..., stepUpGate, ...)
-```
+`whenStepUpEnforced(...)` is a no-op unless `STEP_UP_ENFORCEMENT=on`.
+**`STEP_UP_ENFORCEMENT` is OFF**, so every gate below is dormant in production
+today. This document does not change that flag and must not.
 
-`routes/walletRoutes.js` is the **only** router that references
-`requireActionStepUp`; no other router mentions step-up at all.
+## 1. Gated today (7)
 
-`whenStepUpEnforced(...)` means the gate is a no-op unless
-`STEP_UP_ENFORCEMENT=on`. **`STEP_UP_ENFORCEMENT` is OFF**, so even the
-withdrawal gate is dormant in production today. This branch does not change that
-flag and must not.
-
-Grant semantics (unchanged, proven elsewhere): server-issued, single-use,
-transaction-atomic, bound to the canonical action, consumed inside the economic
-transaction. A body-supplied PIN/password is not a substitute, and the matrix
-below does not treat `require2FA()` as step-up.
-
-## 2. Financial mutation route inventory (46 money-path routes)
-
-| route | controls present |
+| route | action |
 |---|---|
-| `wallet POST /withdraw` | KYC:withdraw, **step-up**, idem, auth |
-| `wallet POST /deposit/initialize` | KYC:deposit, idem, auth |
-| `wallet POST /internal-transfer` | KYC:p2p, 2FA, idem, auth |
-| `trade POST /initiate` | KYC:trade, 2FA, idem, auth |
-| `trade POST /accept` | KYC:trade, idem, auth |
-| `trade POST /decline` | auth |
-| `trade POST /extend` | auth |
-| `trade POST /extend/respond` | auth |
-| `trade POST /upload-proof` | auth |
-| `trade POST /dispute` | auth |
-| `trade POST /review` | auth |
-| `withdrawal POST /fiat` | KYC:withdraw, 2FA, idem |
-| `withdrawal POST /ghs/quote` | idem |
-| `withdrawal POST /ghs` | KYC:withdraw, 2FA, idem |
-| `withdrawal POST /crypto` | KYC:withdraw, 2FA, idem |
-| `withdrawal POST /bank/quote` | idem |
-| `withdrawal POST /bank` | KYC:withdraw, 2FA, idem |
-| `deposit POST /fiat/initiate` | KYC:deposit, idem, auth |
-| `deposit POST /fiat/webhook` | — |
-| `deposit POST /webhook/tatum` | — |
-| `deposit POST /fiat/initiate/moolre` | KYC:deposit, idem, auth |
-| `deposit POST /fiat/initiate/moolre/otp` | auth |
-| `deposit POST /fiat/webhook/moolre` | — |
-| `deposit POST /validate-name` | auth |
-| `susu POST /groups` | KYC:susu, idem, auth |
-| `susu POST /groups/:id/contract` | idem, auth |
-| `susu POST /groups/:id/cancel` | idem, auth |
-| `susu POST /vouches` | idem, auth |
-| `susu POST /` | idem, auth |
-| `susu POST /:id/cancel` | idem, auth |
-| `susu POST /:id/auto-retain` | auth |
-| `susu POST /:id/invites` | auth |
-| `susu POST /invites/:token/redeem` | idem, auth |
-| `susu POST /invites/:id/accept` | auth |
-| `susu POST /invites/:id/decline` | auth |
-| `susu POST /invites/:id/revoke` | auth |
-| `susu POST /:id/contract/accept` | idem, auth |
-| `crossBorderSusu POST /` | — |
-| `crossBorderSusu POST /contribute` | KYC:susu, idem |
-| `crossBorderSusu POST /payout` | KYC:susu, idem |
-| `friend PUT /request/:id/accept` | — |
-| `friend POST /transfer/send` | KYC:p2p, 2FA, idem |
-| `friend POST /transfer/request` | — |
-| `friend PUT /transfer/:id/fulfill` | KYC:p2p |
-| `friend PUT /transfer/:id/decline` | — |
-| `escrow POST /fund` | KYC:pay, 2FA, idem, auth |
+| `escrow POST /fund` | ESCROW_FUND |
+| `escrow POST /satisfy` | ESCROW_RELEASE |
+| `p2p POST /complete` | P2P_TRADE_COMPLETE |
+| `trade POST /accept` | TRADE_ACCEPT |
+| `trade POST /initiate` | TRADE_INITIATE |
+| `wallet POST /internal-transfer` | INTERNAL_TRANSFER |
+| `wallet POST /withdraw` | FIAT_WITHDRAWAL — the proven end-to-end path |
 
-## 3. What this proves and what it does not
+Only the withdrawal path has a real end-to-end route proof (challenge → proof →
+grant → exact retry → transaction consumption). The other gates are wired and
+covered by the static guard and unit-level action binding; they are NOT proven
+end-to-end by that withdrawal test, and this document does not claim they are.
 
-**Proven:** every money-path route above carries the controls listed beside it,
-read from source. `POST /api/withdraw` is the only route with an action-bound
-step-up gate, and that gate is dormant while the flag is off.
+## 2. Recorded customer coverage gaps (30)
 
-**Not proven, and not claimed:** that step-up covers deposits, P2P,
-internal-transfer, transfers, trade, savings, susu or escrow funding. Those rely
-on KYC + 2FA + idempotency, not on a step-up grant.
+Genuinely value-moving customer routes with no action-bound step-up. This list
+is frozen by the guard: it may only shrink, and every entry carries the
+economic reason it is still open.
 
-## 4. KYC at the economic boundary
-
-Gated actions in the current build, with the canonical action name:
-
-| action | routes |
+| route | why it is a gap |
 |---|---|
-| `withdraw` | `withdrawal POST /fiat`, `/ghs`, `/crypto`, `/bank`; `wallet POST /withdraw` |
-| `deposit` | `deposit POST /fiat/initiate`, `/fiat/initiate/moolre`; `wallet POST /deposit/initialize` |
-| `p2p` | `friend POST /transfer/send`, `PUT /transfer/:id/fulfill`; `wallet POST /internal-transfer` |
-| `trade` | `trade POST /initiate`, `trade POST /accept` |
-| `susu` | `susu POST /groups`; `crossBorderSusu POST /contribute`, `/payout` |
-| `pay` | `escrow POST /fund` |
+| `azmConversion POST /` | AZM→USDC conversion; idempotent, no action-bound step-up |
+| `azmGift POST /send` | AZM gift to another user; idempotent, no action-bound step-up |
+| `businessOS POST /ewa/withdraw` | EWA payout to an employee; no action-bound step-up |
+| `businessOS POST /finance/payout` | business payout; no action-bound step-up |
+| `businessOS POST /orders/:id/refund` | order refund moves funds back; no action-bound step-up |
+| `business POST /invoices/:invoiceId/pay` | customer pays a business invoice; KYC(pay) gated, no action-bound step-up |
+| `conversation POST /:conversationId/messages/:messageId/fund-escrow` | funds escrow from a conversation; no action-bound step-up |
+| `conversation POST /:conversationId/messages/:messageId/release-escrow` | releases escrow from a conversation; no action-bound step-up |
+| `crossBorderSusu POST /contribute` | cross-border susu contribution; KYC + idempotent, no action-bound step-up |
+| `crossBorderSusu POST /payout` | cross-border susu payout; KYC + idempotent, no action-bound step-up |
+| `deposit POST /fiat/initiate` | initiates a fiat deposit; KYC + idempotent, no action-bound step-up |
+| `deposit POST /fiat/initiate/moolre` | initiates a Moolre deposit; KYC + idempotent, no action-bound step-up |
+| `dineIn POST /tabs/:tabId/pay` | customer pays a dine-in tab; KYC(pay) + 2FA, no action-bound step-up |
+| `finance POST /withdraw/fiat` | legacy finance fiat withdrawal; KYC + 2FA + idempotent, no action-bound step-up |
+| `friend PUT /transfer/:id/fulfill` | fulfils a peer transfer request and moves funds; KYC gated, no step-up |
+| `friend POST /transfer/send` | peer transfer of funds; KYC + 2FA + idempotent, no action-bound step-up |
+| `multiCurrency POST /convert` | currency conversion; idempotent, no action-bound step-up |
+| `orderBook POST /orders` | places an order and reserves balance; idempotent, no action-bound step-up |
+| `savings POST /goals/:id/deposit` | savings deposit; fresh-rate + idempotent, no action-bound step-up |
+| `savings POST /goals/:id/withdraw` | savings withdrawal; 2FA + fresh-rate + idempotent, no action-bound step-up |
+| `sharedVault POST /:id/deposit` | shared-vault deposit; idempotent, no action-bound step-up |
+| `storefrontCheckoutIntegrity POST /:businessProfileId/order` | storefront checkout (integrity variant); no action-bound step-up |
+| `storefront POST /:businessProfileId/order` | storefront checkout; no action-bound step-up |
+| `vault POST /:id/break` | early vault break; 2FA + idempotent, no action-bound step-up |
+| `vault POST /:id/deposit` | vault deposit; idempotent, no action-bound step-up |
+| `wallet POST /deposit/initialize` | initiates a deposit; KYC + idempotent, no action-bound step-up |
+| `withdrawal POST /bank` | bank payout; KYC + 2FA + idempotent, no action-bound step-up |
+| `withdrawal POST /crypto` | crypto withdrawal; KYC + 2FA + idempotent, no action-bound step-up |
+| `withdrawal POST /fiat` | legacy fiat withdrawal; KYC + 2FA + idempotent, no action-bound step-up |
+| `withdrawal POST /ghs` | native-GHS withdrawal; KYC + 2FA + idempotent, no action-bound step-up |
 
-### Two boundaries worth naming explicitly
+## 3. Customer-exempt (3)
 
-**Trade acceptance (fixed on this branch).** `POST /trades/accept` was exempt
-with the reason "counterparty accepts an already-authorised trade". That reason
-does not hold: `controllers/tradeController.js` `acceptTrade` is executed by the
-**vendor**, and on a SELL ad it decrements the vendor's
-`vendorUnallocatedBalance` and increments `escrowLockedBalance` inside a
-transaction. That is the vendor locking its own trading pool into escrow, so it
-is an economic action and now carries `requireKyc('trade')`. Initiation and
-acceptance are both gated.
+| route | economic reason step-up is not required |
+|---|---|
+| `azm POST /spend/ad-boost` | spends non-redeemable internal AZM reward points; no fiat/USDC exit rail exists |
+| `azm POST /spend/card-skin/purchase` | spends non-redeemable internal AZM reward points; no fiat/USDC exit rail exists |
+| `azm POST /spend/fee-discount` | spends non-redeemable internal AZM reward points; no fiat/USDC exit rail exists, so the economic loss is bounded to the reward balance |
 
-**Moolre deposit OTP confirmation (audited, left exempt).**
-`deposit POST /fiat/initiate/moolre/otp` carries no KYC gate, deliberately: it is
-a continuation of an initiation that already passed `requireKyc('deposit')`, and
-the continuation is bound to the same user and quote. Gating it again would
-refuse a deposit already authorised at the economic entry point while stranding
-the customer's in-flight quote. This is a reasoned exemption, not an oversight,
-and it is recorded in `__tests__/kyc-route-matrix.test.js` `EXEMPT`.
+## 4. Business-operator routes (11)
 
-**Susu contract acceptance (audited, left ungated, and the matrix does not see
-it).** `susu POST /groups/:id/contract` and `POST /:id/contract/accept` accept
-group terms; `services/susu/liabilityContract.service.js` updates the group row
-and moves no funds. Contributions are the money-moving step and are gated at
-`crossBorderSusu POST /contribute`. **Disclosed blind spot:** the matrix's
-`MONEY_PATH` regex does not match the token `contract`, so these routes are not
-even scanned. They are safe today because no funds move, but the blind spot
-itself is real.
+KYB-scoped business operators acting on their own business; membership and KYB
+are the boundary, not customer step-up.
 
-## 5. Regression guard
+| route | reason |
+|---|---|
+| `businessOSInventory POST /restaurant/inventory/:id/restock` | KYB-scoped business operator acting on their own business; membership + KYB gated |
+| `businessOSInventory POST /restaurant/inventory/restock-intents` | KYB-scoped business operator acting on their own business; membership + KYB gated |
+| `businessOSInventory POST /restaurant/inventory/restock-intents/:id/ack` | KYB-scoped business operator acting on their own business; membership + KYB gated |
+| `businessOSInventory POST /restaurant/inventory/restock-intents/:id/cancel` | KYB-scoped business operator acting on their own business; membership + KYB gated |
+| `businessOSPos POST /pos/order` | KYB-scoped business operator acting on their own business; membership + KYB gated |
+| `businessOS POST /payroll/disburse` | disburses the operator's own business payroll (payroll.disburse permission) |
+| `businessOS POST /payroll/process` | runs a payroll batch for the operator's own business (payroll.process permission) |
+| `businessOS POST /pos/cash-close-tab` | KYB-scoped business operator acting on their own business; membership + KYB gated |
+| `businessOS POST /pos/cash-sale` | KYB-scoped business operator acting on their own business; membership + KYB gated |
+| `businessOS POST /retail/purchase-orders` | KYB-scoped business operator acting on their own business; membership + KYB gated |
+| `businessOS PATCH /retail/purchase-orders/:id` | KYB-scoped business operator acting on their own business; membership + KYB gated |
 
-`__tests__/kyc-route-matrix.test.js` scans >80 mounted routes and fails if any
-money-path route is ungated without a reasoned exemption, if KYC is mounted after
-idempotency/step-up, if an exemption goes stale, if a provider webhook is gated,
-or if the mandatory action baseline is narrowed by configuration. It passes
-21/21 on a real PostgreSQL database.
+## 5. Operator routes (20)
 
-## 6. Standing owner actions
+Admin/operator actions. The brief forbids customer step-up here; these need
+separate operator authorisation.
 
-- `STEP_UP_ENFORCEMENT` remains **OFF**. Turning it on is an owner decision and
-  needs the grant installer (`infra/install-action-step-up-grant.js`) applied
-  first.
-- Do not describe step-up as covering all financial mutations. It covers
-  `POST /api/withdraw` only.
+| route | reason |
+|---|---|
+| `adminChat POST /intervene/:tradeId` | operator/admin action — needs separate operator authorisation, never customer step-up |
+| `adminControlPlane POST /staff/:id/suspend` | operator/admin action — needs separate operator authorisation, never customer step-up |
+| `adminControlPlaneSummary POST /disputes/:escrowId/assign` | operator/admin action — needs separate operator authorisation, never customer step-up |
+| `adminControlPlaneSummary POST /disputes/:escrowId/resolve` | operator/admin action — needs separate operator authorisation, never customer step-up |
+| `admin DELETE /ad-posts/:id` | operator/admin action — needs separate operator authorisation, never customer step-up |
+| `admin POST /businesses/:bizId/suspend` | operator/admin action — needs separate operator authorisation, never customer step-up |
+| `admin POST /businesses/:bizId/unsuspend` | operator/admin action — needs separate operator authorisation, never customer step-up |
+| `admin POST /disputes/:tradeId/resolve` | operator/admin action — needs separate operator authorisation, never customer step-up |
+| `admin POST /escrow-disputes/:id/assign` | operator/admin action — needs separate operator authorisation, never customer step-up |
+| `admin POST /escrow-disputes/:id/resolve` | operator/admin action — needs separate operator authorisation, never customer step-up |
+| `admin POST /fee-profiles` | operator/admin action — needs separate operator authorisation, never customer step-up |
+| `admin PUT /fee-profiles/:id` | operator/admin action — needs separate operator authorisation, never customer step-up |
+| `admin DELETE /fee-profiles/:id` | operator/admin action — needs separate operator authorisation, never customer step-up |
+| `admin POST /payouts/batch-process` | operator/admin action — needs separate operator authorisation, never customer step-up |
+| `admin PUT /payouts/settings` | operator/admin action — needs separate operator authorisation, never customer step-up |
+| `admin POST /trade-accounts/:id/approve` | operator/admin action — needs separate operator authorisation, never customer step-up |
+| `admin POST /trade-accounts/:id/reject` | operator/admin action — needs separate operator authorisation, never customer step-up |
+| `admin POST /withdrawals/:id/approve` | operator/admin action — needs separate operator authorisation, never customer step-up |
+| `admin POST /withdrawals/:id/reject` | operator/admin action — needs separate operator authorisation, never customer step-up |
+| `admin POST /withdrawals/:id/resolve-review` | operator/admin action — needs separate operator authorisation, never customer step-up |
 
-## Measured inventory (2026-11-18, PR #405 working branch `feat/wp-h-payout-authority-closure`)
+## 6. Non-value matches (60)
 
-This section records what was MEASURED from the mounted route definitions, not what
-the matrix above asserts. It exists because the matrix says only `POST /api/withdraw`
-consumes the action-bound grant, and that claim needed checking.
+| route | reason |
+|---|---|
+| `azm POST /spend/card-skin/equip` | equips an owned cosmetic; no balance change |
+| `bills POST /saved-accounts` | saves a bill account record; no funds move |
+| `businessDirectMessage POST /send` | does not move value |
+| `businessOS POST /employees/my-ewa-request` | creates an EWA request record; the payout is POST /ewa/withdraw |
+| `businessOS POST /employees/shifts/:shiftId/request-swap` | does not move value |
+| `businessOS POST /feedback` | does not move value |
+| `businessOS POST /messages/:conversationId/send` | does not move value |
+| `businessOS POST /orders/bulk-status` | does not move value |
+| `businessOS POST /reservations/:id/propose-reschedule` | does not move value |
+| `businessOS POST /restaurant/inventory` | does not move value |
+| `businessOS PATCH /restaurant/inventory/:id` | does not move value |
+| `businessOS POST /restaurant/inventory/deduct/:orderId` | does not move value |
+| `businessOS PATCH /restaurant/sections/reorder` | does not move value |
+| `businessOS PATCH /restaurant/tables/:id/metadata` | does not move value |
+| `businessOS PATCH /retail/products/:id/barcode` | does not move value |
+| `businessOS POST /retail/stock-counts` | does not move value |
+| `businessOS PATCH /retail/stock-counts/:id/items/:itemId` | does not move value |
+| `businessOS POST /retail/stock-counts/:id/reconcile` | does not move value |
+| `businessOS POST /retail/suppliers` | does not move value |
+| `businessOS PATCH /retail/suppliers/:id` | does not move value |
+| `businessOS DELETE /retail/suppliers/:id` | does not move value |
+| `business POST /invoices/:invoiceId/send` | does not move value |
+| `business PATCH /orders/:orderId/delivered` | does not move value |
+| `chat POST /send` | does not move value |
+| `chatUploadRoutesExtended.js POST /vendor-docs` | file upload |
+| `conversation POST /:conversationId/messages/:messageId/dispute-escrow` | flags a dispute; no balance change |
+| `deposit POST /fiat/initiate/moolre/otp` | OTP confirmation for the initiate above |
+| `deposit POST /validate-name` | name validation |
+| `friend POST /request` | does not move value |
+| `friend PUT /request/:id/accept` | does not move value |
+| `friend PUT /request/:id/reject` | does not move value |
+| `friend PUT /transfer/:id/decline` | does not move value |
+| `friend POST /transfer/request` | creates a request record; funds move only at fulfil |
+| `groupChat POST /:id/join-requests` | does not move value |
+| `groupChat POST /:id/join-requests/:reqId/approve` | does not move value |
+| `groupChat POST /:id/join-requests/:reqId/reject` | does not move value |
+| `groupChat POST /:id/susu/cancel` | does not move value |
+| `groupChat POST /:id/susu/initiate` | starts a susu cycle; contributions are scheduler-driven |
+| `groupChat POST /:id/susu/vouch` | does not move value |
+| `notification POST /trigger/deposit-success` | notification trigger |
+| `notification POST /trigger/trade-started` | notification trigger |
+| `orderBook DELETE /orders/:id` | cancels an order and releases its own reservation |
+| `orderTracking PUT /:orderId/tracking/eta` | does not move value |
+| `orderTracking PUT /:orderId/tracking/location` | does not move value |
+| `orderTracking POST /:orderId/tracking/status` | does not move value |
+| `p2p POST /overpayment` | dispute marking |
+| `p2p POST /underpayment` | dispute marking |
+| `paymentRequest POST /` | creates a request record; no funds move until the payer pays |
+| `reservation POST /:id/counter-propose` | does not move value |
+| `savedMomo POST /` | saves a payout destination record; no funds move |
+| `security POST /app-unlock/sms/send` | sends an app-unlock OTP challenge; no value moves |
+| `security POST /phone/send-otp` | sends an OTP challenge; no value moves |
+| `showcase POST /reorder` | does not move value |
+| `susu POST /:id/contract/accept` | accepts a contract |
+| `susu POST /groups` | creates a susu group record |
+| `susu POST /groups/:id/cancel` | does not move value |
+| `susu POST /groups/:id/contract` | accepts a contract; contributions are scheduler-driven |
+| `walletPass POST /vault/:vaultId` | generates a pass; no balance change |
+| `withdrawal POST /bank/quote` | returns an indicative quote; no value moves |
+| `withdrawal POST /ghs/quote` | returns an indicative quote; no value moves |
 
-**Method.** Parsed `router.<verb>('<path>')` declarations across `routes/*.js` and
-counted every route in a money-bearing router or with a money-bearing path segment
-(withdraw, deposit, transfer, trade, escrow, susu, vendor, payout, contribute,
-fulfil/fulfill, send). `grep -rn requireActionStepUp routes/` gives the consumption
-side directly.
+## 7. Provider webhooks (4)
 
-**Measured: 101 financial mutation routes across 21 routers.**
+Settlement must never depend on a customer action.
 
-| Router | Mutations | Consumes action-bound step-up |
-| --- | --- | --- |
-| susuRoutes | 13 | no |
-| adminRoutes | 10 | no (operator surface) |
-| tradeRoutes | 8 | no |
-| depositRoutes | 7 | no |
-| withdrawalRoutes | 6 | no |
-| escrowRoutes | 5 | no |
-| p2pRoutes | 5 | no |
-| walletRoutes | 5 | **yes, 1 of 5** (`POST /api/withdraw`, `FIAT_WITHDRAWAL`) |
-| friendRoutes | 4 | no |
-| businessOSRoutes | 3 | no |
-| conversationRoutes | 3 | no |
-| crossBorderSusuRoutes | 3 | no |
-| groupChatRoutes | 3 | no |
-| paymentRequestRoutes | 3 | no |
-| financeRoutes | 2 | no |
-| savingsRoutes | 2 | no |
-| tradeAccountRoutes | 2 | no |
-| other (5 routers) | 2 each | no |
+| route | reason |
+|---|---|
+| `deposit POST /fiat/webhook` | provider deposit callback |
+| `deposit POST /fiat/webhook/moolre` | provider deposit callback |
+| `deposit POST /webhook/tatum` | provider crypto callback |
+| `finance POST /webhook/deposit` | provider deposit callback; settlement must not depend on a customer action |
 
-**So the coverage figure is 1 of 101, not "1 route and that is the complete set".**
-`STEP_UP_ENFORCEMENT` remains OFF and no production flag was touched; the grant is
-prepared but not activated.
+## 8. What the guard enforces
 
-### Deliberate exclusions (must never be gated by customer step-up)
-
-- `POST /api/deposit/fiat/webhook`, `/api/deposit/fiat/webhook/moolre`, `/api/deposit/webhook/tatum`
-  — provider callbacks. They authenticate as the provider. A customer grant here
-  would make settlement depend on a customer action.
-- Operator-only routes (`adminRoutes` withdrawal approve/reject/resolve-review,
-  payout batch-process, payouts/settings, dispute assign/resolve). These need
-  operator authorization, not customer step-up; they are out of scope for B5.
-
-### What this inventory does NOT establish
-
-- **Per-route KYC and 2FA classification is not measured.** A middleware-name grep
-  is not evidence: the routers use several different guards and a zero hit can mean
-  "different name" rather than "no gate". The KYC/2FA columns of the matrix above
-  remain unverified until each router is read.
-- **No route has been wired.** Nothing in this section changes behaviour; it
-  records the size of the gap so the wiring work is not scoped from an
-  understatement.
-- **No route tests were written for the challenge -> proof -> grant -> retry ->
-  consumption flow**, and the wrong-amount/recipient/currency/route/resource/
-  operation/user/idempotency, expiry, concurrent consumption, rollback and
-  lost-response cases in the brief are all still owed.
-- `P2P fulfil` and `trade acceptance` were NOT reviewed. If fulfil performs a payer
-  debit and recipient credit, it is a financial mutation that currently has no
-  action-bound step-up, and that remains an open finding rather than a decision.
+1. Every in-scope route has exactly one classification; a NEW money route fails
+   the build until it is gated or explicitly exempted with a reason.
+2. Every recorded gate is still present, and every gate sits behind
+   `whenStepUpEnforced(...)` so wiring cannot activate enforcement by accident.
+3. The CUSTOMER_GAP population matches the frozen list exactly — it cannot grow.
+4. Provider webhooks are never gated.
