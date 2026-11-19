@@ -1,0 +1,59 @@
+diff --git a/infra/install-fiat-liquidity-overlay.js b/infra/install-fiat-liquidity-overlay.js
+--- a/infra/install-fiat-liquidity-overlay.js
++++ b/infra/install-fiat-liquidity-overlay.js
+@@ -14,6 +14,8 @@
+ 
+ const { PrismaClient } = require('@prisma/client');
+ const logger = require('../src/config/logger');
++const fs = require('fs');
++const path = require('path');
+ 
+ const prisma = new PrismaClient();
+ 
+@@ -31,6 +33,7 @@
+     "dedupKey" TEXT NOT NULL,
+     "amountGhs" DECIMAL(20,2),
+     "relatedReference" TEXT,
++    "walletAccount" TEXT,
+     "raw" JSONB,
+     "receivedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+     CONSTRAINT "FiatProviderEvent_pkey" PRIMARY KEY ("id")
+@@ -167,6 +170,27 @@
+    ON CONFLICT ("id") DO NOTHING;`,
+ ];
+ 
++// WP-I trusted wallet - part of THIS table's contract, not a later overlay.
++//
++// `CREATE TABLE IF NOT EXISTS` above only helps a fresh database; a path that
++// recreates the table (the p5d authority suite drops and re-provisions it) would
++// otherwise produce a table without the column, and a wallet-scoped reader would
++// then fail closed on a database the release chain reports as provisioned.
++//
++// The DDL is NOT restated here. prisma/sql/2026-11-18-fiat-provider-event-wallet-account.sql
++// is the single source of truth and is also applied by
++// install-wp-i-observation-wallet-overlay.js (release segment 15), so the two
++// installers converge on one contract instead of drifting.
++const WALLET_COLUMN_SQL = path.join(__dirname, '..', 'prisma', 'sql', '2026-11-18-fiat-provider-event-wallet-account.sql');
++
++/** Statements from a shared .sql file. Comments are stripped BEFORE splitting:
++ *  a comment may contain a semicolon and splitting first yields a broken statement. */
++function statementsFromSqlFile(file) {
++  const raw = fs.readFileSync(file, 'utf8');
++  return raw.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n')
++    .split(';').map((s) => s.trim()).filter(Boolean);
++}
++
+ async function installFiatLiquidityOverlay() {
+   // r15 R15-A duplicate preflight (READ-ONLY): the partial unique index
+   // enforcing "at most one AVAILABLE receipt per relatedTransactionId"
+@@ -238,7 +262,9 @@
+     throw err;
+   }
+ 
+-  for (const statement of STATEMENTS) {
++  // The shared wallet-column DDL runs AFTER the CREATE TABLE statements above, so
++  // it can never execute against a table that does not exist yet.
++  for (const statement of [...STATEMENTS, ...statementsFromSqlFile(WALLET_COLUMN_SQL)]) {
+     try {
+       await prisma.$executeRawUnsafe(statement);
+     } catch (err) {
