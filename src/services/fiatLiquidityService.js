@@ -1148,6 +1148,32 @@ async function confirmTreasuryOpening(tx, {
         linkedWitnessId = witness.id;
     }
 
+    // §WP-I — A WITNESS IS NOT PROMOTABLE WHILE ITS EVIDENCE IS UNDER
+    // RECONCILIATION. The witness path refuses to WRITE a witness over an open
+    // unresolved case; this is the other half: a witness that was written first,
+    // before the case existed, must not later unlock spendable GHS while that
+    // case is still open. Both reasons are blocking, so a case recorded after the
+    // witness (the witness-wins interleaving) still parks the promotion.
+    if (observation.providerRef) {
+        const openCase = await tx.$queryRawUnsafe(
+            `SELECT "entityId", "reason"
+               FROM "ReconciliationException"
+              WHERE "status" = 'OPEN'
+                AND "reason" IN ('PROVIDER_EVIDENCE_WITHOUT_CANONICAL_REFERENCE',
+                                 'PROVIDER_EVIDENCE_CONFLICTS_WITH_WITNESS')
+                AND "reference" = $1
+              LIMIT 1`,
+            String(observation.providerRef),
+        );
+        if (Array.isArray(openCase) && openCase.length > 0) {
+            throw new TreasuryFundingEvidenceUnavailableError(
+                '[wp-i] the provider evidence behind this treasury opening is under operator reconciliation for a '
+                + 'customer deposit; it cannot be promoted to spendable GHS until that case is adjudicated',
+                { dedupKey, reason: openCase[0].reason, caseDepositId: openCase[0].entityId },
+            );
+        }
+    }
+
     const claim = await tx.fiatLiquidityReceipt.updateMany({
         where: { id: receipt.id, status: 'RECEIVED' },
         data: { status: 'AVAILABLE', confirmedAt: new Date() },

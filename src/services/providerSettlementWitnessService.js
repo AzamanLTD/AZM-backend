@@ -33,6 +33,7 @@
 
 const crypto = require('crypto');
 const { claimProviderObservation, CLAIM_PURPOSE } = require('./providerObservationClaimService');
+const { acquireObservationArbitration } = require('./observationArbitration');
 
 /** Currencies this witness layer can prove. GHS only, deliberately. */
 const WITNESS_CURRENCIES = Object.freeze(['GHS']);
@@ -330,6 +331,19 @@ async function assertNoUnresolvedEvidenceCase(tx, identifiers) {
 }
 
 async function recordProviderSettlementWitness(tx, input = {}) {
+  // §WP-I — ARBITRATION BEFORE EVIDENCE. The guard below READS open unresolved
+  // cases; a read alone cannot stop a case writer committing in the same instant.
+  // Both writers take the same transaction-scoped advisory lock, so one of them
+  // always observes the other's committed result. The lock is taken here, after
+  // any provider I/O has already returned, and released by COMMIT/ROLLBACK.
+  await acquireObservationArbitration(tx, {
+    provider: input.provider || 'moolre',
+    walletAccount: input.walletAccount ?? null,
+    reference: input.externalref
+      || input.reference
+      || (input.requestParams && input.requestParams.externalref)
+      || null,
+  });
   // §WP-I CASE B, before anything else: unresolved evidence cannot fund a witness.
   await assertNoUnresolvedEvidenceCase(tx, [
     input.externalref,
