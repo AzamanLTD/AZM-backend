@@ -73,6 +73,17 @@ describe('§WP-H payout claim races (real PostgreSQL, two backends)', () => {
             INSERT INTO "SystemFiatPool" (id, balance, "updatedAt")
             VALUES (1, 100000, now())
             ON CONFLICT (id) DO UPDATE SET balance = 100000, "updatedAt" = now()`);
+        // The authority headroom gate reads FiatLiquidityState.availableGhs, not
+        // SystemFiatPool.balance. Seeding only the pool made this suite depend on
+        // liquidity an earlier suite in the same database happened to leave behind
+        // (fresh database: AUTHORITY_HEADROOM_BELOW_THRESHOLD, zero dispatches).
+        // Seed the projection the gate actually reads, and zero the reserved and
+        // in-transit columns so no ambient reservation can authorise a payout.
+        await admin.$executeRawUnsafe(`
+            INSERT INTO "FiatLiquidityState" (id, "availableGhs", "reservedGhs", "inTransitGhs", "updatedAt")
+            VALUES (1, 100000, 0, 0, now())
+            ON CONFLICT (id) DO UPDATE SET "availableGhs" = 100000, "reservedGhs" = 0,
+                "inTransitGhs" = 0, "updatedAt" = now()`);
     }, 40000);
 
     afterAll(async () => {
