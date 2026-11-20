@@ -815,6 +815,25 @@ async function main() {
                 .map((q) => q.split('\n').filter((l) => !l.trim().startsWith('--')).join('\n').trim())
                 .filter(Boolean);
 
+            // ── §WP-I CUT-OVER GUARD ─────────────────────────────────────
+            // This installer still derives the LEGACY identity. The live writers
+            // now file wallet-scoped v2 claims, and the two key shapes do not
+            // collide — so a backfill that wrote v1 against a v2 database would
+            // hand one payment two identities. It refuses instead, until it is
+            // migrated, rather than leaving a second writer running.
+            {
+                const v2 = await prisma.$queryRawUnsafe(
+                    `SELECT 1 AS x FROM "ProviderObservationClaim" WHERE "observationKey" LIKE '%|v2|%' LIMIT 1`,
+                );
+                if (Array.isArray(v2) && v2.length > 0) {
+                    throw new Error(
+                        '[wp-i] the claim table already holds wallet-scoped (v2) identities and this backfill still '
+                        + 'derives the legacy key. Refusing to write a second identity for the same payment. '
+                        + 'Migrate this installer to the wallet-scoped key before running it.',
+                    );
+                }
+            }
+
             // ONE transaction: DDL, every claim, every quarantine row — or none.
             await prisma.$transaction(async (tx) => {
                 await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '" + STATEMENT_TIMEOUT_MS + "ms'");

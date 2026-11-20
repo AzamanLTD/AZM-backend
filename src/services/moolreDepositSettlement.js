@@ -152,7 +152,8 @@ async function settleMoolreDeposit(prisma, {
     const observationClaim = await claimProviderObservation(tx, {
       provider: providerEvent.provider || 'moolre',
       reference: externalRef,
-      accountNumber: providerEvent.accountNumber || null,
+      // The wallet comes from the PERSISTED observation, never from the payload.
+      accountNumber: providerEvent.walletAccount || null,
       purpose: CLAIM_PURPOSE.CUSTOMER_DEPOSIT,
       claimedByRef: String(deposit.id),
     });

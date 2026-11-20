@@ -24,6 +24,7 @@
  */
 const logger = require('../../src/config/logger');
 const fiatLiquidity = require('./fiatLiquidityService');
+const { trustedCollectionWallet } = require('./moolreTrustedWallet');
 const settlementCore = require('./moolreDepositSettlement');
 const { getPersistedTransactionQuoteExact } = require('./transactionQuoteService');
 const { recordReconciliationException } = require('../../services/reconciliationExceptionService');
@@ -187,6 +188,7 @@ async function resolvePendingDeposit({ prisma, moolre, transactionHistoryId }) {
             dedupKey: `event:moolre-collection:${deposit.txHash}`,
             amountGhs: observedAmount,
             relatedReference: deposit.txHash,
+            walletAccount: trustedCollectionWallet(),
             raw: { source: 'STATUS_QUERY', ...statusData },
         });
         const settlementProviderRef = await settlementCore.reconcileSettlementProviderRef(prisma, {
@@ -226,6 +228,7 @@ async function resolvePendingDeposit({ prisma, moolre, transactionHistoryId }) {
             dedupKey: `event:moolre-status:${deposit.txHash}:FAILED`,
             amountGhs: observedAmount,
             relatedReference: deposit.txHash,
+            walletAccount: trustedCollectionWallet(),
             raw: { source: 'STATUS_QUERY', ...statusData },
         });
         const failed = await prisma.transactionHistory.updateMany({

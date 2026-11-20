@@ -457,6 +457,11 @@ async function enrichReceiptProviderRef(tx, existing, incomingProviderRef) {
 async function recordProviderEvent(prisma, {
     provider, rail = null, direction, status, providerRef = null, dedupKey,
     amountGhs = null, relatedReference = null, raw = null,
+    // §WP-I: the TRUSTED wallet that received this payment, from server-side
+    // configuration — never from the provider payload's accountnumber and never
+    // from a caller body. NULL means unknown, and a wallet-scoped claim refuses
+    // rather than guessing one.
+    walletAccount = null,
 }) {
     if (!['INBOUND', 'OUTBOUND'].includes(direction)) {
         throw new InvalidEvidenceError(`[fiatLiquidity] invalid direction: ${direction}`);
@@ -482,6 +487,7 @@ async function recordProviderEvent(prisma, {
             providerRef: providerRef == null ? null : String(providerRef),
             amountGhs: amount,
             relatedReference: relatedReference == null ? null : String(relatedReference),
+            walletAccount: walletAccount == null ? null : String(walletAccount).trim(),
             raw: raw ?? undefined,
         });
         const diffs = observationSemanticDiffs(
@@ -529,6 +535,7 @@ async function recordProviderEvent(prisma, {
                 dedupKey,
                 amountGhs: amount,
                 relatedReference: relatedReference == null ? null : String(relatedReference),
+                walletAccount: walletAccount == null ? null : String(walletAccount).trim(),
                 raw: raw ?? undefined,
             },
         });
