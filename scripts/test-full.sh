@@ -55,6 +55,10 @@ if ! compose exec -T postgres psql -U postgres -d postgres -tAc \
   compose exec -T postgres createdb -U postgres azm_saved_service_accounts_test
 fi
 
+# The suite's documented test contract (.env.test): a disposable signing
+# secret and test mode. Neither is a credential for any real environment.
+export NODE_ENV=test
+export JWT_SECRET="test-full-disposable-signing-secret-not-for-any-deployment"
 export DATABASE_URL TEST_DATABASE_URL="$DATABASE_URL"
 export SAVED_ACCOUNTS_TEST_DATABASE_URL="$SAVED_ACCOUNTS_URL"
 export AZM_RELEASE_TARGET_POLICY=disposable-postgres
