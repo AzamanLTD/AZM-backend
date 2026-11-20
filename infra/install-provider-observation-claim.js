@@ -156,6 +156,9 @@ const SQL_FILE = path.join(__dirname, 'sql', 'provider-observation-claim.sql');
 const MOOLRE_SUCCESS_STATUS = 'SUCCESSFUL';
 const MOOLRE_EVENT_PREFIX = 'event:moolre-collection:';
 
+// Bounded so a pathological history cannot hold the claim-writer locks forever.
+const STATEMENT_TIMEOUT_MS = Number(process.env.WP_I_BACKFILL_STATEMENT_TIMEOUT_MS || 900000);
+
 function referenceFromWitness(row) {
     const params = row.requestParams && typeof row.requestParams === 'object' ? row.requestParams : {};
     for (const candidate of [params.id, params.reference, params.externalref]) {
@@ -814,6 +817,7 @@ async function main() {
 
             // ONE transaction: DDL, every claim, every quarantine row — or none.
             await prisma.$transaction(async (tx) => {
+                await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '" + STATEMENT_TIMEOUT_MS + "ms'");
                 for (const statement of statements) await tx.$executeRawUnsafe(statement);
 
                 const selection = await selectCandidates(tx);
