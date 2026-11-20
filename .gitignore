@@ -78,3 +78,6 @@ conversations/
 # Local Redis persistence artifact
 dump.rdb
 *.rdb
+
+# disposable TLS fixture for the redis-tls compose profile
+docker/test-tls/
