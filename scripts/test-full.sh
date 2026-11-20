@@ -30,6 +30,11 @@ cleanup() {
 }
 trap cleanup EXIT
 
+if [ ! -x node_modules/.bin/jest ]; then
+  echo "[test-full] installing dependencies"
+  npm ci
+fi
+
 echo "[test-full] starting postgres and redis"
 if [ "${AZM_TEST_REDIS_TLS:-0}" = "1" ]; then
   compose --profile tls up -d postgres redis-tls
