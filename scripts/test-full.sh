@@ -5,7 +5,37 @@
 #   1. brings up PostgreSQL 15 and Redis in Docker (disposable, no host state);
 #   2. creates the databases the suites need;
 #   3. bootstraps the greenfield baseline exactly as CI does (prisma db push);
-#   4. runs the REAL release chain (`npm run release` — every installer in
+# Bootstrap mirrors the CI lane exactly: db push for the greenfield schema,
+# then the 23 overlays in the same order test.yml applies them. The production
+# release chain is deliberately NOT used here — it converges an existing
+# production-shaped branch and its drift remediation removes greenfield tables.
+for overlay in \
+  infra/install-wallet-address-overlay.js \
+  infra/install-custody-execution-overlay.js \
+  infra/install-custody-accounting-overlay.js \
+  infra/install-transaction-quote-overlay.js \
+  infra/install-r19-smartroute-execution-snapshot-overlay.js \
+  infra/install-r42-idempotency-overlay.js \
+  infra/install-payment-requests-overlay.js \
+  infra/install-payout-reconciliation-infra.js \
+  infra/install-fiat-liquidity-overlay.js \
+  infra/install-model-b-settlement-overlay.js \
+  infra/install-ghs-wallet-overlay.js \
+  infra/install-native-ghs-settlement-overlay.js \
+  infra/install-native-ghs-withdrawal-overlay.js \
+  infra/install-business-os-overlay.js \
+  infra/install-retail-checkout-integrity.js \
+  infra/install-business-price-overlay.js \
+  infra/install-business-currency-overlay.js \
+  infra/install-admin-money-settings-overlay.js \
+  infra/install-dine-in-currency-overlay.js \
+  infra/install-marketplace-discovery-overlay.js \
+  infra/install-business-offered-categories-overlay.js \
+  infra/install-provider-observation-claim.js \
+  infra/install-app-unlock-totp-claim.js ; do
+  echo "[test-full] ${overlay}"
+  node "$overlay"
+done
 #      package.json order) under the release target guard, which refuses any
 #      target that is not explicitly declared disposable;
 #   5. runs the full jest suite serially (--runInBand is the CI contract);
