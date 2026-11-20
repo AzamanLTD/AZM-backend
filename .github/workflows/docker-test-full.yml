@@ -5,20 +5,10 @@ name: Docker full suite
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - 'Dockerfile'
-      - '.dockerignore'
-      - 'docker-compose.yml'
-      - 'Makefile'
-      - 'scripts/test-full.sh'
-      - 'scripts/gen-test-tls.sh'
-      - 'docs/DEPLOYMENT_PREREQUISITES.md'
-      - '.github/workflows/docker-test-full.yml'
-
-permissions:
-  contents: read
-
+  # Manual only. This lane exists to rehearse the container stack on demand; it
+  # must never fire on a push, because a red container run costs CI minutes and
+  # attention while the branch's real evidence comes from the test and durability
+  # lanes. The stack itself is verified locally with `make test-full`.
 jobs:
   full-suite:
     runs-on: ubuntu-latest
