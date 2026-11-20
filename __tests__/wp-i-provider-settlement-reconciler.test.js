@@ -120,7 +120,7 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
     // Paired with the wallet binding: an answer to a DIFFERENT question is not
     // evidence about this opening, even when wallet and amount agree.
     test('a provider answer naming a DIFFERENT reference cannot vouch for this opening', async () => {
-        await seedOpening(OPENING_A, { walletAccount: 'WALLET-AZM-1' });
+        await seedOpening(OPENING_A, { walletAccount: '0244000001' });
         stubProvider({ externalref: 'MREF-SOMEBODY-ELSE' });
 
         const results = await reconciler.reconcileTreasuryOpenings({ openingDedupKeys: [OPENING_A] });
@@ -133,7 +133,7 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
     // Transport timeout: the provider never answered. An unanswered question is
     // not a failure and is certainly not success — it must produce no witness.
     test('a provider call that times out never becomes a witness', async () => {
-        await seedOpening(OPENING_A, { walletAccount: 'WALLET-AZM-1' });
+        await seedOpening(OPENING_A, { walletAccount: '0244000001' });
         const timeout = new Error('The operation was aborted due to timeout');
         timeout.name = 'TimeoutError';
         global.fetch = jest.fn().mockRejectedValue(timeout);
@@ -149,7 +149,7 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
     });
 
     test('a provider answer for a DIFFERENT wallet cannot vouch for this opening', async () => {
-        await seedOpening(OPENING_A, { walletAccount: 'WALLET-AZM-1' });
+        await seedOpening(OPENING_A, { walletAccount: '0244000001' });
         // Settled, correct amount, correct reference — but another wallet's money.
         stubProvider({ accountnumber: 'WALLET-SOMEBODY-ELSE' });
 
@@ -161,7 +161,7 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
     });
 
     test('a malformed currency map refuses every opening instead of guessing GHS', async () => {
-        await seedOpening(OPENING_A, { walletAccount: 'WALLET-AZM-1' });
+        await seedOpening(OPENING_A, { walletAccount: '0244000001' });
         stubProvider({});
         process.env.WITNESS_ACCOUNT_CURRENCY_MAP = '{not json';
 
@@ -176,7 +176,7 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
         await prisma.fiatLiquidityReceipt.create({
             data: {
                 provider: 'MOOLRE', dedupKey: OPENING_A, amountGhs: 99, status: 'RECEIVED',
-                providerRef: null, walletAccount: 'WALLET-AZM-1',
+                providerRef: null, walletAccount: '0244000001',
                 // The runtime can write this. It is not evidence of a payment.
                 evidence: { fundingReference: 'INVENTED-BY-RUNTIME' },
             },
@@ -192,7 +192,7 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
 
     // ── The wallet comes from the opening, never from a claim or the environment ──
     test('the wallet account is read from the opening row, not from evidence JSON', async () => {
-        await seedOpening(OPENING_A, { walletAccount: 'WALLET-FROM-COLUMN' });
+        await seedOpening(OPENING_A, { walletAccount: '0244000003' });
         stubProvider({ accountnumber: 'WALLET-FROM-COLUMN' });
         delete process.env.AZM_RECONCILER_ACCOUNT_NUMBER;
         process.env.WITNESS_ACCOUNT_CURRENCY_MAP = JSON.stringify({ 'WALLET-FROM-COLUMN': 'GHS' });
@@ -210,7 +210,7 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
                 provider: 'MOOLRE', dedupKey: OPENING_A, amountGhs: 99, status: 'RECEIVED',
                 providerRef: PROVIDER_REF,
                 // A claim inside evidence is exactly what must NOT be trusted.
-                evidence: { walletAccount: 'WALLET-AZM-1' },
+                evidence: { walletAccount: '0244000001' },
             },
         });
         stubProvider({});
@@ -224,7 +224,7 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
     });
 
     test('a reconciler pinned to a different wallet refuses instead of querying it', async () => {
-        await seedOpening(OPENING_A, { walletAccount: 'WALLET-AZM-1' });
+        await seedOpening(OPENING_A, { walletAccount: '0244000001' });
         stubProvider({});
         process.env.AZM_RECONCILER_ACCOUNT_NUMBER = 'WALLET-SOMEONE-ELSE';
 
@@ -241,7 +241,7 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
         await prisma.providerSettlementWitness.create({
             data: {
                 openingDedupKey: OPENING_A, observationKey: 'backfill-obs', provider: 'MOOLRE',
-                fundingType: 'COLLECTION', witnessKind: 'TYPE1_STATUS', walletAccount: 'WALLET-BACKFILLED',
+                fundingType: 'COLLECTION', witnessKind: 'TYPE1_STATUS', walletAccount: '0244000005',
                 currency: 'GHS', netPesewas: 9900n, providerState: 'SETTLED',
                 endpoint: 'https://api.moolre.com/open/transact/status', requestParams: {},
                 rawResponseDigest: 'digest', rawResponse: '{}', fetchedAt: new Date(),
@@ -335,7 +335,7 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
         // leaves a FiatProviderEvent keyed event:moolre-collection:<externalref>
         // and NO witness row, so a witness-only single-use check would let the
         // same money be counted twice. This is the real anti-replay proof.
-        await seedOpening(OPENING_A, { walletAccount: 'WALLET-AZM-1' });
+        await seedOpening(OPENING_A, { walletAccount: '0244000001' });
         await prisma.fiatProviderEvent.create({
             data: {
                 provider: 'MOOLRE', rail: 'MOMO', direction: 'INBOUND', status: 'FUNDED',
@@ -392,7 +392,7 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
             rawResponse: raw,
             providerPayload: { txstatus: 1, externalref: 'REF-DIR', accountnumber: 'WALLET-AZM-1', value: '100.00', amount: '102.00' },
             fetchedAt: new Date(),
-            walletAccount: 'WALLET-AZM-1',
+            walletAccount: '0244000001',
             currencyMapping: { 'WALLET-AZM-1': 'GHS' },
         }));
 
@@ -446,7 +446,7 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
                 data: { txstatus: 1, externalref: PROVIDER_REF, accountnumber: 'WALLET-AZM-1', value: '99.00', amount: '100.00' },
             }),
             fetchedAt: new Date(),
-            walletAccount: 'WALLET-AZM-1',
+            walletAccount: '0244000001',
             currencyMapping: { 'WALLET-AZM-1': 'GHS' },
         }))).rejects.toMatchObject({ code: 'WITNESS_FUNDING_TYPE_UNSUPPORTED' });
 
@@ -461,7 +461,7 @@ describeOrSkip('WP-I provider settlement reconciler (real PostgreSQL, stubbed pr
             data: {
                 provider: 'MOOLRE', dedupKey: OPENING_A, amountGhs: 99, status: 'RECEIVED',
                 providerRef: PROVIDER_REF,
-                walletAccount: 'WALLET-UNMAPPED',
+                walletAccount: '0244000002',
                 evidence: { fundingReference: PROVIDER_REF },
             },
         });

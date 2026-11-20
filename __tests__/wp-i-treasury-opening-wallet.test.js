@@ -56,10 +56,10 @@ describeDb('WP-I treasury opening wallet binding (real PostgreSQL)', () => {
     test('an explicit provider-derived wallet is recorded as given', async () => {
         const { receipt } = await record({
             provider: 'MOOLRE', dedupKey: 'treasury:wallet-explicit',
-            amountGhs: 50, treasury: true, walletAccount: 'WALLET-EXPLICIT',
+            amountGhs: 50, treasury: true, walletAccount: '0244000004',
         });
 
-        expect(receipt.walletAccount).toBe('WALLET-EXPLICIT');
+        expect(receipt.walletAccount).toBe('0244000004');
     });
 
     test('an internal liquidation has no wallet and never borrows one', async () => {
