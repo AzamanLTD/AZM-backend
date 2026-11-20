@@ -26,6 +26,38 @@ const { protect, adminOnly } = require('../../middleware/authMiddleware');
  * }} deps
  */
 function mountHealthRoutes(app, { prisma, workerStatus, redisStatusRef, APP_VERSION, IS_PRODUCTION }) {
+  // GET /healthz — LIVENESS only. Never touches a dependency: a process that
+  // can answer this is alive even while the database is down, so an orchestrator
+  // restarts a wedged process instead of flapping on a database blip.
+  app.get('/healthz', (req, res) => {
+    res.status(200).json({ status: 'ok', version: APP_VERSION });
+  });
+
+  // GET /readyz — READINESS. The database is the readiness gate. Redis is
+  // reported and gates readiness only when REDIS_REQUIRED=1 (see
+  // docs/DEPLOYMENT_PREREQUISITES.md); a deployment that treats Redis as
+  // optional must not lose the whole fleet to a cache outage.
+  app.get('/readyz', async (req, res) => {
+    const checks = {
+      database: 'unknown',
+      redis: redisStatusRef ? redisStatusRef() : 'not_configured',
+    };
+    try {
+      await prisma.$queryRaw`SELECT 1`;
+      checks.database = 'connected';
+    } catch (_) {
+      checks.database = 'unavailable';
+    }
+    const redisRequired = String(process.env.REDIS_REQUIRED || '').toLowerCase() === '1';
+    const redisOk = ['connected', 'ready', 'not_configured'].includes(String(checks.redis).toLowerCase());
+    const ready = checks.database === 'connected' && (!redisRequired || redisOk);
+    res.status(ready ? 200 : 503).json({
+      status: ready ? 'ready' : 'not_ready',
+      checks,
+      version: APP_VERSION,
+    });
+  });
+
   // GET /health — DB liveness probe + optional system stats.
   app.get('/health', async (req, res) => {
     try {

@@ -1,0 +1,10 @@
+node_modules
+.git
+.github
+coverage
+*.log
+.env
+.env.*
+!.env.example
+incoming_files
+tmp

@@ -1,0 +1,90 @@
+# §WP-H §8 — disposable, reproducible full-suite stack.
+#
+# PostgreSQL 15 is the major version the money paths are written and measured
+# against. The schema is NOT established with `prisma db push` alone:
+# `scripts/test-full.sh` bootstraps the greenfield baseline the same way CI
+# does, then runs the real release chain (`npm run release`, every installer in
+# package.json order) under the release target guard with
+# AZM_RELEASE_TARGET_POLICY=disposable-postgres.
+#
+# Profiles:
+#   default  postgres + redis (plain)            -> make test-full
+#   tls      adds redis-tls (TLS-only listener)   -> make test-full-tls
+#   api      builds and runs the API image        -> docker compose --profile api up
+name: azm-backend-test
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: azm_test
+    ports:
+      - "55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d azm_test"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "56379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  # TLS-only listener. Certificates come from `make tls-certs` (a local CA and a
+  # server certificate with SANs for localhost/redis-tls). Nothing here is a
+  # real secret: the fixture proves verification is ON, not to protect data.
+  redis-tls:
+    profiles: ["tls"]
+    image: redis:7-alpine
+    command:
+      - redis-server
+      - --port
+      - "0"
+      - --tls-port
+      - "6379"
+      - --tls-cert-file
+      - /tls/server.crt
+      - --tls-key-file
+      - /tls/server.key
+      - --tls-ca-cert-file
+      - /tls/ca.crt
+      - --tls-auth-clients
+      - "no"
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+    volumes:
+      - ./docker/test-tls:/tls:ro
+    ports:
+      - "56380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "--tls", "--cacert", "/tls/ca.crt", "-h", "localhost", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  api:
+    profiles: ["api"]
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: development
+      PORT: "10000"
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/azm_test?schema=public
+      REDIS_URL: redis://redis:6379
+    ports:
+      - "10000:10000"
