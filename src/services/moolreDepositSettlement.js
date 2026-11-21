@@ -31,6 +31,7 @@ const {
     LATE_DEPOSIT_SETTLEMENT_GRACE_MS,
 } = require('../config/lateDepositSettlement');
 const { claimProviderObservation, CLAIM_PURPOSE } = require('./providerObservationClaimService');
+const { trustedCollectionWallet } = require('./moolreTrustedWallet');
 const fiatLiquidity = require('./fiatLiquidityService');
 const modelBSettlement = require('../../services/modelBSettlementService');
 const nativeGhsSettlement = require('../../src/services/nativeGhsSettlementService'); // GHS-native collection settlement (flag-gated, #369)
@@ -153,7 +154,15 @@ async function settleMoolreDeposit(prisma, {
       provider: providerEvent.provider || 'moolre',
       reference: externalRef,
       // The wallet comes from the PERSISTED observation, never from the payload.
-      accountNumber: providerEvent.walletAccount || null,
+      // When the persisted evidence predates the wallet column (walletAccount
+      // NULL — historical rows, or an observation first written by a path that
+      // did not know its wallet) the only permitted substitute is the wallet WE
+      // are configured to collect into: server-side configuration, never the
+      // callback body and never the provider payload. Without this the claim
+      // refuses and a genuine collection cannot settle even though the server
+      // knows its own wallet; with a caller-supplied fallback it could be
+      // steered into another identity, which is exactly what the rule prevents.
+      accountNumber: providerEvent.walletAccount || trustedCollectionWallet() || null,
       purpose: CLAIM_PURPOSE.CUSTOMER_DEPOSIT,
       claimedByRef: String(deposit.id),
     });

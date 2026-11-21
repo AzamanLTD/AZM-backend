@@ -33,6 +33,7 @@
 
 const crypto = require('crypto');
 const { claimProviderObservation, CLAIM_PURPOSE } = require('./providerObservationClaimService');
+const { trustedCollectionWallet } = require('./moolreTrustedWallet');
 const { acquireObservationArbitration } = require('./observationArbitration');
 
 /** Currencies this witness layer can prove. GHS only, deliberately. */
@@ -641,7 +642,12 @@ async function recordProviderSettlementWitness(tx, input = {}) {
     // the stored opening — never the account the provider response claims. The
     // witness's account/currency mapping is already validated against it above,
     // and this is the identity that must agree across the deposit path too.
-    accountNumber: opening.walletAccount ?? null,
+    // Same rule as the deposit path: stored evidence first, and when the
+    // opening predates the wallet column the ONE wallet we are configured to
+    // collect into (server-side config, never provider payload). Both paths must
+    // resolve an unknown wallet the same way or the unique index would see two
+    // different identities for one payment and could not arbitrate.
+    accountNumber: opening.walletAccount ?? trustedCollectionWallet() ?? null,
     purpose: CLAIM_PURPOSE.TREASURY_WITNESS,
     claimedByRef: openingDedupKey,
   });
