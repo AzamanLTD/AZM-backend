@@ -306,11 +306,28 @@ function settledAmountFromProviderPayload(payload) {
 async function assertNoUnresolvedEvidenceCase(tx, identifiers) {
   const ids = [...new Set((identifiers || []).filter((v) => typeof v === 'string' && v.trim() !== ''))];
   if (ids.length === 0) return;
-  if (typeof tx.$queryRawUnsafe !== 'function') return;
+
+  // FAIL CLOSED. This guard is the witness path's half of the "one payment, one
+  // economic use" invariant. A client that cannot run the query, or a database
+  // without the case table, means the check cannot be performed — and an
+  // unperformed integrity check must never read as "no conflict found".
+  if (typeof tx.$queryRawUnsafe !== 'function') {
+    throw new WitnessError(
+      'WITNESS_EVIDENCE_UNVERIFIABLE',
+      '[wp-i] this client cannot read unresolved reconciliation cases, so the witness cannot prove it is not consuming disputed evidence',
+      {},
+    );
+  }
 
   const table = await tx.$queryRawUnsafe(`SELECT to_regclass('"ReconciliationException"')::text AS t`);
   const present = Array.isArray(table) && table[0] && table[0].t;
-  if (!present) return;
+  if (!present) {
+    throw new WitnessError(
+      'WITNESS_EVIDENCE_UNVERIFIABLE',
+      '[wp-i] the reconciliation case table is absent, so the witness cannot prove it is not consuming disputed evidence',
+      {},
+    );
+  }
 
   const rows = await tx.$queryRawUnsafe(
     `SELECT "entityId", "reason", "details"
@@ -331,27 +348,9 @@ async function assertNoUnresolvedEvidenceCase(tx, identifiers) {
 }
 
 async function recordProviderSettlementWitness(tx, input = {}) {
-  // §WP-I — ARBITRATION BEFORE EVIDENCE. The guard below READS open unresolved
-  // cases; a read alone cannot stop a case writer committing in the same instant.
-  // Both writers take the same transaction-scoped advisory lock, so one of them
-  // always observes the other's committed result. The lock is taken here, after
-  // any provider I/O has already returned, and released by COMMIT/ROLLBACK.
-  await acquireObservationArbitration(tx, {
-    provider: input.provider || 'moolre',
-    walletAccount: input.walletAccount ?? null,
-    reference: input.externalref
-      || input.reference
-      || (input.requestParams && input.requestParams.externalref)
-      || null,
-  });
-  // §WP-I CASE B, before anything else: unresolved evidence cannot fund a witness.
-  await assertNoUnresolvedEvidenceCase(tx, [
-    input.externalref,
-    input.reference,
-    input.requestParams && input.requestParams.externalref,
-    input.openingDedupKey,
-  ]);
-
+  // WHO may write comes before WHAT the evidence says: a caller that is not the
+  // reconciler is refused on authority alone, and must not learn anything about
+  // the evidence state from the shape of the error.
   assertReconcilerContext();
 
   const {
@@ -395,6 +394,28 @@ async function recordProviderSettlementWitness(tx, input = {}) {
       `[wp-i] treasury opening ${openingDedupKey} does not exist; the reconciler never queries for a reference it was handed`
     );
   }
+
+  // §WP-I — ARBITRATION BEFORE EVIDENCE, and AFTER the opening is known.
+  // The order is deliberate: authority first, then "does this opening exist",
+  // then "is its evidence disputed". A caller learns only the first refusal that
+  // applies to it, and the case table is never consulted for an opening that is
+  // not even real. The lock is transaction-scoped and taken after any provider
+  // I/O has returned, so it is never held across the network.
+  await acquireObservationArbitration(tx, {
+    provider: input.provider || 'moolre',
+    walletAccount: input.walletAccount ?? null,
+    reference: input.externalref
+      || input.reference
+      || (input.requestParams && input.requestParams.externalref)
+      || null,
+  });
+  // §WP-I CASE B: unresolved evidence cannot fund a witness.
+  await assertNoUnresolvedEvidenceCase(tx, [
+    input.externalref,
+    input.reference,
+    input.requestParams && input.requestParams.externalref,
+    input.openingDedupKey,
+  ]);
 
   if (!TRUSTED_FUNDING_PROVIDERS.includes(String(provider))) {
     throw new WitnessError(

@@ -37,6 +37,11 @@ describeDB('§WP-I observation arbitration (two real sessions)', () => {
 
     beforeAll(async () => {
         process.env.AZM_RECONCILER_MODE = '1';
+        // The reconciler must present its OWN provider credential, so the writer
+        // authority check passes before the evidence check is reached. These are
+        // fixtures: no live provider credential is used anywhere in this suite.
+        process.env.AZM_RECONCILER_PROVIDER_USER = 'fixture-reconciler-user';
+        process.env.AZM_RECONCILER_PROVIDER_PUBKEY = 'fixture-reconciler-pubkey';
         a = new PrismaClient();
         b = new PrismaClient();
         await a.$connect();
@@ -52,7 +57,10 @@ describeDB('§WP-I observation arbitration (two real sessions)', () => {
     test('the lock blocks a second session until the first transaction ends', async () => {
         const identity = { provider: 'moolre', walletAccount: '0244000001', reference: REF };
         const key = coordinationKey(identity);
-        expect(key).toBe(`wp-i:arb:moolre:0244000001:${REF}`);
+        // The wallet is deliberately NOT in the coordination key: a Case B has no
+        // wallet and must still contend with a witness that does.
+        expect(key).toBe(`wp-i:arb:moolre:${REF}`);
+        expect(coordinationKey({ provider: 'moolre', reference: REF })).toBe(key);
 
         // Session A holds the lock inside an open transaction.
         const held = await a.$transaction(async (tx) => {
@@ -81,6 +89,15 @@ describeDB('§WP-I observation arbitration (two real sessions)', () => {
 
     test('Ordering A — a committed unresolved case makes the witness refuse', async () => {
         const reference = `${REF}-a`;
+        // The opening must pre-exist: authority is checked first, then whether the
+        // opening is real, then whether its evidence is disputed. The case guard is
+        // therefore only reachable for an opening that exists.
+        await a.fiatLiquidityReceipt.create({
+            data: {
+                provider: 'MOOLRE', dedupKey: `opening-${RUN}-a`, amountGhs: '120.00',
+                status: 'RECEIVED', providerRef: reference, walletAccount: '0244000001',
+            },
+        });
         await a.$executeRawUnsafe(
             `INSERT INTO "ReconciliationException" ("entityType","entityId","reference","reason","status","details")
              VALUES ('DEPOSIT_FIAT',$1,$2,'PROVIDER_EVIDENCE_WITHOUT_CANONICAL_REFERENCE','OPEN','{}'::jsonb)`,
@@ -90,6 +107,7 @@ describeDB('§WP-I observation arbitration (two real sessions)', () => {
         await expect(b.$transaction((tx) => recordProviderSettlementWitness(tx, {
             openingDedupKey: `opening-${RUN}-a`,
             provider: 'moolre',
+            fundingType: 'COLLECTION',
             externalref: reference,
             walletAccount: '0244000001',
         }))).rejects.toMatchObject({ code: 'WITNESS_EVIDENCE_UNDER_RECONCILIATION' });

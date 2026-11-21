@@ -33,7 +33,10 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
     const { spawnSync, spawn } = require('child_process');
     const { insertClaimOrVerify, PreexistingClaimConflict, readExistingClaims } = require('../infra/install-provider-observation-claim');
     const path = require('path');
-    const { canonicalObservationIdentity } = require('../src/services/providerObservationIdentity');
+    const { canonicalObservationIdentityV2 } = require('../src/services/providerObservationIdentity');
+    // The one wallet every fixture event carries, so the backfill and the live
+    // claim derive the same identity for the same payment.
+    const WALLET = '0244000000';
     const { claimProviderObservation, CLAIM_PURPOSE } = require('../src/services/providerObservationClaimService');
 
     const REPO = path.join(__dirname, '..');
@@ -41,7 +44,7 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
 
     const tag = `bf${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
     const ref = (n) => `${tag}-${n}`;
-    const key = (r) => canonicalObservationIdentity({ provider: 'moolre', reference: r }).observationKey;
+    const key = (r, wallet = WALLET) => canonicalObservationIdentityV2({ provider: 'moolre', reference: r, accountNumber: wallet }).observationKey;
 
     const R_DIRECT = ref('direct');
     const R_GENERIC = ref('generic');
@@ -143,7 +146,9 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
     }
 
     const claimsFor = (refs) => prisma.providerObservationClaim.findMany({
-        where: { observationKey: { in: refs.map(key) } },
+        // NOT refs.map(key): map passes the index as the second argument, which
+        // would arrive as the wallet.
+        where: { observationKey: { in: refs.map((r) => key(r)) } },
         select: { observationKey: true, purpose: true, claimedByRef: true, provider: true, accountKey: true },
     });
     // CASE A — an ownerless QUARANTINE row is a claim like any other: it is what
@@ -176,6 +181,7 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
                 dedupKey: `event:moolre-collection:${reference}`,
                 amountGhs: '120.00',
                 relatedReference: txHash || null,
+                walletAccount: WALLET,
                 raw: { status: 1 },
             },
         });
@@ -271,6 +277,7 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
             data: {
                 provider: 'MOOLRE', rail: 'MOMO', direction: 'INBOUND', status: 'SUCCESSFUL',
                 dedupKey: `event:moolre-collection:${tag}-tx-noref`, amountGhs: '120.00', relatedReference: `${tag}-tx-noref`,
+                walletAccount: WALLET,
             },
         });
 
@@ -323,7 +330,8 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
                 data: {
                     openingDedupKey: `${tag}-opening-dup-${n}`, provider: 'MOOLRE',
                     fundingType: 'COLLECTION', witnessKind: 'payment_status_lookup',
-                    walletAccount: '0244000001', currency: 'GHS',
+                    // The same wallet the assertions derive keys from.
+                    walletAccount: WALLET, currency: 'GHS',
                     netPesewas: 12000n, grossPesewas: 12000n, providerState: 'settled',
                     endpoint: '/payment/status', requestParams: { id: R_DUP_WITNESSES },
                     rawResponseDigest: `digest-d${n}`, rawResponse: JSON.stringify({ status: 1 }), fetchedAt: new Date(),
@@ -376,7 +384,7 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
             prisma.fiatProviderEvent.create({
                 data: {
                     provider: 'MOOLRE', rail: 'MOMO', direction: 'INBOUND', status: 'SUCCESSFUL',
-                    providerRef, dedupKey, amountGhs: '120.00', relatedReference, raw: { status: 1 },
+                    providerRef, dedupKey, amountGhs: '120.00', relatedReference, walletAccount: WALLET, raw: { status: 1 },
                 },
             });
 
@@ -442,7 +450,7 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
                 data: {
                     provider: 'MOOLRE', rail: 'MOMO', direction: 'INBOUND', status: 'SUCCESSFUL',
                     providerRef, dedupKey: dedupKey || `event:moolre-collection:${externalRef}`,
-                    amountGhs: '120.00', relatedReference, raw: { status: 1 },
+                    amountGhs: '120.00', relatedReference, walletAccount: WALLET, raw: { status: 1 },
                 },
             });
 
@@ -607,7 +615,7 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
 
     test('the key the backfill writes is byte-identical to the key the live claim takes', async () => {
         for (const reference of [R_DIRECT, R_GENERIC]) {
-            const live = canonicalObservationIdentity({ provider: 'moolre', reference }).observationKey;
+            const live = canonicalObservationIdentityV2({ provider: 'moolre', reference, accountNumber: WALLET }).observationKey;
             const row = await prisma.providerObservationClaim.findUnique({ where: { observationKey: live } });
             expect(row).not.toBeNull();
             expect(row.purpose).toBe('CUSTOMER_DEPOSIT');
@@ -661,7 +669,7 @@ run('§WP-I — provider-observation claim backfill (real PostgreSQL, real metad
         for (const purpose of [CLAIM_PURPOSE.CUSTOMER_DEPOSIT, CLAIM_PURPOSE.TREASURY_WITNESS]) {
             await expect(
                 prisma.$transaction((tx) => claimProviderObservation(tx, {
-                    provider: 'moolre', reference: R_COLLIDE, purpose, claimedByRef: `${purpose}-after-quarantine`,
+                    provider: 'moolre', accountNumber: WALLET, reference: R_COLLIDE, purpose, claimedByRef: `${purpose}-after-quarantine`,
                 })),
             ).rejects.toMatchObject({ code: 'OBSERVATION_QUARANTINED' });
         }

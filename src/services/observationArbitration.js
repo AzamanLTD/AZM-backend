@@ -15,7 +15,15 @@
 // Both writers take a transaction-scoped PostgreSQL advisory lock on the SAME
 // coordination key before they touch evidence:
 //
-//     wp-i:arb:<provider>:<wallet-or-?>:<reference>
+//     wp-i:arb:<provider>:<reference>
+//
+// THE WALLET IS DELIBERATELY NOT IN THE COORDINATION KEY. A witness knows the
+// trusted wallet; an unresolved Case B does not, by definition. Keying on the
+// wallet would give those two writers DIFFERENT locks for the same provider
+// reference, which is the opposite of arbitration: they would each acquire
+// uncontended and both commit. Coordination is allowed to be more conservative
+// than the economic identity, and this is where it must be — one reference, one
+// lock, regardless of what either writer happens to know about the wallet.
 //
 // `pg_advisory_xact_lock` is released by COMMIT/ROLLBACK, so there is no lock to
 // leak and no unlock to forget. Because both sides take exactly ONE key in a
@@ -46,12 +54,11 @@ function normaliseSegment(value) {
  * Deterministic coordination key. Returns null when there is nothing to
  * coordinate on (no reference), which callers must treat as "not arbitrable".
  */
-function coordinationKey({ provider, walletAccount = null, reference = null } = {}) {
+function coordinationKey({ provider, reference = null } = {}) {
     const p = normaliseSegment(provider);
     const ref = normaliseSegment(reference);
     if (!p || !ref) return null;
-    const wallet = normaliseSegment(walletAccount) || '?';
-    return `${ARB_NAMESPACE}:${p.toLowerCase()}:${wallet}:${ref}`;
+    return `${ARB_NAMESPACE}:${p.toLowerCase()}:${ref}`;
 }
 
 /**
