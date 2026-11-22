@@ -234,7 +234,23 @@ run('WP-F — global TOTP replay protection (real PostgreSQL)', () => {
     });
 
     // ── 7, 8, 9, 10. matched-step boundaries ────────────────────────────────
+    // A code is minted against a captured instant but ACCEPTED against the
+    // server clock at verification time. If a 30s boundary falls inside the
+    // request's latency (hundreds of ms on a loaded CI runner), a code minted
+    // for step-1 is verified at step+1, i.e. delta -2, and is correctly refused
+    // with 401. That is the implementation behaving, not the rule failing; the
+    // harness must simply not mint a code it cannot get verified in the same
+    // step. Wait for a step with room, then mint.
+    const freshStep = async (minRemainingMs = 5000) => {
+        const stepMs = STEP_SECONDS * 1000;
+        const remaining = stepMs - (Date.now() % stepMs);
+        if (remaining < minRemainingMs) {
+            await new Promise((resolve) => setTimeout(resolve, remaining + 50));
+        }
+    };
+
     test('7. a previous-window code is claimed at the PREVIOUS step', async () => {
+        await freshStep();
         const { user, secret } = await makeUser();
         // The code and the expected step come from the SAME captured instant, so
         // a 30s edge falling mid-test cannot make them disagree.
@@ -247,6 +263,7 @@ run('WP-F — global TOTP replay protection (real PostgreSQL)', () => {
     });
 
     test('8. a current-window code is claimed at the CURRENT step', async () => {
+        await freshStep();
         const { user, secret } = await makeUser();
         // The code and the expected step come from the SAME captured instant, so
         // a 30s edge falling mid-test cannot make them disagree.
@@ -258,6 +275,7 @@ run('WP-F — global TOTP replay protection (real PostgreSQL)', () => {
     });
 
     test('9. a next-window code is accepted by the existing policy and claimed at the NEXT step', async () => {
+        await freshStep();
         const { user, secret } = await makeUser();
         // The code and the expected step come from the SAME captured instant, so
         // a 30s edge falling mid-test cannot make them disagree.
@@ -269,6 +287,7 @@ run('WP-F — global TOTP replay protection (real PostgreSQL)', () => {
     });
 
     test('10. an already-claimed adjacent step cannot be reused inside its window', async () => {
+        await freshStep();
         const { user, secret } = await makeUser();
         const previousCode = codeAt(secret, -1);
         expect((await post('/mfa/wired', { totpToken: previousCode }, user)).status).toBe(200);
