@@ -153,6 +153,14 @@ const {
     legacyObservationKey,
 } = require('../src/services/providerObservationIdentity');
 const { acquireObservationArbitration } = require('../src/services/observationArbitration');
+// §WP-I: the Case B writer is a PRODUCTION function, not inline backfill code.
+// The backfill calls it, and the two-session concurrency proof drives the same
+// function against the settlement-witness writer — so the proof exercises the
+// writer the product actually runs, not a test-only duplicate of it.
+const {
+    recordUnresolvedEvidenceCase,
+    mergeCaseDetails,
+} = require('../src/services/unresolvedEvidenceCaseService');
 
 const SQL_FILE = path.join(__dirname, 'sql', 'provider-observation-claim.sql');
 
@@ -213,29 +221,6 @@ function agreedWallet(candidates) {
 //   * a scalar that was absent is filled in when a later run learns it;
 //   * every key present in either side survives.
 const MERGE_UNION_KEYS = ['evidenceIds', 'ties', 'ownerIds', 'candidateReferences', 'providerEventIds'];
-
-function mergeCaseDetails(existing, incoming) {
-    const base = (existing && typeof existing === 'object' && !Array.isArray(existing)) ? existing : {};
-    const next = (incoming && typeof incoming === 'object' && !Array.isArray(incoming)) ? incoming : {};
-    const out = { ...base };
-
-    for (const key of MERGE_UNION_KEYS) {
-        const a = Array.isArray(base[key]) ? base[key] : [];
-        const b = Array.isArray(next[key]) ? next[key] : [];
-        if (a.length === 0 && b.length === 0) continue;
-        out[key] = [...new Set([...a.map(String), ...b.map(String)])].sort();
-    }
-
-    for (const [key, value] of Object.entries(next)) {
-        if (MERGE_UNION_KEYS.includes(key)) continue;
-        const current = out[key];
-        const empty = current === undefined || current === null || current === '';
-        if (empty && value !== undefined && value !== null && value !== '') out[key] = value;
-    }
-
-    out.lastMergedAt = new Date().toISOString();
-    return out;
-}
 
 function depositProviderRefOrNull(a, b) {
     const x = String(a || '').trim();
@@ -1048,60 +1033,19 @@ async function main() {
                     }
                 }
                 for (const c of selection.unresolvedEvidenceCases) {
-                    // ── ARBITRATION BEFORE EVIDENCE ─────────────────────────
-                    // The witness writer takes this same lock on the same
-                    // provider reference. Taking it here, before the case row is
-                    // read or written, is what makes the two writers serialize
-                    // instead of each reading "nothing yet" and both committing.
-                    // The key deliberately excludes the wallet, because a Case B
-                    // has none by definition and must still contend with a
-                    // witness that does.
-                    await acquireObservationArbitration(tx, {
-                        provider: 'moolre',
-                        reference: c.providerRef || c.txHash || null,
-                    });
-
-                    const incoming = {
+                    // The production Case B writer takes the wallet-independent
+                    // arbitration lock BEFORE reading or writing the case, so this
+                    // serializes against the settlement-witness writer instead of
+                    // letting both observe "nothing yet" and both commit. It also
+                    // accumulates evidence rather than replacing it.
+                    await recordUnresolvedEvidenceCase(tx, {
+                        depositId: c.depositId,
+                        reason: c.reason,
                         ties: c.ties,
                         providerRef: c.providerRef,
                         txHash: c.txHash,
                         evidenceIds: c.evidenceIds,
-                        note: 'Moolre evidence is tied to this completed deposit but no canonical observation key can be established. No claim was created and no owner was chosen; resolve with independent evidence.',
-                    };
-
-                    // ── EVIDENCE IS ACCUMULATED, NEVER REPLACED ─────────────
-                    // A second run observes new events, owners and contradictions.
-                    // Overwriting details would erase what the first run proved, so
-                    // the existing case is read under FOR UPDATE (we already hold
-                    // the arbitration lock) and merged deterministically:
-                    // identifiers union without duplicates, first-seen values stay,
-                    // and distinct conflicting evidence is never dropped.
-                    const existingRows = await tx.$queryRawUnsafe(
-                        `SELECT "details" FROM "ReconciliationException"
-                          WHERE "entityType" = 'DEPOSIT_FIAT' AND "entityId" = $1
-                            AND "reason" = $2 AND "status" = 'OPEN'
-                          FOR UPDATE`,
-                        c.depositId, c.reason,
-                    );
-                    const existing = Array.isArray(existingRows) && existingRows[0]
-                        ? existingRows[0].details : null;
-
-                    if (!existing) {
-                        await tx.$executeRawUnsafe(
-                            `INSERT INTO "ReconciliationException" ("entityType","entityId","reference","reason","status","details")
-                             VALUES ('DEPOSIT_FIAT',$1,$2,$3,'OPEN',$4::jsonb)`,
-                            c.depositId, c.providerRef, c.reason, JSON.stringify(incoming),
-                        );
-                    } else {
-                        const merged = mergeCaseDetails(existing, incoming);
-                        await tx.$executeRawUnsafe(
-                            `UPDATE "ReconciliationException"
-                                SET "details" = $3::jsonb, "lastSeenAt" = now()
-                              WHERE "entityType" = 'DEPOSIT_FIAT' AND "entityId" = $1
-                                AND "reason" = $2 AND "status" = 'OPEN'`,
-                            c.depositId, c.reason, JSON.stringify(merged),
-                        );
-                    }
+                    });
                     out.unresolvedCasesEnsured += 1;
                 }
 
