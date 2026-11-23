@@ -47,8 +47,23 @@ It prints machine-readable per-opening results, for example:
 }
 ```
 
-Exit codes: `0` processed (witnessed or truthfully refused), `1` usage or missing
-credential, `2` fatal error.
+### Exit codes (the contract monitoring relies on)
+
+| Code | Name | Meaning |
+| --- | --- | --- |
+| `0` | `EXIT_ALL_WITNESSED` | Every requested opening now has a durable witness row. |
+| `1` | `EXIT_INVALID` | Invalid invocation, or a required credential/configuration value is missing or invalid. Nothing was attempted. |
+| `2` | `EXIT_FATAL` | Fatal process/database/initialization failure. The batch could not be attempted to completion. |
+| `3` | `EXIT_INCOMPLETE` | The batch **completed**, but one or more openings were refused, pending, unknown, mismatched or otherwise not witnessed. |
+
+A refusal is a correctly handled result, but it is **not** proof of funding. Only
+`0` may be read as "every requested opening is witnessed". `3` means the run was
+honest and incomplete: read the per-opening `reason` in the JSON on stdout. An
+empty result set is `3`, never a vacuous `0`.
+
+Earlier versions returned `0` for both cases (`every(...) ? 0 : 0`), so a batch in
+which nothing was witnessed exited successfully — a monitoring integration reading
+that code would have concluded the treasury had been reconciled.
 
 `netPesewas` is emitted as a decimal **string** — exact money is a BigInt and must
 never pass through a float.

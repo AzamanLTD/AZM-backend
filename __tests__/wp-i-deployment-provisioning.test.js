@@ -108,7 +108,13 @@ describe('WP-I reconciler operator entrypoint', () => {
 
     test('with a complete environment the process actually starts and reports per-opening truth', () => {
         const r = runCli(['OPENING-DOES-NOT-EXIST'], COMPLETE_ENV);
-        expect(r.code).toBe(0);
+        // §WP-I EXIT CONTRACT: an opening that does not exist is REFUSED, and a
+        // refusal is not a successful reconciliation run. This assertion used to
+        // expect 0 — it encoded the very defect (`every(...) ? 0 : 0`) that made
+        // a batch with zero witnesses exit successfully. Exit 0 now means every
+        // requested opening is witnessed; a completed batch containing a refusal
+        // is 3.
+        expect(r.code).toBe(3);
         const out = JSON.parse(r.stdout);
         expect(Array.isArray(out.results)).toBe(true);
         expect(out.results[0].witnessed).toBe(false);

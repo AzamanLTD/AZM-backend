@@ -67,7 +67,11 @@ wallets with one service per wallet, each with its own credentials.
 - **Start command:** `node workers/run-provider-settlement-reconciler.js`
 - **Replicas:** 1. Concurrency is settled by the database, but there is no reason to run two.
 - **Auto-deploy:** off. Deploy deliberately, after the API's schema is applied.
-- **Health:** the process exits non-zero when it refuses; there is no long-running daemon.
+- **Health:** there is no long-running daemon. Exit codes are the health signal:
+  `0` all requested openings witnessed; `1` invalid invocation or credentials;
+  `2` fatal failure; `3` batch completed but at least one opening was not
+  witnessed. Alert on `2` immediately and on `3` as an incomplete run that needs
+  an operator, never as success. Only `0` is proof that the openings are funded.
 
 ## 5. Operating it
 
