@@ -70,6 +70,14 @@ const STATEMENTS = [
   `CREATE UNIQUE INDEX IF NOT EXISTS "FiatLiquidityReceipt_dedupKey_key"
      ON "FiatLiquidityReceipt"("dedupKey");`,
   `CREATE INDEX IF NOT EXISTS "FiatLiquidityReceipt_status_idx" ON "FiatLiquidityReceipt"("status");`,
+  // WP-I: the wallet account an opening's money lands in, as a real column.
+  // Nullable so existing rows survive; the reconciler refuses a null rather
+  // than guessing, and the backfill below fills it from witnessed evidence.
+  `ALTER TABLE "FiatLiquidityReceipt" ADD COLUMN IF NOT EXISTS "walletAccount" TEXT`,
+  `CREATE INDEX IF NOT EXISTS "FiatLiquidityReceipt_walletAccount_idx" ON "FiatLiquidityReceipt"("walletAccount")`,
+  `UPDATE "FiatLiquidityReceipt" r SET "walletAccount" = w."walletAccount"
+     FROM "ProviderSettlementWitness" w
+    WHERE w."openingDedupKey" = r."dedupKey" AND r."walletAccount" IS NULL`,
   `CREATE INDEX IF NOT EXISTS "FiatLiquidityReceipt_provider_providerRef_idx"
      ON "FiatLiquidityReceipt"("provider", "providerRef");`,
   `CREATE INDEX IF NOT EXISTS "FiatLiquidityReceipt_relatedTransactionId_idx"

@@ -709,7 +709,7 @@ async function verifyDepositEvidenceChain(tx, {
 async function recordReceipt(tx, {
     provider, rail = null, providerRef = null, dedupKey, amountGhs,
     route = null, reference = null, relatedTransactionId = null, evidence = null, treasury = false,
-    eventDedupKey = null, quoteId = null,
+    eventDedupKey = null, quoteId = null, walletAccount = null,
 }) {
     if (!provider || !dedupKey) {
         throw new InvalidEvidenceError('[fiatLiquidity] provider and dedupKey are required receipt evidence');
@@ -777,12 +777,29 @@ async function recordReceipt(tx, {
     // VALID — the loser re-reads the authoritative row in the SAME
     // transaction, validates the full identity and converges with ZERO
     // liquidity mutation.
+    // WP-I: which wallet holds this opening's money. Taken from the caller only when
+    // it IS provider evidence; otherwise derived server-side from the linked provider
+    // observation's stored payload. Never inferred, and never defaulted to something.
+    // An internal treasury liquidation legitimately has no wallet and stays NULL —
+    // it is not reconcilable against a provider payment, and the reconciler refuses it.
+    let openingWalletAccount = walletAccount == null ? null : String(walletAccount).trim();
+    if (!openingWalletAccount && treasury && eventDedupKey != null) {
+        const observed = await tx.$queryRaw`
+            SELECT raw -> 'data' ->> 'accountnumber' AS account
+              FROM "FiatProviderEvent"
+             WHERE "dedupKey" = ${String(eventDedupKey)}
+             LIMIT 1`;
+        const derived = observed && observed[0] ? observed[0].account : null;
+        openingWalletAccount = derived == null ? null : String(derived).trim();
+    }
+    if (openingWalletAccount === '') openingWalletAccount = null;
+
     const id = crypto.randomUUID();
     const claimed = await tx.$executeRaw`
         INSERT INTO "FiatLiquidityReceipt" (
             "id", "provider", "rail", "providerRef", "dedupKey", "amountGhs", "status",
             "route", "reference", "eventDedupKey", "relatedTransactionId", "confirmedAt",
-            "evidence", "createdAt", "updatedAt"
+            "walletAccount", "evidence", "createdAt", "updatedAt"
         ) VALUES (
             ${id}, ${String(provider)}, ${rail == null ? null : String(rail)},
             ${providerRef == null ? null : String(providerRef)}, ${String(dedupKey)},
@@ -792,6 +809,7 @@ async function recordReceipt(tx, {
             ${eventDedupKey == null ? null : String(eventDedupKey)},
             ${relatedTransactionId == null ? null : String(relatedTransactionId)},
             ${status === 'AVAILABLE' ? new Date() : null},
+            ${openingWalletAccount},
             ${evidence == null ? null : JSON.stringify(evidence)}::jsonb,
             CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
         )
@@ -1029,6 +1047,7 @@ async function confirmTreasuryOpening(tx, {
     dedupKey, confirmedBy = null, providerEventDedupKey = null,
 }) {
     await ensureStateRow(tx);
+    let linkedWitnessId = null;
     const receipt = await tx.fiatLiquidityReceipt.findUnique({ where: { dedupKey } });
     if (!receipt) throw new InvalidEvidenceError(`[fiatLiquidity] unknown receipt identity ${dedupKey}`);
     if (receipt.status === 'AVAILABLE') return { receipt, replay: true };
@@ -1098,6 +1117,35 @@ async function confirmTreasuryOpening(tx, {
             `[fiatLiquidity] observation ${observation.dedupKey} is already bound to ${observation.relatedReference} `
             + `and cannot also fund ${dedupKey}`
         );
+    }
+
+    // ── WP-I: the validated observation still is not proof of real money ────
+    // Every check above reads columns this application's own runtime identity
+    // can write. Treasury funding therefore ALSO requires an independently
+    // fetched provider settlement witness for this opening, bound to the
+    // FUNDING provider (observation.provider) — a treasury receipt carries the
+    // internal AZM_TREASURY marker, which no provider would ever witness.
+    // No witness → no AVAILABLE. Fail closed.
+    // WP-I is the default: a treasury opening cannot become AVAILABLE on the
+    // strength of an application-authored FiatProviderEvent alone. Set
+    // AZM_WP_I_WITNESS_REQUIRED=0 only to reproduce pre-WP-I behaviour, which
+    // is exactly the forgery WP-I exists to close.
+    if (process.env.AZM_WP_I_WITNESS_REQUIRED !== '0') {
+        const { findWitnessForOpening } = require('./providerSettlementWitnessService');
+        const { ghsToPesewas } = require('./providerSettlementWitnessService');
+        const witness = await findWitnessForOpening(tx, {
+            openingDedupKey: receipt.dedupKey,
+            provider: observation.provider,
+            openingPesewas: ghsToPesewas(receipt.amountGhs.toString()),
+        });
+        if (!witness) {
+            throw new TreasuryFundingEvidenceUnavailableError(
+                '[wp-i] treasury funding requires an independently fetched provider settlement witness for this '
+                + 'opening. A provider event row is application-authored evidence and cannot unlock spendable GHS.',
+                { dedupKey, receiptAmountGhs: receipt.amountGhs?.toString() ?? null, fundingProvider: observation.provider },
+            );
+        }
+        linkedWitnessId = witness.id;
     }
 
     const claim = await tx.fiatLiquidityReceipt.updateMany({
