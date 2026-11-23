@@ -27,6 +27,7 @@ async function revokeDefaultPrivileges(prisma, role, applied) {
            AND a.grantee <> ${oidSub()}
          GROUP BY 1,2,3,4`, role);
     let count = 0;
+    const schemas = new Set();
     for (const r of rows || []) {
         const kind = ACL_KINDS[r.defaclobjtype];
         if (!kind) continue;
@@ -35,7 +36,22 @@ async function revokeDefaultPrivileges(prisma, role, applied) {
         await prisma.$executeRawUnsafe(
             `ALTER DEFAULT PRIVILEGES FOR ROLE ${q(role)}${scope} REVOKE ALL ON ${kind} FROM ${grantee}`);
         applied.push(`revoked default ${kind}${scope || ' (global)'} from ${grantee || 'PUBLIC'}`);
+        if (r.nspname) schemas.add(r.nspname);
         count += 1;
+    }
+    // A FUNCTIONS entry that grants nothing to anyone else disappears from
+    // pg_default_acl entirely, and a missing entry means PostgreSQL's
+    // BUILT-IN default applies — which for functions is EXECUTE to PUBLIC.
+    // Revoking the poison therefore restores the very grant it removed
+    // unless an explicit protective entry is recorded. Do that for the
+    // global scope and for every schema the poison lived in.
+    await prisma.$executeRawUnsafe(
+        `ALTER DEFAULT PRIVILEGES FOR ROLE ${q(role)} REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`);
+    applied.push('recorded default FUNCTIONS without PUBLIC execute (global)');
+    for (const schema of schemas) {
+        await prisma.$executeRawUnsafe(
+            `ALTER DEFAULT PRIVILEGES FOR ROLE ${q(role)} IN SCHEMA ${q(schema)} REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC`);
+        applied.push(`recorded default FUNCTIONS without PUBLIC execute in ${schema}`);
     }
     return count;
 }
