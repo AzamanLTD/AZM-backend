@@ -19,7 +19,9 @@ const {
 } = require('../src/services/totpStepClaimService');
 
 const restrictedObligations = require('../services/restrictedObligationService');
-const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
+const _exact = (n) => (n instanceof Prisma.Decimal
+    ? n.toFixed(8)
+    : new Prisma.Decimal(String(n)).toFixed(8));
 
 /**
  * 1. REQUEST WITHDRAWAL (The Address Detective)
@@ -35,15 +37,16 @@ exports.requestWithdrawal = async (req, res) => {
         // digit-length-guessed.
         const { amount, destination, destinationType, networkPref } = req.body;
         const userId = req.user.id;
-        const withdrawAmount = parseFloat(amount);
-        // The exact value of what the client sent, kept separately: legacy math
-        // below stays as it is, but a guard must not measure a double.
+        // The exact value of what the client sent. There is no double in the
+        // money path: validation, the balance CAS, the fees, the ledger and the
+        // durable row all read this one Decimal.
         const withdrawAmountExact = requestAmountExact(amount);
 
         // 1. Basic Validation
         // r42: provably pre-economics failures — the claim (if any) is released
         // so the key stays reusable; nothing was executed.
-        if (!withdrawAmount || withdrawAmount <= 0) {
+        const requestedDec = withdrawAmountExact ? new Prisma.Decimal(withdrawAmountExact) : null;
+        if (!requestedDec || requestedDec.lte(0)) {
             res.locals.financialClaimRelease = true;
             return res.status(400).json({ success: false, message: "Invalid amount." });
         }
@@ -75,9 +78,19 @@ exports.requestWithdrawal = async (req, res) => {
         if (!settings) throw new Error("Global settings offline.");
 
         // --- Phase ADMIN-CONTROL-2 FIX 2: Read crypto platform fee ---
-        const cryptoPlatformFeePct = Number(settings?.cryptoPlatformFeePct ?? 0);
-        const platformFeeUsdc = parseFloat((withdrawAmount * cryptoPlatformFeePct).toFixed(6));
-        const netAfterPlatformFee = withdrawAmount - platformFeeUsdc;
+        // EXACT ECONOMICS. The request text is the only authority for what the
+        // customer asked to move; every fee, split and posting below is derived
+        // from this Decimal and never from the double. The fee keeps the
+        // established scale (6dp) and half-up rounding that toFixed(6) applied.
+        const amountDec = requestedDec;
+        const cryptoPlatformFeePctDec = new Prisma.Decimal(String(settings?.cryptoPlatformFeePct ?? 0));
+        const platformFeeUsdcDec = amountDec
+            .mul(cryptoPlatformFeePctDec)
+            .toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP);
+        const netAfterPlatformFeeDec = amountDec.minus(platformFeeUsdcDec);
+        // Legacy names retained for the response/serialisation paths below.
+        const platformFeeUsdc = platformFeeUsdcDec.toNumber();
+        const netAfterPlatformFee = netAfterPlatformFeeDec.toNumber();
 
         // --- PAYOUT CLASSIFICATION (resolved above; no silent guessing) ---
         let totalGasFee = 0.0;
@@ -105,8 +118,8 @@ exports.requestWithdrawal = async (req, res) => {
             // demanded a fresh rate for this class, so the rate read here
             // is gate-vetted; the split verdict mirrors finance.service).
             const rateExact = new Prisma.Decimal(String(settings?.liveRetailRate ?? 0));
-            // EXACT REQUEST AMOUNT: `String(withdrawAmount)` is the text of a
-            // double, so the pesewa boundary was decided on an approximation.
+            // EXACT REQUEST AMOUNT: the pesewa boundary is decided on the
+            // request text, never on a double approximation.
             // When the request text cannot be read exactly there is nothing
             // trustworthy to measure, so it is refused before any debit.
             if (!withdrawAmountExact) {
@@ -140,9 +153,17 @@ exports.requestWithdrawal = async (req, res) => {
             }
         }
 
-        // Calculate the 50/50 Split!
-        const vendorGasShare = totalGasFee / 2;
-        const adminGasShare = totalGasFee / 2;
+        // 50/50 split, exactly. A gas fee with an odd base unit cannot be halved
+        // at 8dp, so the vendor share takes the floor and the admin share takes
+        // the remainder: the two always sum to the fee, no unit is created or
+        // lost, and the allocation is deterministic.
+        const totalGasFeeDec = new Prisma.Decimal(String(totalGasFee ?? 0));
+        const vendorGasShareDec = totalGasFeeDec
+            .dividedBy(2)
+            .toDecimalPlaces(8, Prisma.Decimal.ROUND_DOWN);
+        const adminGasShareDec = totalGasFeeDec.minus(vendorGasShareDec);
+        const vendorGasShare = vendorGasShareDec.toNumber();
+        const adminGasShare = adminGasShareDec.toNumber();
 
         // 3. Execute the Transaction
         const result = await prisma.$transaction(async (tx) => {
@@ -167,8 +188,8 @@ exports.requestWithdrawal = async (req, res) => {
             // Two racing withdrawal requests: exactly one consumes the funds;
             // the other fails cleanly and orphans nothing.
             const debit = await tx.user.updateMany({
-                where: { id: userId, availableBalance: { gte: withdrawAmount } },
-                data: { availableBalance: { decrement: withdrawAmount } }
+                where: { id: userId, availableBalance: { gte: amountDec } },
+                data: { availableBalance: { decrement: amountDec } }
             });
             if (debit.count !== 1) {
                 const err = new Error("Insufficient balance.");
@@ -177,15 +198,15 @@ exports.requestWithdrawal = async (req, res) => {
             }
 
             // --- Phase ADMIN-CONTROL-2 FIX 2: Credit platform fee ---
-            if (platformFeeUsdc > 0) {
+            if (platformFeeUsdcDec.gt(0)) {
                 await tx.systemProfitFees.upsert({
                     where: { id: 1 },
-                    update: { balance: { increment: platformFeeUsdc } },
-                    create: { id: 1, balance: platformFeeUsdc }
+                    update: { balance: { increment: platformFeeUsdcDec } },
+                    create: { id: 1, balance: platformFeeUsdcDec }
                 });
                 await tx.adminProfitLog.create({
                     data: {
-                        amountUsdc: platformFeeUsdc,
+                        amountUsdc: platformFeeUsdcDec,
                         source: 'CRYPTO_WITHDRAWAL_FEE',
                         relatedTxId: `crypto_pfee_${userId}_${Date.now()}`
                     }
@@ -196,13 +217,13 @@ exports.requestWithdrawal = async (req, res) => {
             const withdrawal = await tx.withdrawal.create({
                 data: {
                     userId: userId,
-                    amount: withdrawAmount,
+                    amount: amountDec,
                     payoutMethod: payoutMethod,
                     network: detectedNetwork,
                     destination: cleanDest,
-                    totalGasFee: totalGasFee,
-                    vendorGasShare: vendorGasShare,
-                    adminGasShare: adminGasShare,
+                    totalGasFee: totalGasFeeDec,
+                    vendorGasShare: vendorGasShareDec,
+                    adminGasShare: adminGasShareDec,
                     status: "PENDING"
                 }
             });
@@ -227,8 +248,7 @@ exports.requestWithdrawal = async (req, res) => {
             //                               increment above)
             // reserve + fee === full debit exactly (8dp), and the restricted
             // obligation total stays equal to the reserves ledger balance.
-            const reserveNet = new Prisma.Decimal(_exact(withdrawAmount))
-                .minus(new Prisma.Decimal(_exact(platformFeeUsdc)));
+            const reserveNet = amountDec.minus(platformFeeUsdcDec);
             const reservation = await ledger.post(tx, {
                 idempotencyKey: `ledger:wallet:withdrawal:${withdrawal.id}`,
                 entryType: 'WITHDRAWAL',
@@ -240,14 +260,14 @@ exports.requestWithdrawal = async (req, res) => {
                     status: 'PENDING',
                     payoutMethod,
                     network: detectedNetwork,
-                    platformFeeUsdc: _exact(platformFeeUsdc),
-                    totalGasFee: _exact(totalGasFee),
+                    platformFeeUsdc: platformFeeUsdcDec.toFixed(8),
+                    totalGasFee: totalGasFeeDec.toFixed(8),
                 },
                 lines: [
-                    { account: `user:${userId}:liability`, debit: _exact(withdrawAmount) },
+                    { account: `user:${userId}:liability`, debit: amountDec.toFixed(8) },
                     { account: 'restricted:reserves', credit: reserveNet.toFixed(8) },
-                    ...(platformFeeUsdc > 0
-                        ? [{ account: 'equity:treasury', credit: _exact(platformFeeUsdc) }]
+                    ...(platformFeeUsdcDec.gt(0)
+                        ? [{ account: 'equity:treasury', credit: platformFeeUsdcDec.toFixed(8) }]
                         : []),
                 ],
             });
