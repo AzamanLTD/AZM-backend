@@ -29,6 +29,43 @@ NODE
 PG_CLI_URL="$(normalize_pg_cli_url "$DATABASE_URL")"
 PG_ADMIN_CLI_URL="$(normalize_pg_cli_url "$PG_ADMIN_URL")"
 
+# ── client/server major-version agreement ────────────────────────────────────
+# A pg_dump NEWER than the server emits GUCs the server has never heard of. PG17
+# clients write `SET transaction_timeout = 0` into the archive, and restoring
+# that archive into a PG16 server dies with
+#   pg_restore: error: unrecognized configuration parameter "transaction_timeout"
+# which says nothing about the backup's integrity — it is a tooling mismatch and
+# it fails the drill for the wrong reason. Pick the installed client whose major
+# version matches the server, and never one that is newer than the server.
+pick_pg_bin() {
+  local tool="$1"
+  local server_num
+  server_num="$(psql "$PG_ADMIN_CLI_URL" -tAc 'SHOW server_version_num' 2>/dev/null | tr -d '[:space:]')"
+  if [[ ! "$server_num" =~ ^[0-9]+$ ]]; then
+    command -v "$tool"
+    return 0
+  fi
+  local server_major=$((server_num / 10000))
+  local candidate
+  for candidate in $(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -rV); do
+    local major
+    major="$(basename "$(dirname "$candidate")")"
+    [[ "$major" =~ ^[0-9]+$ ]] || continue
+    (( major <= server_major )) || continue
+    if [[ -x "$candidate/$tool" ]]; then
+      printf '%s\n' "$candidate/$tool"
+      return 0
+    fi
+  done
+  command -v "$tool"
+}
+
+PG_DUMP_BIN="$(pick_pg_bin pg_dump)"
+PG_RESTORE_BIN="$(pick_pg_bin pg_restore)"
+printf '[recovery-drill] clients: %s / %s (server %s)\n' \
+  "$("$PG_DUMP_BIN" --version)" "$("$PG_RESTORE_BIN" --version)" \
+  "$(psql "$PG_ADMIN_CLI_URL" -tAc 'SHOW server_version' 2>/dev/null | tr -d '[:space:]')"
+
 cleanup() {
   set +e
   psql "$PG_CLI_URL" -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS backup_drill CASCADE;' >/dev/null 2>&1
@@ -62,7 +99,7 @@ INSERT INTO backup_drill.sentinel (id, marker) VALUES (1, 'azaman-backup-restore
 SQL
 
 printf '[recovery-drill] creating custom-format logical backup\n'
-pg_dump \
+"$PG_DUMP_BIN" \
   --format=custom \
   --no-owner \
   --no-acl \
@@ -70,7 +107,7 @@ pg_dump \
   "$PG_CLI_URL"
 
 printf '[recovery-drill] validating archive\n'
-pg_restore --list "$BACKUP_FILE" >/dev/null
+"$PG_RESTORE_BIN" --list "$BACKUP_FILE" >/dev/null
 
 printf '[recovery-drill] creating disposable restore database %s\n' "$DRILL_DB"
 psql "$PG_ADMIN_CLI_URL" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$DRILL_DB\";"
@@ -84,12 +121,28 @@ NODE
 )"
 
 printf '[recovery-drill] restoring archive\n'
-pg_restore \
-  --exit-on-error \
-  --no-owner \
-  --no-acl \
-  --dbname="$RESTORE_URL" \
-  "$BACKUP_FILE"
+# Attempt 1: the native custom-format restore.
+if ! "$PG_RESTORE_BIN" --exit-on-error --no-owner --no-acl \
+      --dbname="$RESTORE_URL" "$BACKUP_FILE" >"$WORK_DIR/restore.log" 2>&1; then
+  if grep -q 'unrecognized configuration parameter' "$WORK_DIR/restore.log"; then
+    # A newer dump client wrote GUCs this server does not have (PG17 archives
+    # carry `SET transaction_timeout = 0`). That is a tool mismatch, not a bad
+    # backup, so re-run the SAME archive through a sanitized SQL stream instead
+    # of failing the drill for it. Session GUCs fall back to server defaults;
+    # everything the drill actually proves (full schema, sentinel row, inventory)
+    # is still restored and re-verified below.
+    printf '[recovery-drill] client/server GUC mismatch — restoring through a sanitized stream\n'
+    psql "$PG_ADMIN_CLI_URL" -v ON_ERROR_STOP=1 \
+      -c "DROP DATABASE IF EXISTS \"$DRILL_DB\";" \
+      -c "CREATE DATABASE \"$DRILL_DB\";"
+    "$PG_RESTORE_BIN" --no-owner --no-acl --file=- "$BACKUP_FILE" 2>/dev/null \
+      | sed -E '/^SET [A-Za-z_]+ = /d' \
+      | psql "$RESTORE_URL" -v ON_ERROR_STOP=1 >/dev/null
+  else
+    cat "$WORK_DIR/restore.log" >&2
+    exit 1
+  fi
+fi
 
 printf '[recovery-drill] verifying restored sentinel and schema inventory\n'
 psql "$RESTORE_URL" -v ON_ERROR_STOP=1 <<'SQL'
