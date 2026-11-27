@@ -240,9 +240,29 @@ async function installAuthorityActivationFunction(prisma, options = {}) {
 module.exports = { installAuthorityActivationFunction, DEFAULTS, FN, TABLE };
 
 if (require.main === module) {
+    // The sanctioned DBA invocation is role-scoped: `--role-scoped`, or any
+    // explicitly named role. (verify-authority-boundary.js recommends exactly
+    // this; the CLI used to ignore argv, so the advice silently did a plain,
+    // non-role-scoped run.) Same parsing rules as the roles installer: a named
+    // flag without a value is a typo and exits 2 before touching the database.
+    const args = process.argv.slice(2);
+    const get = (flag) => {
+        const i = args.indexOf(flag);
+        return i >= 0 && args[i + 1] && !args[i + 1].startsWith('--') ? args[i + 1] : null;
+    };
+    const named = {};
+    for (const [flag, key] of [['--owner', 'tableOwner'], ['--runtime', 'runtime'], ['--operator', 'operator'], ['--function-owner', 'functionOwner']]) {
+        if (args.includes(flag)) named[key] = get(flag);
+    }
+    const missing = Object.entries(named).filter(([, v]) => !v).map(([k]) => k);
+    if (missing.length > 0) {
+        console.error(`[authority-activation-fn] ${missing.join(', ')} was named without a value`);
+        process.exit(2);
+    }
+    if (args.includes('--role-scoped') || Object.keys(named).length > 0) named.roleScoped = true;
     const { PrismaClient } = require('@prisma/client');
     const prisma = new PrismaClient();
-    installAuthorityActivationFunction(prisma, { log: (l) => console.log(`[authority-activation-fn] ${l}`) })
+    installAuthorityActivationFunction(prisma, { ...named, log: (l) => console.log(`[authority-activation-fn] ${l}`) })
         .then((report) => {
             console.log(JSON.stringify({ ok: report.ok, problems: report.problems, applied: report.applied }, null, 2));
             if (!report.ok) process.exitCode = 1;

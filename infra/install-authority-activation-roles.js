@@ -286,7 +286,12 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
               WHERE g.rolname = $1 AND m.rolname <> $1
               ORDER BY m.rolname`,
             grantor
-        ).catch(() => []);
+        ).catch((err) => {
+            // Fail closed. Reading "no members" from a failed catalog query
+            // would let a foreign membership into a protected role survive the
+            // install while the report says it was clean.
+            throw new Error(`could not enumerate members of ${grantor}: ${err.message}`);
+        });
         for (const row of rows) {
             foreignMemberships.push(`${row.member} inherits ${grantor}`);
             await prisma.$executeRawUnsafe(
@@ -304,7 +309,10 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
          UNION ALL
          SELECT unnest(proacl)::text AS acl FROM pg_proc WHERE oid = $2::regproc`,
         TABLE, TRIGGER_FN
-    ).catch(() => []);
+    ).catch((err) => {
+        // Fail closed for the same reason: an unread ACL is not an empty ACL.
+        throw new Error(`could not read the ACLs of ${TABLE} / ${TRIGGER_FN}: ${err.message}`);
+    });
     const foreignGrantees = new Set();
     for (const row of aclRows) {
         const grantee = String(row.acl || '').split('=')[0].replace(/"/g, '');
