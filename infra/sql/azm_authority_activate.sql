@@ -251,7 +251,10 @@ BEGIN
     SELECT count(*) INTO v_count
       FROM public."TransactionHistory" t
      WHERE t."status"::text = ANY(c_blocking)
-       AND t."type"::text IN ('FIAT_DEPOSIT','FIAT_WITHDRAWAL','MOMO_DEPOSIT','MOMO_WITHDRAWAL')
+       -- The real enum value (prisma TransactionType), identical to the JS
+       -- preflight in fiatLiquidityActivationService. The former list named
+       -- types that do not exist, so this blocker could never fire.
+       AND t."type"::text IN ('WITHDRAWAL_FIAT')
        AND NOT EXISTS (SELECT 1 FROM public."FiatLiquidityReservation" r WHERE r."reference" = t."txHash")
        AND NOT EXISTS (SELECT 1 FROM public."Withdrawal" w WHERE w."transactionHistoryId" = t."id");
     IF v_count > 0 THEN
