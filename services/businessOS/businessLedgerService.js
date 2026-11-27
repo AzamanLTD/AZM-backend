@@ -178,7 +178,17 @@ class BusinessLedgerService {
                 throw this._fail(409, 'NOT_REVERSIBLE', 'Reversal entries cannot be reversed.');
             }
 
-            const originalAmount = new Prisma.Decimal(original.amount);
+            // A reversal is the exact negation IN THE ENTRY'S OWN CURRENCY. A
+            // native-GHS row carries its cedis in amountGhs with amount NULL
+            // (ck_businessledgerentry_currency_shape); reading amount threw on
+            // NULL, so no GHS entry could ever be reversed, and a reversal that
+            // dropped currency/amountGhs would have broken the GHS shape check.
+            const isGhs = original.currency === 'GHS';
+            const sourceAmount = isGhs ? original.amountGhs : original.amount;
+            if (sourceAmount === null || sourceAmount === undefined) {
+                throw this._fail(409, 'NOT_REVERSIBLE', 'Entry cannot be reversed.');
+            }
+            const originalAmount = new Prisma.Decimal(sourceAmount);
             if (!originalAmount.isFinite() || originalAmount.isZero()) {
                 throw this._fail(409, 'NOT_REVERSIBLE', 'Entry cannot be reversed.');
             }
@@ -197,14 +207,17 @@ class BusinessLedgerService {
                         type: original.type,
                         category: original.category,
                         description: `Reversal: ${original.description}`.slice(0, 500),
-                        amount: originalAmount.neg(), // exact negation, full Decimal precision
+                        ...(isGhs
+                            ? { currency: 'GHS', amount: null, amountGhs: originalAmount.neg() }
+                            : { currency: original.currency, amount: originalAmount.neg() }), // exact negation, full precision
                         sourceType: original.sourceType,
                         sourceId: original.sourceId,
                         reversalOfId: original.id,
                         metadata: {
                             reversalOf: original.id,
                             reversal: true,
-                            reversedAmount: _fixed(original.amount),
+                            reversedAmount: _fixed(sourceAmount),
+                            ...(isGhs ? { reversedCurrency: 'GHS' } : {}),
                             ...(reason ? { reversalReason: String(reason).slice(0, 500) } : {}),
                         },
                     },
