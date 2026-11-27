@@ -4191,57 +4191,19 @@ router.post('/sync-outbox', requirePermission('orders.manage'), wrap(async (req,
         
         try {
             if (type === 'create_order') {
-                // Check if already processed — scoped to this business's
-                // outbox (§r42: the durable identity is business + customer +
-                // key; a colliding POS action id from ANOTHER business's
-                // outbox is never silently swallowed as "already processed").
-                const existing = await prisma.businessOrder.findFirst({
-                    where: { idempotencyKey, businessProfileId: bpId },
+                // RETIRED. This branch wrote a COMPLETED order (and a ledger
+                // income row) from a client-supplied float total, with a
+                // default customer id of 1, a client-controlled createdAt and
+                // no transaction, bypassing the POS settlement containment
+                // that /pos/order enforces (POS_SETTLEMENT_NOT_ENABLED). The
+                // portal's offline outbox replays through /pos/order, so no
+                // client relies on it. It now records nothing.
+                results.push({
+                    id: idempotencyKey,
+                    status: 'FAILED',
+                    code: 'POS_SYNC_CREATE_RETIRED',
+                    message: 'Offline orders replay through /api/business-os/pos/order. Nothing was recorded.',
                 });
-                if (existing) {
-                    results.push({ id: idempotencyKey, status: 'SYNCED', message: 'Already processed' });
-                    continue;
-                }
-                
-                // Create order (CASH payments bypass escrow)
-                const order = await prisma.businessOrder.create({
-                    data: {
-                        idempotencyKey,
-                        businessProfileId: bpId,
-                        customerId: payload.customerId || 1, // Fallback if guest
-                        amountUsdc: parseFloat(payload.totalAmount || 0),
-                        title: payload.title || 'POS Order',
-                        status: payload.paymentMethod === 'CASH' ? 'COMPLETED' : 'AWAITING_PAYMENT',
-                        orderRef: `POS-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-                        paymentMethod: payload.paymentMethod, // e.g. "CASH"
-                        cashReceived: payload.cashReceived ? parseFloat(payload.cashReceived) : null,
-                        cashChange: payload.cashChange ? parseFloat(payload.cashChange) : null,
-                        createdAt: timestamp ? new Date(timestamp) : new Date(),
-                    }
-                });
-                
-                // If it's a CASH order, record it in Ledger directly so it shows up in Finance
-                if (payload.paymentMethod === 'CASH') {
-                    await prisma.businessLedgerEntry.create({
-                        data: {
-                            businessProfileId: bpId,
-                            amount: parseFloat(payload.totalAmount || 0),
-                            type: 'INCOME',
-                            category: 'POS Sales',
-                            description: `POS Cash Order - ${order.orderRef}`,
-                            sourceType: 'ORDER',
-                            sourceId: order.id,
-                            createdAt: timestamp ? new Date(timestamp) : new Date()
-                        }
-                    });
-                }
-                // Fire webhook event for synced order
-                webhookDispatcher.dispatch(bpId, 'order.created', {
-                    orderId: order.id, orderRef: order.orderRef,
-                    amount: parseFloat(payload.totalAmount || 0),
-                    paymentMethod: payload.paymentMethod,
-                }).catch(() => {});
-                results.push({ id: idempotencyKey, status: 'SYNCED' });
             } else if (type === 'clock_in' || type === 'clock_out') {
                 // Ignore for now or implement similarly
                 results.push({ id: idempotencyKey, status: 'SYNCED' });
