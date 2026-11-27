@@ -69,6 +69,8 @@ const PROVIDER_OUTCOMES = {
 // timeouts, mid-flight resets, 5xx gateways — conservatively UNKNOWN.
 const PROVABLY_PRE_DISPATCH = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
 
+const { mockRefused, warnIfMockInProduction, MOCK_REFUSED_CODE } = require('../src/config/providerModeGuard');
+
 class MoolreCollectionService {
     constructor(opts = {}) {
         this.accountNumber = opts.accountNumber || process.env.MOOLRE_ACCOUNT_NUMBER || null;
@@ -87,6 +89,7 @@ class MoolreCollectionService {
 
         const mode = this.providerMode === 'LIVE' ? `LIVE → ${this.baseUrl}` : 'MOCK';
         logger.info(`[MoolreCollectionService] ${mode}`);
+        warnIfMockInProduction('MoolreCollectionService', this.providerMode);
     }
 
     // ── Internals ─────────────────────────────────────────────────────────────
@@ -190,6 +193,12 @@ class MoolreCollectionService {
         if (!externalRef) throw this._outcomeError('externalRef is required.', PROVIDER_OUTCOMES.NOT_DISPATCHED, { stage: 'INITIATE' });
 
         if (this.providerMode === 'MOCK') {
+            // Production never runs a mock collection: nothing is sent, so the
+            // refusal is provably NOT_DISPATCHED and no deposit is opened.
+            if (mockRefused()) {
+                throw this._outcomeError('MOCK provider refused in production; no collection was initiated.',
+                    PROVIDER_OUTCOMES.NOT_DISPATCHED, { referenceId: externalRef, stage: 'INITIATE', code: MOCK_REFUSED_CODE });
+            }
             const ref = `mock-prov-${Date.now()}`;
             this._mockLedger.set(externalRef, {
                 status: 'PENDING', amount: amountGhs, payer: payerPhone, ref,
@@ -247,7 +256,13 @@ class MoolreCollectionService {
      * Returns the name string, or null if not found. Never throws on "not found".
      */
     async validateName({ payerPhone, network = 'MTN' } = {}) {
-        if (this.providerMode === 'MOCK') return 'MOCK ACCOUNT HOLDER';
+        if (this.providerMode === 'MOCK') {
+            if (mockRefused()) {
+                throw this._outcomeError('MOCK provider refused in production; name lookup was not performed.',
+                    PROVIDER_OUTCOMES.NOT_DISPATCHED, { stage: 'VALIDATE_NAME', code: MOCK_REFUSED_CODE });
+            }
+            return 'MOCK ACCOUNT HOLDER';
+        }
 
         const channel = VALIDATE_CHANNEL_MAP[network.toUpperCase()] ?? VALIDATE_CHANNEL_MAP.MTN;
         const data = await this._post('/open/transact/validate', {
@@ -265,6 +280,13 @@ class MoolreCollectionService {
      */
     async getPaymentStatus({ externalRef } = {}) {
         if (this.providerMode === 'MOCK') {
+            // A mock status would report every deposit as settled. In production
+            // the outcome stays UNRESOLVED: the deposit remains pending and is
+            // never credited from a mock answer.
+            if (mockRefused()) {
+                throw this._outcomeError('MOCK provider refused in production; settlement status is unknown.',
+                    PROVIDER_OUTCOMES.UNKNOWN_OUTCOME, { referenceId: externalRef, stage: 'STATUS_QUERY', code: MOCK_REFUSED_CODE });
+            }
             const entry = this._mockLedger.get(externalRef);
             if (!entry) throw new Error('Unknown reference in MOCK ledger.');
             return { txstatus: 1, externalref: externalRef, amount: entry.amount, payer: entry.payer };
@@ -291,7 +313,13 @@ class MoolreCollectionService {
      * Returns { paymentid, name, qrcode }.
      */
     async createPaymentId({ phone, name, externalRef } = {}) {
-        if (this.providerMode === 'MOCK') return { paymentid: `mock-${Date.now()}`, name };
+        if (this.providerMode === 'MOCK') {
+            if (mockRefused()) {
+                throw this._outcomeError('MOCK provider refused in production; no Payment ID was minted.',
+                    PROVIDER_OUTCOMES.NOT_DISPATCHED, { referenceId: externalRef || null, stage: 'CREATE_PAYMENT_ID', code: MOCK_REFUSED_CODE });
+            }
+            return { paymentid: `mock-${Date.now()}`, name };
+        }
 
         const body = {
             type: 2, phone: this._sanitizeMsisdn(phone),

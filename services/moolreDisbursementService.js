@@ -163,6 +163,8 @@ const STATUS_MAP = {
 // END VERIFY BLOCK — code below is provider-correct and should not need edits.
 // =============================================================================
 
+const { mockRefused, warnIfMockInProduction, MOCK_REFUSED_CODE } = require('../src/config/providerModeGuard');
+
 class MoolreDisbursementService {
     constructor(opts = {}) {
         this.apiUser        = process.env.MOOLRE_API_USER || null;
@@ -192,6 +194,7 @@ class MoolreDisbursementService {
         } else {
             logger.info(`[MoolreDisbursementService] Running in LIVE mode → ${this.baseUrl}`);
         }
+        warnIfMockInProduction('MoolreDisbursementService', this.providerMode);
     }
 
     // ── Public API (mirrors MtnDisbursementService) ───────────────────────────
@@ -269,6 +272,13 @@ class MoolreDisbursementService {
         const channel           = NETWORK_TO_CHANNEL[(network || 'MTN').toUpperCase()] || NETWORK_TO_CHANNEL.MTN;
 
         if (this.providerMode === 'MOCK') {
+            // A mock payout reports success while nothing leaves Azaman. In
+            // production that is refused as provably NOT_DISPATCHED, so the
+            // withdrawal is never marked paid from a mock answer.
+            if (mockRefused()) {
+                throw this._outcomeError('MOCK provider refused in production; no payout was sent.',
+                    PROVIDER_OUTCOMES.NOT_DISPATCHED, { referenceId, stage: 'INITIATE', code: MOCK_REFUSED_CODE });
+            }
             return this._mockInitiateTransfer({
                 referenceId,
                 amountGhs:      amountGhsValue,
@@ -371,6 +381,10 @@ class MoolreDisbursementService {
         }
 
         if (this.providerMode === 'MOCK') {
+            if (mockRefused()) {
+                throw this._outcomeError('MOCK provider refused in production; payout status is unknown.',
+                    PROVIDER_OUTCOMES.UNKNOWN_OUTCOME, { referenceId, stage: 'STATUS_QUERY', code: MOCK_REFUSED_CODE });
+            }
             return this._mockGetTransferStatus(referenceId);
         }
 
