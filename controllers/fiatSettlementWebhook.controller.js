@@ -28,29 +28,22 @@ const constantTimeEqual = (left, right) => {
     return a.length === b.length && crypto.timingSafeEqual(a, b);
 };
 
+// ONE verifier for every Moolre callback (src/services/moolreWebhookAuth): the
+// documented X-Moolre-Signature, or the legacy data.secret until Moolre's
+// sunset; the undocumented static header is accepted outside production only.
+const { verifyMoolreCallback } = require('../src/services/moolreWebhookAuth');
 const authenticateMoolre = (req) => {
-    const secret = process.env.MOOLRE_WEBHOOK_SECRET;
-    if (!secret) return { ok: false, code: 503, message: 'Webhook endpoint is not configured.' };
-
-    const suppliedSecret = req.headers['x-moolre-webhook-secret'];
-    if (typeof suppliedSecret === 'string' && constantTimeEqual(suppliedSecret, secret)) {
-        return { ok: true };
-    }
-
-    const signature = ['x-moolre-signature', 'x-signature', 'x-webhook-signature']
-        .map((header) => req.headers[header])
-        .find((value) => typeof value === 'string' && value.length > 0);
-    if (!signature) return { ok: false, code: 401, message: 'Missing webhook authentication.' };
-
-    const expected = crypto
-        .createHmac('sha256', secret)
-        .update(req.rawBody || '')
-        .digest('hex');
-    return constantTimeEqual(signature, expected)
-        ? { ok: true }
-        : { ok: false, code: 401, message: 'Invalid webhook signature.' };
+    const verdict = verifyMoolreCallback({
+        headers: req.headers,
+        rawBody: req.rawBody,
+        body: req.body,
+        secret: process.env.MOOLRE_WEBHOOK_SECRET,
+    });
+    if (verdict.ok) return { ok: true };
+    return verdict.status === 503
+        ? { ok: false, code: 503, message: 'Webhook endpoint is not configured.' }
+        : { ok: false, code: 401, message: 'Invalid webhook authentication.' };
 };
-
 const authenticateMtn = (req) => {
     const secret = process.env.MTN_WEBHOOK_SECRET;
     if (!secret) return { ok: false, code: 503, message: 'Webhook endpoint is not configured.' };
@@ -60,7 +53,29 @@ const authenticateMtn = (req) => {
 };
 
 const normalizeMoolre = (body) => {
-    const payload = body?.data && typeof body.data === 'object' ? body.data : (body || {});
+    // The transaction state lives in data (or, for a documented payout webhook,
+    // in its single hook's data). The envelope's own status/code describe the
+    // delivery, not the payout: Moolre documents a failed hook carrying
+    // "status": 1, so the envelope is never read as a payout outcome. A body
+    // with no data, or a multi-hook batch, normalises to no status (ignored);
+    // reconciliation then resolves the payout from Transfer Status.
+    const data = body?.data && typeof body.data === 'object' ? body.data : null;
+    let payload = null;
+    if (data && Array.isArray(data.hooks)) {
+        payload = data.hooks.length === 1 && data.hooks[0]?.data && typeof data.hooks[0].data === 'object'
+            ? data.hooks[0].data
+            : null;
+    } else if (data) {
+        payload = data;
+    } else if (body && body.txstatus !== undefined && body.txstatus !== null) {
+        // A flat body carrying the TRANSACTION field txstatus. Moolre's envelope
+        // has no txstatus, so this cannot be the delivery status; only txstatus
+        // is read from it below, never the envelope-level status.
+        payload = { ...body, status: undefined };
+    }
+    if (!payload) {
+        return { reference: null, status: null, providerTxId: null, reason: body?.message || null, amountGhs: null };
+    }
     const rawStatus = payload.txstatus ?? payload.status;
     const upper = String(rawStatus ?? '').toUpperCase();
     let status;
@@ -259,5 +274,7 @@ module.exports = {
     // existing evidence rows are durable history and are never rewritten;
     // new observations converge under the canonical key).
     moolreDisbursementWebhook: handleSettlement('MOOLRE_DISBURSEMENT', authenticateMoolre, normalizeMoolre),
-    mtnDisbursementWebhook: handleSettlement('MTN_MOMO_DISBURSEMENT', authenticateMtn, normalizeMtn)
+    mtnDisbursementWebhook: handleSettlement('MTN_MOMO_DISBURSEMENT', authenticateMtn, normalizeMtn),
+    // Exported for the contract tests of the parser itself.
+    _normalizeMoolre: normalizeMoolre,
 };

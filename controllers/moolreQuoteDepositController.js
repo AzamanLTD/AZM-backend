@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const { verifyMoolreCallback } = require('../src/services/moolreWebhookAuth');
 const { audit } = require('../utils/audit');
 const logger = require('../src/config/logger');
 const ledger = require('../services/ledgerService'); // §P.4 authoritative ledger (shadow journalIntegration no longer used on this path)
@@ -334,30 +335,22 @@ exports.webhook = async (req, res) => {
   let quoteId;
   let settlementProviderRef;
   try {
-    const expectedSecret = process.env.MOOLRE_WEBHOOK_SECRET;
-    if (!expectedSecret) return res.status(503).json({ success: false, message: 'Webhook endpoint not configured.' });
-
-    // ── WP-I matrix case 4: a body that ASSERTS a secret must assert the right
-    // one. Moolre's documented callback contract carries a `secret` field in the
-    // body; previously a caller holding the static header could send a body with
-    // a DIFFERENT secret and still be authenticated, so the payload's own claim
-    // was never checked against the shared secret. Evaluated before any header
-    // credential, so a mismatching body secret is refused even when a header
-    // would otherwise authenticate. Absent body secret = unchanged behaviour.
-    const assertedBodySecret = req.body?.secret;
-    if (assertedBodySecret !== undefined && assertedBodySecret !== null
-        && !safeEqual(String(assertedBodySecret), expectedSecret)) {
-        return res.status(401).json({ success: false, message: 'Unauthorized.' });
+    // ONE verifier for every Moolre callback (src/services/moolreWebhookAuth):
+    // the documented X-Moolre-Signature (t=,v1= over "<t>.<raw body>", 5-minute
+    // window), or the legacy documented data.secret until Moolre's sunset. A
+    // body that asserts a secret must assert the right one (WP-I case 4). The
+    // undocumented static header / bare HMAC are accepted outside production
+    // only.
+    const auth = verifyMoolreCallback({
+      headers: req.headers,
+      rawBody: req.rawBody,
+      body: req.body,
+      secret: process.env.MOOLRE_WEBHOOK_SECRET,
+    });
+    if (!auth.ok) {
+      if (auth.status === 503) return res.status(503).json({ success: false, message: 'Webhook endpoint not configured.' });
+      return res.status(401).json({ success: false, message: 'Unauthorized.' });
     }
-
-    const rawBody = req.rawBody || JSON.stringify(req.body);
-    const signature = req.headers['x-moolre-signature'];
-    let authenticated = signature && safeEqual(
-      signature,
-      crypto.createHmac('sha256', expectedSecret).update(rawBody).digest('hex'),
-    );
-    if (!authenticated) authenticated = safeEqual(req.headers['x-moolre-webhook-secret'], expectedSecret);
-    if (!authenticated) return res.status(401).json({ success: false, message: 'Unauthorized.' });
 
     const { status, code, data } = req.body || {};
     if (Number(status) !== 1 || code !== 'P01') return res.status(200).json({ success: true, message: 'Event acknowledged.' });
