@@ -150,18 +150,24 @@ describe('financial realtime extension contracts', () => {
             payerSatisfied: true,
             payeeSatisfied: false,
         };
+        // markSatisfied is one transaction (§WP-H G): the flag claim and the
+        // PENDING_SETTLEMENT transition commit together. "Committed" is the
+        // moment the transaction resolves, so that is when the state update
+        // counts as complete; the event must not be emitted before it.
         const prisma = {
             smartEscrow: {
                 findUnique: jest.fn()
-                    .mockResolvedValueOnce(escrow)
-                    .mockResolvedValueOnce(pending),
+                    .mockResolvedValueOnce(escrow)    // pre-read
+                    .mockResolvedValueOnce(pending)   // post-claim read (one party)
+                    .mockResolvedValueOnce(pending),  // after PENDING_SETTLEMENT
                 updateMany: jest.fn().mockResolvedValue({ count: 1 }),
-                update: jest.fn(async () => {
-                    stateUpdateComplete = true;
-                    return pending;
-                }),
             },
         };
+        prisma.$transaction = jest.fn(async (fn) => {
+            const out = await fn(prisma);
+            stateUpdateComplete = true;
+            return out;
+        });
 
         const result = await escrowService.markSatisfied(prisma, {
             escrowId: escrow.id,

@@ -16,6 +16,12 @@
 'use strict';
 
 const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+
+// Accepting a trade locks escrow, so the route carries a second factor
+// (require2FA). The vendor has no TOTP, so its factor is its password, as a
+// real client sends it. The fixture therefore stores a real bcrypt hash.
+const VENDOR_PASSWORD = 'TradeVendor1!secure';
 const request = require('supertest');
 const { PrismaClient } = require('@prisma/client');
 
@@ -44,7 +50,7 @@ describeIfDb('#383 trade acceptance is a KYC economic boundary (real PostgreSQL)
             data: {
                 username: `tp_vendor_${RUN}`,
                 email: `tp_vendor_${RUN}@example.test`,
-                password: 'x'.repeat(20),
+                password: await bcrypt.hash(VENDOR_PASSWORD, 4),
                 kycStatus: 'UNVERIFIED',
                 vendorUnallocatedBalance: 100,
                 escrowLockedBalance: 0,
@@ -130,7 +136,7 @@ describeIfDb('#383 trade acceptance is a KYC economic boundary (real PostgreSQL)
             // key. The unverified call got 403 without ever reaching it, which
             // is the ordering being asserted; this call must satisfy it.
             .set('Idempotency-Key', `tp-accept-${RUN}`)
-            .send({ tradeId: trade.id });
+            .send({ tradeId: trade.id, password: VENDOR_PASSWORD });
 
         expect(res.status).toBe(200);
 
