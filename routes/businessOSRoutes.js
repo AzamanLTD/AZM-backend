@@ -3480,10 +3480,12 @@ router.post('/pos/cash-close-tab', requirePermission('orders.manage'), wrap(asyn
             TAB_ALREADY_CLOSED: 409,
             IDEMPOTENCY_KEY_FOREIGN: 409,
             IDEMPOTENCY_KEY_CONFLICT: 409,
+            CURRENCY_MISMATCH: 409,
+            GHS_PRICE_UNAVAILABLE: 422,
         };
         const status = statusByCode[err.code] || 400;
         if (status >= 500) logger.error({ err }, '[pos/cash-close-tab]');
-        res.status(status).json({ success: false, message: err.message });
+        res.status(status).json({ success: false, code: err.code || undefined, message: err.message });
     }
 }));
 

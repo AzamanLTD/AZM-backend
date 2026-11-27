@@ -83,13 +83,16 @@ const parseMoney = (value, field, { required = false } = {}) => {
 // Replay fingerprint over the EXACT 8-decimal canonical forms — tip/cash are
 // now Prisma.Decimal, so the fingerprint pins the precise stored value rather
 // than a lossy float rounding.
-const fingerprintOf = ({ businessProfileId, actorId, tabId, tip, cash }) =>
+// The requested currency is material: a same-key retry that switches the
+// till's currency is a different request, not a replay.
+const fingerprintOf = ({ businessProfileId, actorId, tabId, tip, cash, currency = null }) =>
     crypto.createHash('sha256').update(JSON.stringify({
         businessProfileId: String(businessProfileId),
         actorId: Number(actorId),
         tabId: String(tabId),
         tip: tip.toFixed(8),
         cash: cash == null ? null : cash.toFixed(8),
+        ...(currency ? { currency } : {}),
     })).digest('hex');
 
 class DineInCashCloseService {
@@ -163,7 +166,7 @@ class DineInCashCloseService {
         const tip = parseMoney(tipAmount, 'tipAmount');
         const cash = cashReceived == null || cashReceived === '' ? null : parseMoney(cashReceived, 'cashReceived');
 
-        const fingerprint = key ? fingerprintOf({ businessProfileId, actorId, tabId, tip, cash }) : null;
+        const fingerprint = key ? fingerprintOf({ businessProfileId, actorId, tabId, tip, cash, currency: requestedCurrency }) : null;
 
         // Fast-path replay of a committed close (exact durable result).
         const committed = await this._findIdempotentClose(businessProfileId, key, fingerprint);
@@ -193,7 +196,23 @@ class DineInCashCloseService {
                     // The currency decides WHICH durable line values are summed. A
                     // GHS tab's money is in the cedi columns; summing the USDC
                     // columns there would silently total zero.
+                    // The tab's own currency is the authority. The client may
+                    // state it (a Ghana till closes in cedis) but never switch
+                    // a tab into a currency it was not opened in.
+                    if (requestedCurrency !== null && tab.currency != null && requestedCurrency !== tab.currency) {
+                        throw fail('CURRENCY_MISMATCH', `This tab is in ${tab.currency}; it cannot be closed in ${requestedCurrency}. Nothing was recorded.`);
+                    }
                     const isGhsTab = requestedCurrency === 'GHS' || (requestedCurrency === null && tab.currency === 'GHS');
+                    // A GHS close is only as true as its cedi prices. A line with
+                    // no exact GHS price would otherwise count as zero and record a
+                    // paid sale for the tip alone.
+                    if (isGhsTab) {
+                        const unpriced = tab.items.filter((item) => item.lineTotalGhs == null && item.unitPriceGhs == null);
+                        if (unpriced.length > 0) {
+                            throw fail('GHS_PRICE_UNAVAILABLE',
+                                `${unpriced.length} item(s) on this tab have no GHS price. Nothing was recorded.`);
+                        }
+                    }
                     const subtotalDec = tab.items.reduce((sum, item) => {
                         if (isGhsTab) {
                             if (item.lineTotalGhs != null) return sum.plus(new Prisma.Decimal(item.lineTotalGhs));
