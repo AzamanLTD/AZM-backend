@@ -132,7 +132,7 @@ class SmartRouteService {
         if (!name || !action || !amountUsdc || !frequency || !startDate) {
             throw new Error('name, action, amountUsdc, frequency and startDate are required');
         }
-        if (Number(amountUsdc) <= 0) throw new Error('amountUsdc must be > 0');
+        const exactAmount = this._parsePositiveAmount(amountUsdc);
 
         const start = new Date(startDate);
         if (Number.isNaN(start.getTime())) throw new Error('Invalid startDate');
@@ -141,7 +141,7 @@ class SmartRouteService {
             userId,
             name: String(name).slice(0, 60),
             action,
-            amountUsdc: new Prisma.Decimal(amountUsdc),
+            amountUsdc: exactAmount,
             frequency,
             dayOfMonth: frequency === 'ON_DAY_OF_MONTH' ? Number(dayOfMonth) : null,
             startDate: start,
@@ -179,13 +179,28 @@ class SmartRouteService {
         return this.prisma.smartRoute.create({ data });
     }
 
+    /**
+     * Exact, positive, at most 8 decimal places. A binary float or an
+     * over-precise value is refused, never rounded into the stored amount.
+     */
+    _parsePositiveAmount(value) {
+        let exact;
+        try {
+            exact = ledger.toExactDecimal(typeof value === 'number' ? value : String(value), 'amountUsdc');
+        } catch (e) {
+            throw new Error('amountUsdc must be a positive amount with at most 8 decimal places');
+        }
+        if (!exact.gt(0)) throw new Error('amountUsdc must be > 0');
+        return exact;
+    }
+
     async update(userId, routeId, patch) {
         const route = await this.prisma.smartRoute.findUnique({ where: { id: routeId } });
         if (!route || route.userId !== userId) throw new Error('Route not found');
 
         const data = {};
         if (patch.name) data.name = String(patch.name).slice(0, 60);
-        if (patch.amountUsdc) data.amountUsdc = new Prisma.Decimal(patch.amountUsdc);
+        if (patch.amountUsdc !== undefined && patch.amountUsdc !== null) data.amountUsdc = this._parsePositiveAmount(patch.amountUsdc);
         // r19 P0-7: validate against the CANONICAL cadence set — the old
         // FREQUENCY_MS[patch.frequency] gate silently rejected
         // ON_DAY_OF_MONTH patches. An invalid cadence fails loudly.
@@ -715,7 +730,9 @@ class SmartRouteService {
             result = await financeService.processFiatWithdrawal(
                 this.prisma,
                 route.userId,
-                Number(run.amountUsdc),
+                // Exact: the run's Decimal goes straight to the canonical
+                // exact parser, never through a binary float.
+                run.amountUsdc,
                 {
                     reference,
                     // §P.5-D intended route identity (mirrors the direct fiat
@@ -736,7 +753,7 @@ class SmartRouteService {
                         // mirror, no provider I/O). finance.service masks
                         // err.code on callback failures, so the helper's
                         // message token carries the classification.
-                        await this._assertLiveUserAuthorizationTx(tx, route.userId, { atBoundary: 'withdrawal reservation' });
+                        await this._assertLiveUserAuthorizationTx(tx, route.userId, { atBoundary: 'withdrawal reservation', requireVerifiedKyc: true });
                         const rows = await tx.$queryRawUnsafe(
                             'INSERT INTO "Withdrawal" ' +
                             '("userId", "amount", "payoutMethod", "network", "destination", "status", "transactionHistoryId", "createdAt", "updatedAt") ' +
@@ -796,10 +813,10 @@ class SmartRouteService {
     // The error message carries a stable token because one integration point
     // (finance.service's createWithdrawalRecordInTransaction wrapper)
     // overwrites err.code; classification then matches on the token.
-    async _assertLiveUserAuthorizationTx(tx, userId, { atBoundary = 'economic boundary' } = {}) {
+    async _assertLiveUserAuthorizationTx(tx, userId, { atBoundary = 'economic boundary', requireVerifiedKyc = false } = {}) {
         const live = await tx.user.findUnique({
             where: { id: userId },
-            select: { banStatus: true, isDeleted: true },
+            select: { banStatus: true, isDeleted: true, kycStatus: true, role: true },
         });
         if (!live) {
             const err = new Error(`SMART_ROUTE_USER_MISSING: Smart Route blocked at ${atBoundary} — user no longer exists.`);
@@ -810,6 +827,19 @@ class SmartRouteService {
             const err = new Error(
                 `SMART_ROUTE_AUTHORIZATION_LOST: Smart Route blocked at ${atBoundary} — account no longer active `
                 + `(${live.banStatus}${live.isDeleted ? ', deleted' : ''}).`
+            );
+            err.code = 'SMART_ROUTE_AUTHORIZATION_LOST';
+            throw err;
+        }
+        // A scheduled payout runs long after it was configured. Money that
+        // leaves the user needs a VERIFIED identity at the moment it moves,
+        // by the same rule as the manual routes (requireKyc: VERIFIED, ADMIN
+        // exempt). Same token family, so the run classifies as authorization
+        // lost: rolled back, no debit, no provider I/O.
+        if (requireVerifiedKyc && live.role !== 'ADMIN' && live.kycStatus !== 'VERIFIED') {
+            const err = new Error(
+                `SMART_ROUTE_AUTHORIZATION_LOST: Smart Route blocked at ${atBoundary} — identity not verified `
+                + `(${live.kycStatus || 'UNVERIFIED'}).`
             );
             err.code = 'SMART_ROUTE_AUTHORIZATION_LOST';
             throw err;
@@ -1341,7 +1371,7 @@ class SmartRouteService {
             // never the authority: a ban that committed before the guarded
             // claim below fails the whole transaction (no debit, no credit,
             // no ledger mutation, no successful run).
-            await this._assertLiveUserAuthorizationTx(tx, route.userId, { atBoundary: 'internal transfer transaction' });
+            await this._assertLiveUserAuthorizationTx(tx, route.userId, { atBoundary: 'internal transfer transaction', requireVerifiedKyc: true });
             await this._assertLiveRouteAuthorizationTx(tx, route.id, { atBoundary: 'internal transfer transaction' });
             // ── r19 P0-4: CANONICAL RECIPIENT AUTHORIZATION ──────────────
             // The direct peer-transfer contract (peerTransferController
