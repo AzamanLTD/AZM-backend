@@ -99,6 +99,15 @@ async function main() {
             }
         }
 
+        // The witness writer claims the provider observation in the SAME
+        // transaction as the witness row (one observation, one economic use),
+        // so the claim table must exist before the reconciler can be granted.
+        const claimTable = await prisma.$queryRawUnsafe('SELECT to_regclass($1)::text AS oid', 'public."ProviderObservationClaim"');
+        if (claimTable[0].oid === null) {
+            console.error('[wp-i] refusing to run: ProviderObservationClaim does not exist. Run infra/install-provider-observation-claim.js first.');
+            process.exit(1);
+        }
+
         const statements = [
             // Nobody gets the table by default, including PUBLIC.
             'REVOKE ALL ON "ProviderSettlementWitness" FROM PUBLIC',
@@ -115,6 +124,13 @@ async function main() {
             // fails at runtime with a permission error.
             `REVOKE ALL ON "FiatLiquidityReceipt" FROM ${Q_RECONCILER}`,
             `GRANT SELECT ON "FiatLiquidityReceipt" TO ${Q_RECONCILER}`,
+            // The witness transaction also INSERTs the observation claim and
+            // SELECTs a conflicting holder (providerObservationClaimService).
+            // Without these the first witness attempt fails with a permission
+            // error. Append and read only: a claim is never rewritten or
+            // released by the reconciler.
+            `REVOKE ALL ON "ProviderObservationClaim" FROM ${Q_RECONCILER}`,
+            `GRANT SELECT, INSERT ON "ProviderObservationClaim" TO ${Q_RECONCILER}`,
             // Promotion is the runtime's job under its own authority checks. The
             // reconciler proves a payment happened; it never moves money state.
             `REVOKE ALL ON "FiatLiquidityState" FROM ${Q_RECONCILER}`,
@@ -146,6 +162,11 @@ async function main() {
         await expect(RECONCILER, 'FiatLiquidityReceipt', 'SELECT', true);
         for (const p of ['INSERT', 'UPDATE', 'DELETE']) {
             await expect(RECONCILER, 'FiatLiquidityReceipt', p, false);
+        }
+        await expect(RECONCILER, 'ProviderObservationClaim', 'SELECT', true);
+        await expect(RECONCILER, 'ProviderObservationClaim', 'INSERT', true);
+        for (const p of ['UPDATE', 'DELETE', 'TRUNCATE']) {
+            await expect(RECONCILER, 'ProviderObservationClaim', p, false);
         }
         // These two exist in any database the release chain has touched. If one
         // is absent this is not the financial schema at all, and asserting on it

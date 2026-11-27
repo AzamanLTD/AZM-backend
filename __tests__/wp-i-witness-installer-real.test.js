@@ -101,6 +101,19 @@ describeDb('the shipped witness installer (real PostgreSQL)', () => {
         expect(await failsAs(RECONCILER_ROLE, `TRUNCATE "ProviderSettlementWitness"`)).toBe(true);
     });
 
+    test('the reconciler can read and append observation claims, never rewrite or release one', async () => {
+        // The witness transaction INSERTs the observation claim and SELECTs a
+        // conflicting holder. Without these grants the first witness attempt
+        // fails with a permission error.
+        await expect(as(RECONCILER_ROLE, 'SELECT count(*) FROM "ProviderObservationClaim"')).resolves.toBeDefined();
+        const [insert] = await as(RECONCILER_ROLE,
+            `SELECT has_table_privilege(current_user, '"ProviderObservationClaim"', 'INSERT') AS ok`);
+        expect(insert.ok).toBe(true);
+        expect(await failsAs(RECONCILER_ROLE, `UPDATE "ProviderObservationClaim" SET "claimedByRef"='x'`)).toBe(true);
+        expect(await failsAs(RECONCILER_ROLE, `DELETE FROM "ProviderObservationClaim"`)).toBe(true);
+        expect(await failsAs(RECONCILER_ROLE, `TRUNCATE "ProviderObservationClaim"`)).toBe(true);
+    });
+
     test('the reconciler cannot promote liquidity or touch the aggregate', async () => {
         expect(await failsAs(RECONCILER_ROLE, `UPDATE "FiatLiquidityReceipt" SET "status"='AVAILABLE'`)).toBe(true);
         expect(await failsAs(RECONCILER_ROLE, `INSERT INTO "FiatLiquidityReceipt" ("id","provider","dedupKey","amountGhs","status") VALUES ('z','MOOLRE','z',1,'AVAILABLE')`)).toBe(true);
