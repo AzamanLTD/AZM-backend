@@ -40,8 +40,12 @@ const transactionScopedPrisma = (prisma, tx) => new Proxy(prisma, {
 class DineInService {
     constructor(prisma, io) { this.prisma = prisma; this.io = io; }
 
-    async openTab({ businessProfileId, azamanId, locationId, tableId }) {
+    async openTab({ businessProfileId, azamanId, locationId, tableId, currency = null }) {
         if (!businessProfileId) throw new Error('businessProfileId is required.');
+        const tabCurrency = currency == null || currency === '' ? null : String(currency).trim().toUpperCase();
+        if (tabCurrency !== null && !['GHS', 'USDC'].includes(tabCurrency)) {
+            throw new Error('currency must be GHS or USDC.');
+        }
         if (!azamanId) throw new Error('azamanId is required.');
         if (tableId && !locationId) throw new Error('tableId requires locationId.');
 
@@ -77,6 +81,7 @@ class DineInService {
                             locationId: locationId || null,
                             tableId: tableId || null,
                             status: 'OPEN',
+                            ...(tabCurrency ? { currency: tabCurrency } : {}),
                         },
                         include: { items: true },
                     });

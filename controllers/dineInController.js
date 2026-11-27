@@ -35,6 +35,9 @@ exports.openTab = async (req, res) => {
             customerAzamanId: req.body.customerAzamanId,
             locationId: req.body.locationId,
             tableId: req.body.tableId,
+            // 'GHS' opens a cedi tab (priced from confirmed GHS prices, closed
+            // in cedis). Omitted keeps the legacy USDC tab.
+            currency: req.body.currency,
         }));
         res.status(201).json(result);
     } catch (err) { res.status(400).json({ success: false, message: err.message }); }
@@ -55,10 +58,14 @@ exports.addItem = async (req, res) => {
             productId: req.body.productId,
             name: req.body.name,
             unitPriceUsdc: req.body.unitPriceUsdc,
+            priceGhs: req.body.priceGhs,
             quantity: req.body.quantity,
         }));
         res.json(result);
-    } catch (err) { res.status(400).json({ success: false, message: err.message }); }
+    } catch (err) {
+        const status = err.code === 'GHS_PRICE_UNAVAILABLE' || err.code === 'GHS_OPTION_PRICE_UNAVAILABLE' ? 422 : 400;
+        res.status(status).json({ success: false, code: err.code || undefined, message: err.message });
+    }
 };
 
 exports.addCustomerItem = async (req, res) => {
@@ -72,7 +79,10 @@ exports.addCustomerItem = async (req, res) => {
             quantity: req.body.quantity,
         }));
         res.status(201).json({ success: true, item: result });
-    } catch (err) { res.status(err.status || 400).json({ success: false, message: err.message }); }
+    } catch (err) {
+        const ghsRefusal = err.code === 'GHS_PRICE_UNAVAILABLE' || err.code === 'GHS_OPTION_PRICE_UNAVAILABLE';
+        res.status(ghsRefusal ? 422 : (err.status || 400)).json({ success: false, code: err.code || undefined, message: err.message });
+    }
 };
 
 exports.finalizeTab = async (req, res) => {
