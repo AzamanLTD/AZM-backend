@@ -43,7 +43,7 @@ jest.mock('../middleware/banGuardMiddleware', () => {
 const { PrismaClient, Prisma } = require('@prisma/client');
 const conversationRoutes = require('../routes/conversationRoutes');
 const { ConversationMoneyService } = require('../services/conversationMoneyService');
-const { seedUser } = require('./helpers/factories');
+const { seedUser, TEST_PASSWORD } = require('./helpers/factories');
 
 const url = process.env.TEST_DATABASE_URL;
 const run = url ? describe : describe.skip;
@@ -56,7 +56,10 @@ run('r38/P0 — chat-money asset contract (+ key integrity, exact serialization)
     let convAB, convABFull;
 
     const asUser = (user) => { global.__R38_MONEY_USER__ = user ? { id: user.id } : null; };
-    const post = (convId, body) => request(app).post(`/api/conversations/${convId}/messages`).send(body);
+    // MONEY_SEND carries a second factor; seeded users have no TOTP, so it is
+    // their password, as a real client sends.
+    const post = (convId, body) => request(app).post(`/api/conversations/${convId}/messages`)
+        .send(body && body.type === 'MONEY_SEND' ? { ...body, password: TEST_PASSWORD } : body);
     const history = (convId) => request(app).get(`/api/conversations/${convId}/messages`);
     const bal = async (id) => new Prisma.Decimal(
         (await db.user.findUnique({ where: { id }, select: { availableBalance: true } })).availableBalance);

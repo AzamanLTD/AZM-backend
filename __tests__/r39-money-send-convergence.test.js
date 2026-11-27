@@ -59,7 +59,7 @@ run('r39/P1 — money-send same-key concurrent response convergence', () => {
 
     test('concurrent same-key: one economic effect, loser converges to the exact committed outcome', async () => {
         const user = { id: 1 };
-        const conv = { id: 'conv1' };
+        const conv = { id: 'conv1', participants: [{ id: 1 }, { id: 2 }] }; // sender + recipient, as the route loads them
         const base = { user, conv, type: 'MONEY_SEND', moneyAmount: '25', recipientId: '2', clientRequestId: 'r39-key-1' };
 
         const [r1, r2] = await Promise.allSettled([
@@ -97,7 +97,7 @@ run('r39/P1 — money-send same-key concurrent response convergence', () => {
 
     test('same-key retry after commit always returns the exact committed result', async () => {
         const user = { id: 1 };
-        const conv = { id: 'conv1' };
+        const conv = { id: 'conv1', participants: [{ id: 1 }, { id: 2 }] }; // sender + recipient, as the route loads them
         const base = { user, conv, type: 'MONEY_SEND', moneyAmount: '10', recipientId: '2', clientRequestId: 'r39-key-2' };
 
         const first = await svc.sendMoney(base);
@@ -115,7 +115,7 @@ run('r39/P1 — money-send same-key concurrent response convergence', () => {
 
     test('concurrent same-key with DIFFERENT parameters fails closed — no laundering', async () => {
         const user = { id: 1 };
-        const conv = { id: 'conv1' };
+        const conv = { id: 'conv1', participants: [{ id: 1 }, { id: 2 }] }; // sender + recipient, as the route loads them
         const key = 'r39-key-3';
 
         const [r1, r2] = await Promise.allSettled([
@@ -180,7 +180,7 @@ run('r39/P1 — money-send same-key concurrent response convergence', () => {
         const svc = new Svc({ prisma, io: null, emitBalanceUpdate: () => {}, pushIfOffline: () => {} });
 
         const out = await svc.sendMoney({
-            user: { id: 1 }, conv: { id: 'conv1' }, type: 'MONEY_SEND',
+            user: { id: 1 }, conv: { id: 'conv1', participants: [{ id: 1 }, { id: 2 }] }, type: 'MONEY_SEND',
             moneyAmount: '25', recipientId: '2', clientRequestId: 'r39-key-4',
         });
 
@@ -197,7 +197,7 @@ run('r39/P1 — money-send same-key concurrent response convergence', () => {
         } };
         const conflictSvc = new Svc({ prisma: conflictPrisma, io: null, emitBalanceUpdate: () => {}, pushIfOffline: () => {} });
         await expect(conflictSvc.sendMoney({
-            user: { id: 1 }, conv: { id: 'conv1' }, type: 'MONEY_SEND',
+            user: { id: 1 }, conv: { id: 'conv1', participants: [{ id: 1 }, { id: 2 }] }, type: 'MONEY_SEND',
             moneyAmount: '99', recipientId: '2', clientRequestId: 'r39-key-4',
         })).rejects.toMatchObject({ code: 'IDEMPOTENCY_CONFLICT' });
     });

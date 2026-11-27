@@ -30,6 +30,28 @@ const { Prisma } = require('@prisma/client');
 const { protect } = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
 const { ConversationMoneyService } = require('../services/conversationMoneyService');
+const { requireKyc } = require('../middleware/requireKyc');
+const { require2FA } = require('../middleware/require2FA');
+
+// Money that leaves the caller through a conversation carries the same gates
+// as the dedicated money routes: VERIFIED identity, then a second factor.
+// Plain messages, requests, declines and disputes move nothing and keep the
+// session gate.
+function moneyGate(kycAction) {
+    return (req, res, next) => requireKyc(kycAction)(req, res, (err) => {
+        if (err) return next(err);
+        return require2FA()(req, res, next);
+    });
+}
+const p2pMoneyGate = moneyGate('p2p');
+const payMoneyGate = moneyGate('pay');
+
+// POST /:conversationId/messages carries every message type; only MONEY_SEND
+// moves money at send time.
+function moneySendGate(req, res, next) {
+    if (req.body && req.body.type === 'MONEY_SEND' && !req.body.e2ee) return p2pMoneyGate(req, res, next);
+    return next();
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -133,7 +155,7 @@ router.get('/:conversationId/messages', protect, async (req, res) => {
 });
 
 // 2. POST send message (supports TEXT, MONEY_SEND, MONEY_REQUEST, ESCROW_TICKET)
-router.post('/:conversationId/messages', protectActive, async (req, res) => {
+router.post('/:conversationId/messages', protectActive, moneySendGate, async (req, res) => {
     try {
         const prisma = req.app.get('prisma');
         const { conversationId } = req.params;
@@ -309,7 +331,7 @@ const _action = (fn) => async (req, res) => {
 };
 
 // 3. Accept a money request
-router.post('/:conversationId/messages/:messageId/accept-money', protectActive,
+router.post('/:conversationId/messages/:messageId/accept-money', protectActive, p2pMoneyGate,
     _action((s, a) => s.acceptMoney(a)));
 
 // 4. Decline a money request
@@ -317,11 +339,11 @@ router.post('/:conversationId/messages/:messageId/decline-money', protectActive,
     _action((s, a) => s.declineMoney(a)));
 
 // 5. Fund an escrow ticket
-router.post('/:conversationId/messages/:messageId/fund-escrow', protectActive,
+router.post('/:conversationId/messages/:messageId/fund-escrow', protectActive, payMoneyGate,
     _action((s, a) => s.fundEscrow(a)));
 
 // 6. Release escrow funds
-router.post('/:conversationId/messages/:messageId/release-escrow', protectActive,
+router.post('/:conversationId/messages/:messageId/release-escrow', protectActive, payMoneyGate,
     _action((s, a) => s.releaseEscrow(a)));
 
 // 7. Dispute an escrow ticket
@@ -329,3 +351,4 @@ router.post('/:conversationId/messages/:messageId/dispute-escrow', protectActive
     _action((s, a) => s.disputeEscrow(a)));
 
 module.exports = router;
+module.exports.moneySendGate = moneySendGate;

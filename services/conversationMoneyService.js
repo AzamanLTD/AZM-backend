@@ -175,6 +175,15 @@ class ConversationMoneyService {
             throw fail(400, 'INVALID_INPUT', 'Valid recipientId and moneyAmount required.');
         }
         if (userId === receiverId) throw fail(400, 'INVALID_INPUT', 'Cannot send money to yourself.');
+        // The recipient must be someone in this conversation. The transfer
+        // message lands here, so paying an arbitrary user id from a thread
+        // they are not part of would move money they never see announced,
+        // and would let a guessed integer id stand in for recipient review.
+        const participants = Array.isArray(conv.participants) ? conv.participants : [];
+        if (!participants.some((p) => p && Number(p.id) === receiverId)) {
+            throw fail(403, 'RECIPIENT_NOT_IN_CONVERSATION',
+                'You can only send money to someone in this conversation. Nothing was sent.');
+        }
 
         if (!clientRequestId || typeof clientRequestId !== 'string' || !clientRequestId.trim()) {
             throw fail(400, 'IDEMPOTENCY_REQUIRED',
