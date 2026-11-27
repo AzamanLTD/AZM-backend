@@ -31,7 +31,8 @@
  *   2  fatal error - the run could not complete
  *   3  one or more requested openings did NOT receive a witness (refused,
  *      parked, not found, not eligible, provider not settled, transport
- *      unknown). Per-opening reasons are in the JSON on stdout.
+ *      unknown), or the batch came back empty or shorter than requested.
+ *      Per-opening reasons are in the JSON on stdout.
  *
  * 3 is deliberately distinct from 2: a refusal is a truthful answer about the
  * provider, not a broken run, and an alert triager must tell them apart.
@@ -50,6 +51,25 @@ const EXIT = Object.freeze({
     FATAL: 2,
     NOT_WITNESSED: 3,
 });
+
+/**
+ * Map a completed batch to its exit code.
+ *
+ * Only a batch where EVERY requested opening came back with `witnessed === true`
+ * may exit 0. A refusal, a pending provider state, an unknown opening or a
+ * thrown per-opening error is NOT_WITNESSED. So is an EMPTY batch (the
+ * invocation required at least one key, so no results means the request was
+ * not honoured) and a PARTIAL batch (an opening silently dropped somewhere must
+ * not be reported as funded). A non-array result is a broken run: FATAL.
+ */
+function exitCodeForResults(results, requestedCount = null) {
+    if (!Array.isArray(results)) return EXIT.FATAL;
+    if (results.length === 0) return EXIT.NOT_WITNESSED;
+    if (Number.isInteger(requestedCount) && results.length < requestedCount) {
+        return EXIT.NOT_WITNESSED;
+    }
+    return results.every((r) => r && r.witnessed === true) ? EXIT.OK : EXIT.NOT_WITNESSED;
+}
 
 const REQUIRED_ENV = [
     'AZM_RECONCILER_MODE',
@@ -90,16 +110,20 @@ function main(argv) {
             // precision is lost on the way to the operator.
             const json = JSON.stringify({ results }, (_k, v) => (typeof v === 'bigint' ? v.toString() : v), 2);
             process.stdout.write(`${json}\n`);
-            const unwitnessed = results.filter((r) => r.witnessed !== true);
-            if (unwitnessed.length > 0) {
+            const code = exitCodeForResults(results, openingDedupKeys.length);
+            if (code !== EXIT.OK) {
                 // Also on stderr: an operator tailing the log must not have to
                 // parse JSON to learn that nothing was reconciled.
+                const list = Array.isArray(results) ? results : [];
+                const requested = Math.max(openingDedupKeys.length, list.length);
+                const witnessed = list.filter((r) => r && r.witnessed === true).length;
+                const missing = Math.max(0, openingDedupKeys.length - list.length);
                 process.stderr.write(
-                    `[wp-i reconciler] ${unwitnessed.length} of ${results.length} opening(s) were NOT witnessed; this run is not a successful reconciliation\n`
+                    `[wp-i reconciler] ${requested - witnessed} of ${requested} opening(s) were NOT witnessed` +
+                    `${missing > 0 ? ` (${missing} never returned a result)` : ''}; this run is not a successful reconciliation\n`
                 );
-                return EXIT.NOT_WITNESSED;
             }
-            return EXIT.OK;
+            return code;
         })
         .catch((err) => {
             process.stderr.write(`[wp-i reconciler] fatal: ${err?.message || err}\n`);
@@ -111,4 +135,4 @@ if (require.main === module) {
     Promise.resolve(main(process.argv)).then((code) => process.exit(code));
 }
 
-module.exports = { REQUIRED_ENV, EXIT, main };
+module.exports = { REQUIRED_ENV, EXIT, exitCodeForResults, main };

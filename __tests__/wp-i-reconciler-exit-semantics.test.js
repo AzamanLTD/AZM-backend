@@ -114,6 +114,35 @@ describe('§6 reconciler exit semantics', () => {
         expect(reconcileTreasuryOpenings).not.toHaveBeenCalled();
     });
 
+    test('an empty batch is not a vacuous success', async () => {
+        reconcileTreasuryOpenings.mockResolvedValue([]);
+        await expect(main(argv('A'))).resolves.toBe(EXIT.NOT_WITNESSED);
+        expect(stderr.join('')).toMatch(/1 of 1 opening\(s\) were NOT witnessed \(1 never returned a result\)/);
+    });
+
+    test('a partial batch is not a success even if every returned row is witnessed', async () => {
+        reconcileTreasuryOpenings.mockResolvedValue([
+            { openingDedupKey: 'A', witnessed: true, witnessId: 'w1' },
+        ]);
+        await expect(main(argv('A', 'B'))).resolves.toBe(EXIT.NOT_WITNESSED);
+        expect(stderr.join('')).toMatch(/1 of 2 opening\(s\) were NOT witnessed \(1 never returned a result\)/);
+    });
+
+    test('a non-array result is a broken run, not a refusal', async () => {
+        reconcileTreasuryOpenings.mockResolvedValue({ witnessed: true });
+        await expect(main(argv('A'))).resolves.toBe(EXIT.FATAL);
+    });
+
+    test('exitCodeForResults maps every shape', () => {
+        const { exitCodeForResults } = require('../workers/run-provider-settlement-reconciler');
+        expect(exitCodeForResults(null, 1)).toBe(EXIT.FATAL);
+        expect(exitCodeForResults([], 1)).toBe(EXIT.NOT_WITNESSED);
+        expect(exitCodeForResults([{ witnessed: true }], 2)).toBe(EXIT.NOT_WITNESSED);
+        expect(exitCodeForResults([{ witnessed: true }, null], 2)).toBe(EXIT.NOT_WITNESSED);
+        expect(exitCodeForResults([{ witnessed: 'true' }], 1)).toBe(EXIT.NOT_WITNESSED);
+        expect(exitCodeForResults([{ witnessed: true }, { witnessed: true }], 2)).toBe(EXIT.OK);
+    });
+
     test('the four outcomes are distinct codes', () => {
         const codes = new Set([EXIT.OK, EXIT.USAGE, EXIT.FATAL, EXIT.NOT_WITNESSED]);
         expect(codes.size).toBe(4);
