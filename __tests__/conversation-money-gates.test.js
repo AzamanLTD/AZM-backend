@@ -66,12 +66,36 @@ describe('conversation route gates', () => {
 describe('MONEY_SEND recipient must be in the conversation', () => {
     const { ConversationMoneyService } = require('../services/conversationMoneyService');
 
-    test('a non-participant recipient is refused with nothing read or written', async () => {
-        const prisma = new Proxy({}, { get: () => { throw new Error('prisma must not be touched'); } });
+    // Only the replay lookup may run; any money read or write throws.
+    function prismaWithReplay(existing) {
+        return {
+            conversationMoneyTicket: { findUnique: jest.fn(async () => existing) },
+            message: { findUnique: jest.fn(async () => ({ id: 'm1', sender: { id: 3 } })) },
+            $transaction: () => { throw new Error('no money transaction may start'); },
+            user: new Proxy({}, { get: () => { throw new Error('user must not be touched'); } }),
+        };
+    }
+
+    test('a new send to a non-participant is refused before any money read or write', async () => {
+        const prisma = prismaWithReplay(null);
         const svc = new ConversationMoneyService({ prisma, io: null, emitBalanceUpdate: async () => {} });
         const conv = { id: 'c1', type: 'PERSONAL', participants: [{ id: 3 }, { id: 4 }] };
         await expect(svc._sendMoney({
             user: { id: 3 }, conv, moneyAmount: '5', recipientId: 99, asset: 'USDC', clientRequestId: 'req-x',
         })).rejects.toMatchObject({ status: 403, code: 'RECIPIENT_NOT_IN_CONVERSATION' });
+    });
+
+    test('a committed same-key replay still returns its stored outcome after the recipient left', async () => {
+        const existing = {
+            kind: 'MONEY_SEND', conversationId: 'c1', requesterId: 3, counterpartyId: 4,
+            currency: 'USDC', amount: '5', messageId: 'm1',
+        };
+        const prisma = prismaWithReplay(existing);
+        const svc = new ConversationMoneyService({ prisma, io: null, emitBalanceUpdate: async () => {} });
+        const convWithout4 = { id: 'c1', type: 'PERSONAL', participants: [{ id: 3 }] };
+        const res = await svc._sendMoney({
+            user: { id: 3 }, conv: convWithout4, moneyAmount: '5', recipientId: 4, asset: 'USDC', clientRequestId: 'req-y',
+        });
+        expect(res.replay).toBe(true);
     });
 });

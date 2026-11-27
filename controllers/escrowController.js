@@ -153,7 +153,7 @@ exports.fundEscrow = async (req, res) => {
         // committed replay and the live response are byte-identical.
         return res.status(200).json(result.body);
     } catch (err) {
-        if (isStepUpRejection(err)) return respondStepUpRejected(res);
+        if (isStepUpRejection(err)) return respondStepUpRejected(res, err);
         logger.error({ err: err }, '[fundEscrow] error');
         // §r42.1 failure semantics: a lost funding CAS (state changed /
         // already funded) or an insufficient-balance loss provably committed
@@ -245,7 +245,7 @@ exports.markSatisfied = async (req, res) => {
 
         return res.status(200).json({ success: true, settled: result.settled, escrow });
     } catch (err) {
-        if (isStepUpRejection(err)) return respondStepUpRejected(res);
+        if (isStepUpRejection(err)) return respondStepUpRejected(res, err);
         // Satisfaction is one transaction: these refusals provably committed
         // nothing, so the idempotency claim is released for a corrected retry
         // instead of poisoning the key behind a 500.

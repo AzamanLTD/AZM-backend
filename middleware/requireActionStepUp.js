@@ -66,12 +66,16 @@ function requireActionStepUp(spec) {
             }
             return next();
         } catch (err) {
-            // A gate that cannot compute what it is authorising must not proceed.
+            // A gate that cannot compute what it is authorising must not
+            // proceed. canonicalAction throws only on the request itself (a
+            // missing field, an inexact or numeric amount), so this is a 400:
+            // the client must correct the request, and as a 4xx the release
+            // mark below is honoured on every route's idempotency policy.
             if (res.locals) res.locals.financialClaimRelease = true;
-            return res.status(503).json({
+            return res.status(400).json({
                 success: false,
-                code: 'STEP_UP_UNAVAILABLE',
-                message: 'Step-up verification is unavailable. Nothing was executed.',
+                code: 'STEP_UP_ACTION_INVALID',
+                message: 'This request cannot be bound to a verification (amounts must be exact decimal strings). Nothing was executed.',
             });
         }
     };
@@ -103,22 +107,37 @@ async function requireConsumedStepUp(tx, req) {
     if (!isStepUpEnforced()) return { enforced: false };
     const verdict = await consumeStepUp(tx, req);
     if (!verdict || !verdict.ok) {
-        const err = new Error('Step-up verification does not authorise this exact action.');
-        err.code = 'STEP_UP_REJECTED';
+        // A store outage is not a verdict about the grant: say so (503) rather
+        // than tell the user it "was already used".
+        const unavailable = verdict && verdict.reason === 'STEP_UP_GRANT_STORE_UNAVAILABLE';
+        const err = new Error(unavailable
+            ? 'Step-up verification is temporarily unavailable.'
+            : 'Step-up verification does not authorise this exact action.');
+        err.code = unavailable ? 'STEP_UP_UNAVAILABLE' : 'STEP_UP_REJECTED';
         err.reason = (verdict && verdict.reason) || 'STEP_UP_GRANT_INVALID';
         throw err;
     }
     return { enforced: true };
 }
 
-const isStepUpRejection = (err) => !!err && err.code === 'STEP_UP_REJECTED';
+const isStepUpRejection = (err) => !!err && (err.code === 'STEP_UP_REJECTED' || err.code === 'STEP_UP_UNAVAILABLE');
 
 /**
  * The one response for a refused grant. The throw rolled the whole transaction
  * back, so the idempotency claim is provably releasable for a corrected retry.
  */
-function respondStepUpRejected(res) {
+function respondStepUpRejected(res, err) {
     if (res.locals) res.locals.financialClaimRelease = true;
+    if (err && err.code === 'STEP_UP_UNAVAILABLE') {
+        // The transaction rolled back. A 5xx releases the claim only on
+        // RELEASE-policy routes; elsewhere the client retries on a new key.
+        return res.status(503).json({
+            success: false,
+            code: 'STEP_UP_UNAVAILABLE',
+            retryable: true,
+            message: 'Verification is temporarily unavailable. Nothing was executed. Please try again.',
+        });
+    }
     return res.status(409).json({
         success: false,
         code: 'STEP_UP_REJECTED',

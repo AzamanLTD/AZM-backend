@@ -401,7 +401,7 @@ exports.initiateTrade = async (req, res) => {
 
     } catch (error) {
         // The throw rolled the whole transaction back: nothing was created.
-        if (isStepUpRejection(error)) return respondStepUpRejected(res);
+        if (isStepUpRejection(error)) return respondStepUpRejected(res, error);
         logger.error('Initiate Trade Error:', error);
         res.status(400).json({ success: false, message: error.message });
     }
@@ -584,7 +584,7 @@ exports.acceptTrade = async (req, res) => {
         res.status(200).json({ success: true, trade: updatedTrade });
 
     } catch (error) {
-        if (isStepUpRejection(error)) return respondStepUpRejected(res);
+        if (isStepUpRejection(error)) return respondStepUpRejected(res, error);
         logger.error({ err: error }, 'acceptTrade error');
         const status = error.message.includes('not found') ? 404
             : error.message.includes('Only') || error.message.includes('Cannot') ? 403

@@ -62,13 +62,19 @@ const EXIT = Object.freeze({
  * not honoured) and a PARTIAL batch (an opening silently dropped somewhere must
  * not be reported as funded). A non-array result is a broken run: FATAL.
  */
-function exitCodeForResults(results, requestedCount = null) {
+function exitCodeForResults(results, requested = null) {
     if (!Array.isArray(results)) return EXIT.FATAL;
     if (results.length === 0) return EXIT.NOT_WITNESSED;
-    if (Number.isInteger(requestedCount) && results.length < requestedCount) {
-        return EXIT.NOT_WITNESSED;
+    if (!results.every((r) => r && r.witnessed === true)) return EXIT.NOT_WITNESSED;
+    // Key-exact when the requested keys are known: every requested opening must
+    // have its OWN witnessed result. Two results for key A cannot stand in for
+    // a missing key B, which a count comparison would allow.
+    if (Array.isArray(requested)) {
+        const witnessedKeys = new Set(results.map((r) => r.openingDedupKey));
+        return requested.every((key) => witnessedKeys.has(key)) ? EXIT.OK : EXIT.NOT_WITNESSED;
     }
-    return results.every((r) => r && r.witnessed === true) ? EXIT.OK : EXIT.NOT_WITNESSED;
+    if (Number.isInteger(requested) && results.length < requested) return EXIT.NOT_WITNESSED;
+    return EXIT.OK;
 }
 
 const REQUIRED_ENV = [
@@ -110,14 +116,16 @@ function main(argv) {
             // precision is lost on the way to the operator.
             const json = JSON.stringify({ results }, (_k, v) => (typeof v === 'bigint' ? v.toString() : v), 2);
             process.stdout.write(`${json}\n`);
-            const code = exitCodeForResults(results, openingDedupKeys.length);
+            const code = exitCodeForResults(results, openingDedupKeys);
             if (code !== EXIT.OK) {
                 // Also on stderr: an operator tailing the log must not have to
                 // parse JSON to learn that nothing was reconciled.
                 const list = Array.isArray(results) ? results : [];
-                const requested = Math.max(openingDedupKeys.length, list.length);
-                const witnessed = list.filter((r) => r && r.witnessed === true).length;
-                const missing = Math.max(0, openingDedupKeys.length - list.length);
+                const witnessedKeys = new Set(list.filter((r) => r && r.witnessed === true).map((r) => r.openingDedupKey));
+                const returnedKeys = new Set(list.map((r) => r && r.openingDedupKey));
+                const requested = openingDedupKeys.length;
+                const witnessed = openingDedupKeys.filter((k) => witnessedKeys.has(k)).length;
+                const missing = openingDedupKeys.filter((k) => !returnedKeys.has(k)).length;
                 process.stderr.write(
                     `[wp-i reconciler] ${requested - witnessed} of ${requested} opening(s) were NOT witnessed` +
                     `${missing > 0 ? ` (${missing} never returned a result)` : ''}; this run is not a successful reconciliation\n`

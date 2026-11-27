@@ -497,7 +497,7 @@ router.post('/internal-transfer', protectActive, requireKyc('p2p'), exclusiveSec
             return res.status(200).json(committedBody);
         }
     } catch (error) {
-        if (isStepUpRejection(error)) return respondStepUpRejected(res);
+        if (isStepUpRejection(error)) return respondStepUpRejected(res, error);
         if (String(error.message || '').startsWith('Insufficient')) {
             return res.status(400).json({ success: false, message: error.message });
         }

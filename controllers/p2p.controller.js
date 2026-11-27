@@ -641,7 +641,7 @@ exports.completeTrade = async (req, res) => {
         // canonical post-completion side effects (balances, gamification,
         // queue auto-process, notifications) all ran on the first call,
         // so the second caller just sees the trade as done.
-        if (isStepUpRejection(error)) return respondStepUpRejected(res);
+        if (isStepUpRejection(error)) return respondStepUpRejected(res, error);
         if (error.message === 'TRADE_ALREADY_FINALIZED') {
             return res.status(200).json({
                 success: true,

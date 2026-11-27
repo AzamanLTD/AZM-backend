@@ -133,6 +133,15 @@ describe('§6 reconciler exit semantics', () => {
         await expect(main(argv('A'))).resolves.toBe(EXIT.FATAL);
     });
 
+    test('a duplicate result for one key cannot stand in for a missing key', async () => {
+        reconcileTreasuryOpenings.mockResolvedValue([
+            { openingDedupKey: 'A', witnessed: true, witnessId: 'w1' },
+            { openingDedupKey: 'A', witnessed: true, witnessId: 'w1' },
+        ]);
+        await expect(main(argv('A', 'B'))).resolves.toBe(EXIT.NOT_WITNESSED);
+        expect(stderr.join('')).toMatch(/1 of 2 opening\(s\) were NOT witnessed \(1 never returned a result\)/);
+    });
+
     test('exitCodeForResults maps every shape', () => {
         const { exitCodeForResults } = require('../workers/run-provider-settlement-reconciler');
         expect(exitCodeForResults(null, 1)).toBe(EXIT.FATAL);
@@ -141,6 +150,8 @@ describe('§6 reconciler exit semantics', () => {
         expect(exitCodeForResults([{ witnessed: true }, null], 2)).toBe(EXIT.NOT_WITNESSED);
         expect(exitCodeForResults([{ witnessed: 'true' }], 1)).toBe(EXIT.NOT_WITNESSED);
         expect(exitCodeForResults([{ witnessed: true }, { witnessed: true }], 2)).toBe(EXIT.OK);
+        expect(exitCodeForResults([{ openingDedupKey: 'A', witnessed: true }], ['A', 'B'])).toBe(EXIT.NOT_WITNESSED);
+        expect(exitCodeForResults([{ openingDedupKey: 'B', witnessed: true }, { openingDedupKey: 'A', witnessed: true }], ['A', 'B'])).toBe(EXIT.OK);
     });
 
     test('the four outcomes are distinct codes', () => {
