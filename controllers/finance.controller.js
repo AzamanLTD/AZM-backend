@@ -19,7 +19,7 @@
 // Routes wired in routes/financeRoutes.js:
 //   POST /api/finance/withdraw/fiat                   → (r42 WAVE-2: canonical alias → withdrawalController.fiatWithdrawal, full authority)
 //   POST /api/finance/admin/liquidate-profits         → liquidateProfits        (admin only)
-//   POST /api/finance/webhook/deposit                 → cryptoDepositWebhook    (public, idempotent)
+//   POST /api/finance/webhook/deposit                 → retiredCryptoDepositWebhook (410, no state access)
 
 /**
  * Phase N helper: retrieve the singleton NotificationService from app context.
@@ -123,72 +123,29 @@ exports.liquidateProfits = async (req, res) => {
 };
 
 // =============================================================================
-// POST /api/finance/webhook/deposit  — crypto deposit listener (Tatum/Alchemy)
+// POST /api/finance/webhook/deposit — RETIRED. Refuses before any read or write.
+//
+// This route was mounted with no authentication and no signature check. It
+// took `userId`, `amount` and `txHash` from the request body and credited that
+// user's spendable USDC balance, so anyone who could reach the API could mint
+// balance for any account with a made-up hash. No client calls it, and no
+// provider is configured to: crypto deposits arrive through the verified
+// Tatum webhook (POST /api/finance/webhook/tatum), which resolves the owner
+// from the WalletAddress registry rather than from the payload.
+//
+// The handler deliberately touches nothing — no prisma, no socket, no
+// notification — so a request can never mutate state, whatever its body.
 // =============================================================================
-exports.cryptoDepositWebhook = async (req, res) => {
-    const prisma            = req.app.get('prisma');
-    const io                = req.app.get('socketio');
-    const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
-
-    try {
-        const { amount, txHash, address, userId } = req.body;
-        if (!amount || !txHash) {
-            return res.status(400).json({ success: false, message: 'Missing required fields: amount, txHash.' });
-        }
-        const amountUsdc   = parseFloat(amount);
-        const targetUserId = parseInt(userId, 10);
-        if (isNaN(amountUsdc) || amountUsdc <= 0) {
-            return res.status(400).json({ success: false, message: 'Invalid USDC amount.' });
-        }
-        if (!targetUserId || isNaN(targetUserId)) {
-            return res.status(400).json({ success: false, message: 'userId is required in the webhook payload.' });
-        }
-
-        const result = await financeService.processCryptoDeposit(prisma, {
-            userId:     targetUserId,
-            amountUsdc,
-            txHash,
-            address
-        });
-
-        if (result.alreadyProcessed) {
-            return res.status(200).json({
-                success: true,
-                message: 'Transaction already processed.',
-                data:    { txHash, alreadyProcessed: true }
-            });
-        }
-
-        await emitBalanceUpdate(targetUserId);
-        io.to(`user_${targetUserId}`).emit('deposit_success', {
-            type:       'DEPOSIT_CRYPTO',
-            amount:     amountUsdc,
-            txHash,
-            newBalance: result.data.newBalance,
-            timestamp:  new Date().toISOString()
-        });
-
-        try {
-            await _getNotificationService(req).sendNotification({
-                userId:        targetUserId,
-                title:         '💰 Deposit Confirmed',
-                body:          `${amountUsdc} USDC has been credited to your account.`,
-                category:      'GENERAL',
-                actionPayload: { action: 'OPEN_WALLET', reference: txHash }
-            });
-        } catch (notifErr) {
-            logger.error({ err: notifErr }, '[cryptoDepositWebhook] Notification write failed');
-        }
-
-        return res.status(200).json({
-            success: true,
-            message: `Crypto deposit of ${amountUsdc} USDC confirmed for user ${targetUserId}.`,
-            data:    result.data
-        });
-    } catch (error) {
-        logger.error({ err: error }, '[finance.cryptoDepositWebhook] error');
-        return res.status(500).json({ success: false, message: error.message });
-    }
+exports.retiredCryptoDepositWebhook = (req, res) => {
+    logger.warn(
+        { ip: req.ip, path: req.originalUrl },
+        '[finance] refused call to the retired unauthenticated deposit webhook'
+    );
+    return res.status(410).json({
+        success: false,
+        code: 'DEPOSIT_WEBHOOK_RETIRED',
+        message: 'This endpoint has been retired. Nothing was credited.',
+    });
 };
 
 // =============================================================================

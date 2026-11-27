@@ -1033,6 +1033,9 @@ const liquidateProfits = async (prisma, amountIn, adminId, auditContext = {}) =>
     };
 };
 
+// No HTTP route reaches this function. Its only caller was the retired,
+// unauthenticated POST /api/finance/webhook/deposit (now a 410). Do not wire
+// it to a route again: it trusts the caller-supplied userId and amount.
 const processCryptoDeposit = async (prisma, { userId, amountUsdc, txHash, address }) => {
     try {
         const result = await prisma.$transaction(async (tx) => {
