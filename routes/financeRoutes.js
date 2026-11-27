@@ -65,8 +65,10 @@ router.post(
     financeController.liquidateProfits
 );
 
-// Webhook endpoints (no auth — external providers).
-router.post('/webhook/deposit', financeController.cryptoDepositWebhook);
+// Retired: this path credited a body-supplied userId with no authentication.
+// It stays mounted only to answer 410 so a stale caller gets an explicit,
+// non-mutating refusal. The verified crypto deposit path is /webhook/tatum.
+router.post('/webhook/deposit', financeController.retiredCryptoDepositWebhook);
 
 // Provider settlement callbacks are deliberately routed through the dedicated
 // adapter. The old controller handlers remain available for compatibility, but

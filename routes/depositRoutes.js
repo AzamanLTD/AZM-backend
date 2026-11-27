@@ -6,9 +6,9 @@
 //   1. POST /api/deposit/fiat/initiate  — auth required, returns a persisted quote
 //   2. POST /api/deposit/fiat/webhook   — payment aggregator confirms settlement
 //
-// Crypto deposits remain webhook-driven via the canonical finance.service path
-// (POST /api/finance/webhook/deposit). The Tatum-specific shim here delegates
-// to the same service so there is exactly one crypto-deposit code path.
+// Crypto deposits are webhook-driven through the verified Tatum webhook
+// (POST /api/finance/webhook/tatum). The old unauthenticated
+// POST /api/finance/webhook/deposit is retired and answers 410.
 //
 // The legacy POST /api/deposit/transfer route was removed — internal transfers
 // happen via the canonical peer-transfer rail (POST /api/friends/transfer/...).
