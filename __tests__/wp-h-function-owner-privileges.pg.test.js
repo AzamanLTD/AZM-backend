@@ -126,6 +126,10 @@ run('WP-H function-owner privilege normalisation (real PostgreSQL)', () => {
         await admin.$executeRawUnsafe(`GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO ${fnO}`);
         await admin.$executeRawUnsafe(`GRANT CREATE, USAGE ON SCHEMA public TO ${fnO}`);
         await admin.$executeRawUnsafe(`GRANT SELECT, UPDATE ON ALL TABLES IN SCHEMA public TO ${el(ROLE.foreign)}`);
+        // The foreign role exists to be a privilege-bearing role the function
+        // owner is made a member of. A foreign grantee ON the boundary record is a
+        // different tamper, which the installer must refuse; it has its own test.
+        await admin.$executeRawUnsafe(`REVOKE ALL ON TABLE ${TABLE} FROM ${el(ROLE.foreign)}`);
         await admin.$executeRawUnsafe(`GRANT ${el(ROLE.foreign)} TO ${fnO}`);
         poisonedBefore = (await directGrantCount(ROLE.fnOwner))[0].grants;
         const [preAttrs] = await admin.$queryRawUnsafe(`
@@ -364,6 +368,37 @@ run('WP-H function-owner privilege normalisation (real PostgreSQL)', () => {
             await admin.$executeRawUnsafe(`DROP ROLE IF EXISTS ${el(attacker)}`).catch(() => {});
         }
     });
+
+    t('a foreign grantee on the boundary record is revoked and reported, and the function owner is not one', async () => {
+        // The installer reads the record's and the trigger function's ACLs from the
+        // catalog. A role outside the boundary that holds privileges there is
+        // tampering: it is revoked and the install fails loudly. The function
+        // owner's own SELECT, INSERT (granted by the function installer) must
+        // never be mistaken for that, or every re-run would strip it.
+        const intruder = `wp_h_grantee_${RUN}`;
+        const { installAuthorityActivationRoles } = require('../infra/install-authority-activation-roles');
+        const roles = { owner: ROLE.owner, runtime: ROLE.runtime, operator: ROLE.operator, functionOwner: ROLE.fnOwner, log: () => {} };
+        const priv = async (role, what) => (await admin.$queryRawUnsafe(
+            `SELECT has_table_privilege($1, $2, $3) AS ok`, role, TABLE, what))[0].ok;
+        try {
+            await admin.$executeRawUnsafe(`CREATE ROLE ${el(intruder)} NOLOGIN`);
+            await admin.$executeRawUnsafe(`GRANT SELECT, UPDATE ON TABLE ${TABLE} TO ${el(intruder)}`);
+            expect(await priv(intruder, 'UPDATE')).toBe(true);
+
+            const report = await installAuthorityActivationRoles(admin, roles);
+            expect(report.ok).toBe(false);
+            expect(report.problems.join(' ')).toContain(`foreign grantee had privileges on the boundary: ${intruder}`);
+            expect(await priv(intruder, 'SELECT')).toBe(false);
+            expect(await priv(intruder, 'UPDATE')).toBe(false);
+
+            const again = await installAuthorityActivationRoles(admin, roles);
+            expect(again.problems.join(' ')).not.toMatch(/foreign grantee/);
+            expect(await priv(ROLE.fnOwner, 'INSERT')).toBe(true);
+        } finally {
+            await admin.$executeRawUnsafe(`DROP OWNED BY ${el(intruder)}`).catch(() => {});
+            await admin.$executeRawUnsafe(`DROP ROLE IF EXISTS ${el(intruder)}`).catch(() => {});
+        }
+    }, 60000);
 
     t('an unexpected owned object fails the install with precise diagnostics', async () => {
         await admin.$executeRawUnsafe(`CREATE TABLE "AttackerOwned" ("id" int)`);

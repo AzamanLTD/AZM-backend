@@ -273,7 +273,9 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
     // Remediate first, then fail: the database is left safe either way, but
     // evidence of tampering must reach a human instead of passing as a clean
     // install (same posture as an unexpected owned object).
-    const allow = new Set([owner, operator, runtime]);
+    // The function owner is a sanctioned grantee: the function installer grants
+    // it SELECT, INSERT on the record so the SECURITY DEFINER path can write.
+    const allow = new Set([owner, operator, runtime, functionOwner]);
     const foreignMemberships = [];
     // The function owner is included deliberately: whoever inherits it can replace
     // the SECURITY DEFINER function, which is the same power as owning the record.
@@ -307,7 +309,7 @@ async function installAuthorityActivationRoles(prisma, options = {}) {
     const aclRows = await prisma.$queryRawUnsafe(
         `SELECT unnest(relacl)::text AS acl FROM pg_class WHERE oid = $1::regclass
          UNION ALL
-         SELECT unnest(proacl)::text AS acl FROM pg_proc WHERE oid = $2::regproc`,
+         SELECT unnest(proacl)::text AS acl FROM pg_proc WHERE oid = $2::regprocedure`,
         TABLE, TRIGGER_FN
     ).catch((err) => {
         // Fail closed for the same reason: an unread ACL is not an empty ACL.
