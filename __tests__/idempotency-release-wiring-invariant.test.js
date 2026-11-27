@@ -46,12 +46,14 @@ describe('release-declaration recovery evidence', () => {
         // Sanity floor: this many declarations exist today. If the parser silently
         // stops matching (someone renames the middleware options), this fails
         // instead of the invariant passing vacuously.
-        expect(decls.length).toBeGreaterThanOrEqual(27);
+        // 26: the AZM -> USDC conversion route was retired (409 AZM_NOT_CASH)
+        // and no longer declares an idempotency claim.
+        expect(decls.length).toBeGreaterThanOrEqual(26);
         expect(decls.every((d) => !d.key.includes('?'))).toBe(true);
         const releasing = decls.filter((d) => d.policy === 'RELEASE_5XX');
         const on4xxOnly = decls.filter((d) => d.policy === 'RELEASE_4XX_ONLY');
         expect(releasing.length).toBe(19);
-        expect(on4xxOnly.length).toBe(8);
+        expect(on4xxOnly.length).toBe(7); // AZM conversion retired (was the 8th)
     });
 
     test('every releasing declaration has matching, source-proven evidence', () => {

@@ -710,7 +710,7 @@ const flagOverpayment = async (prisma, { tradeId, buyerId, overpaidAmountUsdc })
  *   releasedByUserId: number   // must be vendorId for SELL ad, userId for BUY ad
  * }} params
  */
-const completeTrade = async (prisma, { tradeId, releasedByUserId, adminOverride = false, financialOperation = null }) => {
+const completeTrade = async (prisma, { tradeId, releasedByUserId, adminOverride = false, financialOperation = null, authorize = null }) => {
     // Pre-fetch outside the transaction (read-only checks)
     const trade = await prisma.trade.findUnique({
         where:  { id: tradeId },
@@ -783,6 +783,9 @@ const completeTrade = async (prisma, { tradeId, releasedByUserId, adminOverride 
         calculateFeeSplit(trade.amountCrypto, effectiveFeePct, adminPct, vendorPct);
 
     const result = await prisma.$transaction(async (tx) => {
+        // §WP-H G — the releasing party's authorisation (the action-bound grant
+        // when enforced) is spent first, inside the settlement transaction.
+        if (authorize) await authorize(tx);
         // Phase H8 BUGFIX (2026-05-27): atomic conditional status flip.
         // The status check was happening OUTSIDE the transaction
         // (`findUnique` at the top of this function), so two concurrent

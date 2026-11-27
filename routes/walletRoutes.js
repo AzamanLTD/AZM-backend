@@ -107,7 +107,7 @@ const { protect }              = require('../middleware/authMiddleware');
 const { idempotency } = require('../middleware/idempotency');
 const { require2FA } = require('../middleware/require2FA');
 const { protectActive }        = require('../middleware/banGuardMiddleware');
-const { requireActionStepUp, whenStepUpEnforced, isStepUpEnforced } = require('../middleware/requireActionStepUp');
+const { requireActionStepUp, whenStepUpEnforced, isStepUpEnforced, requireConsumedStepUp, isStepUpRejection, respondStepUpRejected, exclusiveSecondFactor } = require('../middleware/requireActionStepUp');
 
 // Route-specific FX gate (AZM-Planning #75 — PROPOSED, pending owner
 // approval): the wallet withdrawal is FX-dependent exactly when the
@@ -140,8 +140,22 @@ const { requireFreshFxRate } = require('../middleware/fxTransactionGateMiddlewar
 //   * require2FA() and the gate are mutually exclusive. When step-up is enforced
 //     the grant IS the second factor (it was earned with a TOTP bound to this
 //     action); running both would burn two TOTP steps for one withdrawal.
+// This route debits USDC and pays out to MoMo, Binance Pay or an on-chain
+// address. Its action is WALLET_WITHDRAWAL scoped to the route actually
+// mounted, not the fiat route at /api/withdraw/fiat. The descriptor binds the
+// destination type and network as well as the destination itself.
 const stepUpGate = whenStepUpEnforced(
-    requireActionStepUp({ actionType: 'FIAT_WITHDRAWAL', routeScope: 'POST /api/withdraw' })
+    requireActionStepUp({
+        actionType: 'WALLET_WITHDRAWAL',
+        routeScope: 'POST /api/wallet/withdraw',
+        currency: () => 'USDC',
+        amount: (req) => (req.body ? req.body.amount : null), // raw value: the canonical contract refuses a JSON number rather than authorise a possibly-rounded amount
+        destination: (req) => (req.body && req.body.destination) || null,
+        params: (req) => ({
+            destinationType: (req.body && req.body.destinationType) || null,
+            networkPref: (req.body && req.body.networkPref) || null,
+        }),
+    })
 );
 const secondFactor = (req, res, next) => (isStepUpEnforced() ? next() : require2FA()(req, res, next));
 
@@ -242,8 +256,20 @@ router.get('/pool-withdrawal-preview', protect, async (req, res) => {
 // at or above that magnitude is refused with USDC_AMOUNT_STRING_REQUIRED
 // rather than silently rounded, because JSON.parse may already have destroyed
 // the last digit. Over-precision (>8dp) is USDC_AMOUNT_PRECISION.
-router.post('/internal-transfer', protectActive, requireKyc('p2p'), require2FA(), whenStepUpEnforced(requireActionStepUp({ actionType: 'INTERNAL_TRANSFER' })),
-    idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), async (req, res) => {
+// §WP-H G — the same contract as /withdraw: idempotency BEFORE the gate (a
+// committed retry replays without a new grant), the grant consumed inside the
+// money transaction, and require2FA / the grant mutually exclusive. The
+// descriptor binds the direction and the exact amount text, so a grant earned
+// for one transfer cannot spend another.
+const internalTransferStepUp = whenStepUpEnforced(requireActionStepUp({
+    actionType: 'INTERNAL_TRANSFER',
+    routeScope: 'POST /api/wallet/internal-transfer',
+    currency: () => 'USDC',
+    amount: (req) => (req.body ? req.body.amount : null), // raw value: the canonical contract refuses a JSON number rather than authorise a possibly-rounded amount
+    params: (req) => ({ direction: (req.body && req.body.direction) || null }),
+}));
+router.post('/internal-transfer', protectActive, requireKyc('p2p'), exclusiveSecondFactor(require2FA),
+    idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), internalTransferStepUp, async (req, res) => {
     const prisma = req.app.get('prisma');
     const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
 
@@ -292,6 +318,8 @@ router.post('/internal-transfer', protectActive, requireKyc('p2p'), require2FA()
             // a racing wallet spend loses the CAS cleanly instead of driving
             // the balance negative.
             const committedBody = await prisma.$transaction(async (tx) => {
+                // The grant and the money move together or not at all.
+                await requireConsumedStepUp(tx, req);
                 const claim = await tx.user.updateMany({
                     where: { id: userId, availableBalance: { gte: amountExact } },
                     data: {
@@ -368,6 +396,7 @@ router.post('/internal-transfer', protectActive, requireKyc('p2p'), require2FA()
             // read below is authoritative because the guarded claim holds
             // the user row lock.
             const committedBody = await prisma.$transaction(async (tx) => {
+                await requireConsumedStepUp(tx, req);
                 const claim = await tx.user.updateMany({
                     where: { id: userId, vendorUnallocatedBalance: { gte: amountExact } },
                     data: {
@@ -468,6 +497,7 @@ router.post('/internal-transfer', protectActive, requireKyc('p2p'), require2FA()
             return res.status(200).json(committedBody);
         }
     } catch (error) {
+        if (isStepUpRejection(error)) return respondStepUpRejected(res);
         if (String(error.message || '').startsWith('Insufficient')) {
             return res.status(400).json({ success: false, message: error.message });
         }

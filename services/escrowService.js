@@ -159,7 +159,7 @@ const createEscrow = async (prisma, { ticketId, payerId, payeeId, amountUsdc, de
 // =============================================================================
 // 2. FUND ESCROW — payer locks USDC. The critical financial step.
 // =============================================================================
-const fundEscrow = async (prisma, { escrowId, payerId, financialOperation = null }) => {
+const fundEscrow = async (prisma, { escrowId, payerId, financialOperation = null, authorize = null }) => {
     const escrow = await prisma.smartEscrow.findUnique({
         where: { id: escrowId },
         include: { ticket: true }
@@ -192,6 +192,10 @@ const fundEscrow = async (prisma, { escrowId, payerId, financialOperation = null
     const reference = randomUUID();
 
     const updatedEscrow = await prisma.$transaction(async (tx) => {
+        // §WP-H G — the caller's authorisation (the action-bound step-up grant
+        // when enforced) is spent first, inside this transaction: a rollback of
+        // the funding leaves it unspent, a commit spends it with the money.
+        if (authorize) await authorize(tx);
         // r25 P0 — ATOMIC FUNDING CLAIM (the single-winner boundary for the
         // ENTIRE economic operation): the DRAFT→FUNDED transition is claimed
         // by an exact-lifecycle CAS on the durable escrow identity. The
@@ -364,7 +368,7 @@ const fundEscrow = async (prisma, { escrowId, payerId, financialOperation = null
 // =============================================================================
 // 3. MARK SATISFIED — a party signals completion. Both true → auto-settle.
 // =============================================================================
-const markSatisfied = async (prisma, { escrowId, userId }) => {
+const markSatisfied = async (prisma, { escrowId, userId, authorize = null }) => {
     const escrow = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
     if (!escrow) throw new Error('Escrow not found.');
     if (escrow.status === 'SETTLED') {
@@ -385,57 +389,87 @@ const markSatisfied = async (prisma, { escrowId, userId }) => {
 
     const isPayer = escrow.payerId === userId;
     const data = isPayer ? { payerSatisfied: true } : { payeeSatisfied: true };
-
-    // TOCTOU guard: claim this party's satisfaction flag with a conditional
-    // update so two concurrent markSatisfied calls for the SAME party cannot
-    // both "win" (the loser sees count=0 and bails). Combined with the
-    // single-winner claim inside _releaseEscrow, this makes double-settlement
-    // (and therefore double-payout) impossible even under concurrent calls
-    // from both parties at once. Mirrors the completeTrade atomic-flip pattern.
-    // §r41: the claim is also STATUS-BOUND — a flag can only be claimed while
-    // the escrow is still in a satisfaction-capable state, so a terminal
-    // refund/dispute resolution that committed after the stale pre-read can
-    // never have a satisfaction flag (or a pending write) land on top of it.
     const guard = isPayer ? { payerSatisfied: false } : { payeeSatisfied: false };
-    const claimed = await prisma.smartEscrow.updateMany({
-        where: {
-            id: escrowId,
-            ...guard,
-            status: { in: ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'] }
-        },
-        data
-    });
-    if (claimed.count === 0) {
+    const SATISFIABLE = ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'];
+
+    // ONE TRANSACTION (§WP-H G). The action-bound grant (when enforced), this
+    // party's satisfaction flag and — if both parties are now satisfied — the
+    // release to the payee commit together or not at all. Previously the flag
+    // was written in its own statement and the release opened a second
+    // transaction, so a grant could never be spent atomically with the money,
+    // and a failed release left a committed flag behind.
+    //
+    // Concurrency: both parties' flag claims UPDATE the same escrow row, so
+    // PostgreSQL serialises them. The second claim runs after the first
+    // commits and its read sees both flags, so exactly one transaction
+    // performs the release; _releaseEscrowTx's own status claim is the final
+    // single-winner guard.
+    //
+    // A claim that loses (already marked, terminal state won, already settled)
+    // throws a sentinel so the transaction rolls back and a grant is NOT spent
+    // on an operation that did nothing.
+    const LOST = 'ESCROW_SATISFY_CLAIM_LOST';
+    let outcome;
+    try {
+        outcome = await prisma.$transaction(async (tx) => {
+            if (authorize) await authorize(tx);
+
+            // TOCTOU + terminal-state guard: status-bound conditional claim of
+            // this party's flag (§r41).
+            const claimed = await tx.smartEscrow.updateMany({
+                where: { id: escrowId, ...guard, status: { in: SATISFIABLE } },
+                data,
+            });
+            if (claimed.count === 0) {
+                const lost = new Error(LOST);
+                lost.code = LOST;
+                throw lost;
+            }
+            const current = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
+
+            if (current.payerSatisfied && current.payeeSatisfied) {
+                const settled = await _releaseEscrowTx(tx, current, 'SETTLED');
+                return { kind: 'SETTLED', escrow: settled };
+            }
+
+            // Awaiting the other side: PENDING_SETTLEMENT, status-bound so a
+            // terminal escrow is never reverted to pending.
+            const pending = await tx.smartEscrow.updateMany({
+                where: { id: escrowId, status: { in: SATISFIABLE } },
+                data: { status: 'PENDING_SETTLEMENT' },
+            });
+            if (pending.count !== 1) {
+                const lost = new Error(LOST);
+                lost.code = LOST;
+                throw lost;
+            }
+            const marked = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
+            return { kind: 'PENDING', escrow: marked };
+        });
+    } catch (err) {
+        const lostClaim = err && (err.code === LOST || err.message === 'ESCROW_ALREADY_FINALIZED');
+        if (!lostClaim) throw err;
+        // Nothing committed. Converge to the truth of the row as it stands now.
         const current = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
         if (current && current.status === 'SETTLED') {
             return { settled: true, alreadySettled: true, escrow: current };
         }
-        if (current && ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'].includes(current.status)) {
-            throw new Error('You have already marked this escrow as satisfied.');
+        if (current && SATISFIABLE.includes(current.status)) {
+            const already = isPayer ? current.payerSatisfied : current.payeeSatisfied;
+            if (already) throw new Error('You have already marked this escrow as satisfied.');
         }
-        // §r41: the escrow left the satisfaction-capable states between the
-        // stale pre-read and the claim (refund / dispute resolution won).
-        const err = new Error(`Cannot mark satisfied from status ${current ? current.status : 'UNKNOWN'}.`);
-        err.code = 'ESCROW_STATE_CHANGED';
-        throw err;
+        const conflict = new Error(
+            `Cannot mark satisfied from status ${current ? current.status : 'UNKNOWN'}.`
+        );
+        conflict.code = 'ESCROW_STATE_CHANGED';
+        throw conflict;
     }
-    const updated = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
 
-    // Both satisfied → release to payee (SETTLED). _releaseEscrow fires
-    // ORDER_SETTLED itself, so we do NOT also fire ORDER_SATISFIED here.
-    if (updated.payerSatisfied && updated.payeeSatisfied) {
-        try {
-            const settled = await _releaseEscrow(prisma, escrowId, 'SETTLED');
-            return { settled: true, escrow: settled };
-        } catch (err) {
-            if (err && err.message === 'ESCROW_ALREADY_FINALIZED') {
-                const current = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
-                if (current && current.status === 'SETTLED') {
-                    return { settled: true, alreadySettled: true, escrow: current };
-                }
-            }
-            throw err;
-        }
+    if (outcome.kind === 'SETTLED') {
+        // _releaseEscrow's post-commit effects (realtime, order sync, business
+        // stats and the owner feed), run only after the commit above.
+        _afterReleaseCommitted(prisma, outcome.escrow, escrowId, 'SETTLED');
+        return { settled: true, escrow: outcome.escrow };
     }
 
     // Buyer (payer) signalled completion but the owner hasn't confirmed yet —
@@ -450,72 +484,27 @@ const markSatisfied = async (prisma, { escrowId, userId }) => {
         });
     }
 
-    // Otherwise mark we are awaiting the other side.
-    try {
-        // §r41 — TERMINAL-STATE CAS (final-audit: satisfaction resurrection).
-        // The stale pre-read above is only a fast-fail. A concurrent
-        // opposite-party satisfaction can commit SETTLED, and a racing
-        // refund/dispute resolution can commit REFUNDED/RELEASED, between
-        // that read and this write. The PENDING_SETTLEMENT transition is
-        // therefore a DB-boundary conditional claim (extended-unique update:
-        // the status predicate is part of the row's own WHERE, and Prisma
-        // raises P2025 when the terminal state won the race): it may only
-        // land on a still-satisfaction-capable escrow, and a terminal escrow
-        // is NEVER reverted to pending.
-        let pending;
+    // Realtime convergence: emit only after the PENDING_SETTLEMENT commit.
+    const pending = outcome.escrow;
+    if (_socketIo) {
+        const payload = {
+            escrowId: pending.id,
+            ticketId: pending.ticketId,
+            status: pending.status,
+            amountUsdc: pending.amountUsdc,
+            payerId: pending.payerId,
+            payeeId: pending.payeeId,
+        };
         try {
-            pending = await prisma.smartEscrow.update({
-                where: {
-                    id: escrowId,
-                    status: { in: ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'] }
-                },
-                data: { status: 'PENDING_SETTLEMENT' }
-            });
+            _socketIo.to(`user_${pending.payerId}`).emit('escrow_pending_settlement', payload);
+            _socketIo.to(`user_${pending.payeeId}`).emit('escrow_pending_settlement', payload);
+            _socketIo.to('admin_spy_room').emit('escrow_pending_settlement', payload);
         } catch (err) {
-            if (err && err.code === 'P2025') {
-                const current = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
-                if (current && current.status === 'SETTLED') {
-                    return { settled: true, alreadySettled: true, escrow: current };
-                }
-                const conflict = new Error(
-                    `Cannot mark satisfied from status ${current ? current.status : 'UNKNOWN'} (terminal state won the race).`
-                );
-                conflict.code = 'ESCROW_STATE_CHANGED';
-                throw conflict;
-            }
-            throw err;
+            logger.warn({ err, escrowId: pending.id }, '[escrowService.markSatisfied] realtime emit failed');
         }
-        // Realtime convergence: emit only after the PENDING_SETTLEMENT update commits.
-        if (_socketIo) {
-            const payload = {
-                escrowId: pending.id,
-                ticketId: pending.ticketId,
-                status: pending.status,
-                amountUsdc: pending.amountUsdc,
-                payerId: pending.payerId,
-                payeeId: pending.payeeId,
-            };
-            try {
-                _socketIo.to(`user_${pending.payerId}`).emit('escrow_pending_settlement', payload);
-                _socketIo.to(`user_${pending.payeeId}`).emit('escrow_pending_settlement', payload);
-                _socketIo.to('admin_spy_room').emit('escrow_pending_settlement', payload);
-            } catch (err) {
-                logger.warn({ err, escrowId: pending.id }, '[escrowService.markSatisfied] realtime emit failed');
-            }
-        }
-
-        return { settled: false, escrow: pending };
-    } catch (err) {
-        // A concurrent opposite-party request can settle between the read above
-        // and this pending-state write. The database terminal-state guard must
-        // remain intact; converge to the committed settlement instead of turning
-        // a successful concurrent settlement into a misleading 500.
-        const current = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
-        if (current && current.status === 'SETTLED') {
-            return { settled: true, alreadySettled: true, escrow: current };
-        }
-        throw err;
     }
+
+    return { settled: false, escrow: pending };
 };
 
 // =============================================================================
@@ -1129,20 +1118,12 @@ const _refundEscrowTx = async (tx, escrow, finalStatus = 'REFUNDED') => {
 };
 
 // =============================================================================
-// PRIVATE: _releaseEscrow — principal → payee.availableBalance.
-//   finalStatus 'SETTLED' (auto, source escrowLockedBalance) or
-//   'RELEASED' (admin from a dispute, source disputeEscrowBalance).
+// PRIVATE: _afterReleaseCommitted — the post-commit effects of a release.
+// Shared by _releaseEscrow and the atomic markSatisfied transaction so both
+// emit, sync the order, update business stats and notify the owner exactly
+// the same way, and only after the money has committed.
 // =============================================================================
-const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
-    // The authoritative escrow row is read INSIDE the transaction that claims
-    // it — closing the helper's own TOCTOU window (a status change between the
-    // old outer read and the claim no longer misdirects the balance mutation).
-    const updated = await prisma.$transaction(async (tx) => {
-        const escrow = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
-        if (!escrow) throw new Error('Escrow not found.');
-        return _releaseEscrowTx(tx, escrow, finalStatus);
-    });
-
+const _afterReleaseCommitted = (prisma, updated, escrowId, finalStatus) => {
     // Realtime convergence: emit only after the $transaction commits.
     if (_socketIo && finalStatus === 'SETTLED') {
         const payload = {
@@ -1207,6 +1188,24 @@ const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
         });
     }
 
+};
+
+// =============================================================================
+// PRIVATE: _releaseEscrow — principal → payee.availableBalance.
+//   finalStatus 'SETTLED' (auto, source escrowLockedBalance) or
+//   'RELEASED' (admin from a dispute, source disputeEscrowBalance).
+// =============================================================================
+const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
+    // The authoritative escrow row is read INSIDE the transaction that claims
+    // it — closing the helper's own TOCTOU window (a status change between the
+    // old outer read and the claim no longer misdirects the balance mutation).
+    const updated = await prisma.$transaction(async (tx) => {
+        const escrow = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
+        if (!escrow) throw new Error('Escrow not found.');
+        return _releaseEscrowTx(tx, escrow, finalStatus);
+    });
+
+    _afterReleaseCommitted(prisma, updated, escrowId, finalStatus);
     return updated;
 };
 

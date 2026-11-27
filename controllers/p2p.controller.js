@@ -20,6 +20,7 @@
 
 const logger = require('../src/config/logger');
 const p2pService = require('../services/p2p.service');
+const { requireConsumedStepUp, isStepUpRejection, respondStepUpRejected } = require('../middleware/requireActionStepUp');
 const { audit } = require('../utils/audit');
 
 /**
@@ -454,6 +455,7 @@ exports.completeTrade = async (req, res) => {
         const data = await p2pService.completeTrade(prisma, {
             tradeId, releasedByUserId,
             financialOperation: res.locals?.financialOperation || null,
+            authorize: (tx) => requireConsumedStepUp(tx, req),
         });
 
         // Phase N: deliver notifications via full pipeline (DB + socket + FCM)
@@ -639,6 +641,7 @@ exports.completeTrade = async (req, res) => {
         // canonical post-completion side effects (balances, gamification,
         // queue auto-process, notifications) all ran on the first call,
         // so the second caller just sees the trade as done.
+        if (isStepUpRejection(error)) return respondStepUpRejected(res);
         if (error.message === 'TRADE_ALREADY_FINALIZED') {
             return res.status(200).json({
                 success: true,

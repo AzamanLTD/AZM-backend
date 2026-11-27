@@ -271,17 +271,8 @@ const RELEASE_EVIDENCE = [
     },
 
     // ── releaseOn4xx only: RETAIN on 5xx, still wired ───────────────────────
-    {
-        file: 'routes/azmConversionRoutes.js',
-        key: 'POST /',
-        policy: 'RELEASE_4XX_ONLY',
-        ...IN_TX(
-            'controllers/azmConversionController.js',
-            '§r42.1 WIRED CLAIM COMMIT — the conversion economics above and the',
-            'await commitOperation(tx, res.locals?.financialOperation || null, 200, response);',
-            { file: '__tests__/r42.1-idempotency-closure.pg.test.js', name: 'B. same-key replay: byte-identical; economics never re-execute' },
-        ),
-    },
+    // routes/azmConversionRoutes.js POST / no longer takes an idempotency claim:
+    // the AZM -> USDC conversion is refused (409 AZM_NOT_CASH) before any state.
     {
         file: 'routes/azmGiftRoutes.js',
         key: 'POST /send',

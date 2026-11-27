@@ -148,7 +148,7 @@ run('action-bound step-up through POST /api/wallet/withdraw (real PostgreSQL)', 
     expect(res.body.code).toBe('STEP_UP_REQUIRED');
     expect(res.body.action).toBeTruthy();
     expect(res.body.action.amount).toBe('12.5');
-    expect(res.body.action.actionType).toBe('FIAT_WITHDRAWAL');
+    expect(res.body.action.actionType).toBe('WALLET_WITHDRAWAL');
     expect(res.body.actionDigest).toMatch(/^[0-9a-f]{64}$/);
   });
 

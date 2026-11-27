@@ -13,6 +13,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const { requireConsumedStepUp, isStepUpRejection, respondStepUpRejected } = require('../middleware/requireActionStepUp');
 const { Prisma } = require('@prisma/client');
 const ledger = require('../services/ledgerService');
 const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
@@ -219,6 +220,9 @@ exports.initiateTrade = async (req, res) => {
         // single atomic transaction to prevent race conditions where two requests
         // both pass the capacity check simultaneously.
         const tradeResult = await prisma.$transaction(async (tx) => {
+            // §WP-H G — the grant (when enforced) is spent first: the queue entry
+            // or the trade it authorises commits with it, or neither does.
+            await requireConsumedStepUp(tx, req);
             // Count active trades INSIDE the transaction (prevents race condition)
             const activeTradeCount = await tx.trade.count({
                 where: {
@@ -396,6 +400,8 @@ exports.initiateTrade = async (req, res) => {
         });
 
     } catch (error) {
+        // The throw rolled the whole transaction back: nothing was created.
+        if (isStepUpRejection(error)) return respondStepUpRejected(res);
         logger.error('Initiate Trade Error:', error);
         res.status(400).json({ success: false, message: error.message });
     }
@@ -430,6 +436,8 @@ exports.acceptTrade = async (req, res) => {
         }
 
         const updatedTrade = await prisma.$transaction(async (tx) => {
+            // §WP-H G — spend the grant (when enforced) before the escrow lock.
+            await requireConsumedStepUp(tx, req);
             const trade = await tx.trade.findUnique({
                 where: { id: tradeIdInt },
                 include: {
@@ -576,6 +584,7 @@ exports.acceptTrade = async (req, res) => {
         res.status(200).json({ success: true, trade: updatedTrade });
 
     } catch (error) {
+        if (isStepUpRejection(error)) return respondStepUpRejected(res);
         logger.error({ err: error }, 'acceptTrade error');
         const status = error.message.includes('not found') ? 404
             : error.message.includes('Only') || error.message.includes('Cannot') ? 403
