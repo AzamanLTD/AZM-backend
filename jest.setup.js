@@ -17,4 +17,13 @@ if (!process.env.JWT_SECRET) {
 if (!process.env.QR_CHECKIN_SIGNING_KEY) {
     process.env.QR_CHECKIN_SIGNING_KEY = 'test_only_qr_checkin_signing_key!2026-azm';
 }
+
+// §WP-I: the trusted collection wallet is a DEPLOYMENT PREREQUISITE, exactly like
+// JWT_SECRET above. The wallet-scoped observation identity refuses without it, so
+// a suite that settles a Moolre collection must have one configured. A test that
+// needs to prove the refusal deletes this variable itself.
+if (!process.env.MOOLRE_ACCOUNT_NUMBER) {
+    process.env.MOOLRE_ACCOUNT_NUMBER = '0244000001';
+}
+
 process.env.NODE_ENV = 'test';

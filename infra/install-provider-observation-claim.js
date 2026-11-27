@@ -148,13 +148,28 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { PrismaClient } = require('@prisma/client');
-const { canonicalObservationIdentity } = require('../src/services/providerObservationIdentity');
+const {
+    canonicalObservationIdentityV2,
+    legacyObservationKey,
+} = require('../src/services/providerObservationIdentity');
+const { acquireObservationArbitration } = require('../src/services/observationArbitration');
+// §WP-I: the Case B writer is a PRODUCTION function, not inline backfill code.
+// The backfill calls it, and the two-session concurrency proof drives the same
+// function against the settlement-witness writer — so the proof exercises the
+// writer the product actually runs, not a test-only duplicate of it.
+const {
+    recordUnresolvedEvidenceCase,
+    mergeCaseDetails,
+} = require('../src/services/unresolvedEvidenceCaseService');
 
 const SQL_FILE = path.join(__dirname, 'sql', 'provider-observation-claim.sql');
 
 /** The only provider-event status that records a settled inbound collection. */
 const MOOLRE_SUCCESS_STATUS = 'SUCCESSFUL';
 const MOOLRE_EVENT_PREFIX = 'event:moolre-collection:';
+
+// Bounded so a pathological history cannot hold the claim-writer locks forever.
+const STATEMENT_TIMEOUT_MS = Number(process.env.WP_I_BACKFILL_STATEMENT_TIMEOUT_MS || 900000);
 
 function referenceFromWitness(row) {
     const params = row.requestParams && typeof row.requestParams === 'object' ? row.requestParams : {};
@@ -173,7 +188,57 @@ function referenceFromWitness(row) {
     return null;
 }
 
-const keyFor = (reference) => canonicalObservationIdentity({ provider: 'moolre', reference }).observationKey;
+// ── §WP-I: THE BACKFILL USES THE SAME WALLET-SCOPED IDENTITY AS THE LIVE CLAIM
+// A reference alone is not an identity: Moolre externalrefs are unique per
+// wallet, so the wallet is part of what the payment IS. The wallet here comes
+// only from durable evidence already persisted (the provider event row or the
+// witness row) — never from whatever account happens to be configured today,
+// because a historical payment may have landed in a different wallet and
+// guessing would be indistinguishable from fraud.
+//
+// When no wallet can be established the answer is NULL: the caller must treat
+// that payment as unclassifiable and route it to operator review, never to a
+// claim. Writing the legacy key here would hand one payment two identities.
+// Neither provider reference is authoritative when the two disagree, so the case
+// names both and picks no winner.
+// The wallet the EVIDENCE agrees on, or null. Two events naming different wallets
+// are a disagreement about where the money landed, which no key may resolve.
+function agreedWallet(candidates) {
+    const wallets = new Set(
+        (candidates || [])
+            .map((e) => (e && e.walletAccount == null ? null : String(e.walletAccount).trim()))
+            .filter((w) => w),
+    );
+    return wallets.size === 1 ? [...wallets][0] : null;
+}
+
+// ── CASE B DETAIL MERGE ─────────────────────────────────────────────────────
+// Deterministic, order-independent, and lossless:
+//   * identifier arrays (evidenceIds, ties, ownerIds) are UNIONED and deduped,
+//     so a later run can only ADD evidence;
+//   * scalars keep the FIRST observed value, because the earliest sighting is
+//     what the case was opened on and a later run must not rewrite history;
+//   * a scalar that was absent is filled in when a later run learns it;
+//   * every key present in either side survives.
+const MERGE_UNION_KEYS = ['evidenceIds', 'ties', 'ownerIds', 'candidateReferences', 'providerEventIds'];
+
+function depositProviderRefOrNull(a, b) {
+    const x = String(a || '').trim();
+    const y = String(b || '').trim();
+    return x && y ? `${x} vs ${y}` : (x || y || null);
+}
+
+const keyFor = (reference, walletAccount = null) => {
+    try {
+        return canonicalObservationIdentityV2({
+            provider: 'moolre',
+            reference,
+            accountNumber: walletAccount,
+        }).observationKey;
+    } catch (_) {
+        return null;
+    }
+};
 
 /**
  * Reference equality through the SAME canonical normalisation the live claim
@@ -184,7 +249,11 @@ function sameReference(a, b) {
     if (typeof a !== 'string' || typeof b !== 'string') return false;
     if (!a.trim() || !b.trim()) return false;
     try {
-        return keyFor(a) === keyFor(b);
+        // Reference EQUALITY is a comparison, not an identity: it must not
+        // depend on which wallet either side knows, or two spellings of the same
+        // provider reference would stop comparing equal.
+        return legacyObservationKey({ provider: 'moolre', reference: a })
+            === legacyObservationKey({ provider: 'moolre', reference: b });
     } catch (_) {
         return a.trim() === b.trim();
     }
@@ -343,6 +412,8 @@ async function selectCandidates(db) {
         witnessOwners: new Map(),
         witnessAccountKeys: new Map(),
         anomalies: [],
+        quarantineAnomalies: [],
+        unresolvedEvidenceCases: [],
         skipped: {
             nonMoolreDeposits: 0,
             nonMoolreWitnesses: 0,
@@ -362,7 +433,7 @@ async function selectCandidates(db) {
 
     // ── durable Moolre processor evidence ────────────────────────────────
     const events = await db.$queryRawUnsafe(`
-        SELECT "id", "dedupKey", "providerRef", "relatedReference"
+        SELECT "id", "dedupKey", "providerRef", "relatedReference", "walletAccount"
         FROM "FiatProviderEvent"
         WHERE "provider" = 'MOOLRE' AND "direction" = 'INBOUND' AND "status" = '${MOOLRE_SUCCESS_STATUS}'
     `);
@@ -497,9 +568,44 @@ async function selectCandidates(db) {
         // WHICH provider collection this was. Fail closed, claim nothing.
         if (persistedProviderRef && metadataProviderRef && !sameReference(persistedProviderRef, metadataProviderRef)) {
             report.skipped.unclassifiableDeposits += 1;
-            anomaly('CONTRADICTORY_PROVIDER_REFERENCE', keyFor(ref), [String(d.id)],
+            // The two references disagree, but the settlement reference still
+            // points at real events. If those events AGREE on the wallet, a
+            // trustworthy canonical key exists and this is Case A: quarantine the
+            // observation under it so neither economic path can consume it.
+            // Both references are still candidates here — the disagreement is
+            // exactly what is unresolved, so neither is preferred. (The single
+            // depositProviderRef is only computed after this branch.)
+            const cands = [
+                ...((txHash && eventsByRelatedReference.get(txHash)) || []),
+                ...((persistedProviderRef && eventsByProviderRef.get(persistedProviderRef)) || []),
+                ...((metadataProviderRef && eventsByProviderRef.get(metadataProviderRef)) || []),
+            ];
+            const wallet = agreedWallet(cands);
+            const key = keyFor(ref, wallet);
+            // The anomaly reports the key when one exists, so an operator can find
+            // the quarantined row. It is null only when no key could be trusted.
+            anomaly('CONTRADICTORY_PROVIDER_REFERENCE', key, [String(d.id)],
                 `the deposit's provider references disagree: TransactionHistory.providerRef=${persistedProviderRef} vs metadata.settlementProviderRef=${metadataProviderRef}`,
                 ref || null);
+            if (key) {
+                report.quarantineAnomalies.push({
+                    observationKey: key,
+                    reason: 'CONTRADICTORY_PROVIDER_REFERENCE',
+                    owners: [String(d.id)],
+                });
+            } else {
+                // No agreed wallet means no key can be trusted, and inventing one
+                // is exactly what this work forbids. Case B instead.
+                report.unresolvedEvidenceCases.push({
+                    depositId: String(d.id),
+                    reason: 'CONTRADICTORY_PROVIDER_REFERENCE',
+                    ties: [`providerRef(${persistedProviderRef})`, `settlementProviderRef(${metadataProviderRef})`],
+                    providerRef: depositProviderRefOrNull(persistedProviderRef, metadataProviderRef),
+                    txHash: txHash || null,
+                    evidenceIds: cands.map((e) => String(e.id)),
+                    amountMinor: null,
+                });
+            }
             continue;
         }
         const depositProviderRef = persistedProviderRef || metadataProviderRef || null;
@@ -518,6 +624,22 @@ async function selectCandidates(db) {
             }
             if (ties.length) {
                 report.skipped.unclassifiableDeposits += 1;
+                // CASE B: no canonical key can be established, and inventing one
+                // from the txHash or a provider ref would name an observation the
+                // economic paths never use — so nothing is claimed. Instead the
+                // evidence becomes a durable case an operator can act on.
+                report.unresolvedEvidenceCases.push({
+                    depositId: String(d.id),
+                    reason: 'PROVIDER_EVIDENCE_WITHOUT_CANONICAL_REFERENCE',
+                    ties,
+                    providerRef: depositProviderRef || null,
+                    txHash: txHash || null,
+                    evidenceIds: [
+                        ...((txHash && eventsByRelatedReference.get(txHash)) || []).map((e) => String(e.id)),
+                        ...((depositProviderRef && eventsByProviderRef.get(depositProviderRef)) || []).map((e) => String(e.id)),
+                    ],
+                    amountMinor: null,
+                });
                 anomaly('MOOLRE_EVIDENCE_WITHOUT_SETTLEMENT_REFERENCE', null, [String(d.id)],
                     `Moolre evidence is tied to this completed deposit (${ties.join(', ')}) but the settlement committed no settlementExternalRef, so the canonical claim key cannot be established`,
                     txHash || depositProviderRef || null);
@@ -536,16 +658,58 @@ async function selectCandidates(db) {
         }
         if (evidence.status === 'contradictory') {
             report.skipped.unclassifiableDeposits += 1;
-            anomaly('CONTRADICTORY_MOOLRE_EVIDENCE', keyFor(ref), [String(d.id)],
+            const wallet = agreedWallet(evidence.candidates);
+            const key = keyFor(ref, wallet);
+            anomaly('CONTRADICTORY_MOOLRE_EVIDENCE', key, [String(d.id)],
                 `Moolre event(s) matched a link on this deposit but their other identity fields contradict it: ${JSON.stringify(evidence.contradictions)}`,
                 ref);
+            if (key) {
+                // CASE A — the wallet is agreed by the evidence, so a trustworthy
+                // canonical key exists and the observation is quarantined under it.
+                report.quarantineAnomalies.push({
+                    observationKey: key,
+                    reason: 'CONTRADICTORY_MOOLRE_EVIDENCE',
+                    owners: [String(d.id)],
+                });
+            } else {
+                // CASE B — the candidates do not agree on the wallet, so no key is
+                // trustworthy and none is invented.
+                report.unresolvedEvidenceCases.push({
+                    depositId: String(d.id),
+                    reason: 'CONTRADICTORY_MOOLRE_EVIDENCE',
+                    ties: ['contradictory events', ...evidence.contradictions.map(String)],
+                    providerRef: depositProviderRef || null,
+                    txHash: txHash || null,
+                    evidenceIds: (evidence.candidates || []).map((e) => String(e.id)),
+                    amountMinor: null,
+                });
+            }
             continue;
         }
         if (evidence.status === 'ambiguous') {
             report.skipped.unclassifiableDeposits += 1;
-            anomaly('AMBIGUOUS_MOOLRE_EVIDENCE', keyFor(ref), [String(d.id)],
+            const wallet = agreedWallet(evidence.candidates);
+            const key = keyFor(ref, wallet);
+            anomaly('AMBIGUOUS_MOOLRE_EVIDENCE', key, [String(d.id)],
                 `${evidence.candidates.length} distinct Moolre events tie to this deposit (${JSON.stringify(evidence.candidates.map((e) => ({ id: e.id, dedupKey: e.dedupKey, providerRef: e.providerRef, relatedReference: e.relatedReference })))}) — a single settlement cannot have two provider observations, so no candidate is chosen`,
                 ref);
+            if (key) {
+                report.quarantineAnomalies.push({
+                    observationKey: key,
+                    reason: 'AMBIGUOUS_MOOLRE_EVIDENCE',
+                    owners: [String(d.id)],
+                });
+            } else {
+                report.unresolvedEvidenceCases.push({
+                    depositId: String(d.id),
+                    reason: 'AMBIGUOUS_MOOLRE_EVIDENCE',
+                    ties: ['ambiguous events'],
+                    providerRef: depositProviderRef || null,
+                    txHash: txHash || null,
+                    evidenceIds: (evidence.candidates || []).map((e) => String(e.id)),
+                    amountMinor: null,
+                });
+            }
             continue;
         }
         const event = evidence.event;
@@ -553,7 +717,27 @@ async function selectCandidates(db) {
         // The event's provider reference has already been checked against the
         // deposit's provider identity by eventContradictions(); nothing here may
         // compare it to the merchant external reference.
-        addOwner(report.depositOwners, keyFor(ref), String(d.id));
+        // §WP-I: the wallet comes from the persisted EVENT, which is the durable
+        // record of where this payment landed. Without one the deposit is not
+        // claimable and becomes an operator case instead of a guessed key.
+        const depositKey = keyFor(ref, event ? event.walletAccount : null);
+        if (!depositKey) {
+            report.skipped.unclassifiableDeposits += 1;
+            anomaly('MOOLRE_EVIDENCE_WITHOUT_TRUSTED_WALLET', null, [String(d.id)],
+                'the matched Moolre event carries no trusted wallet, so no wallet-scoped claim identity can be established; the payment is left unclaimed for operator review',
+                ref);
+            report.unresolvedEvidenceCases.push({
+                depositId: String(d.id),
+                reason: 'MOOLRE_EVIDENCE_WITHOUT_TRUSTED_WALLET',
+                ties: ['wallet missing on the provider event'],
+                providerRef: depositProviderRef || null,
+                txHash: txHash || null,
+                evidenceIds: event ? [String(event.id)] : [],
+                amountMinor: null,
+            });
+            continue;
+        }
+        addOwner(report.depositOwners, depositKey, String(d.id));
     }
 
     // ── existing treasury witnesses ──────────────────────────────────────
@@ -570,19 +754,15 @@ async function selectCandidates(db) {
             report.skipped.unclassifiableWitnesses += 1;
             continue;
         }
-        const witnessKey = keyFor(ref);
-        // The trusted account the witness was fetched for, through the same
-        // canonical identity the runtime claim uses. This is what lets a
-        // pre-existing witness claim be compared rather than assumed.
-        let accountKey = null;
-        try {
-            accountKey = canonicalObservationIdentity({
-                provider: 'moolre',
-                reference: ref,
-                accountNumber: typeof w.walletAccount === 'string' ? w.walletAccount : null,
-            }).accountKey;
-        } catch (_) { accountKey = null; }
-        report.witnessAccountKeys.set(witnessKey, accountKey);
+        // §WP-I: the witness row carries the trusted wallet the opening was
+        // configured for, so the same wallet-scoped identity the live claim uses
+        // can be rebuilt here. A witness without one is not claimable.
+        const witnessKey = keyFor(ref, typeof w.walletAccount === 'string' ? w.walletAccount : null);
+        if (!witnessKey) {
+            report.skipped.unclassifiableWitnesses += 1;
+            continue;
+        }
+        report.witnessAccountKeys.set(witnessKey, w.walletAccount ? String(w.walletAccount).trim() : null);
         addOwner(report.witnessOwners, witnessKey, String(w.openingDedupKey));
     }
 
@@ -607,6 +787,15 @@ async function selectCandidates(db) {
         }
     }
 
+    // CASE A — quarantine keys whose evidence is trustworthy in identity but
+    // contradictory or ambiguous in content. Never a winner: no owner is chosen
+    // and the row is written with claimedByRef NULL.
+    for (const a of report.quarantineAnomalies) {
+        if (!quarantine.has(a.observationKey)) {
+            quarantine.set(a.observationKey, { reason: a.reason, owners: a.owners });
+        }
+    }
+
     const claimDeposits = [...report.depositOwners].filter(([k]) => !quarantine.has(k));
     const claimWitnesses = [...report.witnessOwners].filter(([k]) => !quarantine.has(k));
 
@@ -616,6 +805,10 @@ async function selectCandidates(db) {
         claimWitnesses,
         witnessAccountKeys: report.witnessAccountKeys,
         quarantine: [...quarantine].map(([key, v]) => ({ observationKey: key, ...v })),
+        // CASE B — no trustworthy canonical reference exists. No key is invented;
+        // the durable reconciliation case below is the only artifact, and it is
+        // tied to the real deposit and the real persisted provider events.
+        unresolvedEvidenceCases: report.unresolvedEvidenceCases,
     };
 }
 
@@ -717,11 +910,14 @@ async function main() {
         alreadyClaimedDeposits: 0,
         alreadyClaimedWitnesses: 0,
         alreadyQuarantined: 0,
+        unresolvedCasesEnsured: 0,
+        wouldCreateUnresolvedCases: 0,
         racedReplays: 0,
         raceReplays: [],
         conflicts: [],
         candidates: { deposits: [], witnesses: [], quarantine: [] },
         anomalies: [],
+        unresolvedEvidenceCases: [],
         skipped: { deposits: 0, witnesses: 0, nonMoolreProvider: 0, unclassifiableDeposits: 0, unclassifiableWitnesses: 0 },
     };
 
@@ -742,6 +938,7 @@ async function main() {
             out.wouldClaimDeposits = selection.claimDeposits.length;
             out.wouldClaimWitnesses = selection.claimWitnesses.length;
             out.wouldQuarantine = selection.quarantine.length;
+            out.wouldCreateUnresolvedCases = selection.unresolvedEvidenceCases.length;
             out.candidates.deposits = selection.claimDeposits.map(([key, owner]) => ({ observationKey: key, owner }));
             out.candidates.witnesses = selection.claimWitnesses.map(([key, owner]) => ({ observationKey: key, owner }));
             out.candidates.quarantine = selection.quarantine;
@@ -760,6 +957,7 @@ async function main() {
 
             // ONE transaction: DDL, every claim, every quarantine row — or none.
             await prisma.$transaction(async (tx) => {
+                await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '" + STATEMENT_TIMEOUT_MS + "ms'");
                 for (const statement of statements) await tx.$executeRawUnsafe(statement);
 
                 const selection = await selectCandidates(tx);
@@ -809,6 +1007,48 @@ async function main() {
                     else { out.racedReplays += 1; out.raceReplays.push({ kind: 'quarantine', observationKey: q.observationKey, notes: r.notes }); }
                     maybeFault();
                 }
+                // ── CASE B: durable unresolved-evidence cases ────────────────
+                // No claim key is invented here. Each case names the REAL
+                // completed deposit and the REAL persisted provider-event ids, so
+                // an operator can investigate, and so the witness path can refuse
+                // this payment rather than treat the evidence as free money.
+                // The case table is created earlier in the release chain
+                // (install-payout-reconciliation-infra.js) and is deliberately NOT
+                // duplicated here. A database without it cannot hold the case, so
+                // the count is reported instead of silently pretending the
+                // evidence was recorded.
+                if (selection.unresolvedEvidenceCases.length > 0) {
+                    const probe = await tx.$queryRawUnsafe(`SELECT to_regclass('"ReconciliationException"')::text AS t`);
+                    const caseTablePresent = !!(Array.isArray(probe) && probe[0] && probe[0].t);
+                    if (!caseTablePresent) {
+                        // A REAL run that cannot persist a required case must abort
+                        // and roll back. An observation left "reported" but
+                        // unrecorded is the invisible state this work exists to
+                        // close, so a skipped counter is not an acceptable outcome.
+                        throw new Error(
+                            'CASE_TABLE_MISSING: the backfill must record '
+                            + `${selection.unresolvedEvidenceCases.length} unresolved-evidence case(s) but `
+                            + '"ReconciliationException" does not exist. Run infra/install-payout-reconciliation-infra.js first; refusing to leave evidence invisible.'
+                        );
+                    }
+                }
+                for (const c of selection.unresolvedEvidenceCases) {
+                    // The production Case B writer takes the wallet-independent
+                    // arbitration lock BEFORE reading or writing the case, so this
+                    // serializes against the settlement-witness writer instead of
+                    // letting both observe "nothing yet" and both commit. It also
+                    // accumulates evidence rather than replacing it.
+                    await recordUnresolvedEvidenceCase(tx, {
+                        depositId: c.depositId,
+                        reason: c.reason,
+                        ties: c.ties,
+                        providerRef: c.providerRef,
+                        txHash: c.txHash,
+                        evidenceIds: c.evidenceIds,
+                    });
+                    out.unresolvedCasesEnsured += 1;
+                }
+
                 for (const [key, owners] of partition.toInsert.deposits) {
                     // owners is the list used to DETECT duplicates; only a single
                     // owner survives to here (multi-owner keys are quarantined).

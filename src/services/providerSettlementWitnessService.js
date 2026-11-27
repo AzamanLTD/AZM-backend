@@ -33,6 +33,8 @@
 
 const crypto = require('crypto');
 const { claimProviderObservation, CLAIM_PURPOSE } = require('./providerObservationClaimService');
+const { trustedCollectionWallet } = require('./moolreTrustedWallet');
+const { acquireObservationArbitration } = require('./observationArbitration');
 
 /** Currencies this witness layer can prove. GHS only, deliberately. */
 const WITNESS_CURRENCIES = Object.freeze(['GHS']);
@@ -290,7 +292,66 @@ function settledAmountFromProviderPayload(payload) {
  * @param input.amounts          { netPesewas, grossPesewas }
  * @param input.fetchedAt        Date of the provider call
  */
+/**
+ * §WP-I CASE B — EVIDENCE THAT COULD BELONG TO AN UNRESOLVED DEPOSIT.
+ *
+ * The claim backfill refuses to invent a canonical key when a completed customer
+ * deposit is tied to Moolre evidence but committed no settlement reference. That
+ * evidence is not free money: an OPEN unresolved-evidence case naming the same
+ * provider reference (or the deposit's related reference) blocks a treasury
+ * witness until an operator resolves it with independent evidence.
+ *
+ * The guard reads only persisted reconciliation state. It never consults the raw
+ * provider payload for identity and never picks an owner.
+ */
+async function assertNoUnresolvedEvidenceCase(tx, identifiers) {
+  const ids = [...new Set((identifiers || []).filter((v) => typeof v === 'string' && v.trim() !== ''))];
+  if (ids.length === 0) return;
+
+  // FAIL CLOSED. This guard is the witness path's half of the "one payment, one
+  // economic use" invariant. A client that cannot run the query, or a database
+  // without the case table, means the check cannot be performed — and an
+  // unperformed integrity check must never read as "no conflict found".
+  if (typeof tx.$queryRawUnsafe !== 'function') {
+    throw new WitnessError(
+      'WITNESS_EVIDENCE_UNVERIFIABLE',
+      '[wp-i] this client cannot read unresolved reconciliation cases, so the witness cannot prove it is not consuming disputed evidence',
+      {},
+    );
+  }
+
+  const table = await tx.$queryRawUnsafe(`SELECT to_regclass('"ReconciliationException"')::text AS t`);
+  const present = Array.isArray(table) && table[0] && table[0].t;
+  if (!present) {
+    throw new WitnessError(
+      'WITNESS_EVIDENCE_UNVERIFIABLE',
+      '[wp-i] the reconciliation case table is absent, so the witness cannot prove it is not consuming disputed evidence',
+      {},
+    );
+  }
+
+  const rows = await tx.$queryRawUnsafe(
+    `SELECT "entityId", "reason", "details"
+       FROM "ReconciliationException"
+      WHERE "status" = 'OPEN'
+        AND "reason" = 'PROVIDER_EVIDENCE_WITHOUT_CANONICAL_REFERENCE'
+        AND ("reference" = ANY($1::text[]) OR "details"->>'txHash' = ANY($1::text[]))
+      LIMIT 1`,
+    ids,
+  );
+  if (Array.isArray(rows) && rows.length > 0) {
+    throw new WitnessError(
+      'WITNESS_EVIDENCE_UNDER_RECONCILIATION',
+      '[wp-i] Moolre evidence tied to a completed customer deposit has no canonical observation key and is under operator reconciliation; a treasury witness cannot be recorded from it until that case is resolved',
+      { depositId: rows[0].entityId, reason: rows[0].reason },
+    );
+  }
+}
+
 async function recordProviderSettlementWitness(tx, input = {}) {
+  // WHO may write comes before WHAT the evidence says: a caller that is not the
+  // reconciler is refused on authority alone, and must not learn anything about
+  // the evidence state from the shape of the error.
   assertReconcilerContext();
 
   const {
@@ -334,6 +395,28 @@ async function recordProviderSettlementWitness(tx, input = {}) {
       `[wp-i] treasury opening ${openingDedupKey} does not exist; the reconciler never queries for a reference it was handed`
     );
   }
+
+  // §WP-I — ARBITRATION BEFORE EVIDENCE, and AFTER the opening is known.
+  // The order is deliberate: authority first, then "does this opening exist",
+  // then "is its evidence disputed". A caller learns only the first refusal that
+  // applies to it, and the case table is never consulted for an opening that is
+  // not even real. The lock is transaction-scoped and taken after any provider
+  // I/O has returned, so it is never held across the network.
+  await acquireObservationArbitration(tx, {
+    provider: input.provider || 'moolre',
+    walletAccount: input.walletAccount ?? null,
+    reference: input.externalref
+      || input.reference
+      || (input.requestParams && input.requestParams.externalref)
+      || null,
+  });
+  // §WP-I CASE B: unresolved evidence cannot fund a witness.
+  await assertNoUnresolvedEvidenceCase(tx, [
+    input.externalref,
+    input.reference,
+    input.requestParams && input.requestParams.externalref,
+    input.openingDedupKey,
+  ]);
 
   if (!TRUSTED_FUNDING_PROVIDERS.includes(String(provider))) {
     throw new WitnessError(
@@ -559,7 +642,12 @@ async function recordProviderSettlementWitness(tx, input = {}) {
     // the stored opening — never the account the provider response claims. The
     // witness's account/currency mapping is already validated against it above,
     // and this is the identity that must agree across the deposit path too.
-    accountNumber: opening.walletAccount ?? null,
+    // Same rule as the deposit path: stored evidence first, and when the
+    // opening predates the wallet column the ONE wallet we are configured to
+    // collect into (server-side config, never provider payload). Both paths must
+    // resolve an unknown wallet the same way or the unique index would see two
+    // different identities for one payment and could not arbitrate.
+    accountNumber: opening.walletAccount ?? trustedCollectionWallet() ?? null,
     purpose: CLAIM_PURPOSE.TREASURY_WITNESS,
     claimedByRef: openingDedupKey,
   });

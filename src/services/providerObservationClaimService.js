@@ -29,7 +29,8 @@ const {
     CLAIM_PURPOSE,
     QUARANTINE_PURPOSE,
     ObservationIdentityError,
-    canonicalObservationIdentity,
+    canonicalObservationIdentityV2,
+    legacyObservationKey,
 } = require('./providerObservationIdentity');
 
 class ProviderObservationClaimError extends Error {
@@ -74,14 +75,39 @@ async function claimProviderObservation(tx, {
         );
     }
 
+    // ── §WP-I CUT-OVER: THE WALLET-SCOPED IDENTITY IS THE ONLY WRITER KEY ────
+    // Every writer now files the wallet-scoped v2 identity. A claim without a
+    // trusted wallet is REFUSED rather than written under the legacy key: writing
+    // v1 here while any other path writes v2 is the double-spend window, because
+    // the two keys do not collide and one payment could be claimed under each.
     let identity;
     try {
-        identity = canonicalObservationIdentity({ provider, reference, accountNumber });
+        identity = canonicalObservationIdentityV2({ provider, reference, accountNumber });
     } catch (e) {
         if (e instanceof ObservationIdentityError) {
             throw new ProviderObservationClaimError(e.code, e.message, e.detail);
         }
         throw e;
+    }
+
+    // A FROZEN legacy claim still owns this payment. v1 rows are never rewritten
+    // (their wallet is unknown), and no v2 claim may step over one: nothing writes
+    // v1 any more, so this read cannot race a concurrent v1 writer.
+    const legacyKey = legacyObservationKey({ provider, reference });
+    if (legacyKey) {
+        const legacyRows = await tx.$queryRawUnsafe(
+            `SELECT "purpose", "claimedByRef" FROM "ProviderObservationClaim" WHERE "observationKey" = $1 LIMIT 1`,
+            legacyKey,
+        );
+        const legacy = Array.isArray(legacyRows) ? legacyRows[0] : null;
+        if (legacy && !(legacy.purpose === purpose && legacy.claimedByRef === claimedByRef)) {
+            throw new ProviderObservationClaimError(
+                'OBSERVATION_CLAIM_LEGACY_CONFLICT',
+                '[wp-i] this provider observation is already claimed under the legacy identity by a different economic use; '
+                + 'the wallet-scoped claim cannot step over it',
+                { legacyObservationKey: legacyKey, heldBy: legacy.purpose, claimedByRef: legacy.claimedByRef },
+            );
+        }
     }
 
     const id = crypto.randomUUID();

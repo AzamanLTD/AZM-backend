@@ -37,11 +37,18 @@ describeDb('WP-I database provenance (real PostgreSQL roles)', () => {
         for (const role of [RUNTIME_ROLE, RECONCILER_ROLE]) {
             await admin.$executeRawUnsafe(`DROP ROLE IF EXISTS ${role}`);
             await admin.$executeRawUnsafe(`CREATE ROLE ${role} LOGIN PASSWORD '${PASSWORD}'`);
-            await admin.$executeRawUnsafe(`GRANT USAGE ON SCHEMA public TO ${role}`);
         }
-        // The runtime identity: may READ evidence, may never author it.
-        await admin.$executeRawUnsafe(`GRANT SELECT ON "ProviderSettlementWitness" TO ${RUNTIME_ROLE}`);
-        await admin.$executeRawUnsafe(`GRANT SELECT, INSERT ON "ProviderSettlementWitness" TO ${RECONCILER_ROLE}`);
+        // §7 — the grants come from the INSTALLER, not from this file. A test that
+        // recreates them by hand proves what the test author wrote, not what
+        // deployment applies. The installer is run twice here: the second run is
+        // the idempotency check, and any drift in its GRANT/REVOKE statements
+        // would break the assertions below.
+        process.env.WP_I_PROVISION_WITNESS_ROLES = '1';
+        process.env.WP_I_RUNTIME_ROLE = RUNTIME_ROLE;
+        process.env.WP_I_RECONCILER_ROLE = RECONCILER_ROLE;
+        const installer = require('../infra/install-wp-i-settlement-witness.js');
+        await installer.runInstaller();
+        await installer.runInstaller();
 
         runtime = new PrismaClient({ datasources: { db: { url: urlFor(RUNTIME_ROLE) } } });
         reconciler = new PrismaClient({ datasources: { db: { url: urlFor(RECONCILER_ROLE) } } });
@@ -127,6 +134,53 @@ describeDb('WP-I database provenance (real PostgreSQL roles)', () => {
         })).rejects.toThrow(/permission denied/i);
         await admin.providerSettlementWitness.delete({ where: { id: created.id } });
     });
+
+
+    // ── §7 PRIVILEGE MATRIX ──────────────────────────────────────────────────
+    // The grants above are only half the claim. These prove the OTHER half: what
+    // each identity must be UNABLE to do, including reaching the other's rights.
+
+    test('the reconciler identity cannot touch customer balances, deposits or the ledger', async () => {
+        for (const sql of [
+            'UPDATE "User" SET "balance" = "balance" + 1',
+            'UPDATE "TransactionHistory" SET "status" = \'COMPLETED\'',
+            'DELETE FROM "TransactionHistory"',
+            'UPDATE "FiatLiquidityState" SET "availableGhs" = 999999',
+        ]) {
+            await expect(reconciler.$executeRawUnsafe(sql)).rejects.toBeTruthy();
+        }
+    }, 60000);
+
+    test('the reconciler identity cannot rewrite or remove a witness it created', async () => {
+        const key = `DB-WITNESS-${Date.now()}-immut`;
+        await reconciler.$executeRawUnsafe(
+            'INSERT INTO "ProviderSettlementWitness" ("id","openingDedupKey","provider","fundingType","witnessKind","walletAccount","currency","netPesewas","providerState","endpoint","requestParams","rawResponseDigest","rawResponse","fetchedAt") '
+            + "VALUES (gen_random_uuid(), $1, 'MOOLRE', 'COLLECTION', 'PAYMENT_STATUS_TYPE_1', '0244000000', 'GHS', 100, 'SETTLED', 'e', '{}'::jsonb, repeat('a',64), '{}', now())",
+            key,
+        );
+        await expect(reconciler.$executeRawUnsafe('UPDATE "ProviderSettlementWitness" SET "netPesewas" = 999 WHERE "openingDedupKey" = $1', key)).rejects.toBeTruthy();
+        await expect(reconciler.$executeRawUnsafe('DELETE FROM "ProviderSettlementWitness" WHERE "openingDedupKey" = $1', key)).rejects.toBeTruthy();
+        await expect(reconciler.$executeRawUnsafe('TRUNCATE "ProviderSettlementWitness"')).rejects.toBeTruthy();
+    }, 60000);
+
+    test('the runtime identity cannot assume the reconciler rights by role switching', async () => {
+        await expect(runtime.$executeRawUnsafe(`SET ROLE ${RECONCILER_ROLE}`)).rejects.toBeTruthy();
+        const [who] = await runtime.$queryRawUnsafe('SELECT session_user AS s, current_user AS c');
+        expect(who.s).toBe(RUNTIME_ROLE);
+        expect(who.c).toBe(RUNTIME_ROLE);
+    }, 60000);
+
+    test('session_user and current_user are reported as the actual login, not the owner', async () => {
+        const [asRuntime] = await runtime.$queryRawUnsafe('SELECT session_user AS s, current_user AS c, (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) AS is_super');
+        expect(asRuntime.s).toBe(RUNTIME_ROLE);
+        expect(asRuntime.c).toBe(RUNTIME_ROLE);
+        expect(asRuntime.is_super).toBe(false);
+
+        const [asReconciler] = await reconciler.$queryRawUnsafe('SELECT session_user AS s, current_user AS c, (SELECT rolsuper FROM pg_roles WHERE rolname = current_user) AS is_super');
+        expect(asReconciler.s).toBe(RECONCILER_ROLE);
+        expect(asReconciler.c).toBe(RECONCILER_ROLE);
+        expect(asReconciler.is_super).toBe(false);
+    }, 60000);
 
     test('the runtime process cannot write a witness even holding full DB rights', async () => {
         // Credential separation is defeated inside one process: the CODE guard is

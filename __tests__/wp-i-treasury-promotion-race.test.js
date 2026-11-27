@@ -49,12 +49,16 @@ describeDb('WP-I treasury promotion race (real PostgreSQL)', () => {
             dedupKey: OPENING,
             amountGhs: AMOUNT,
             treasury: true,
+            // §WP-I: the opening must carry the trusted wallet, or the witness
+            // cannot build a wallet-scoped claim and is refused.
+            walletAccount: '0244000000',
             evidence: { kind: 'AUDITED_TREASURY_OPENING' },
         }));
         await prisma.fiatProviderEvent.create({
             data: {
                 provider: 'MOOLRE', rail: 'BANK', direction: 'INBOUND', status: 'FUNDED',
                 providerRef: 'RACE-REF-1', dedupKey: EVENT, amountGhs: AMOUNT,
+                walletAccount: '0244000000',
             },
         });
         // The documented Moolre Payment Status shape: numeric data.txstatus, and the

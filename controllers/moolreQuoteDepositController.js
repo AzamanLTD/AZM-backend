@@ -18,6 +18,7 @@ const {
   getPersistedTransactionQuoteExact,
 } = require('../src/services/transactionQuoteService');
 const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
+const { trustedCollectionWallet } = require('../src/services/moolreTrustedWallet');
 const modelBSettlement = require('../services/modelBSettlementService'); // §P.5-E
 const routePolicy = require('../src/services/routePolicyService');
 const { Prisma } = require('@prisma/client');
@@ -224,6 +225,7 @@ exports.initiate = async (req, res) => {
             dedupKey: `event:moolre-initiation:${pending.txHash}`,
             amountGhs: amountGhsCanonical,
             relatedReference: pending.txHash,
+            walletAccount: trustedCollectionWallet(),
             raw: { stage: 'INITIATE', ...attempt },
           });
         } catch (evidenceErr) {
@@ -487,6 +489,9 @@ exports.webhook = async (req, res) => {
             dedupKey: moolreEventDedupKey(externalRef),
             amountGhs: settledGhs,
             relatedReference: externalRef,
+            // §WP-I: the wallet is the one WE are configured to collect into. The
+            // callback body's accountnumber is never used to establish identity.
+            walletAccount: trustedCollectionWallet(),
             raw: req.body || null,
         });
         providerEvent = recorded.event;

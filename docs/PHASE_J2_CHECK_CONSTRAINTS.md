@@ -1,3 +1,9 @@
+> **SCHEMA AUTHORITY (2026-11-20):** production schema is applied by the raw-SQL
+> release-overlay chain (`npm run release`, the `infra/install-*.js` installers).
+> `prisma migrate deploy` is NOT the production path; the commands below apply only
+> to a disposable or local database where the migration history is authoritative.
+> Do not run `prisma migrate deploy` against production.
+
 # Phase J2 — Operator runbook for the CHECK-constraint migration
 
 > **What this migration does.** Adds ~50 `CHECK` constraints to the

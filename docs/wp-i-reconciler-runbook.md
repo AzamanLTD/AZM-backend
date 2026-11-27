@@ -165,3 +165,18 @@ account-creation reference plus accountnumber), Payment ID funding (the backend 
 credits (`/open/account/status`, which needs the private key and is the only witness for money
 nobody initiated). Each needs its own documented adapter, fixtures and matrix rows before any of
 them is described as working. MTN has no witness path at all.
+
+## What is supported today (2026-11-20)
+
+- **Supported:** Moolre type-1 collection status (`/open/transact/status`, `type: 1`,
+  `idtype: 1`, `id: <externalref>`, `accountnumber: <configured wallet>`) for a
+  collection Azaman itself initiated, proven against the pre-existing treasury
+  opening (reference, account, currency, exact net pesewas).
+- **Not supported, and not claimed:** bank virtual-account credits, Payment ID
+  funding, unsolicited wallet inflows, and provider reversals/chargebacks. There is
+  no witness path for them; a run that sees one must refuse rather than guess.
+- **Wallet scope:** an external reference is unique PER WALLET, not globally. The
+  wallet-scoped v2 identity exists but is **not** in use by any writer yet; the live
+  writers still use the legacy key, so do not read a v2 key as authoritative.
+- **Exit contract:** 0 all witnessed, 1 usage/credential, 2 fatal, 3 not witnessed.
+  A scheduler must treat 3 as a failure to reconcile, not as success.

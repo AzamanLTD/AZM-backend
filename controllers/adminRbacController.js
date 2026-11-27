@@ -39,6 +39,7 @@ const ADMIN_ROLES = {
   FINANCE_ADMIN: {
     name: 'Finance Admin',
     permissions: [
+      'reconciliation.view',
       'withdrawals.approve', 'withdrawals.review', 'withdrawals.export',
       'trades.view', 'trades.export', 'fees.manage',
       // Exact money settings: Finance Admin may read AND write quote TTLs, FX
@@ -64,6 +65,7 @@ const ADMIN_ROLES = {
   COMPLIANCE_ADMIN: {
     name: 'Compliance Admin',
     permissions: [
+      'reconciliation.view',
       'withdrawals.approve', 'withdrawals.review', 'withdrawals.export',
       'users.view', 'users.kyc_approve', 'users.kyc_reject',
       'audit.view', 'audit.export', 'audit.delete',

@@ -63,7 +63,53 @@ const STATEMENTS = [
      ON "ProviderSettlementWitness"("provider", "openingDedupKey");`,
 ];
 
+
+// ── §7 ROLE PROVISIONING (OPT-IN) ───────────────────────────────────────────
+// The witness grants are only meaningful if they are applied by the installer
+// rather than recreated by hand in a test. They are OPT-IN because the release
+// chain runs with an application credential that may not hold CREATEROLE, and a
+// chain that fails on a permission it was never granted would block every other
+// installer. Absent the flag, this installer says so and continues.
+const PROVISION_ROLES = process.env.WP_I_PROVISION_WITNESS_ROLES === '1';
+const RUNTIME_ROLE = process.env.WP_I_RUNTIME_ROLE || 'azam_wp_i_runtime';
+const RECONCILER_ROLE = process.env.WP_I_RECONCILER_ROLE || 'azam_wp_i_reconciler';
+
+async function provisionWitnessRoles(client) {
+    const [me] = await client.$queryRawUnsafe(
+        'SELECT current_user AS u, rolsuper, rolcreaterole FROM pg_roles WHERE rolname = current_user',
+    );
+    if (!me || (!me.rolsuper && !me.rolcreaterole)) {
+        console.log('[wp-i witness] role provisioning skipped: ' + (me && me.u) + ' cannot create roles');
+        return { provisioned: false, reason: 'NO_CREATEROLE' };
+    }
+    // CREATE ROLE has no IF NOT EXISTS, so existence is checked first: a second
+    // run must be a no-op, not an error.
+    for (const role of [RUNTIME_ROLE, RECONCILER_ROLE]) {
+        const [exists] = await client.$queryRawUnsafe('SELECT 1 AS x FROM pg_roles WHERE rolname = $1', role);
+        if (!exists) {
+            await client.$executeRawUnsafe('CREATE ROLE "' + role + '" LOGIN');
+            console.log('[wp-i witness] created role ' + role);
+        }
+    }
+    // Least privilege, restated on every run so a drifted grant is repaired.
+    await client.$executeRawUnsafe('GRANT USAGE ON SCHEMA public TO "' + RUNTIME_ROLE + '"');
+    await client.$executeRawUnsafe('GRANT USAGE ON SCHEMA public TO "' + RECONCILER_ROLE + '"');
+    await client.$executeRawUnsafe('GRANT SELECT ON "ProviderSettlementWitness" TO "' + RUNTIME_ROLE + '"');
+    await client.$executeRawUnsafe('GRANT SELECT, INSERT ON "ProviderSettlementWitness" TO "' + RECONCILER_ROLE + '"');
+    // Explicitly NOT granted: UPDATE/DELETE/TRUNCATE to either role, and any
+    // privilege at all on customer balances, deposits or the ledger.
+    await client.$executeRawUnsafe('REVOKE UPDATE, DELETE, TRUNCATE ON "ProviderSettlementWitness" FROM "' + RUNTIME_ROLE + '"');
+    await client.$executeRawUnsafe('REVOKE UPDATE, DELETE, TRUNCATE ON "ProviderSettlementWitness" FROM "' + RECONCILER_ROLE + '"');
+    return { provisioned: true };
+}
+
 async function main() {
+    if (PROVISION_ROLES) {
+        const out = await provisionWitnessRoles(prisma);
+        console.log('[wp-i witness] roles: ' + JSON.stringify(out));
+    } else {
+        console.log('[wp-i witness] role provisioning not requested (WP_I_PROVISION_WITNESS_ROLES != 1)');
+    }
     for (const sql of STATEMENTS) {
         await prisma.$executeRawUnsafe(sql);
         console.log(`[wp-i witness] ok: ${sql.split('\n')[0].slice(0, 96)}`);
@@ -104,10 +150,16 @@ async function main() {
     console.log(`[wp-i witness] verified ${names.length} columns and ${idxNames.length} indexes`);
 }
 
-main()
-    .then(() => prisma.$disconnect())
-    .catch(async (e) => {
-        console.error('[wp-i witness] installer failed:', e.message);
-        await prisma.$disconnect();
-        process.exit(1);
-    });
+if (require.main === module) {
+    main()
+        .then(() => prisma.$disconnect())
+        .catch(async (e) => {
+            console.error('[wp-i witness] installer failed:', e.message);
+            await prisma.$disconnect();
+            process.exit(1);
+        });
+}
+
+// Exported so the provenance suite can provision through THIS installer rather
+// than restating its grants. Running the file directly still executes it.
+module.exports = { runInstaller: main };

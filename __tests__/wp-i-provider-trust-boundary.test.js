@@ -29,6 +29,10 @@ const OPENING = {
     provider: 'MOOLRE',
     amountGhs: '250.00',
     status: 'RECEIVED',
+    // §WP-I: the opening carries the trusted wallet the money lands in, and the
+    // wallet-scoped claim identity is built from it. Without one the witness is
+    // refused, so the fixture must model a real opening.
+    walletAccount: '0244000001',
     // The real receipt always carries this; a witness is bound to it.
     createdAt: new Date('2026-11-14T08:00:00Z'),
 };
@@ -57,6 +61,14 @@ function fakeTx({ opening = OPENING } = {}) {
         // genuinely cannot enforce it.
         $executeRaw: async () => 1,
         $executeRawUnsafe: async () => 1,
+        // The unresolved-case guard must be able to READ. A stub that cannot run
+        // the query is refused (fail closed), so the stub models a database that
+        // HAS the case table and holds no case for these fixtures.
+        $queryRawUnsafe: async (sql) => (
+            String(sql).includes('to_regclass')
+                ? [{ t: '"ReconciliationException"' }]
+                : []
+        ),
         providerSettlementWitness: {
             create: async ({ data }) => {
                 // Model the schema's @unique(openingDedupKey): one witness, one opening.

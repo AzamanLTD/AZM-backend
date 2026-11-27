@@ -1859,6 +1859,7 @@ model FiatProviderEvent {
   @@index([provider, providerRef])
   @@index([relatedReference])
   @@index([direction, status])
+  walletAccount    String? // WP-I: trusted server-side wallet that received this payment; NULL = unknown, never a default
 }
 
 /// Inbound GHS evidence. RECEIVED is durable evidence only; AVAILABLE arises

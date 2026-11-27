@@ -24,6 +24,9 @@
 
 const logger = require('../src/config/logger');
 const { resolvePendingDeposit } = require('../src/services/moolreCollectionRecoveryService');
+const {
+    readParking, recordAttempt, TRANSIENT_OUTCOMES, CONTRADICTORY_OUTCOMES,
+} = require('../src/services/depositReconciliationParking');
 
 const RECONCILE_INTERVAL_MS = 60_000;
 const STALE_AFTER_MS = 60_000; // a deposit pending past this window may have a missed callback
@@ -77,6 +80,15 @@ class DepositReconciliationWorker {
             });
             for (const row of stale) {
                 try {
+                    // §6 — a deposit with an open blocking case, or one still inside
+                    // its durable backoff window, is not asked again on this tick.
+                    // The financial row stays PENDING; only the retry is paused.
+                    const parking = await readParking(this.prisma, row.id);
+                    if (parking.blocked) {
+                        logger.debug({ reference: row.txHash, parked: parking.parked, nextAttemptAt: parking.nextAttemptAt },
+                            '[DepositReconciliation] deposit parked or backing off — not retried');
+                        continue;
+                    }
                     const out = await resolvePendingDeposit({
                         prisma: this.prisma,
                         moolre: this.moolre,
@@ -88,8 +100,21 @@ class DepositReconciliationWorker {
                     } else if (out.outcome === 'FAILED') {
                         logger.info({ reference: row.txHash }, '[DepositReconciliation] deposit failed by provider status');
                         await this._notifyFailed(row.txHash);
-                    } else if (out.outcome === 'NOT_MOOLRE_SURFACE' || out.outcome === 'STILL_PENDING' || out.outcome === 'STATUS_UNAVAILABLE') {
-                        // unresolved by design — the next pass retries
+                    } else if (TRANSIENT_OUTCOMES.includes(out.outcome)) {
+                        // Unresolved by design: the reference is preserved and the
+                        // next attempt is scheduled durably, so a restart does not
+                        // reset the schedule. Never a failure, never a credit.
+                        await recordAttempt(this.prisma, {
+                            transactionHistoryId: row.id, outcome: out.outcome, reason: out.reason || null,
+                        });
+                    } else if (CONTRADICTORY_OUTCOMES.includes(out.outcome)) {
+                        // A human must adjudicate. Park immediately rather than ask
+                        // the provider the same question every 60 seconds.
+                        await recordAttempt(this.prisma, {
+                            transactionHistoryId: row.id, outcome: out.outcome, reason: out.reason || null, park: true,
+                        });
+                        logger.warn({ reference: row.txHash, outcome: out.outcome },
+                            '[DepositReconciliation] contradictory evidence — deposit parked for operator review');
                     } else {
                         logger.debug({ reference: row.txHash, outcome: out.outcome },
                             '[DepositReconciliation] pass complete');

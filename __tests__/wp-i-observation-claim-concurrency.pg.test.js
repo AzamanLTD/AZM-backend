@@ -29,6 +29,8 @@ const run = DB_URL ? describe : describe.skip;
 
 run('§WP-I — provider observation claim (real PostgreSQL)', () => {
     const { PrismaClient } = require('@prisma/client');
+    // The one trusted wallet these fixtures use.
+    const WALLET = '0244000001';
     const { claimProviderObservation, CLAIM_PURPOSE, ProviderObservationClaimError } =
         require('../src/services/providerObservationClaimService');
 
@@ -60,6 +62,7 @@ run('§WP-I — provider observation claim (real PostgreSQL)', () => {
         return prisma.$transaction(async (tx) => {
             await claimProviderObservation(tx, {
                 provider: 'moolre',
+                provider: 'moolre', accountNumber: WALLET,
                 reference,
                 purpose: CLAIM_PURPOSE.CUSTOMER_DEPOSIT,
                 claimedByRef: ownerRef,
@@ -80,6 +83,7 @@ run('§WP-I — provider observation claim (real PostgreSQL)', () => {
         return prisma.$transaction(async (tx) => {
             await claimProviderObservation(tx, {
                 provider: 'moolre',
+                provider: 'moolre', accountNumber: WALLET,
                 reference,
                 purpose: CLAIM_PURPOSE.TREASURY_WITNESS,
                 claimedByRef: ownerRef,
@@ -118,7 +122,7 @@ run('§WP-I — provider observation claim (real PostgreSQL)', () => {
 
             // 8: no stranded or duplicate claim.
             const claims = await prisma.providerObservationClaim.findMany({
-                where: { observationKey: `moolre|collection|${reference}` },
+                where: { observationKey: `moolre|collection|v2|${WALLET}|${reference}` },
             });
             expect(claims.length).toBe(1);
 
@@ -135,14 +139,14 @@ run('§WP-I — provider observation claim (real PostgreSQL)', () => {
             const winnerPurpose = winner === 'deposit' ? CLAIM_PURPOSE.CUSTOMER_DEPOSIT : CLAIM_PURPOSE.TREASURY_WITNESS;
             const winnerOwner = winner === 'deposit' ? depositRef : treasuryRef;
             const retry = await prisma.$transaction((tx) => claimProviderObservation(tx, {
-                provider: 'moolre', reference, purpose: winnerPurpose, claimedByRef: winnerOwner,
+                provider: 'moolre', reference, accountNumber: WALLET, purpose: winnerPurpose, claimedByRef: winnerOwner,
             }));
             expect(retry.claimed).toBe(false);
             expect(retry.samePathRetry).toBe(true);
 
             const losingPurpose = winner === 'deposit' ? CLAIM_PURPOSE.TREASURY_WITNESS : CLAIM_PURPOSE.CUSTOMER_DEPOSIT;
             await expect(prisma.$transaction((tx) => claimProviderObservation(tx, {
-                provider: 'moolre', reference, purpose: losingPurpose, claimedByRef: 'other-owner',
+                provider: 'moolre', reference, accountNumber: WALLET, purpose: losingPurpose, claimedByRef: 'other-owner',
             }))).rejects.toMatchObject({ code: 'OBSERVATION_SPENT_BY_OTHER_PATH' });
         }
     }, 120000);
@@ -151,19 +155,19 @@ run('§WP-I — provider observation claim (real PostgreSQL)', () => {
         const reference = refFor('rollback');
         await expect(prisma.$transaction(async (tx) => {
             await claimProviderObservation(tx, {
-                provider: 'moolre', reference,
+                provider: 'moolre', reference, accountNumber: WALLET,
                 purpose: CLAIM_PURPOSE.CUSTOMER_DEPOSIT, claimedByRef: 'dep-rollback',
             });
             throw new Error('economic step failed after the claim');
         })).rejects.toThrow('economic step failed after the claim');
 
         const afterFailure = await prisma.providerObservationClaim.findMany({
-            where: { observationKey: `moolre|collection|${reference}` },
+            where: { observationKey: `moolre|collection|v2|${WALLET}|${reference}` },
         });
         expect(afterFailure.length).toBe(0);
 
         const claimed = await prisma.$transaction((tx) => claimProviderObservation(tx, {
-            provider: 'moolre', reference,
+            provider: 'moolre', reference, accountNumber: WALLET,
             purpose: CLAIM_PURPOSE.TREASURY_WITNESS, claimedByRef: 'open-after-rollback',
         }));
         expect(claimed.claimed).toBe(true);
@@ -173,10 +177,10 @@ run('§WP-I — provider observation claim (real PostgreSQL)', () => {
         const a = refFor('distinct-a');
         const b = refFor('distinct-b');
         const ra = await prisma.$transaction((tx) => claimProviderObservation(tx, {
-            provider: 'moolre', reference: a, purpose: CLAIM_PURPOSE.CUSTOMER_DEPOSIT, claimedByRef: 'dep-a',
+            provider: 'moolre', reference: a, accountNumber: WALLET, purpose: CLAIM_PURPOSE.CUSTOMER_DEPOSIT, claimedByRef: 'dep-a',
         }));
         const rb = await prisma.$transaction((tx) => claimProviderObservation(tx, {
-            provider: 'moolre', reference: b, purpose: CLAIM_PURPOSE.CUSTOMER_DEPOSIT, claimedByRef: 'dep-b',
+            provider: 'moolre', reference: b, accountNumber: WALLET, purpose: CLAIM_PURPOSE.CUSTOMER_DEPOSIT, claimedByRef: 'dep-b',
         }));
         expect(ra.claimed).toBe(true);
         expect(rb.claimed).toBe(true);
@@ -192,15 +196,35 @@ run('§WP-I — provider observation claim (real PostgreSQL)', () => {
         }))).rejects.toMatchObject({ code: 'OBSERVATION_PROVIDER_UNSUPPORTED' });
     }, 60000);
 
-    test('the same reference observed against a different account is refused for review, not merged', async () => {
+    // §WP-I v2: the wallet is PART OF THE IDENTITY. Moolre externalrefs are unique
+    // per wallet, so the same reference against two wallets is two different
+    // payments and both may be claimed. Collapsing them would be the bug.
+    test('the same reference against different wallets is two distinct identities', async () => {
         const reference = refFor('account');
-        await prisma.$transaction((tx) => claimProviderObservation(tx, {
+        const first = await prisma.$transaction((tx) => claimProviderObservation(tx, {
             provider: 'moolre', reference, accountNumber: '0244000001',
             purpose: CLAIM_PURPOSE.CUSTOMER_DEPOSIT, claimedByRef: 'dep-acct',
         }));
-        await expect(prisma.$transaction((tx) => claimProviderObservation(tx, {
+        const second = await prisma.$transaction((tx) => claimProviderObservation(tx, {
             provider: 'moolre', reference, accountNumber: '0244000002',
             purpose: CLAIM_PURPOSE.CUSTOMER_DEPOSIT, claimedByRef: 'dep-acct',
-        }))).rejects.toMatchObject({ code: 'OBSERVATION_ACCOUNT_MISMATCH' });
+        }));
+        expect(first.claimed).toBe(true);
+        expect(second.claimed).toBe(true);
+        expect(first.observationKey).not.toBe(second.observationKey);
+        expect(first.observationKey).toContain('0244000001');
+        expect(second.observationKey).toContain('0244000002');
+
+        // The SAME wallet and reference is the same identity: a retry converges,
+        // and a different economic use is still refused.
+        const same = await prisma.$transaction((tx) => claimProviderObservation(tx, {
+            provider: 'moolre', reference, accountNumber: '0244000001',
+            purpose: CLAIM_PURPOSE.CUSTOMER_DEPOSIT, claimedByRef: 'dep-acct',
+        }));
+        expect(same.samePathRetry).toBe(true);
+        await expect(prisma.$transaction((tx) => claimProviderObservation(tx, {
+            provider: 'moolre', reference, accountNumber: '0244000001',
+            purpose: CLAIM_PURPOSE.TREASURY_WITNESS, claimedByRef: 'opening-acct',
+        }))).rejects.toMatchObject({ code: 'OBSERVATION_SPENT_BY_OTHER_PATH' });
     }, 60000);
 });

@@ -25,6 +25,7 @@ const adminController = require('../controllers/adminController');
 const profitBreakdownController = require('../controllers/adminProfitBreakdownController');
 const { protect, adminOnly } = require('../middleware/authMiddleware');
 const { requireEffectivePermission } = require('../middleware/requireEffectivePermission');
+const adminReconciliationController = require('../controllers/adminReconciliationController');
 const { idempotency } = require('../middleware/idempotency');
 const { validate } = require('../middleware/validate');
 const {
@@ -43,6 +44,19 @@ router.use(adminOnly);
 // ─── PLATFORM OVERVIEW ───────────────────────────────────────────────────────
 router.get('/stats', requireEffectivePermission('reports.view'), adminController.getPlatformStats);
 router.get('/system-health', requireEffectivePermission('reports.view'), adminController.getSystemHealth);
+// ─── WP-I RECONCILIATION (read-only operator visibility) ─────────────────────
+// Read-only by construction: quarantined observations and unresolved evidence
+// cases are shown so they cannot stay invisible, and no route here can resolve,
+// dismiss, unquarantine or manufacture a provider witness.
+router.get('/reconciliation/exceptions/summary',
+    requireEffectivePermission('reconciliation.view'), adminReconciliationController.summary);
+router.get('/reconciliation/exceptions',
+    requireEffectivePermission('reconciliation.view'), adminReconciliationController.list);
+router.get('/reconciliation/quarantined',
+    requireEffectivePermission('reconciliation.view'), adminReconciliationController.quarantined);
+router.get('/reconciliation/stuck-deposits',
+    requireEffectivePermission('reconciliation.view'), adminReconciliationController.stuckDeposits);
+
 router.get('/profit-breakdown', requireEffectivePermission('fees.manage'), profitBreakdownController.getProfitBreakdown);
 
 // ─── TRADE OVERSIGHT ─────────────────────────────────────────────────────────
