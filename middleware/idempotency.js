@@ -56,6 +56,8 @@ const logger = require('../src/config/logger');
 
 const OPERATION_IN_PROGRESS = 'IN_PROGRESS';
 const OPERATION_COMMITTED = 'COMMITTED';
+// Upper bound on holding a 2xx response for its COMMITTED bookkeeping write.
+const COMMIT_BOOKKEEPING_TIMEOUT_MS = 5000;
 
 const RETAIN = 'RETAIN';   // default: a 5xx may follow a committed mutation
 const RELEASE = 'RELEASE'; // the service is provably convergent / rolled back
@@ -181,6 +183,12 @@ function idempotency(options = {}) {
     const releaseDelayMs = Number.isFinite(releasePolicy.delayMs) && releasePolicy.delayMs >= 0
         ? releasePolicy.delayMs
         : CLAIM_RELEASE_RETRY_DELAY_MS;
+    // The 2xx COMMITTED write is awaited before the response leaves, up to
+    // this bound (tests inject a short one to prove a stalled write never
+    // holds the response).
+    const commitBookkeepingTimeoutMs = Number.isFinite(options.commitBookkeepingTimeoutMs) && options.commitBookkeepingTimeoutMs > 0
+        ? options.commitBookkeepingTimeoutMs
+        : COMMIT_BOOKKEEPING_TIMEOUT_MS;
     // r42 review P0-2: a financial mutation mounted under this authority
     // REQUIRES a client Idempotency-Key. Without one, every network retry is a
     // brand-new operation and can move money twice. Opt out ONLY where an
@@ -391,8 +399,20 @@ function idempotency(options = {}) {
         };
 
         const originalJson = res.json.bind(res);
+        // The first response wins. Sending can now wait on bookkeeping, so a
+        // handler that calls res.status()/res.json() again (a catch block after
+        // an already-sent success) must neither change the status nor send a
+        // second body while that write is in flight.
+        let responding = false;
         res.json = function (body) {
+            if (responding) {
+                logger.warn({ operationId: claim.id, statusCode: res.statusCode },
+                    '[idempotency] second response on one claim ignored — the first response stands');
+                return res;
+            }
+            responding = true;
             const statusCode = res.statusCode;
+            const send = () => { res.statusCode = statusCode; originalJson(body); };
 
             // Release dispositions — durable BEFORE the response leaves.
             // r42 review P0-1 (4xx): a 4xx NEVER implies "nothing committed";
@@ -403,7 +423,7 @@ function idempotency(options = {}) {
             // IN_PROGRESS claim proves the transaction rolled back).
             if (statusCode >= 400 && statusCode < 500) {
                 if (res.locals.financialClaimRelease === true || releaseOn4xx) {
-                    releaseClaim().finally(() => originalJson(body));
+                    releaseClaim().finally(send);
                     return res;
                 }
                 // RETAIN (no explicit disposition): the key stays poisoned —
@@ -413,7 +433,7 @@ function idempotency(options = {}) {
                 if (failurePolicy === RELEASE) {
                     // The route declared its service state-convergent /
                     // provably rolled back on 5xx: release for retry.
-                    releaseClaim().finally(() => originalJson(body));
+                    releaseClaim().finally(send);
                     return res;
                 }
                 // RETAIN: a 5xx may follow a committed mutation. The claim
@@ -421,13 +441,18 @@ function idempotency(options = {}) {
                 // refuses. The client must use a NEW key.
             }
 
-            originalJson(body);
-
-            try {
-                if (statusCode >= 200 && statusCode < 300) {
-                    // Guarded: a wired service may have already committed the
-                    // row inside its transaction — never overwrite that.
-                    prisma.financialOperation.updateMany({
+            if (statusCode >= 200 && statusCode < 300) {
+                // COMMITTED is durable BEFORE the response leaves, like the
+                // release dispositions above. A client that has the 2xx in hand
+                // and retries the same key must get the committed replay, never
+                // IDEMPOTENCY_IN_PROGRESS for an operation that already
+                // succeeded. Guarded: a wired service may have already committed
+                // the row inside its transaction — never overwrite that.
+                // Bounded: a stalled write never holds the response; the claim
+                // then stays IN_PROGRESS and same-key replays refuse safely.
+                let bookkeeping;
+                try {
+                    bookkeeping = Promise.resolve(prisma.financialOperation.updateMany({
                         where: { id: claim.id, status: OPERATION_IN_PROGRESS },
                         data: {
                             status: OPERATION_COMMITTED,
@@ -442,14 +467,30 @@ function idempotency(options = {}) {
                             // and break byte-identical replay).
                             responseBody: JSON.stringify(body),
                         },
-                    }).catch((e) => logger.warn(
+                    }));
+                } catch (e) {
+                    bookkeeping = Promise.reject(e);
+                }
+                let timer;
+                const bounded = new Promise((resolve) => {
+                    timer = setTimeout(() => {
+                        logger.warn({ operationId: claim.id, timeoutMs: commitBookkeepingTimeoutMs },
+                            '[idempotency] commit bookkeeping slow — responding; replays refuse safely until it lands');
+                        resolve();
+                    }, commitBookkeepingTimeoutMs);
+                    if (timer.unref) timer.unref();
+                });
+                Promise.race([
+                    bookkeeping.catch((e) => logger.warn(
                         { err: e.message, operationId: claim.id },
                         '[idempotency] commit bookkeeping failed — replays refuse safely (IN_PROGRESS)'
-                    ));
-                }
-            } catch (e) {
-                logger.warn({ err: e.message }, '[idempotency] disposition error');
+                    )),
+                    bounded,
+                ]).finally(() => { clearTimeout(timer); send(); });
+                return res;
             }
+
+            send();
             return res;
         };
 
