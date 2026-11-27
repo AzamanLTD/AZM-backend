@@ -71,6 +71,9 @@
     },
     "teeny-request": {
       "uuid": "^11.1.1"
+    },
+    "@prisma/config": {
+      "effect": "3.22.1"
     }
   },
   "engines": {
