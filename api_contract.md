@@ -292,10 +292,11 @@ Body: `{ amountUsdc }`. Atomically moves USDC from `SystemProfitFees` →
 `SystemFiatPool`. Writes an `AdminProfitLog` entry with
 `source = 'ARBITRAGE_SPREAD'`.
 
-### `POST /finance/webhook/deposit` (no auth, idempotent)
-Body: `{ amount, txHash, address?, userId }`. Crypto deposit listener
-(Tatum / Alchemy). Idempotent on `txHash`. Credits user, debits master
-crypto and hot wallet, writes `TransactionHistory(DEPOSIT_CRYPTO)`.
+### `POST /finance/webhook/deposit` — **retired (410 `DEPOSIT_WEBHOOK_RETIRED`)**
+Previously credited a body-supplied `userId` with no authentication. It now
+refuses every request before any read or write. Crypto deposits arrive only
+through the verified Tatum webhook (`POST /finance/webhook/tatum`), which
+resolves the owner from the `WalletAddress` registry.
 
 ### `POST /finance/webhook/mtn-disbursement` (no auth, **shared-secret guarded**) — *Phase B v2*
 Header: `X-Mtn-Webhook-Secret: <MTN_WEBHOOK_SECRET>`.
