@@ -94,6 +94,28 @@ exports.getTabs = async (prisma, opts) => service(prisma, opts).getBusinessTabs(
 exports.getOpenTabs = exports.getTabs;
 exports.getCustomerTabs = async (prisma, opts) => service(prisma, opts).getCustomerTabs(opts.userId, opts.status);
 
+// The customer's own tabs for the app's Orders & bookings hub: the ones that
+// still need them (OPEN: being served; FINALIZED: the bill is ready to pay)
+// by default, or the recent closed ones. Newest first, bounded.
+const CUSTOMER_TAB_SETS = Object.freeze({
+    active: ['OPEN', 'FINALIZED'],
+    closed: ['CLOSED', 'CANCELLED'],
+});
+exports.listCustomerTabs = async (prisma, { customerId, set = 'active', limit = 30 }) => {
+    const statuses = CUSTOMER_TAB_SETS[set];
+    if (!statuses) throw Object.assign(new Error('set must be active or closed.'), { httpStatus: 400 });
+    return prisma.dineInTab.findMany({
+        where: { customerId, status: { in: statuses } },
+        include: {
+            items: true,
+            businessProfile: { select: { id: true, bizId: true, businessName: true, logoUrl: true } },
+            table: { select: { id: true, label: true } },
+        },
+        orderBy: { openedAt: 'desc' },
+        take: Math.min(Math.max(parseInt(limit, 10) || 30, 1), 50),
+    });
+};
+
 exports.getTab = async (prisma, { tabId, customerId, businessProfileId, io }) => {
     const svc = new DineInService(prisma, io);
     const tab = await svc.getTab(tabId);

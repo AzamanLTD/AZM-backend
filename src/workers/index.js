@@ -122,7 +122,10 @@ async function startWorkers(app, {
 
     const noShowWorker = require('../../workers/reservationNoShowWorker');
     await register('no-show-sweep', '0 * * * *', async () => {
-        const results = await noShowWorker.sweepAll(prisma);
+        const notify = notificationService && typeof notificationService.sendNotification === 'function'
+            ? (n) => notificationService.sendNotification(n)
+            : null;
+        const results = await noShowWorker.sweepAll(prisma, { notify });
         logger.info({ results }, 'NoShowWorker: sweep complete');
     });
 

@@ -599,3 +599,36 @@ describe('who cancels decides the fee', () => {
         expect(history.metadata.feeRefundOwedUsdc).toBe(res.payment.feeUsdc);
     });
 });
+
+describe('walkways and empty cells are not seats', () => {
+    const withWalkway = () => {
+        const db = makeDb();
+        db.transitTrip.rows[0].vehicle.seatMap.layout = [
+            ...db.transitTrip.rows[0].vehicle.seatMap.layout,
+            { seatId: 'W1', row: 1, col: 3, type: 'NONE' },
+            { seatId: 'W2', row: 2, col: 3, type: 'empty' },
+        ];
+        return db;
+    };
+
+    test('a walkway cannot be quoted or booked, paid or not', async () => {
+        const db = withWalkway();
+        await expect(quoteSeats(db, { tripId: 'trip-1', customerId: 10, seatIds: ['W1'] })).rejects.toMatchObject({ code: 'BAD_SEATS' });
+        await expect(bookSeats(db, { tripId: 'trip-1', customerId: 10, seatIds: ['W2'] })).rejects.toThrow(/Invalid seat IDs: W2/);
+        await expect(bookSeats(db, {
+            tripId: 'trip-1', customerId: 10, seatIds: ['1A', 'W1'], payWith: 'WALLET', expectedTotalUsdc: '10.000000',
+        })).rejects.toBeTruthy();
+        expect(db.smartEscrow.rows).toHaveLength(0);
+        expect(user(db, 10).availableBalance).toBe(100);
+    });
+
+    test('the seat list keeps the space but never counts it', async () => {
+        const { getTripSeatAvailability } = require('../services/transitBookingService');
+        const db = withWalkway();
+        db.transitBookingSeat.findMany = jest.fn(async () => []);
+        const out = await getTripSeatAvailability(db, { tripId: 'trip-1' });
+        expect(out.totalSeats).toBe(3);
+        expect(out.availableCount).toBe(3);
+        expect(out.seats.find((s) => s.seatId === 'W1').status).toBe('SPACE');
+    });
+});

@@ -18,6 +18,7 @@
 //     to the operator, in one transaction
 // =============================================================================
 
+const { isSeatCell, bookableSeats, bookableSeatIds } = require('./transitSeatLayout');
 const { REFUND_CAUSE, refundsFeeNow } = require('./feeRefundPolicy');
 const crypto = require('crypto');
 const { randomUUID } = require('crypto');
@@ -159,9 +160,10 @@ const bookSeats = async (prisma, {
     if (!trip.vehicle?.seatMap) {
         throw new Error('This vehicle has no seat map configured.');
     }
-    const layout = trip.vehicle.seatMap.layout;
-    const validSeatIds = layout.map(s => s.seatId);
-    const invalidSeats = seatIds.filter(id => !validSeatIds.includes(id));
+    // Only real seats: a walkway or empty cell (NONE) is refused like an
+    // unknown seat (transitSeatLayout).
+    const validSeatIds = bookableSeatIds(trip.vehicle.seatMap.layout);
+    const invalidSeats = seatIds.filter(id => !validSeatIds.has(id));
     if (invalidSeats.length > 0) {
         throw new Error(`Invalid seat IDs: ${invalidSeats.join(', ')}.`);
     }
@@ -415,7 +417,7 @@ const quoteSeats = async (prisma, { tripId, customerId, seatIds }) => {
     });
     if (!trip) throw _bookingError('NOT_FOUND', 'Trip not found.', 404);
     if (!trip.vehicle?.seatMap) throw _bookingError('NO_SEAT_MAP', 'This vehicle has no seat map configured.', 409);
-    const validSeatIds = new Set(trip.vehicle.seatMap.layout.map(s => s.seatId));
+    const validSeatIds = bookableSeatIds(trip.vehicle.seatMap.layout);
     const invalid = seatIds.filter(id => !validSeatIds.has(id));
     if (invalid.length > 0) throw _bookingError('BAD_SEATS', `Invalid seat IDs: ${invalid.join(', ')}.`);
 
@@ -468,17 +470,21 @@ const getTripSeatAvailability = async (prisma, { tripId }) => {
     const bookedSet = new Set(bookedSeats.map(s => s.seatId));
     const tierFares = (trip.metadata && trip.metadata.tierFares) || {};
 
-    const seats = layout.map(seat => ({
-        ...seat,
-        status: bookedSet.has(seat.seatId) ? 'OCCUPIED' : 'AVAILABLE',
-        fare: seat.tier && tierFares[seat.tier] != null ? Number(tierFares[seat.tier]) : Number(trip.fareUsdc),
-    }));
+    // Empty cells stay in the list (the app draws the space) but are never
+    // available or counted.
+    const seats = layout.map(seat => (isSeatCell(seat)
+        ? {
+            ...seat,
+            status: bookedSet.has(seat.seatId) ? 'OCCUPIED' : 'AVAILABLE',
+            fare: seat.tier && tierFares[seat.tier] != null ? Number(tierFares[seat.tier]) : Number(trip.fareUsdc),
+        }
+        : { ...seat, status: 'SPACE' }));
 
     return {
         tripId,
         seats,
         availableCount: seats.filter(s => s.status === 'AVAILABLE').length,
-        totalSeats: layout.length,
+        totalSeats: bookableSeats(layout).length,
         tripStatus: trip.status,
         fareUsdc: trip.fareUsdc,
         tierFares,

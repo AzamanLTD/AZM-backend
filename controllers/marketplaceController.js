@@ -38,6 +38,25 @@ exports.generateCheckInQR = async (req, res) => {
     }
 };
 
+/**
+ * Whose business the caller checks guests in for: the owner themselves, or an
+ * ACTIVE employee whose role grants reservations.manage (front-desk staff).
+ * Returns the business owner's user id, which the check-in authority
+ * compares with the reservation's business: a QR from another business is
+ * still refused. Without a business or the permission, the caller's own id
+ * (the authority then refuses).
+ */
+const _checkInActorOwnerId = async (prisma, user) => {
+    const { resolveBusinessContext, resolvePermissions } = require('../middleware/requirePermission');
+    const context = await resolveBusinessContext(prisma, user);
+    if (!context || context.isBusinessOwner) return user.id;
+    const permissions = await resolvePermissions(prisma, user.id, context.businessProfileId);
+    if (!permissions.includes('*') && !permissions.includes('reservations.manage')) return user.id;
+    const business = await prisma.businessProfile.findUnique({ where: { id: context.businessProfileId }, select: { userId: true } });
+    return business && business.userId ? business.userId : user.id;
+};
+exports._checkInActorOwnerId = _checkInActorOwnerId;
+
 // POST /api/marketplace/business/checkin — business scans QR or searches by AZM-ID
 exports.businessCheckIn = async (req, res) => {
     const prisma = req.app.get('prisma');
@@ -46,19 +65,21 @@ exports.businessCheckIn = async (req, res) => {
         const { token, azamanId, reservationId } = req.body;
 
         if (token) {
-            // QR scan path
+            // QR scan path: the owner, or front-desk staff with
+            // reservations.manage for that business.
             const result = await qrSvc.verifyAndCheckIn(prisma, {
-                token, businessUserId: req.user.id,
+                token, businessUserId: await _checkInActorOwnerId(prisma, req.user),
             });
             return res.status(200).json(result);
         } else if (azamanId) {
             // Manual AZM-ID search path: reservations, and the passenger's
             // transit bookings with what staff need for an ID check.
             const boarding = require('../services/transitBoardingService');
+            const actorOwnerId = await _checkInActorOwnerId(prisma, req.user);
             const found = await qrSvc.searchByAzamanId(prisma, {
-                azamanId: boarding.normalizeAzamanId(azamanId), businessUserId: req.user.id,
+                azamanId: boarding.normalizeAzamanId(azamanId), businessUserId: actorOwnerId,
             });
-            const result = await boarding.enrichAzamanIdSearch(prisma, { businessUserId: req.user.id, result: found });
+            const result = await boarding.enrichAzamanIdSearch(prisma, { businessUserId: actorOwnerId, result: found });
             return res.status(200).json({ success: true, ...result });
         } else if (reservationId) {
             // A stay paid in the app checks in only by the guest's QR.
@@ -349,9 +370,10 @@ exports.createTransitTrip = async (req, res) => {
         if (!vehicle || vehicle.businessProfileId !== profile.id)
             return res.status(403).json({ success: false, message: 'Vehicle not found for this business.' });
 
-        // Get seat count from seat map
+        // Seat count from the seat map: real seats only, never walkways or
+        // empty cells (transitSeatLayout).
         const seatMap = await prisma.transitSeatMap.findUnique({ where: { vehicleId } });
-        const availableSeats = seatMap ? seatMap.layout.length : vehicle.capacity;
+        const availableSeats = seatMap ? require('../services/transitSeatLayout').bookableSeats(seatMap.layout).length : vehicle.capacity;
 
         const trip = await prisma.transitTrip.create({
             data: {

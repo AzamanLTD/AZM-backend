@@ -678,3 +678,34 @@ describe('published fee-refund rules reach every refund', () => {
         expect(user(db, 10).availableBalance).toBeCloseTo(500 - out.payment.feeUsdc, 9);
     });
 });
+
+describe('a request the hotel never answers stops holding the room', () => {
+    const { sweepUnansweredRequests, REQUEST_ANSWER_WINDOW_MS } = require('../workers/reservationNoShowWorker');
+    const request = (db, extra) => {
+        const r = db.decorate({
+            id: `req-${db.reservation.rows.length + 1}`, reservationRef: 'RES-REQ1', businessProfileId: 'bp-h', customerId: 10,
+            serviceItemId: 'r1', status: 'PENDING', escrowId: null, startDatetime: IN, endDatetime: OUT,
+            createdAt: new Date(), ...extra,
+        });
+        db.reservation.rows.push(r);
+        return r;
+    };
+
+    test('closed at its start if unconfirmed, or after 72 hours; the guest is told', async () => {
+        const db = makeDb();
+        const fresh = request(db, {});
+        const old = request(db, { createdAt: new Date(Date.now() - REQUEST_ANSWER_WINDOW_MS - 1000) });
+        const started = request(db, { startDatetime: new Date(Date.now() - 1000), createdAt: new Date() });
+        const confirmed = request(db, { status: 'CONFIRMED', createdAt: new Date(Date.now() - REQUEST_ANSWER_WINDOW_MS - 1000) });
+        const notify = jest.fn().mockResolvedValue(undefined);
+        const out = await sweepUnansweredRequests(db, { notify });
+        expect(out.expired).toBe(2);
+        expect(fresh.status).toBe('PENDING');
+        expect(old.status).toBe('CANCELLED_BUSINESS');
+        expect(old.businessNotes).toMatch(/request expired/);
+        expect(started.status).toBe('CANCELLED_BUSINESS');
+        expect(confirmed.status).toBe('CONFIRMED');
+        expect(notify).toHaveBeenCalledTimes(2);
+        expect(notify.mock.calls[0][0]).toEqual(expect.objectContaining({ userId: 10, title: 'Your request was not confirmed' }));
+    });
+});

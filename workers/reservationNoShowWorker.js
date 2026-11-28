@@ -331,7 +331,59 @@ const sweepNoShowTransitBookings = async (prisma) => {
 // =============================================================================
 // sweepAll — convenience function to run both sweeps.
 // =============================================================================
-const sweepAll = async (prisma) => {
+// =============================================================================
+// sweepUnansweredRequests — a reservation REQUEST the business never confirmed
+// holds its room or table (the capacity trigger counts PENDING). It is closed
+// when its start time arrives unconfirmed, or 72 hours after it was made,
+// whichever comes first, through the lifecycle authority (a held deposit is
+// refunded, a draft one expired) as CANCELLED_BUSINESS with the reason in
+// businessNotes. The guest and the business are told. Bounded per run.
+// =============================================================================
+const REQUEST_ANSWER_WINDOW_MS = 72 * 60 * 60 * 1000;
+const UNANSWERED_REASON = 'Not confirmed by the business in time (request expired).';
+
+const sweepUnansweredRequests = async (prisma, { now = new Date(), limit = 100, notify = null } = {}) => {
+    const stale = await prisma.reservation.findMany({
+        where: {
+            status: 'PENDING',
+            OR: [
+                { startDatetime: { lte: now } },
+                { createdAt: { lte: new Date(now.getTime() - REQUEST_ANSWER_WINDOW_MS) } },
+            ],
+        },
+        select: { id: true, businessProfileId: true, customerId: true, reservationRef: true },
+        orderBy: { createdAt: 'asc' },
+        take: limit,
+    });
+    const results = { expired: 0, errors: 0 };
+    const { businessCancelReservation } = require('../services/reservationLifecycleService');
+    for (const r of stale) {
+        try {
+            const done = await businessCancelReservation(prisma, {
+                reservationId: r.id, businessProfileId: r.businessProfileId, reason: UNANSWERED_REASON,
+            });
+            if (done && done.status === 'CANCELLED_BUSINESS') results.expired++;
+            if (typeof notify === 'function') {
+                try {
+                    await notify({
+                        userId: r.customerId,
+                        title: 'Your request was not confirmed',
+                        body: `${r.reservationRef}: the business did not confirm in time, so the request was closed. Nothing was charged.`,
+                        category: 'MARKETPLACE',
+                        actionPayload: { route: '/bookings?tab=reservations' },
+                    });
+                } catch (_) { /* the expiry stands either way */ }
+            }
+        } catch (err) {
+            // Confirmed or changed meanwhile: the lifecycle refused; skip it.
+            results.errors++;
+            logger.warn({ err: err.message, reservationId: r.id }, '[NoShowWorker] request expiry skipped');
+        }
+    }
+    return results;
+};
+
+const sweepAll = async (prisma, { notify = null } = {}) => {
     let reservationResults;
     let transitResults;
     let sweepError = null;
@@ -351,8 +403,19 @@ const sweepAll = async (prisma) => {
         logger.error({ err: err.message }, '[NoShowWorker] held payout sweep failed');
         payouts = { error: err.message };
     }
+    // Requests the business never answered stop holding rooms and tables.
+    let requests;
+    try {
+        requests = await sweepUnansweredRequests(prisma, { notify });
+    } catch (err) {
+        logger.error({ err: err.message }, '[NoShowWorker] request expiry sweep failed');
+        requests = { error: err.message };
+    }
     if (sweepError) throw sweepError; // after the payouts ran
-    return { reservations: reservationResults, transit: transitResults, payouts };
+    return { reservations: reservationResults, transit: transitResults, payouts, requests };
 };
 
-module.exports = { sweepNoShowReservations, sweepNoShowTransitBookings, sweepAll, GRACE_PERIOD_MINS };
+module.exports = {
+    sweepNoShowReservations, sweepNoShowTransitBookings, sweepUnansweredRequests, sweepAll,
+    GRACE_PERIOD_MINS, REQUEST_ANSWER_WINDOW_MS,
+};
