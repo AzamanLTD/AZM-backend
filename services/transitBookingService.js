@@ -915,19 +915,20 @@ const releaseHeldTransitPayout = async (prisma, { bookingId, now = Date.now() } 
 const sweepHeldTransitPayouts = async (prisma, { now = Date.now(), limit = 100, maxPages = 10 } = {}) => {
     const out = { checked: 0, released: 0, held: 0, failed: 0 };
     const seen = new Set();
-    let cursor = null;
     for (let page = 0; page < maxPages; page += 1) {
+        // Rows handled this run are excluded by id: a released row leaves the
+        // filter, so a cursor on it would skip the row after it.
         const due = await prisma.transitBooking.findMany({
             where: {
                 status: 'COMPLETED',
                 escrowId: { not: null },
                 scheduledAt: { lte: new Date(now - ID_CHECK_PAYOUT_HOLD_MS) },
                 escrow: { is: { status: { in: RELEASE_CLAIMABLE } } },
+                ...(seen.size > 0 ? { id: { notIn: [...seen] } } : {}),
             },
             select: { id: true },
             orderBy: [{ scheduledAt: 'asc' }, { id: 'asc' }],
             take: limit,
-            ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
         });
         const fresh = due.filter((b) => !seen.has(b.id));
         for (const b of fresh) {
@@ -943,7 +944,6 @@ const sweepHeldTransitPayouts = async (prisma, { now = Date.now(), limit = 100, 
             }
         }
         if (due.length < limit || fresh.length === 0) break;
-        cursor = due[due.length - 1].id;
     }
     return out;
 };
