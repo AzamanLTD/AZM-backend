@@ -39,6 +39,7 @@ const REASON_MIN = 5;
 const REASON_MAX = 500;
 // Transaction-size histogram edges, in USDC.
 const BUCKET_EDGES = Object.freeze([1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000]);
+const VOLUME_QUERY_TIMEOUT_MS = 4000;
 
 class FeeLabError extends Error {
     constructor(code, message, httpStatus = 400, detail = undefined) {
@@ -90,7 +91,11 @@ function _liveFor(param, settings, policyRows) {
     if (t.kind === 'globalSettingsJson') {
         const map = _json(settings ? settings[t.field] : null);
         const v = map && Object.prototype.hasOwnProperty.call(map, t.path) ? map[t.path] : null;
-        return v == null ? null : _fractionToBps(v);
+        if (v != null) return _fractionToBps(v);
+        // No own entry: the app falls back to this field (the value shown is
+        // what is charged; publishing adds the entry).
+        if (t.fallbackField && settings && settings[t.fallbackField] != null) return _fractionToBps(settings[t.fallbackField]);
+        return null;
     }
     if (t.kind === 'feePolicy') {
         const row = policyRows.get(t.key);
@@ -99,6 +104,14 @@ function _liveFor(param, settings, policyRows) {
     }
     // Modelled only: the catalog's starting value for the model, if any.
     return param.modelDefault ?? null;
+}
+
+/** 'own' for a JSON-map entry that exists, 'fallback' when it does not. */
+function _liveSource(param, settings) {
+    const t = param.target || {};
+    if (t.kind !== 'globalSettingsJson') return null;
+    const map = _json(settings ? settings[t.field] : null);
+    return map && Object.prototype.hasOwnProperty.call(map, t.path) && map[t.path] != null ? 'own' : 'fallback';
 }
 
 /** The catalog with every parameter's live value and whether it can publish. */
@@ -112,6 +125,7 @@ async function readCatalog(db, { now = new Date() } = {}) {
         params: point.params.map((param) => ({
             ...catalogLib.publicParam(param),
             live: _liveFor(param, settings, policyRows),
+            liveSource: _liveSource(param, settings),
         })),
     }));
 }
@@ -151,11 +165,18 @@ async function _volume(db, sourceId, from, to) {
     if (!source) return null;
     const edges = Prisma.sql`ARRAY[${Prisma.join(BUCKET_EDGES)}]::numeric[]`;
     const seg = source.segmented ? Prisma.sql`s.seg::text` : Prisma.sql`NULL::text`;
-    const rows = await db.$queryRaw`
+    const query = db.$queryRaw`
         SELECT ${seg} AS seg, width_bucket(s.amt, ${edges}) AS b, COUNT(*)::int AS n, COALESCE(SUM(s.amt), 0)::text AS v
         FROM (${source.sql(from, to)}) AS s
         WHERE s.amt IS NOT NULL AND s.amt > 0
         GROUP BY 1, 2 ORDER BY 1, 2`;
+    // Each source in its own read-only transaction with a time limit, so a
+    // slow table is reported as unavailable instead of holding the page.
+    const [, , rows] = await db.$transaction([
+        db.$executeRawUnsafe('SET TRANSACTION READ ONLY'),
+        db.$executeRawUnsafe(`SET LOCAL statement_timeout = ${VOLUME_QUERY_TIMEOUT_MS}`),
+        query,
+    ]);
     const all = new Map();
     const bySeg = new Map();
     for (const r of rows) {
@@ -247,20 +268,17 @@ const _same = (unit, a, b) => {
 };
 
 /**
- * Publish changed fee values. All or nothing.
- * @param {object} prisma
- * @param {{changes: Array<{key: string, from: unknown, to: unknown}>, reason: string,
- *          adminId: number, adminName?: string|null, ipAddress?: string|null, now?: Date}} input
+ * The checks that need no database: run BEFORE the second factor, so a
+ * request that would be refused anyway does not spend the admin's code.
+ * Returns the planned changes; throws FeeLabError.
  */
-async function publish(prisma, { changes, reason, adminId, adminName = null, ipAddress = null, now = new Date() }) {
-    if (!Number.isInteger(adminId)) throw new FeeLabError('FEE_LAB_ACTOR_REQUIRED', 'An authenticated admin is required.', 401);
+function precheck({ changes, reason }) {
     const why = typeof reason === 'string' ? reason.trim() : '';
     if (why.length < REASON_MIN || why.length > REASON_MAX) {
         throw new FeeLabError('FEE_LAB_REASON_REQUIRED', `Say why (${REASON_MIN} to ${REASON_MAX} characters).`);
     }
     if (!Array.isArray(changes) || changes.length === 0) throw new FeeLabError('FEE_LAB_NOTHING_TO_PUBLISH', 'There are no changes to publish.');
     if (changes.length > MAX_CHANGES) throw new FeeLabError('FEE_LAB_TOO_MANY', `At most ${MAX_CHANGES} changes at once.`);
-
     const seen = new Set();
     const planned = [];
     for (const c of changes) {
@@ -278,14 +296,30 @@ async function publish(prisma, { changes, reason, adminId, adminName = null, ipA
         }
         planned.push({ key, param, from: c.from ?? null, to });
     }
+    return { why, planned };
+}
+
+/**
+ * Publish changed fee values. All or nothing.
+ * @param {object} prisma
+ * @param {{changes: Array<{key: string, from: unknown, to: unknown}>, reason: string,
+ *          adminId: number, adminName?: string|null, ipAddress?: string|null, now?: Date}} input
+ */
+async function publish(prisma, { changes, reason, adminId, adminName = null, ipAddress = null, now = null }) {
+    if (!Number.isInteger(adminId)) throw new FeeLabError('FEE_LAB_ACTOR_REQUIRED', 'An authenticated admin is required.', 401);
+    const { why, planned } = precheck({ changes, reason });
 
     const publishId = randomUUID();
+    let at = now;
     await prisma.$transaction(async (tx) => {
-        // One publish at a time: the settings row is the lock.
+        // One publish at a time: the settings row is the lock. The time is
+        // taken after it, so a rule published here is the newest one in
+        // effect (a racing publish waited and sees it in the stale check).
         await tx.$executeRaw`SELECT id FROM "GlobalSettings" WHERE id = 1 FOR UPDATE`;
+        at = now || new Date();
         const settings = await tx.globalSettings.findUnique({ where: { id: 1 } });
         if (!settings) throw new FeeLabError('FEE_LAB_SETTINGS_MISSING', 'Platform settings are not initialised.', 409);
-        const policyRows = await _latestPolicyRows(tx, planned.filter((p) => p.param.target.kind === 'feePolicy').map((p) => p.param.target.key), now);
+        const policyRows = await _latestPolicyRows(tx, planned.filter((p) => p.param.target.kind === 'feePolicy').map((p) => p.param.target.key), at);
 
         // Nobody changed these since the admin loaded them.
         const stale = [];
@@ -316,7 +350,7 @@ async function publish(prisma, { changes, reason, adminId, adminName = null, ipA
             await tx.adminMoneySettingRevision.create({
                 data: {
                     key: p.param.target.key, kind: 'enum', valueEnum: p.to,
-                    effectiveAt: now, adminId, adminName, reason: why,
+                    effectiveAt: at, adminId, adminName, reason: why,
                 },
             });
         }
@@ -342,7 +376,7 @@ async function publish(prisma, { changes, reason, adminId, adminName = null, ipA
         }, { throwOnError: true });
     });
 
-    return { publishId, published: planned.map((p) => ({ key: p.key, from: p.live, to: p.to })), catalog: await readCatalog(prisma, { now }) };
+    return { publishId, published: planned.map((p) => ({ key: p.key, from: p.live, to: p.to })), catalog: await readCatalog(prisma, { now: at }) };
 }
 
 /** Recent publishes, newest first (the settings audit trail). */
@@ -358,4 +392,4 @@ async function history(prisma, { limit = 20 } = {}) {
     }));
 }
 
-module.exports = { getOverview, readCatalog, publish, history, FeeLabError, PERIODS, BUCKET_EDGES };
+module.exports = { getOverview, readCatalog, precheck, publish, history, FeeLabError, PERIODS, BUCKET_EDGES };

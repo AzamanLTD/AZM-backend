@@ -38,6 +38,18 @@ exports.getHistory = async (req, res) => {
     }
 };
 
+// Runs before require2FA: a request that would be refused anyway is refused
+// without spending the admin's code.
+exports.precheckPublish = (req, res, next) => {
+    try {
+        feeLab.precheck(req.body || {});
+        return next();
+    } catch (err) {
+        if (err instanceof feeLab.FeeLabError) return _refuse(res, err);
+        return next(err);
+    }
+};
+
 exports.publish = async (req, res) => {
     try {
         const { changes, reason } = req.body || {};

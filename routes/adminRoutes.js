@@ -123,7 +123,7 @@ const { require2FA } = require('../middleware/require2FA');
 const adminFeeLabController = require('../controllers/adminFeeLabController');
 router.get('/fee-lab',          requireEffectivePermission('fees.manage'), adminFeeLabController.getOverview);
 router.get('/fee-lab/history',  requireEffectivePermission('fees.manage'), adminFeeLabController.getHistory);
-router.post('/fee-lab/publish', requireEffectivePermission('fees.manage'), require2FA(), adminFeeLabController.publish);
+router.post('/fee-lab/publish', requireEffectivePermission('fees.manage'), adminFeeLabController.precheckPublish, require2FA(), adminFeeLabController.publish);
 
 // ─── USER DETAIL DRAWER (Phase 3) ────────────────────────────────────────────
 router.get("/users/:id/detail", requireEffectivePermission('users.view'), async (req, res) => {

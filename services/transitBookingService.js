@@ -710,6 +710,7 @@ const cancelTransitBooking = async (prisma, { bookingId, cancelledBy, note, only
                 refund = {
                     outcome: 'REFUNDED', reference, amountUsdc: Number(escrow.amountUsdc),
                     feeRefundedUsdc: refunded ? refunded.feeRefundedUsdc : 0,
+                    feeRefundOwedUsdc: refunded ? refunded.feeRefundOwedUsdc : 0,
                 };
             } else if (escrow && escrow.status === 'DISPUTED') {
                 // The dispute channel owns the money — never mutate it here.
@@ -1006,8 +1007,16 @@ const noShowTransitBookingWithRefund = async (prisma, { bookingId, driverNote = 
             const escrow = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
             if (escrow && REFUND_CLAIMABLE.includes(escrow.status)) {
                 const reference = randomUUID();
-                await _refundBookingEscrowTx(tx, { escrowId, reference });
-                refund = { escrowId, amountUsdc: Number(escrow.amountUsdc), reference };
+                const refunded = await _refundBookingEscrowTx(tx, {
+                    escrowId,
+                    reference,
+                    refundFee: await refundsFeeNow(tx, REFUND_CAUSE.NO_SHOW),
+                });
+                refund = {
+                    escrowId, amountUsdc: Number(escrow.amountUsdc), reference,
+                    feeRefundedUsdc: refunded ? refunded.feeRefundedUsdc : 0,
+                    feeRefundOwedUsdc: refunded ? refunded.feeRefundOwedUsdc : 0,
+                };
             }
         }
         return {

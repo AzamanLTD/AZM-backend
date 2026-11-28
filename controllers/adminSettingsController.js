@@ -103,6 +103,55 @@ exports.getSettings = async (req, res) => {
  * Partial update — only provided fields are changed.
  * Writes an audit log entry with old→new diffs.
  */
+// Fee rates the Fee Lab owns (src/lib/feeLabCatalog.js, its publishable
+// targets): changed only through POST /api/admin/fee-lab/publish, which
+// needs a second factor, refuses a value someone changed meanwhile, and
+// audits both trails. This writer refuses a CHANGE to them (409
+// FEE_MANAGED_IN_FEE_LAB), so an open old page can never silently undo a
+// publish. A form that resends them unchanged still saves its other fields,
+// and entries of a rate map the Fee Lab does not list (a new payment
+// method) can still be set here.
+const feeLabCatalog = require('../src/lib/feeLabCatalog');
+const FEE_LAB_OWNED = (() => {
+    const scalars = new Set();
+    const maps = {};
+    for (const point of feeLabCatalog.FEE_POINTS) {
+        for (const param of point.params) {
+            if (!feeLabCatalog.isPublishable(param)) continue;
+            const t = param.target;
+            if (t.kind === 'globalSettings') scalars.add(t.field);
+            if (t.kind === 'globalSettingsJson') (maps[t.field] = maps[t.field] || new Set()).add(t.path);
+        }
+    }
+    return { scalars, maps };
+})();
+const _num = (v) => (v == null || v === '' ? null : Number(v));
+const _sameRate = (a, b) => {
+    const x = _num(a); const y = _num(b);
+    if (x == null || y == null) return x == null && y == null;
+    return Number.isFinite(x) && Number.isFinite(y) && Math.abs(x - y) < 1e-9;
+};
+const _asMap = (v) => {
+    if (v == null) return {};
+    if (typeof v === 'string') { try { return JSON.parse(v) || {}; } catch { return null; } }
+    return typeof v === 'object' ? v : null;
+};
+const _feeLabOwnedChanges = (body, current) => {
+    const changed = [];
+    if (!body) return changed;
+    for (const field of FEE_LAB_OWNED.scalars) {
+        if (body[field] !== undefined && !_sameRate(body[field], current[field])) changed.push(field);
+    }
+    for (const [field, keys] of Object.entries(FEE_LAB_OWNED.maps)) {
+        if (body[field] === undefined) continue;
+        const next = _asMap(body[field]);
+        const now = _asMap(current[field]);
+        if (!next || !now) { changed.push(field); continue; }
+        for (const key of keys) if (!_sameRate(next[key], now[key])) changed.push(`${field}.${key}`);
+    }
+    return changed;
+};
+
 exports.updateSettings = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
@@ -113,6 +162,17 @@ exports.updateSettings = async (req, res) => {
         let current = await prisma.globalSettings.findUnique({ where: { id: 1 } });
         if (!current) {
             current = await prisma.globalSettings.create({ data: { id: 1 } });
+        }
+
+        const owned = _feeLabOwnedChanges(req.body, current);
+        if (owned.length) {
+            return res.status(409).json({
+                success: false,
+                code: 'FEE_MANAGED_IN_FEE_LAB',
+                fields: owned,
+                message: `Fee rates are changed in the Fee Lab (with a second factor): ${owned.join(', ')}. `
+                    + 'Reload this page: it may show an old value.',
+            });
         }
 
         // Whitelist of updatable fields
@@ -154,6 +214,10 @@ exports.updateSettings = async (req, res) => {
 
         for (const field of ALLOWED_FIELDS) {
             if (req.body[field] === undefined) continue;
+            // A Fee Lab rate resent unchanged (checked above): nothing to
+            // write or audit. (Rate maps pass through: their Fee Lab entries
+            // are unchanged, other entries may be new.)
+            if (FEE_LAB_OWNED.scalars.has(field)) continue;
 
             let newValue = req.body[field];
             const oldValue = current[field];

@@ -308,14 +308,21 @@ exports.declineReservation = async (req, res) => {
                     ? await prisma.transactionHistory.findUnique({ where: { txHash: escrow.refundTxHash }, select: { amountUsdc: true, metadata: true } })
                     : null;
                 const meta = refundRow && refundRow.metadata && typeof refundRow.metadata === 'object' ? refundRow.metadata : {};
-                const usdc = (n) => `${Number(n).toFixed(2)} USDC`;
+                // 2 to 6 decimals: a sub-cent fee is shown, not rounded away.
+                const usdc = (n) => {
+                    const t = Number(n).toFixed(6).replace(/0+$/, '');
+                    const [w, f = ''] = t.split('.');
+                    return `${w}.${f.padEnd(2, '0')} USDC`;
+                };
                 let refunded = 'Nothing was charged.';
                 if (escrow && escrow.status === 'REFUNDED') {
                     if (Number(meta.feeRefundOwedUsdc) > 0) {
                         refunded = `The price you paid (${usdc(escrow.amountUsdc)}) is back in your wallet. `
-                            + `The Azaman fee (${usdc(meta.feeRefundOwedUsdc)}) will be refunded to you separately.`;
+                            + `Our team will refund the Azaman fee (${usdc(meta.feeRefundOwedUsdc)}) to you separately.`;
                     } else if (Number(meta.feeRefundedUsdc) > 0) {
                         refunded = `Everything you paid (${usdc(refundRow.amountUsdc)}, the Azaman fee included) is back in your wallet.`;
+                    } else if (Number(escrow.feeUsdc) > 0) {
+                        refunded = `The price you paid (${usdc(escrow.amountUsdc)}) is back in your wallet; the Azaman fee (${usdc(escrow.feeUsdc)}) is kept.`;
                     } else {
                         refunded = `The ${usdc(escrow.amountUsdc)} you paid is back in your wallet.`;
                     }

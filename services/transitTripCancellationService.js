@@ -102,6 +102,7 @@ const _resolveBookings = async (prisma, bookings) => {
                         return {
                             outcome: 'REFUNDED', escrowStatus: 'REFUNDED', refundReference: reference,
                             feeRefundedUsdc: refunded ? refunded.feeRefundedUsdc : 0,
+                            feeRefundOwedUsdc: refunded ? refunded.feeRefundOwedUsdc : 0,
                         };
                     }
                     if (escrow && escrow.status === 'DISPUTED') {

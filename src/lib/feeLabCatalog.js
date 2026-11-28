@@ -78,7 +78,7 @@ const FEE_POINTS = Object.freeze([
         params: [
             { key: 'feeRefund.BUSINESS_CANCELLED', label: 'The business cancels', unit: 'policy', role: 'policy', target: { kind: 'feePolicy', key: 'feeRefund.BUSINESS_CANCELLED', cause: 'BUSINESS_CANCELLED' } },
             { key: 'feeRefund.CUSTOMER_CANCELLED', label: 'The customer cancels', unit: 'policy', role: 'policy', target: { kind: 'feePolicy', key: 'feeRefund.CUSTOMER_CANCELLED', cause: 'CUSTOMER_CANCELLED' } },
-            { key: 'feeRefund.NO_SHOW', label: 'The customer does not show', unit: 'policy', role: 'policy', target: { kind: 'feePolicy', key: 'feeRefund.NO_SHOW', cause: 'NO_SHOW' } },
+            { key: 'feeRefund.NO_SHOW', label: 'The customer does not show', unit: 'policy', role: 'policy', target: { kind: 'feePolicy', key: 'feeRefund.NO_SHOW', cause: 'NO_SHOW' }, caveat: 'Applies to a no-show refunded in full. When the business charges a no-show penalty, the fee is kept.' },
         ],
         revenueSources: [],
         volume: null,
@@ -129,7 +129,7 @@ const FEE_POINTS = Object.freeze([
         flow: 'WALLET',
         name: 'Cash-out to MoMo (exit fee)',
         status: 'LIVE',
-        summary: 'Withdrawing to mobile money. The rate depends on the account\'s risk tier.',
+        summary: 'Cashing out the USDC wallet to mobile money. The rate depends on the account\'s risk tier. Cedi-wallet payouts to MoMo are free (not this fee).',
         when: 'At the request, on top of the amount; earned when the provider confirms the payout.',
         payer: 'Customer',
         refunds: [
@@ -138,13 +138,16 @@ const FEE_POINTS = Object.freeze([
             'AZM points can cut the fee by 25%, 50% or 100%.',
         ],
         params: [
-            pct('fee.withdrawMomo.STANDARD', 'Standard accounts', { kind: 'globalSettingsJson', field: 'withdrawalFeeByRiskTier', path: 'STANDARD' }, { segment: 'STANDARD' }),
-            pct('fee.withdrawMomo.TRUSTED', 'Trusted accounts', { kind: 'globalSettingsJson', field: 'withdrawalFeeByRiskTier', path: 'TRUSTED' }, { segment: 'TRUSTED' }),
-            pct('fee.withdrawMomo.HIGH_RISK', 'High-risk accounts', { kind: 'globalSettingsJson', field: 'withdrawalFeeByRiskTier', path: 'HIGH_RISK' }, { segment: 'HIGH_RISK' }),
+            pct('fee.withdrawMomo.STANDARD', 'Standard accounts', { kind: 'globalSettingsJson', field: 'withdrawalFeeByRiskTier', path: 'STANDARD', fallbackField: 'fiatWithdrawalFeePct' }, { segment: 'STANDARD' }),
+            pct('fee.withdrawMomo.TRUSTED', 'Trusted accounts', { kind: 'globalSettingsJson', field: 'withdrawalFeeByRiskTier', path: 'TRUSTED', fallbackField: 'fiatWithdrawalFeePct' }, { segment: 'TRUSTED' }),
+            pct('fee.withdrawMomo.HIGH_RISK', 'High-risk accounts', { kind: 'globalSettingsJson', field: 'withdrawalFeeByRiskTier', path: 'HIGH_RISK', fallbackField: 'fiatWithdrawalFeePct' }, { segment: 'HIGH_RISK' }),
         ],
         revenueSources: ['EXIT_FEE'],
         volume: 'momoWithdrawals',
-        caveats: ['Booked exit-fee revenue includes the referrer\'s half; the projection counts the full fee.'],
+        caveats: [
+            'Booked exit-fee revenue includes the referrer\'s half; the projection counts the full fee.',
+            'Volume is split by each account\'s risk tier today, not the tier it had when it withdrew.',
+        ],
     },
     {
         id: 'deposit.cedi',
@@ -219,7 +222,10 @@ const FEE_POINTS = Object.freeze([
         payer: 'Whoever receives the USDC',
         refunds: ['Cancelled, expired or disputed trades are not charged.'],
         params: [
-            ...P2P_METHODS.map((m) => pct(`fee.p2p.${m}`, P2P_LABELS[m], { kind: 'globalSettingsJson', field: 'feeByPaymentMethod', path: m }, { segment: m })),
+            ...P2P_METHODS.map((m) => pct(`fee.p2p.${m}`, P2P_LABELS[m], { kind: 'globalSettingsJson', field: 'feeByPaymentMethod', path: m, fallbackField: 'p2pFeePct' }, {
+                segment: m,
+                caveat: 'With no own rate, a trade on this method pays the Fee Profile rate, or "Other methods" when no profile matches.',
+            })),
             pct('fee.p2p.default', 'Other methods', gs('p2pFeePct'), {
                 segment: '*',
                 caveat: 'Used only for a method without its own rate, and only when no Fee Profile matches the trade.',
@@ -236,7 +242,7 @@ const FEE_POINTS = Object.freeze([
         flow: 'SAVINGS',
         name: 'Susu cycle fee',
         status: 'LIVE',
-        summary: 'A percentage of the pooled contributions, taken from the payout.',
+        summary: 'A percentage of the pooled contributions, taken from the payout, on cycles run by the original Susu engine. Cycles run by the newer engine (susu-cycle-v2) pay out the full pool and charge no fee.',
         when: 'When a cycle pays out.',
         payer: 'The member being paid out',
         refunds: ['Never.'],
@@ -396,9 +402,10 @@ const VOLUME_SOURCES = Object.freeze({
         SELECT "amountCrypto" AS amt, UPPER(regexp_replace("paymentMethod", '[[:space:]-]', '_', 'g')) AS seg
         FROM "Trade"
         WHERE "status" = 'COMPLETED' AND "completedAt" >= ${from} AND "completedAt" < ${to}` },
+    // Only cycles that were charged: the fee-charging engine records feeUsdc.
     susuPayouts: { sql: (from, to) => Prisma.sql`
-        SELECT ("payoutAmount" + COALESCE("feeUsdc", 0)) AS amt FROM "SusuCycle"
-        WHERE "paidOutAt" >= ${from} AND "paidOutAt" < ${to}` },
+        SELECT ("payoutAmount" + "feeUsdc") AS amt FROM "SusuCycle"
+        WHERE "feeUsdc" IS NOT NULL AND "paidOutAt" >= ${from} AND "paidOutAt" < ${to}` },
     vaultBreaks: { sql: (from, to) => Prisma.sql`
         SELECT (ABS("amountUsdc") + "feeUsdc") AS amt FROM "TransactionHistory"
         WHERE "type" = 'VAULT_RELEASE' AND "feeUsdc" > 0
@@ -441,6 +448,7 @@ const publicPoint = (p) => ({
 });
 const publicParam = (x) => ({
     key: x.key, label: x.label, unit: x.unit, role: x.role, segment: x.segment || null,
+    fallsBackTo: x.target && x.target.fallbackField ? `GlobalSettings.${x.target.fallbackField}` : null,
     min: x.min ?? null, max: x.max ?? null,
     publishable: isPublishable(x),
     notPublishableReason: isPublishable(x) ? null : (x.target && x.target.reason) || 'Modelled only.',

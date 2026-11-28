@@ -46,9 +46,11 @@ function makeDb() {
         auditLog: table([]),
         adminProfitLog: { groupBy: jest.fn(async () => [{ source: 'SMART_ESCROW_FEE', _sum: { amountUsdc: new Prisma.Decimal('12.5') }, _count: { _all: 25 } }]) },
         $executeRaw: jest.fn(async () => 1),
+        $executeRawUnsafe: jest.fn(async () => 0),
         $queryRaw: jest.fn(async () => []),
     };
-    db.$transaction = jest.fn(async (cb) => cb(db));
+    // Interactive (callback) and batch (array) transactions.
+    db.$transaction = jest.fn(async (arg) => (Array.isArray(arg) ? Promise.all(arg) : arg(db)));
     return db;
 }
 const param = (cat, key) => cat.flatMap((p) => p.params).find((x) => x.key === key);
@@ -61,7 +63,9 @@ describe('live values', () => {
         expect(param(cat, 'fee.susu.pct').live).toBe(300);
         expect(param(cat, 'fee.withdrawMomo.TRUSTED')).toEqual(expect.objectContaining({ live: 50, segment: 'TRUSTED', writesTo: 'GlobalSettings.withdrawalFeeByRiskTier.TRUSTED' }));
         expect(param(cat, 'fee.p2p.PAYPAL').live).toBe(400);
-        expect(param(cat, 'fee.p2p.VENMO').live).toBe(null); // not in the stored map
+        // Not in the stored map: what the app charges instead (the fallback).
+        expect(param(cat, 'fee.p2p.VENMO')).toEqual(expect.objectContaining({ live: 200, liveSource: 'fallback', fallsBackTo: 'GlobalSettings.p2pFeePct' }));
+        expect(param(cat, 'fee.p2p.PAYPAL').liveSource).toBe('own');
         expect(param(cat, 'fee.p2p.default').live).toBe(200);
         // Refund rules: the defaults until one is published.
         expect(param(cat, 'feeRefund.BUSINESS_CANCELLED').live).toBe('REFUND');
@@ -90,7 +94,7 @@ describe('publishing', () => {
         const out = await publish(db, [
             { key: 'fee.escrow.pct', from: 50, to: 75 },
             { key: 'fee.withdrawMomo.STANDARD', from: 200, to: 150 },
-            { key: 'fee.p2p.VENMO', from: null, to: 250 },
+            { key: 'fee.p2p.VENMO', from: 200, to: 250 },
             { key: 'feeRefund.CUSTOMER_CANCELLED', from: 'KEEP', to: 'REFUND' },
         ]);
         const gsRow = db.globalSettings.rows[0];
@@ -109,9 +113,10 @@ describe('publishing', () => {
         expect(out.published).toEqual([
             { key: 'fee.escrow.pct', from: 50, to: 75 },
             { key: 'fee.withdrawMomo.STANDARD', from: 200, to: 150 },
-            { key: 'fee.p2p.VENMO', from: null, to: 250 },
+            { key: 'fee.p2p.VENMO', from: 200, to: 250 },
             { key: 'feeRefund.CUSTOMER_CANCELLED', from: 'KEEP', to: 'REFUND' },
         ]);
+        expect(param(out.catalog, 'fee.p2p.VENMO').liveSource).toBe('own');
         expect(param(out.catalog, 'fee.escrow.pct').live).toBe(75);
         expect(param(out.catalog, 'feeRefund.CUSTOMER_CANCELLED').live).toBe('REFUND');
     });
@@ -226,8 +231,64 @@ describe('routes', () => {
     test('viewing needs fees.manage; publishing also needs a second factor', () => {
         const src = require('fs').readFileSync(require('path').join(__dirname, '../routes/adminRoutes.js'), 'utf-8');
         expect(src).toContain("router.get('/fee-lab',          requireEffectivePermission('fees.manage'), adminFeeLabController.getOverview);");
-        expect(src).toContain("router.post('/fee-lab/publish', requireEffectivePermission('fees.manage'), require2FA(), adminFeeLabController.publish);");
+        expect(src).toContain("router.post('/fee-lab/publish', requireEffectivePermission('fees.manage'), adminFeeLabController.precheckPublish, require2FA(), adminFeeLabController.publish);");
         // Admin routes all sit behind protect + adminOnly.
         expect(src.indexOf('router.use(adminOnly);')).toBeLessThan(src.indexOf("router.get('/fee-lab'"));
+    });
+});
+
+describe('every booking refund decides the fee', () => {
+    // Each call of the booking refund passes refundFee, so a published
+    // fee-refund rule reaches every refund path (and none silently keeps
+    // the default by omission).
+    test('every _refundBookingEscrowTx call site passes refundFee', () => {
+        const fs = require('fs');
+        const path = require('path');
+        const roots = ['services', 'workers', 'controllers', 'routes'].map((d) => path.join(__dirname, '..', d));
+        const files = [];
+        const walk = (dir) => {
+            for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+                const full = path.join(dir, e.name);
+                if (e.isDirectory()) walk(full);
+                else if (e.name.endsWith('.js')) files.push(full);
+            }
+        };
+        roots.forEach(walk);
+        const sites = [];
+        for (const f of files) {
+            const lines = fs.readFileSync(f, 'utf-8').split(/\r?\n/);
+            lines.forEach((line, i) => {
+                if (line.includes('_refundBookingEscrowTx(tx')) {
+                    sites.push({ at: `${path.relative(path.join(__dirname, '..'), f)}:${i + 1}`, ok: lines.slice(i, i + 6).join(' ').includes('refundFee') });
+                }
+            });
+        }
+        expect(sites.length).toBeGreaterThanOrEqual(8);
+        expect(sites.filter((s) => !s.ok).map((s) => s.at)).toEqual([]);
+    });
+});
+
+describe('a publish that would be refused does not spend the second factor', () => {
+    test('precheck refuses before require2FA runs', () => {
+        const ctrl = require('../controllers/adminFeeLabController');
+        let status = null; let payload = null;
+        const next = jest.fn();
+        ctrl.precheckPublish({ body: { changes: [{ key: 'fee.escrow.pct', from: 50, to: 5000 }], reason: 'Too high on purpose' } },
+            { status(c) { status = c; return this; }, json(p) { payload = p; return this; } }, next);
+        expect(next).not.toHaveBeenCalled();
+        expect(status).toBe(400);
+        expect(payload.code).toBe('FEE_LAB_OUT_OF_BOUNDS');
+        const ok = jest.fn();
+        ctrl.precheckPublish({ body: { changes: [{ key: 'fee.escrow.pct', from: 50, to: 75 }], reason: 'Board pricing review' } }, {}, ok);
+        expect(ok).toHaveBeenCalledWith();
+    });
+
+    test('each volume query runs read-only with a time limit', async () => {
+        const db = makeDb();
+        await feeLab.getOverview(db, { period: '30d', now: NOW });
+        const batches = db.$transaction.mock.calls.filter((c) => Array.isArray(c[0]));
+        expect(batches.length).toBeGreaterThan(5);
+        expect(db.$executeRawUnsafe).toHaveBeenCalledWith('SET TRANSACTION READ ONLY');
+        expect(db.$executeRawUnsafe).toHaveBeenCalledWith(expect.stringMatching(/^SET LOCAL statement_timeout = \d+$/));
     });
 });

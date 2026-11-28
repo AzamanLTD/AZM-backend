@@ -12,6 +12,7 @@
 //   (default 30 minutes after departure, no check-in).
 // =============================================================================
 
+const { REFUND_CAUSE, refundsFeeNow } = require('../services/feeRefundPolicy');
 const logger = require('../src/config/logger');
 // Grace after departure before marking a transit passenger a no-show. It
 // must outlast the QR boarding window (departure + 60 min, qrCheckInService
@@ -172,7 +173,11 @@ const sweepNoShowTransitBookings = async (prisma) => {
                         }
                         // No penalty: the FULL refund is part of the same atomic
                         // transition — the escrow can never be stranded FUNDED.
-                        await _refundBookingEscrowTx(tx, { escrowId: escrow.id, reference: randomUUID() });
+                        await _refundBookingEscrowTx(tx, {
+                            escrowId: escrow.id,
+                            reference: randomUUID(),
+                            refundFee: await refundsFeeNow(tx, REFUND_CAUSE.NO_SHOW),
+                        });
                         escrowEconomicsExecuted = true;
                     } else if (escrow && escrow.status === 'DRAFT') {
                         // Unfunded escrow: expire it in the same transaction.

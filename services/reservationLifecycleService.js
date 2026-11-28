@@ -119,7 +119,11 @@ const cancelReservation = async (prisma, { reservationId, customerId }) =>
             throw fail('ESCROW_IN_DISPUTE', 'Reservation funds are in dispute custody.');
         }
         if (escrow && REFUND_CLAIMABLE.includes(escrow.status)) {
-            await _refundBookingEscrowTx(tx, { escrowId: escrow.id, reference: randomUUID() });
+            await _refundBookingEscrowTx(tx, {
+                escrowId: escrow.id,
+                reference: randomUUID(),
+                refundFee: await refundsFeeNow(tx, REFUND_CAUSE.CUSTOMER_CANCELLED),
+            });
         } else if (escrow?.status === 'DRAFT') {
             await expireDraftEscrow(tx, escrow);
         } else if (escrow && !['REFUNDED', 'EXPIRED'].includes(escrow.status)) {
@@ -264,7 +268,11 @@ const markNoShowReservation = async (prisma, { reservationId, businessUserId = n
                 });
                 return tx.reservation.findUnique({ where: { id: reservationId } });
             }
-            await _refundBookingEscrowTx(tx, { escrowId: escrow.id, reference: randomUUID() });
+            await _refundBookingEscrowTx(tx, {
+                escrowId: escrow.id,
+                reference: randomUUID(),
+                refundFee: await refundsFeeNow(tx, REFUND_CAUSE.NO_SHOW),
+            });
         } else if (escrow?.status === 'DRAFT') {
             await expireDraftEscrow(tx, escrow);
         } else if (escrow && !['REFUNDED', 'EXPIRED'].includes(escrow.status)) {
