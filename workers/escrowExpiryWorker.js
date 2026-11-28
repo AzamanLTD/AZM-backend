@@ -223,7 +223,9 @@ class EscrowExpiryWorker {
                 }
 
                 // Refund the payer and stamp EXPIRED (transactional inside service).
-                const refunded = await escrowService._refundEscrow(this.prisma, escrow.id, 'EXPIRED');
+                // Expired with nothing done: the transaction did not take place, so the
+                // fee comes back too (feeRefundPolicy EXPIRED, set in the Fee Lab).
+                const refunded = await escrowService._refundEscrow(this.prisma, escrow.id, 'EXPIRED', { feeCause: 'EXPIRED' });
 
                 // Balance convergence remains here because this worker already
                 // owns the existing canonical balance emitter wiring. The

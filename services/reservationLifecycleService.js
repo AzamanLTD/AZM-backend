@@ -174,11 +174,14 @@ const businessCancelReservation = async (prisma, { reservationId, businessProfil
         if (escrow && CUSTODY_STATES.has(escrow.status)) {
             throw fail('ESCROW_IN_DISPUTE', 'Reservation funds are in dispute custody.');
         }
+        // An expired request did not take place (REFUND_CAUSE.EXPIRED);
+        // otherwise the business cancelled. Both give the fee back by
+        // default; each is set separately in the Fee Lab.
         if (escrow && REFUND_CLAIMABLE.includes(escrow.status)) {
             await _refundBookingEscrowTx(tx, {
                 escrowId: escrow.id,
                 reference: randomUUID(),
-                refundFee: await refundsFeeNow(tx, REFUND_CAUSE.BUSINESS_CANCELLED),
+                refundFee: await refundsFeeNow(tx, unansweredAsOf ? REFUND_CAUSE.EXPIRED : REFUND_CAUSE.BUSINESS_CANCELLED),
             });
         } else if (escrow?.status === 'DRAFT') {
             await expireDraftEscrow(tx, escrow);

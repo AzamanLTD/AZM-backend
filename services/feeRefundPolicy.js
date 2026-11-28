@@ -8,9 +8,12 @@
 //   • the business cancelled (the hotel declined or cancelled the stay, the
 //     operator cancelled the booking or the whole trip): everything comes
 //     back, fee included. The customer did nothing wrong.
-//   • the customer cancelled, did not show, or the booking lapsed: the price
-//     comes back and the fee is kept (the service was provided: the booking
-//     was held for them).
+//   • the booking lapsed (expired with nothing done) or a dispute was ruled
+//     for the payer: the transaction did not take place, so everything comes
+//     back, fee included (owner rule, 28 Nov 2026: "we cannot keep it for
+//     transactions which didn't take place").
+//   • the customer cancelled or did not show: the price comes back and the
+//     fee is kept (the booking was held for them).
 //
 // These are the defaults. The admin Fee Lab publishes changes to them as
 // AdminMoneySettingRevision rows (key feeRefund.<CAUSE>, valueEnum REFUND or
@@ -23,13 +26,15 @@ const REFUND_CAUSE = Object.freeze({
     CUSTOMER_CANCELLED: 'CUSTOMER_CANCELLED',
     NO_SHOW: 'NO_SHOW',
     EXPIRED: 'EXPIRED',
+    DISPUTE_REFUNDED: 'DISPUTE_REFUNDED',
 });
 
 const DEFAULT_FEE_REFUND = Object.freeze({
     [REFUND_CAUSE.BUSINESS_CANCELLED]: true,
     [REFUND_CAUSE.CUSTOMER_CANCELLED]: false,
     [REFUND_CAUSE.NO_SHOW]: false,
-    [REFUND_CAUSE.EXPIRED]: false,
+    [REFUND_CAUSE.EXPIRED]: true,
+    [REFUND_CAUSE.DISPUTE_REFUNDED]: true,
 });
 
 /**

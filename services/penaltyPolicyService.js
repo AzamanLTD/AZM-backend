@@ -133,7 +133,9 @@ async function processBusinessNoShow(prisma, {
         // 1. Canonical escrow financial mutation — SAME transaction client.
         // escrowService owns escrow money movement; this service must never
         // reimplement it.
-        const refundedEscrow = await escrowService._refundEscrowTx(tx, escrow, 'REFUNDED');
+        // The business did not show: it failed the customer, so the fee comes
+        // back too (feeRefundPolicy BUSINESS_CANCELLED).
+        const refundedEscrow = await escrowService._refundEscrowTx(tx, escrow, 'REFUNDED', { feeCause: 'BUSINESS_CANCELLED' });
 
         // 2. Business stake penalty is an ATOMIC claim. Never read stake,
         // compare in JS, then unconditionally decrement. The WHERE clause

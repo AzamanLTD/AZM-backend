@@ -32,7 +32,8 @@ describe('EscrowExpiryWorker refund convergence', () => {
         const worker = new EscrowExpiryWorker(prisma, io, null, { emitBalanceUpdate });
         await worker._expireInactiveFunded(new Date('2026-08-30T00:00:00.000Z'));
 
-        expect(escrowService._refundEscrow).toHaveBeenCalledWith(prisma, 'escrow-1', 'EXPIRED');
+        // Expired with nothing done: the fee comes back too (feeRefundPolicy EXPIRED).
+        expect(escrowService._refundEscrow).toHaveBeenCalledWith(prisma, 'escrow-1', 'EXPIRED', { feeCause: 'EXPIRED' });
         expect(emitBalanceUpdate).toHaveBeenCalledWith(11);
         expect(emit).not.toHaveBeenCalledWith('escrow_refunded', expect.anything());
         expect(emit).not.toHaveBeenCalledWith('balance_update', expect.anything());
