@@ -571,6 +571,15 @@ router.post('/2fa/setup', async (req, res) => {
         const prisma = req.app.get('prisma');
         const userId = req.user.id;
 
+        // Never replace the secret of an enabled authenticator: a stolen
+        // session could install its own and then pass every second-factor
+        // check (require2FA reads isTwoFactorEnabled + twoFactorSecret).
+        // Disable first, with a valid code (/2fa/disable).
+        const current = await prisma.user.findUnique({ where: { id: userId }, select: { isTwoFactorEnabled: true } });
+        if (current && current.isTwoFactorEnabled) {
+            return res.status(409).json({ success: false, code: '2FA_ALREADY_ENABLED', message: '2FA is already enabled. Disable it with a current code first.' });
+        }
+
         // Generate new secret
         const secret = speakeasy.generateSecret({
             name: `AZAMAN Admin (${req.user.email || userId})`,
@@ -611,14 +620,14 @@ router.post('/2fa/verify', async (req, res) => {
 
         const user = await prisma.user.findUnique({
             where: { id: userId },
-            select: { twoFactorSecret: true, twoFactorEnabled: true },
+            select: { twoFactorSecret: true, isTwoFactorEnabled: true },
         });
 
         if (!user?.twoFactorSecret) {
             return res.status(400).json({ success: false, message: '2FA not set up. Call /2fa/setup first.' });
         }
 
-        if (user.twoFactorEnabled) {
+        if (user.isTwoFactorEnabled) {
             return res.status(400).json({ success: false, message: '2FA is already enabled.' });
         }
 
@@ -635,7 +644,7 @@ router.post('/2fa/verify', async (req, res) => {
 
         await prisma.user.update({
             where: { id: userId },
-            data: { twoFactorEnabled: true },
+            data: { isTwoFactorEnabled: true },
         });
 
         res.json({ success: true, message: '2FA enabled successfully.' });
@@ -659,10 +668,10 @@ router.post('/2fa/disable', async (req, res) => {
 
         const user = await prisma.user.findUnique({
             where: { id: userId },
-            select: { twoFactorSecret: true, twoFactorEnabled: true },
+            select: { twoFactorSecret: true, isTwoFactorEnabled: true },
         });
 
-        if (!user?.twoFactorEnabled) {
+        if (!user?.isTwoFactorEnabled) {
             return res.status(400).json({ success: false, message: '2FA is not enabled.' });
         }
 
@@ -679,7 +688,7 @@ router.post('/2fa/disable', async (req, res) => {
 
         await prisma.user.update({
             where: { id: userId },
-            data: { twoFactorEnabled: false, twoFactorSecret: null },
+            data: { isTwoFactorEnabled: false, twoFactorSecret: null },
         });
 
         res.json({ success: true, message: '2FA disabled.' });
@@ -696,12 +705,12 @@ router.get('/2fa/status', async (req, res) => {
         const prisma = req.app.get('prisma');
         const user = await prisma.user.findUnique({
             where: { id: req.user.id },
-            select: { twoFactorEnabled: true, twoFactorSecret: true },
+            select: { isTwoFactorEnabled: true, twoFactorSecret: true },
         });
 
         res.json({
             success: true,
-            enabled: user?.twoFactorEnabled || false,
+            enabled: user?.isTwoFactorEnabled || false,
             hasSecret: !!user?.twoFactorSecret,
         });
     } catch (err) {
