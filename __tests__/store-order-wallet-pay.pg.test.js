@@ -113,6 +113,11 @@ run('store orders paid from the wallet (PostgreSQL)', () => {
         await prisma.businessProfile.update({ where: { id: biz.id }, data: { businessMeta: {} } });
     });
     beforeEach(sweep, 15000);
+    // The owner is seeded once for the file: each test starts them at zero,
+    // so one test's payout is not counted in the next.
+    beforeEach(async () => {
+        if (owner) await prisma.user.update({ where: { id: owner.id }, data: { availableBalance: 0, escrowLockedBalance: 0 } });
+    });
     afterAll(async () => {
         await sweep();
         await prisma.businessProduct.deleteMany({ where: { businessProfileId: biz.id } });
