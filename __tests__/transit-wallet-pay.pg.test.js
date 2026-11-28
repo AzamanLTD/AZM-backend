@@ -283,11 +283,17 @@ run('transit wallet pay (PostgreSQL)', () => {
 
         const early = await svc.sweepHeldTransitPayouts(prisma);
         expect(early.checked).toBe(0);
-        const later = await svc.sweepHeldTransitPayouts(prisma, { now: Date.now() + DAY_MS });
+        // The hold was fixed at boarding (boarded 1h before the original
+        // departure): a day later it is still held, though the departure
+        // was moved back an hour.
+        const dayLater = await svc.sweepHeldTransitPayouts(prisma, { now: Date.now() + DAY_MS });
+        expect(dayLater.released).toBe(0);
+        expect((await balances(owner.id)).available).toBe(0);
+        const later = await svc.sweepHeldTransitPayouts(prisma, { now: Date.now() + 2 * DAY_MS });
         expect(later.released).toBe(1);
         expect((await balances(owner.id)).available).toBe(10);
         expect((await prisma.smartEscrow.findUnique({ where: { id: res.payment.escrowId } })).status).toBe('SETTLED');
-        expect((await svc.sweepHeldTransitPayouts(prisma, { now: Date.now() + 2 * DAY_MS })).checked).toBe(0);
+        expect((await svc.sweepHeldTransitPayouts(prisma, { now: Date.now() + 3 * DAY_MS })).checked).toBe(0);
     });
 
     test('W10: a reported ID check is disputed and never released', async () => {
@@ -297,7 +303,7 @@ run('transit wallet pay (PostgreSQL)', () => {
         });
         expect(out.alreadyReported).toBe(false);
         expect((await prisma.smartEscrow.findUnique({ where: { id: res.payment.escrowId } })).status).toBe('DISPUTED');
-        const swept = await svc.sweepHeldTransitPayouts(prisma, { now: Date.now() + 2 * DAY_MS });
+        const swept = await svc.sweepHeldTransitPayouts(prisma, { now: Date.now() + 3 * DAY_MS });
         expect(swept.released).toBe(0);
         expect((await balances(owner.id)).available).toBe(0);
         await expect(boarding.reportIdCheckBoarding(prisma, { bookingId: res.booking.id, customerId: customer.id }))

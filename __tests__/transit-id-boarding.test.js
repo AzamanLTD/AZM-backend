@@ -14,6 +14,9 @@
 //   • the passenger's confirmation releases a completed trip's fare at once
 //   • the escrow expiry worker releases a held ID-check fare, never refunds it
 //   • the controller tells the passenger they were boarded
+//   • the hold is fixed at boarding: moving the departure cannot shorten it,
+//     a departure cannot be backdated, nor pulled earlier once anyone boarded
+//   • no boarding on a cancelled trip; no names for an AZM-ID with no booking
 // Real PostgreSQL (the sweep's relation filter, the real dispute) is covered
 // in transit-wallet-pay.pg.test.js (W9-W11).
 // =============================================================================
@@ -101,7 +104,7 @@ describe('AZM-ID search', () => {
         expect(boarding.normalizeAzamanId(null)).toBe('');
     });
 
-    test('adds the passenger\'s transit bookings, and the legal name only with a booking here', async () => {
+    test('adds the passenger\'s transit bookings, and their names only with a booking here', async () => {
         const { db, bookingId } = await paidPassenger();
         const found = { customer: { id: 10, username: 'ama', azamanId: 'AZM-000000010' }, reservations: [] };
         const out = await boarding.enrichAzamanIdSearch(db, { businessUserId: 20, result: found });
@@ -113,6 +116,8 @@ describe('AZM-ID search', () => {
         const none = await boarding.enrichAzamanIdSearch(db, { businessUserId: 20, result: found });
         expect(none.transitBookings).toEqual([]);
         expect(none.customer.legalName).toBeNull();
+        expect(none.customer.displayName).toBeNull();
+        expect(none.customer.idVerified).toBe(false);
     });
 });
 
@@ -135,11 +140,30 @@ describe('boarding by ID check', () => {
         expect(row.status).toBe('CONFIRMED');
     });
 
-    test('only the trip\'s business can board', async () => {
+    test('only the trip\'s business can board (another\'s booking reads as missing)', async () => {
         const { db, row, bookingId } = await paidPassenger();
         await expect(board(db, bookingId, { businessUserId: 99 }))
-            .rejects.toMatchObject({ code: 'FORBIDDEN', httpStatus: 403 });
+            .rejects.toMatchObject({ code: 'NOT_FOUND', httpStatus: 404 });
+        await expect(board(db, 'no-such-booking'))
+            .rejects.toMatchObject({ code: 'NOT_FOUND', httpStatus: 404 });
         expect(row.status).toBe('CONFIRMED');
+    });
+
+    test('never on a cancelled trip', async () => {
+        const { db, row, bookingId } = await paidPassenger();
+        trip(db).status = 'CANCELLED';
+        await expect(board(db, bookingId)).rejects.toMatchObject({ code: 'TRIP_UNAVAILABLE', httpStatus: 409 });
+        expect(row.status).toBe('CONFIRMED');
+    });
+
+    test('runs in one transaction with the escrow locked first', async () => {
+        const { db, bookingId } = await paidPassenger();
+        db.$executeRaw.mockClear();
+        db.$transaction.mockClear();
+        await board(db, bookingId);
+        expect(db.$transaction).toHaveBeenCalledTimes(1);
+        expect(db.$executeRaw).toHaveBeenCalledTimes(1);
+        expect(db.$executeRaw.mock.calls[0][0].join('?')).toContain('"SmartEscrow"');
     });
 
     test('only inside the boarding window', async () => {
@@ -173,19 +197,21 @@ describe('boarding by ID check', () => {
 });
 
 describe('the fare after an ID check', () => {
+    // Boarded 30 minutes before departure; `after` is a clock one hour
+    // after departure (time moves on; the departure does not).
     async function boardedAndDeparted() {
         const ctx = await paidPassenger();
         await board(ctx.db, ctx.bookingId);
-        depart(ctx.db);
-        return ctx;
+        const dep = trip(ctx.db).departureAt.getTime();
+        return { ...ctx, dep, after: dep + HOUR };
     }
 
     test('unconfirmed: the trip completes, the fare waits departure + 24h', async () => {
-        const { db, row, bookingId } = await boardedAndDeparted();
-        const out = await completeTransitBooking(db, { bookingId });
+        const { db, row, bookingId, dep, after } = await boardedAndDeparted();
+        const out = await completeTransitBooking(db, { bookingId, now: after });
         expect(out.booking.status).toBe('COMPLETED');
         expect(out.release).toBeNull();
-        const until = trip(db).departureAt.getTime() + ID_CHECK_PAYOUT_HOLD_MS;
+        const until = dep + ID_CHECK_PAYOUT_HOLD_MS;
         expect(out.payoutHeld.until.getTime()).toBe(until);
         expect(new Date(row.metadata.payout.heldUntil).getTime()).toBe(until);
         expect(row.metadata.boarding.method).toBe('ID_CHECK'); // kept
@@ -194,37 +220,37 @@ describe('the fare after an ID check', () => {
     });
 
     test('the sweep releases it after the hold, not before', async () => {
-        const { db, row, bookingId } = await boardedAndDeparted();
-        await completeTransitBooking(db, { bookingId });
-        const early = await sweepHeldTransitPayouts(db);
+        const { db, row, bookingId, dep, after } = await boardedAndDeparted();
+        await completeTransitBooking(db, { bookingId, now: after });
+        const early = await sweepHeldTransitPayouts(db, { now: dep + ID_CHECK_PAYOUT_HOLD_MS - 60 * 1000 });
         expect(early.released).toBe(0);
         expect(escrow(db).status).toBe('FUNDED');
 
-        const out = await sweepHeldTransitPayouts(db, { now: Date.now() + ID_CHECK_PAYOUT_HOLD_MS });
+        const out = await sweepHeldTransitPayouts(db, { now: dep + ID_CHECK_PAYOUT_HOLD_MS });
         expect(out.released).toBe(1);
         expect(escrow(db).status).toBe('SETTLED');
         expect(user(db, 20).availableBalance).toBe(2);
         expect(row.metadata.payout.releasedAt).toBeTruthy();
         // And never twice.
-        const again = await sweepHeldTransitPayouts(db, { now: Date.now() + 2 * ID_CHECK_PAYOUT_HOLD_MS });
+        const again = await sweepHeldTransitPayouts(db, { now: dep + 2 * ID_CHECK_PAYOUT_HOLD_MS });
         expect(again.released).toBe(0);
         expect(user(db, 20).availableBalance).toBe(2);
     });
 
     test('a reported boarding is never released by the sweep', async () => {
-        const { db, bookingId } = await boardedAndDeparted();
-        await completeTransitBooking(db, { bookingId });
+        const { db, bookingId, dep, after } = await boardedAndDeparted();
+        await completeTransitBooking(db, { bookingId, now: after });
         escrowService.raiseDispute.mockImplementationOnce(async (_p, { escrowId }) => {
             db.smartEscrow.rows.find((e) => e.id === escrowId).status = 'DISPUTED';
             return { dispute: { id: 'd-1' } };
         });
         const rep = await boarding.reportIdCheckBoarding(db, { bookingId, customerId: 10, reason: 'I was at home' });
-        expect(rep).toEqual({ success: true, alreadyReported: false, disputeId: 'd-1' });
+        expect(rep).toMatchObject({ success: true, alreadyReported: false, disputeId: 'd-1', bookingRef: expect.any(String) });
         expect(escrowService.raiseDispute).toHaveBeenCalledWith(db, expect.objectContaining({
             escrowId: escrow(db).id, raisedById: 10,
             reason: expect.stringContaining('I was at home'),
         }));
-        const out = await sweepHeldTransitPayouts(db, { now: Date.now() + 2 * ID_CHECK_PAYOUT_HOLD_MS });
+        const out = await sweepHeldTransitPayouts(db, { now: dep + 2 * ID_CHECK_PAYOUT_HOLD_MS });
         expect(out.released).toBe(0);
         expect(user(db, 20).availableBalance).toBe(0);
     });
@@ -243,15 +269,15 @@ describe('the fare after an ID check', () => {
     });
 
     test('confirmed after completion: released at once', async () => {
-        const { db, row, bookingId } = await boardedAndDeparted();
-        await completeTransitBooking(db, { bookingId });
-        const out = await boarding.confirmIdCheckBoarding(db, { bookingId, customerId: 10 });
+        const { db, row, bookingId, after } = await boardedAndDeparted();
+        await completeTransitBooking(db, { bookingId, now: after });
+        const out = await boarding.confirmIdCheckBoarding(db, { bookingId, customerId: 10, now: after + HOUR });
         expect(out.release).toEqual(expect.objectContaining({ amountUsdc: 2 }));
         expect(row.metadata.boarding.passengerConfirmedAt).toBeTruthy();
         expect(escrow(db).status).toBe('SETTLED');
         expect(user(db, 20).availableBalance).toBe(2);
         // Confirming again changes nothing.
-        const again = await boarding.confirmIdCheckBoarding(db, { bookingId, customerId: 10 });
+        const again = await boarding.confirmIdCheckBoarding(db, { bookingId, customerId: 10, now: after + HOUR });
         expect(again.release).toBeNull();
         expect(user(db, 20).availableBalance).toBe(2);
     });
@@ -261,8 +287,9 @@ describe('the fare after an ID check', () => {
         await board(ctx.db, ctx.bookingId);
         const c = await boarding.confirmIdCheckBoarding(ctx.db, { bookingId: ctx.bookingId, customerId: 10 });
         expect(c.release).toBeNull();
-        depart(ctx.db);
-        const out = await completeTransitBooking(ctx.db, { bookingId: ctx.bookingId });
+        const out = await completeTransitBooking(ctx.db, {
+            bookingId: ctx.bookingId, now: trip(ctx.db).departureAt.getTime() + HOUR,
+        });
         expect(out.payoutHeld).toBeNull();
         expect(out.release).toEqual(expect.objectContaining({ amountUsdc: 2 }));
         expect(user(ctx.db, 20).availableBalance).toBe(2);
@@ -287,15 +314,19 @@ describe('the fare after an ID check', () => {
         expect(user(db, 20).availableBalance).toBe(2);
     });
 
-    test('escrow expiry releases a held ID-check fare instead of refunding', async () => {
-        escrowService._refundEscrow.mockClear();
-        const { db, bookingId } = await boardedAndDeparted();
-        await completeTransitBooking(db, { bookingId });
-        depart(db, 8 * DAY);
-        escrow(db).expiresAt = new Date(Date.now() - 1000);
+    // Expiry comes days after the trip: the worker runs at a later clock.
+    const runExpiryAt = async (db, at) => {
+        escrow(db).expiresAt = new Date(at.getTime() - 1000);
         const EscrowExpiryWorker = require('../workers/escrowExpiryWorker');
         const Worker = EscrowExpiryWorker.EscrowExpiryWorker || EscrowExpiryWorker;
-        await new Worker(db, null, null, {})._expireInactiveFunded(new Date());
+        await new Worker(db, null, null, {})._expireInactiveFunded(at);
+    };
+
+    test('escrow expiry releases a held ID-check fare instead of refunding', async () => {
+        escrowService._refundEscrow.mockClear();
+        const { db, bookingId, after } = await boardedAndDeparted();
+        await completeTransitBooking(db, { bookingId, now: after });
+        await runExpiryAt(db, new Date(Date.now() + 8 * DAY));
         expect(escrowService._refundEscrow).not.toHaveBeenCalled();
         expect(escrow(db).status).toBe('SETTLED');
         expect(user(db, 20).availableBalance).toBe(2);
@@ -305,14 +336,65 @@ describe('the fare after an ID check', () => {
         escrowService._refundEscrow.mockClear();
         const { db, row, bookingId } = await paidPassenger();
         await board(db, bookingId);
-        depart(db, 8 * DAY);
-        escrow(db).expiresAt = new Date(Date.now() - 1000);
-        const EscrowExpiryWorker = require('../workers/escrowExpiryWorker');
-        const Worker = EscrowExpiryWorker.EscrowExpiryWorker || EscrowExpiryWorker;
-        await new Worker(db, null, null, {})._expireInactiveFunded(new Date());
+        await runExpiryAt(db, new Date(Date.now() + 8 * DAY));
         expect(escrowService._refundEscrow).not.toHaveBeenCalled();
         expect(row.status).toBe('COMPLETED');
         expect(user(db, 20).availableBalance).toBe(2);
+    });
+});
+
+describe('the hold is fixed at boarding', () => {
+    const ctrlM = require('../controllers/marketplaceController');
+    const patchTrip = async (db, body) => {
+        let status = null; let payload = null;
+        await ctrlM.updateTransitTrip({
+            app: { get: () => db }, user: { id: 20 }, params: { id: 'trip-1' }, body,
+        }, {
+            status(c) { status = c; return this; },
+            json(p) { payload = p; return this; },
+        });
+        return { status, payload };
+    };
+
+    test('backdating the departure after an ID check pays nothing early', async () => {
+        const { db, row, bookingId } = await paidPassenger(); // departs in 30 min
+        await board(db, bookingId);
+        const boardedAt = Date.now();
+        // The departure written straight to the row 25h into the past (the
+        // API refuses this; the hold must hold even if it were not).
+        depart(db, 25 * HOUR);
+        const out = await completeTransitBooking(db, { bookingId });
+        expect(out.release).toBeNull();
+        expect(out.payoutHeld.until.getTime()).toBeGreaterThanOrEqual(boardedAt + ID_CHECK_PAYOUT_HOLD_MS);
+        expect(user(db, 20).availableBalance).toBe(0);
+        expect((await sweepHeldTransitPayouts(db, { now: Date.now() + HOUR })).released).toBe(0);
+        expect(escrow(db).status).toBe('FUNDED');
+        // After the hold fixed at boarding, it is released.
+        const later = await sweepHeldTransitPayouts(db, { now: Date.now() + ID_CHECK_PAYOUT_HOLD_MS + HOUR });
+        expect(later.released).toBe(1);
+        expect(row.metadata.boarding.holdUntil).toBeTruthy();
+    });
+
+    test('a departure cannot be moved into the past', async () => {
+        const db = makeDb();
+        const out = await patchTrip(db, { departureAt: new Date(Date.now() - 2 * HOUR).toISOString() });
+        expect(out.status).toBe(400);
+        expect(out.payload.code).toBe('DEPARTURE_IN_PAST');
+        const bad = await patchTrip(db, { departureAt: 'not a date' });
+        expect(bad.payload.code).toBe('DEPARTURE_INVALID');
+    });
+
+    test('once anyone is on board, the departure only moves later', async () => {
+        const { db, bookingId } = await paidPassenger({ departInMs: 50 * 60 * 1000 });
+        await board(db, bookingId);
+        const earlier = await patchTrip(db, { departureAt: new Date(Date.now() + 20 * 60 * 1000).toISOString() });
+        expect(earlier.status).toBe(409);
+        expect(earlier.payload.code).toBe('TRIP_UNDERWAY');
+        const later = await patchTrip(db, { departureAt: new Date(Date.now() + 3 * HOUR).toISOString() });
+        expect(later.status).toBe(200);
+        // Re-sending the unchanged departure (a full-form save) is fine.
+        const same = await patchTrip(db, { departureAt: trip(db).departureAt.toISOString(), routeName: 'Express' });
+        expect(same.status).toBe(200);
     });
 });
 
@@ -365,6 +447,45 @@ describe('controllers and routes', () => {
         });
         expect(out.status).toBe(409);
         expect(out.payload).toEqual(expect.objectContaining({ success: false, code: 'AZAMAN_ID_MISMATCH' }));
+    });
+
+    test('a report tells the operator, and refusals stay 409', async () => {
+        const { db, bookingId } = await paidPassenger();
+        await board(db, bookingId);
+        escrowService.raiseDispute.mockResolvedValueOnce({ dispute: { id: 'd-9' } });
+        const sendNotification = jest.fn().mockResolvedValue(undefined);
+        const settings = { prisma: db, notificationService: { sendNotification } };
+        const out = await call(ctrl.reportBoarding, {
+            app: { get: (k) => settings[k] }, user: { id: 10 }, params: { id: bookingId }, body: { reason: 'Not me' },
+        });
+        expect(out.status).toBe(200);
+        expect(out.payload.operatorUserId).toBeUndefined();
+        expect(sendNotification).toHaveBeenCalledWith(expect.objectContaining({
+            userId: 20, title: 'A passenger reported a boarding',
+            actionPayload: { action: 'OPEN_DISPUTE', disputeId: 'd-9' },
+        }));
+
+        escrowService.raiseDispute.mockRejectedValueOnce(new Error('Escrow not found.'));
+        const refused = await call(ctrl.reportBoarding, {
+            app: { get: () => db }, user: { id: 10 }, params: { id: bookingId }, body: {},
+        });
+        expect(refused.status).toBe(409);
+        expect(refused.payload.code).toBe('NOT_REPORTABLE');
+    });
+
+    test('the payout sweep runs even when a no-show sweep fails', async () => {
+        const worker = require('../workers/reservationNoShowWorker');
+        const { db, bookingId } = await paidPassenger();
+        await board(db, bookingId);
+        depart(db, 30 * HOUR);
+        await completeTransitBooking(db, { bookingId, now: Date.now() + ID_CHECK_PAYOUT_HOLD_MS });
+        db.reservation = { findMany: jest.fn().mockRejectedValue(new Error('reservations down')) };
+        // Real time has not passed the hold fixed at boarding, so nothing is
+        // released, but the payout sweep did run before the error surfaced.
+        const spy = jest.spyOn(require('../services/transitBookingService'), 'sweepHeldTransitPayouts');
+        await expect(worker.sweepAll(db)).rejects.toThrow('reservations down');
+        expect(spy).toHaveBeenCalled();
+        spy.mockRestore();
     });
 
     test('the passenger sees where their fare is', async () => {

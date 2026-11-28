@@ -520,6 +520,13 @@ const verifyTransitTokenAndBoard = async (prisma, { token, businessUserId, now =
     if (booking.tripId !== payload.tid) {
         throw new Error('Token does not match this booking trip.');
     }
+    if (booking.tripId) {
+        const trip = await prisma.transitTrip.findUnique({ where: { id: booking.tripId }, select: { status: true } });
+        const st = String((trip && trip.status) || '').toUpperCase();
+        if (st === 'CANCELLED' || st === 'COMPLETED') {
+            throw Object.assign(new Error(`This trip is ${st.toLowerCase()}.`), { code: 'TRIP_UNAVAILABLE' });
+        }
+    }
     if (booking.status === 'IN_PROGRESS') {
         throw new QrTokenError(
             'QR_TOKEN_ALREADY_USED',

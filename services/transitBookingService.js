@@ -73,12 +73,19 @@ const _boardingOf = (booking) => {
     return b && typeof b === 'object' ? b : null;
 };
 const _metaObject = (m) => (m && typeof m === 'object' && !Array.isArray(m) ? m : {});
-/** When a paid fare may be released for this boarding (ms), or null. */
+/**
+ * When a paid fare may be released for this boarding (ms), or null.
+ * An unconfirmed ID check waits for departure + the hold AND for the hold
+ * fixed at boarding (boarding.holdUntil): moving the departure afterwards
+ * can never bring the release forward.
+ */
 const payoutReadyAt = (boarding, departureMs) => {
     if (!boarding || !Number.isFinite(departureMs)) return null;
     if (boarding.method === 'QR_TOKEN') return departureMs;
     if (boarding.method === 'ID_CHECK') {
-        return boarding.passengerConfirmedAt ? departureMs : departureMs + ID_CHECK_PAYOUT_HOLD_MS;
+        if (boarding.passengerConfirmedAt) return departureMs;
+        const fixed = Date.parse(boarding.holdUntil);
+        return Math.max(departureMs + ID_CHECK_PAYOUT_HOLD_MS, Number.isFinite(fixed) ? fixed : 0);
     }
     return null;
 };
@@ -903,28 +910,40 @@ const releaseHeldTransitPayout = async (prisma, { bookingId, now = Date.now() } 
 // Hourly (no-show sweep): completed, paid bookings whose fare is still held
 // and whose departure is at least the hold ago. A disputed escrow is not
 // claimable, so a passenger's report keeps the fare for dispute review.
-const sweepHeldTransitPayouts = async (prisma, { now = Date.now(), limit = 100 } = {}) => {
-    const due = await prisma.transitBooking.findMany({
-        where: {
-            status: 'COMPLETED',
-            escrowId: { not: null },
-            scheduledAt: { lte: new Date(now - ID_CHECK_PAYOUT_HOLD_MS) },
-            escrow: { is: { status: { in: RELEASE_CLAIMABLE } } },
-        },
-        select: { id: true },
-        orderBy: { scheduledAt: 'asc' },
-        take: limit,
-    });
-    const out = { checked: due.length, released: 0, held: 0, failed: 0 };
-    for (const b of due) {
-        try {
-            const r = await releaseHeldTransitPayout(prisma, { bookingId: b.id, now });
-            if (r.released) out.released += 1;
-            else out.held += 1;
-        } catch (err) {
-            out.failed += 1;
-            logger.error({ err: err.message, bookingId: b.id }, '[transitBooking] held payout release failed');
+// Pages through the candidates (a row still held, e.g. boarded after
+// departure, stays a candidate and must not starve the rows behind it).
+const sweepHeldTransitPayouts = async (prisma, { now = Date.now(), limit = 100, maxPages = 10 } = {}) => {
+    const out = { checked: 0, released: 0, held: 0, failed: 0 };
+    const seen = new Set();
+    let cursor = null;
+    for (let page = 0; page < maxPages; page += 1) {
+        const due = await prisma.transitBooking.findMany({
+            where: {
+                status: 'COMPLETED',
+                escrowId: { not: null },
+                scheduledAt: { lte: new Date(now - ID_CHECK_PAYOUT_HOLD_MS) },
+                escrow: { is: { status: { in: RELEASE_CLAIMABLE } } },
+            },
+            select: { id: true },
+            orderBy: [{ scheduledAt: 'asc' }, { id: 'asc' }],
+            take: limit,
+            ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+        });
+        const fresh = due.filter((b) => !seen.has(b.id));
+        for (const b of fresh) {
+            seen.add(b.id);
+            out.checked += 1;
+            try {
+                const r = await releaseHeldTransitPayout(prisma, { bookingId: b.id, now });
+                if (r.released) out.released += 1;
+                else out.held += 1;
+            } catch (err) {
+                out.failed += 1;
+                logger.error({ err: err.message, bookingId: b.id }, '[transitBooking] held payout release failed');
+            }
         }
+        if (due.length < limit || fresh.length === 0) break;
+        cursor = due[due.length - 1].id;
     }
     return out;
 };

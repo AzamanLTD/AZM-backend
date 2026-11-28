@@ -324,8 +324,15 @@ const sweepNoShowTransitBookings = async (prisma) => {
 // sweepAll — convenience function to run both sweeps.
 // =============================================================================
 const sweepAll = async (prisma) => {
-    const reservationResults = await sweepNoShowReservations(prisma);
-    const transitResults = await sweepNoShowTransitBookings(prisma);
+    let reservationResults;
+    let transitResults;
+    let sweepError = null;
+    try {
+        reservationResults = await sweepNoShowReservations(prisma);
+        transitResults = await sweepNoShowTransitBookings(prisma);
+    } catch (err) {
+        sweepError = err;
+    }
     // ID-check boardings whose report window has passed: release the held
     // fare to the operator (a reported one is DISPUTED and stays).
     let payouts;
@@ -336,6 +343,7 @@ const sweepAll = async (prisma) => {
         logger.error({ err: err.message }, '[NoShowWorker] held payout sweep failed');
         payouts = { error: err.message };
     }
+    if (sweepError) throw sweepError; // after the payouts ran
     return { reservations: reservationResults, transit: transitResults, payouts };
 };
 

@@ -386,6 +386,10 @@ exports.listMyTransitTrips = async (req, res) => {
 // PATCH /api/marketplace/business/trips/:id — update a trip's schedule/fare/status.
 // vehicleId is intentionally immutable after creation (the seat map + any
 // existing bookings are keyed off the original vehicle's layout).
+// A departure edit may be up to this far in the past (clock skew, a form
+// opened a minute before departure), never more.
+const DEPARTURE_EDIT_SKEW_MS = 5 * 60 * 1000;
+
 exports.updateTransitTrip = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
@@ -413,6 +417,31 @@ exports.updateTransitTrip = async (req, res) => {
         if (arrivalAt !== undefined) data.arrivalAt = arrivalAt ? new Date(arrivalAt) : null;
         if (fareUsdc !== undefined) data.fareUsdc = parseFloat(fareUsdc);
         if (normalizedStatus !== undefined && !cancelling) data.status = normalizedStatus;
+
+        // A changed departure moves boarding windows, no-show sweeps and
+        // payout holds. It may not be set in the past, and once a passenger
+        // is on board (or carried) it may only move later: pulling it
+        // earlier would shorten what protects those passengers.
+        if (data.departureAt && data.departureAt.getTime() !== new Date(trip.departureAt).getTime()) {
+            if (Number.isNaN(data.departureAt.getTime())) {
+                return res.status(400).json({ success: false, code: 'DEPARTURE_INVALID', message: 'departureAt is not a valid date.' });
+            }
+            if (data.departureAt.getTime() < Date.now() - DEPARTURE_EDIT_SKEW_MS) {
+                return res.status(400).json({ success: false, code: 'DEPARTURE_IN_PAST', message: 'A departure cannot be moved into the past.' });
+            }
+            if (data.departureAt.getTime() < new Date(trip.departureAt).getTime()) {
+                const underway = await prisma.transitBooking.count({
+                    where: { tripId: id, status: { in: ['IN_PROGRESS', 'COMPLETED'] } },
+                });
+                if (underway > 0) {
+                    return res.status(409).json({
+                        success: false,
+                        code: 'TRIP_UNDERWAY',
+                        message: 'Passengers are already on board. The departure can only move later.',
+                    });
+                }
+            }
+        }
 
         // The trip write and its bookings' reschedule commit together: a
         // departure in the body always re-syncs the bookings and paid escrows

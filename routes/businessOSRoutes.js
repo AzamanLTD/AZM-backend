@@ -1528,6 +1528,14 @@ router.post('/transit/irops/reassign', requirePermission('transit.trips.manage')
     if (!sourceTripId || !targetVehicleId) {
         return res.status(400).json({ success: false, message: 'sourceTripId and targetVehicleId are required' });
     }
+    // The moved passengers' boarding windows and payout holds follow this
+    // departure: it may not be in the past.
+    if (departureAt !== undefined && departureAt !== null) {
+        const at = new Date(departureAt);
+        if (Number.isNaN(at.getTime()) || at.getTime() < Date.now() - 5 * 60 * 1000) {
+            return res.status(400).json({ success: false, code: 'DEPARTURE_IN_PAST', message: 'departureAt must be a valid time that has not passed.' });
+        }
+    }
     const sourceTrip = await prisma.transitTrip.findFirst({
         where: { id: sourceTripId, businessProfileId: bpId },
         include: {

@@ -572,7 +572,9 @@ exports.boardById = async (req, res) => {
             });
         }
     } catch (err) {
-        logger.warn({ err: err && err.message, bookingId: result.booking.id }, '[transit.boardById] passenger notice failed');
+        // The trip's "Was this you?" card in the app (from the booking's
+        // boarding record) still asks them; the push is the prompt.
+        logger.error({ err: err && err.message, bookingId: result.booking.id }, '[transit.boardById] passenger notice failed');
     }
     return res.status(200).json(result);
 };
@@ -599,7 +601,26 @@ exports.reportBoarding = async (req, res) => {
             customerId: req.user.id,
             reason: req.body && req.body.reason,
         });
-        return res.status(200).json(out);
+        // The operator hears that the fare is held for review (best effort).
+        if (!out.alreadyReported && out.operatorUserId) {
+            try {
+                const notifier = req.app.get('notificationService');
+                if (notifier && typeof notifier.sendNotification === 'function') {
+                    await notifier.sendNotification({
+                        userId: out.operatorUserId,
+                        title: 'A passenger reported a boarding',
+                        body: `Booking ${out.bookingRef}: the passenger says they were not the one boarded. `
+                            + 'The fare is held while Azaman reviews it.',
+                        category: 'GENERAL',
+                        actionPayload: { action: 'OPEN_DISPUTE', disputeId: out.disputeId },
+                    });
+                }
+            } catch (err) {
+                logger.warn({ err: err && err.message }, '[transit.reportBoarding] operator notice failed');
+            }
+        }
+        const { operatorUserId, ...body } = out;
+        return res.status(200).json(body);
     } catch (err) {
         return _boardingFail(res, err, '[transit.reportBoarding] error');
     }

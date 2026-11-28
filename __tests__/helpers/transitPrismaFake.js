@@ -61,6 +61,7 @@ function table(rows, rel = null) {
         findUnique: jest.fn(async ({ where }) => rows.find(hit(where)) || null),
         findFirst: jest.fn(async ({ where } = {}) => rows.find(hit(where || {})) || null),
         findMany: jest.fn(async ({ where } = {}) => rows.filter(hit(where || {}))),
+        count: jest.fn(async ({ where } = {}) => rows.filter(hit(where || {})).length),
         create: jest.fn(async ({ data }) => { const r = { id: data.id || `id-${rows.length + 1}-${++seq}`, ...data }; rows.push(r); return r; }),
         createMany: jest.fn(async ({ data }) => { data.forEach((d) => rows.push({ ...d })); return { count: data.length }; }),
         update: jest.fn(async ({ where, data }) => applyData(rows.find(hit(where)), data)),

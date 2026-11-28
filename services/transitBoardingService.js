@@ -66,17 +66,18 @@ const paymentOf = (escrowStatus) => {
 
 /**
  * What staff see to check a passenger against their ID: the account photo,
- * AZM-ID and names. The legal name (the name on their ID) is given only for
- * a passenger who holds a booking with this business.
+ * AZM-ID and names. The display name, the legal name (the name on their ID)
+ * and whether their ID is verified are given only for a passenger who holds
+ * a booking with this business (`withDetails`).
  */
-const passengerCard = (customer, { withLegalName = false } = {}) => (customer ? {
+const passengerCard = (customer, { withDetails = false } = {}) => (customer ? {
     id: customer.id,
     azamanId: customer.azamanId || null,
     username: customer.username || null,
-    displayName: customer.displayName || null,
-    legalName: withLegalName ? (customer.legalName || null) : null,
+    displayName: withDetails ? (customer.displayName || null) : null,
+    legalName: withDetails ? (customer.legalName || null) : null,
     profilePictureUrl: customer.profilePictureUrl || null,
-    idVerified: customer.kycStatus === 'VERIFIED',
+    idVerified: withDetails ? customer.kycStatus === 'VERIFIED' : false,
 } : null);
 
 const _departureMs = (trip, booking) => {
@@ -103,7 +104,7 @@ const _bookingView = (booking, { trip, customer, seats, escrowStatus, policy, no
         amountUsdc: Number(booking.amountUsdc),
         payment,
         paid: payment === 'HELD' || payment === 'PAID_OUT' || payment === 'REPORTED',
-        passenger: passengerCard(customer, { withLegalName: true }),
+        passenger: passengerCard(customer, { withDetails: true }),
         boarding: boarding ? {
             method: boarding.method || null,
             at: boarding.at || null,
@@ -231,7 +232,7 @@ const enrichAzamanIdSearch = async (prisma, { businessUserId, result, now = Date
     const hasBooking = transitBookings.length > 0 || (result.reservations || []).length > 0;
     return {
         ...result,
-        customer: { ...customer, ...passengerCard(full || customer, { withLegalName: hasBooking }) },
+        customer: { ...customer, ...passengerCard(full || customer, { withDetails: hasBooking }) },
         transitBookings,
         boardingPolicy: policy,
     };
@@ -240,71 +241,102 @@ const enrichAzamanIdSearch = async (prisma, { businessUserId, result, now = Date
 // =============================================================================
 // 3. BOARD BY ID CHECK — staff saw the passenger and their ID.
 //    The AZM-ID is sent back as the operator's confirmation that they
-//    matched this person to this booking; a mismatch boards nothing.
+//    matched this person to this booking; a mismatch boards nothing. It is
+//    not proof (the manifest shows every AZM-ID): the passenger's notice and
+//    the payout hold are the safeguard, so the hold is fixed HERE, at
+//    boarding: never earlier than boarding time + 24h, whatever the trip's
+//    departure is later changed to.
+//
+//    One transaction, escrow row locked first (the order every other
+//    escrow-backed transition uses); booking, policy, trip and window are
+//    read after the lock.
 // =============================================================================
+const UNBOARDABLE_TRIP_STATUSES = ['CANCELLED', 'COMPLETED'];
+
 const boardByIdCheck = async (prisma, { bookingId, businessUserId, azamanId, now = Date.now() }) => {
     if (!bookingId) throw _err('BAD_REQUEST', 'bookingId is required.');
     if (!businessUserId) throw _err('BAD_REQUEST', 'businessUserId is required.');
     const given = normalizeAzamanId(azamanId);
     if (!given) throw _err('AZAMAN_ID_REQUIRED', "Enter the passenger's AZM-ID.");
 
-    const booking = await prisma.transitBooking.findUnique({ where: { id: bookingId } });
-    if (!booking) throw _err('NOT_FOUND', 'Booking not found.', 404);
-    const profile = await _ownedProfile(prisma, booking.businessProfileId, businessUserId);
-    if (!profile) throw _err('FORBIDDEN', 'This booking does not belong to your business.', 403);
-    if (!transitBoardingPolicy(profile).allowIdCheck) {
-        throw _err('ID_CHECK_DISABLED', 'Your business boards by QR code only. You can change this in boarding settings.', 409);
-    }
-    const customer = await prisma.user.findUnique({ where: { id: booking.customerId }, select: { id: true, azamanId: true } });
-    if (!customer || normalizeAzamanId(customer.azamanId || '') !== given) {
-        throw _err('AZAMAN_ID_MISMATCH', 'That AZM-ID is not the passenger on this booking.', 409);
-    }
-    if (booking.status === 'IN_PROGRESS') throw _err('ALREADY_BOARDED', 'This passenger is already boarded.', 409);
-    if (booking.status !== 'CONFIRMED') throw _err('NOT_BOARDABLE', `Booking is ${booking.status}, cannot board.`, 409);
-
-    const trip = booking.tripId
-        ? await prisma.transitTrip.findUnique({ where: { id: booking.tripId }, select: { departureAt: true } })
-        : null;
-    const dep = _departureMs(trip, booking);
-    if (dep == null) throw _err('NO_BOARDING_WINDOW', 'This booking has no departure time to board against.', 409);
-    if (now < dep - TRANSIT_WINDOW_MS) throw _err('BOARDING_NOT_OPEN', 'Boarding opens an hour before departure.', 409);
-    if (now > dep + TRANSIT_WINDOW_MS) throw _err('BOARDING_CLOSED', 'The boarding window for this trip has closed.', 409);
-
-    const at = new Date(now);
-    const claimed = await prisma.transitBooking.updateMany({
-        where: { id: booking.id, status: 'CONFIRMED', escrowId: booking.escrowId ?? null },
-        data: {
-            status: 'IN_PROGRESS',
-            checkedInAt: at,
-            pickupTime: at,
-            metadata: _withBoarding(booking.metadata, {
-                method: BOARDING_METHOD.ID_CHECK,
-                at: at.toISOString(),
-                by: businessUserId,
-                azamanId: given,
-            }),
-        },
+    const pre = await prisma.transitBooking.findUnique({
+        where: { id: bookingId },
+        select: { id: true, escrowId: true, businessProfileId: true },
     });
-    if (claimed.count !== 1) {
-        const current = await prisma.transitBooking.findUnique({ where: { id: booking.id }, select: { status: true } });
-        if (current && current.status === 'IN_PROGRESS') throw _err('ALREADY_BOARDED', 'This passenger is already boarded.', 409);
-        throw _err('NOT_BOARDABLE', `Booking is ${current ? current.status : 'UNKNOWN'}, cannot board.`, 409);
-    }
-    const updated = await prisma.transitBooking.findUnique({ where: { id: booking.id } });
-    const escrow = booking.escrowId
-        ? await prisma.smartEscrow.findUnique({ where: { id: booking.escrowId }, select: { status: true } })
-        : null;
-    const paid = !!escrow && RELEASE_CLAIMABLE.includes(escrow.status);
+    // Another business's booking reads as missing: no probing of booking ids.
+    const notFound = () => _err('NOT_FOUND', 'Booking not found.', 404);
+    if (!pre || !(await _ownedProfile(prisma, pre.businessProfileId, businessUserId))) throw notFound();
+
+    const out = await prisma.$transaction(async (tx) => {
+        if (pre.escrowId) {
+            await tx.$executeRaw`SELECT id FROM "SmartEscrow" WHERE "id" = ${pre.escrowId} FOR UPDATE`;
+        }
+        const booking = await tx.transitBooking.findUnique({ where: { id: bookingId } });
+        const profile = booking ? await _ownedProfile(tx, booking.businessProfileId, businessUserId) : null;
+        if (!profile) throw notFound();
+        if (!transitBoardingPolicy(profile).allowIdCheck) {
+            throw _err('ID_CHECK_DISABLED', 'Your business boards by QR code only. You can change this in boarding settings.', 409);
+        }
+        const customer = await tx.user.findUnique({ where: { id: booking.customerId }, select: { id: true, azamanId: true } });
+        if (!customer || normalizeAzamanId(customer.azamanId || '') !== given) {
+            throw _err('AZAMAN_ID_MISMATCH', 'That AZM-ID is not the passenger on this booking.', 409);
+        }
+        if (booking.status === 'IN_PROGRESS') throw _err('ALREADY_BOARDED', 'This passenger is already boarded.', 409);
+        if (booking.status !== 'CONFIRMED') throw _err('NOT_BOARDABLE', `Booking is ${booking.status}, cannot board.`, 409);
+
+        const trip = booking.tripId
+            ? await tx.transitTrip.findUnique({ where: { id: booking.tripId }, select: { departureAt: true, status: true } })
+            : null;
+        if (trip && UNBOARDABLE_TRIP_STATUSES.includes(String(trip.status || '').toUpperCase())) {
+            throw _err('TRIP_UNAVAILABLE', `This trip is ${String(trip.status).toLowerCase()}.`, 409);
+        }
+        const dep = _departureMs(trip, booking);
+        if (dep == null) throw _err('NO_BOARDING_WINDOW', 'This booking has no departure time to board against.', 409);
+        if (now < dep - TRANSIT_WINDOW_MS) throw _err('BOARDING_NOT_OPEN', 'Boarding opens an hour before departure.', 409);
+        if (now > dep + TRANSIT_WINDOW_MS) throw _err('BOARDING_CLOSED', 'The boarding window for this trip has closed.', 409);
+
+        const at = new Date(now);
+        const holdUntil = new Date(Math.max(now, dep) + ID_CHECK_PAYOUT_HOLD_MS);
+        const metadata = _withBoarding(booking.metadata, {
+            method: BOARDING_METHOD.ID_CHECK,
+            at: at.toISOString(),
+            by: businessUserId,
+            azamanId: given,
+            holdUntil: holdUntil.toISOString(),
+        });
+        const claimed = await tx.transitBooking.updateMany({
+            where: { id: booking.id, status: 'CONFIRMED', escrowId: booking.escrowId ?? null },
+            data: { status: 'IN_PROGRESS', checkedInAt: at, pickupTime: at, metadata },
+        });
+        if (claimed.count !== 1) {
+            const current = await tx.transitBooking.findUnique({ where: { id: booking.id }, select: { status: true } });
+            if (current && current.status === 'IN_PROGRESS') throw _err('ALREADY_BOARDED', 'This passenger is already boarded.', 409);
+            throw _err('NOT_BOARDABLE', `Booking is ${current ? current.status : 'UNKNOWN'}, cannot board.`, 409);
+        }
+        const escrow = booking.escrowId
+            ? await tx.smartEscrow.findUnique({ where: { id: booking.escrowId }, select: { status: true } })
+            : null;
+        return {
+            // Built from what was just written: nothing after the claim can
+            // turn a committed boarding into an error.
+            booking: { ...booking, status: 'IN_PROGRESS', checkedInAt: at, pickupTime: at, metadata },
+            paid: !!escrow && RELEASE_CLAIMABLE.includes(escrow.status),
+            businessName: profile.businessName || null,
+            holdUntil,
+            trip: trip ? { departureAt: trip.departureAt } : null,
+        };
+    });
     return {
         success: true,
-        booking: updated,
+        booking: out.booking,
         method: BOARDING_METHOD.ID_CHECK,
-        paid,
-        // Without the passenger's confirmation the fare waits this long
-        // after departure before it is released.
-        payoutHoldHours: paid ? ID_CHECK_PAYOUT_HOLD_MS / 3600000 : 0,
-        businessName: profile.businessName || null,
-        trip: trip ? { departureAt: trip.departureAt } : null,
+        paid: out.paid,
+        // Without the passenger's confirmation the fare waits at least this
+        // long after departure (and after boarding) before it is released.
+        payoutHoldHours: out.paid ? ID_CHECK_PAYOUT_HOLD_MS / 3600000 : 0,
+        payoutHeldUntil: out.paid ? out.holdUntil : null,
+        businessName: out.businessName,
+        trip: out.trip,
     };
 };
 
@@ -379,15 +411,32 @@ const reportIdCheckBoarding = async (prisma, { bookingId, customerId, reason }) 
                 + (note || 'I was not boarded on this trip.'),
             evidenceUrls: [],
         });
-        return { success: true, alreadyReported: false, disputeId: out && out.dispute ? out.dispute.id : null };
+        return {
+            success: true,
+            alreadyReported: false,
+            disputeId: out && out.dispute ? out.dispute.id : null,
+            bookingRef: b.bookingRef,
+            operatorUserId: await _operatorUserId(prisma, b.businessProfileId),
+        };
     } catch (err) {
         const msg = (err && err.message) || '';
         if (msg === 'ESCROW_ALREADY_DISPUTED') return { success: true, alreadyReported: true, disputeId: null };
         if (/in status (SETTLED|RELEASED)/.test(msg)) {
             throw _err('ALREADY_PAID_OUT', 'The fare was already paid to the operator. Contact support to report this trip.', 409);
         }
-        if (/Cannot dispute an escrow in status/.test(msg)) throw _err('NOT_REPORTABLE', msg, 409);
+        if (/Cannot dispute an escrow in status|^Escrow not found|^Only a participant/.test(msg)) {
+            throw _err('NOT_REPORTABLE', 'This trip cannot be reported here. Contact support.', 409);
+        }
         throw err;
+    }
+};
+
+const _operatorUserId = async (prisma, businessProfileId) => {
+    try {
+        const p = await prisma.businessProfile.findUnique({ where: { id: businessProfileId }, select: { userId: true } });
+        return p ? p.userId : null;
+    } catch {
+        return null;
     }
 };
 
