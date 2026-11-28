@@ -18,7 +18,7 @@
 //     to the operator, in one transaction
 // =============================================================================
 
-const { isSeatCell, bookableSeats, bookableSeatIds } = require('./transitSeatLayout');
+const { isSeatCell, isBlocked, bookableSeats, bookableSeatIds } = require('./transitSeatLayout');
 const { REFUND_CAUSE, refundsFeeNow } = require('./feeRefundPolicy');
 const crypto = require('crypto');
 const { randomUUID } = require('crypto');
@@ -475,7 +475,7 @@ const getTripSeatAvailability = async (prisma, { tripId }) => {
     const seats = layout.map(seat => (isSeatCell(seat)
         ? {
             ...seat,
-            status: bookedSet.has(seat.seatId) ? 'OCCUPIED' : 'AVAILABLE',
+            status: bookedSet.has(seat.seatId) ? 'OCCUPIED' : (isBlocked(seat) ? 'BLOCKED' : 'AVAILABLE'),
             fare: seat.tier && tierFares[seat.tier] != null ? Number(tierFares[seat.tier]) : Number(trip.fareUsdc),
         }
         : { ...seat, status: 'SPACE' }));

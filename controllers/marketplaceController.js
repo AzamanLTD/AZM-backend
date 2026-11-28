@@ -561,10 +561,24 @@ exports.setSeatMap = async (req, res) => {
         if (!vehicle || vehicle.businessProfileId !== profile.id)
             return res.status(403).json({ success: false, message: 'Vehicle not found for this business.' });
 
+        // Same checks as PUT /api/marketplace-seat-map/:tripId.
+        const seatLayout = require('../services/transitSeatLayout');
+        let clean;
+        try { clean = seatLayout.validateLayout({ layout, rows, cols }); } catch (e) {
+            return res.status(e.httpStatus || 400).json({ success: false, code: e.code, message: e.message });
+        }
+        const lost = await seatLayout.bookedSeatsLost(prisma, { vehicleId, layout: clean.layout });
+        if (lost.length) {
+            return res.status(409).json({
+                success: false, code: 'SEAT_MAP_BOOKED_SEATS', seats: lost,
+                message: `Seats ${lost.join(', ')} have active bookings. Move or cancel those bookings before removing or blocking them.`,
+            });
+        }
+
         const seatMap = await prisma.transitSeatMap.upsert({
             where: { vehicleId },
-            update: { layout, rows, cols },
-            create: { vehicleId, layout, rows, cols },
+            update: { layout: clean.layout, rows: clean.rows, cols: clean.cols },
+            create: { vehicleId, layout: clean.layout, rows: clean.rows, cols: clean.cols },
         });
 
         return res.status(200).json({ success: true, seatMap });
