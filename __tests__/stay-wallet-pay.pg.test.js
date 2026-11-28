@@ -221,7 +221,13 @@ run('hotel stay paid from the wallet (PostgreSQL)', () => {
         expect(short.body.code).toBe('INSUFFICIENT_BALANCE');
         expect(await prisma.financialOperation.count({ where: { userId: poor.id, key: 'h5-b' } })).toBe(0);
         expect(await balances(poor.id)).toEqual({ available: 5, locked: 0 });
-        await prisma.user.update({ where: { id: poor.id }, data: { availableBalance: 500 } });
+        // Top up the way money really arrives: balance and its ledger row
+        // together (the pre-flight ledger audit, runDoubleCheck, refuses a
+        // balance with no history behind it).
+        await prisma.$transaction([
+            prisma.user.update({ where: { id: poor.id }, data: { availableBalance: 500 } }),
+            prisma.transactionHistory.create({ data: { userId: poor.id, type: 'DEPOSIT_CRYPTO', amountUsdc: 495, feeUsdc: 0, status: 'COMPLETED' } }),
+        ]);
         const topped = await drive({ userId: poor.id, key: 'h5-b', body: later });
         expect(topped.status).toBe(201);
         expect(await prisma.smartEscrow.count({ where: { status: 'FUNDED' } })).toBe(2);
