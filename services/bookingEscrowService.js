@@ -417,12 +417,21 @@ const releaseBookingEscrow = async (prisma, { escrowId }) => {
 // transaction, same return shape).
 const REFUND_CLAIMABLE = ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'];
 
-const _refundBookingEscrowTx = async (tx, { escrowId, reference }) => {
+// refundFee (services/feeRefundPolicy): the business cancelled, so the
+// Azaman fee realized at funding is given back too, in the same transaction:
+// the profit bucket, the revenue ledger line, the profit log and the payer's
+// history all reverse it. If the profit bucket no longer holds the fee (it
+// was withdrawn), the cancellation still goes through with the price
+// refunded; the fee is recorded as owed (feeRefundOwedUsdc on the history
+// row and the returned escrow) for the team to settle. A refund is never
+// blocked by the fee.
+const _refundBookingEscrowTx = async (tx, { escrowId, reference, refundFee = false }) => {
     const claimable = REFUND_CLAIMABLE;
 
         const escrow = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
         if (!escrow) throw new Error('Escrow not found.');
         const amount = Number(escrow.amountUsdc);
+        const fee = Number(escrow.feeUsdc || 0);
 
         const claim = await tx.smartEscrow.updateMany({
             where: { id: escrowId, status: { in: claimable } },
@@ -430,35 +439,71 @@ const _refundBookingEscrowTx = async (tx, { escrowId, reference }) => {
         });
         if (claim.count === 0) throw _escrowError('ESCROW_ALREADY_FINALIZED');
 
-        // Guarded, atomic refund: the locked principal moves back to the
-        // payer's available balance in ONE conditional statement — a short
-        // bucket can never go negative and never credits the payer.
+        // The fee, when it comes back: taken out of the profit bucket by a
+        // guarded decrement (the bucket can never go negative).
+        let feeBack = 0;
+        let feeOwed = 0;
+        if (refundFee && fee > 0) {
+            await _ensureProfitFeesSingleton(tx);
+            const taken = await tx.systemProfitFees.updateMany({
+                where: { id: 1, balance: { gte: fee } },
+                data: { balance: { decrement: fee } },
+            });
+            if (taken.count === 1) feeBack = fee;
+            else feeOwed = fee;
+        }
+        // Exact: the price plus the fee as decimals (no float rounding), so
+        // the ledger balances to the last of its 8 decimals. Without a fee
+        // the credit is the price, exactly as before.
+        const credited = feeBack > 0
+            ? new Prisma.Decimal(escrow.amountUsdc).add(new Prisma.Decimal(escrow.feeUsdc))
+            : amount;
+
+        // Guarded, atomic refund: the locked principal (and a fee given back)
+        // moves to the payer's available balance in ONE conditional
+        // statement — a short bucket can never go negative and never credits
+        // the payer.
         const debit = await tx.user.updateMany({
             where: { id: escrow.payerId, escrowLockedBalance: { gte: amount } },
-            data: { escrowLockedBalance: { decrement: amount }, availableBalance: { increment: amount } }
+            data: { escrowLockedBalance: { decrement: amount }, availableBalance: { increment: credited } }
         });
         if (debit.count !== 1) throw _escrowError('ESCROW_BALANCE_INSUFFICIENT');
 
         // §P.4 AUTHORITATIVE LEDGER — same economic identity as the ticket
         // escrow refund:
         //   D escrow:{id}:locked / C user:{payer}:liability
+        // and, when the fee comes back, the fee's revenue reversed:
+        //   D revenue:fees / C user:{payer}:liability
         await ledger.post(tx, {
             idempotencyKey: `ledger:escrow:refund:${escrowId}:REFUNDED`,
             entryType: 'ESCROW_REFUND',
-            description: 'Booking escrow refunded to payer on cancellation',
+            description: feeBack > 0
+                ? 'Booking escrow refunded to payer with the Azaman fee (the business cancelled)'
+                : 'Booking escrow refunded to payer on cancellation',
             reference,
             userId: escrow.payerId,
             relatedEntity: 'smartEscrow',
             relatedEntityId: escrowId,
             lines: [
                 { account: `escrow:escrow-${escrowId}:locked`, debit: _exact(amount) },
-                { account: `user:${escrow.payerId}:liability`, credit: _exact(amount) },
+                ...(feeBack > 0 ? [{ account: 'revenue:fees', debit: _exact(new Prisma.Decimal(escrow.feeUsdc)) }] : []),
+                { account: `user:${escrow.payerId}:liability`, credit: _exact(credited) },
             ],
         });
+        if (feeBack > 0) {
+            // The fee's profit entry, reversed (same source, negative).
+            await tx.adminProfitLog.create({
+                data: { amountUsdc: -feeBack, source: 'SMART_ESCROW_FEE', relatedTxId: `booking_fee_refund_${escrowId}` }
+            });
+        }
         await tx.transactionHistory.create({
-            data: { userId: escrow.payerId, type: 'TICKET_ESCROW_REFUND', amountUsdc: amount, feeUsdc: 0, txHash: reference, status: 'COMPLETED' }
+            data: {
+                userId: escrow.payerId, type: 'TICKET_ESCROW_REFUND', amountUsdc: credited, feeUsdc: 0, txHash: reference, status: 'COMPLETED',
+                ...(refundFee && fee > 0 ? { metadata: { priceUsdc: amount, feeRefundedUsdc: feeBack, feeRefundOwedUsdc: feeOwed } } : {}),
+            }
         });
-        return await tx.smartEscrow.findUnique({ where: { id: escrowId } });
+        const refunded = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
+        return refunded && Object.assign(refunded, { feeRefundedUsdc: feeBack, feeRefundOwedUsdc: feeOwed });
 };
 
 const refundBookingEscrow = async (prisma, { escrowId }) => {

@@ -9,7 +9,9 @@
 //   H3. Two guests paying for the same room and dates at the same moment:
 //       the room lock lets exactly one through; the other is refused and
 //       charged nothing.
-//   H4. The hotel cancelling refunds the price (the fee stays realized).
+//   H4. The hotel cancelling refunds everything, the fee included: the
+//       profit bucket gives it back and the ledger balances. With the bucket
+//       emptied, the price is still refunded and the fee recorded as owed.
 //   H5. Through the route's real idempotency middleware and the controller:
 //       the claim commits with the stay; a same-key retry replays it and
 //       charges nothing; a different stay under the key is refused; a short
@@ -118,17 +120,33 @@ run('hotel stay paid from the wallet (PostgreSQL)', () => {
         expect(await balances(loser.id)).toEqual({ available: 500, locked: 0 });
     });
 
-    test('H4: the hotel cancelling refunds the price', async () => {
+    test('H4: the hotel cancelling refunds everything, the fee included', async () => {
         const ctx = await seedHotel();
         const guest = await seedUser(prisma, { availableBalance: 500 });
+        const bucket = async () => Number((await prisma.systemProfitFees.findUnique({ where: { id: 1 } }))?.balance ?? 0);
         const out = await pay(ctx, guest, 'h4');
+        expect(out.payment.feeUsdc).toBeGreaterThan(0);
+        expect(await bucket()).toBeCloseTo(out.payment.feeUsdc, 6);
         await lifecycle.businessCancelReservation(prisma, { reservationId: out.reservation.id, businessProfileId: ctx.biz.id, reason: 'Flooded' });
         expect((await prisma.reservation.findUnique({ where: { id: out.reservation.id } })).status).toBe('CANCELLED_BUSINESS');
-        expect((await prisma.smartEscrow.findUnique({ where: { id: out.payment.escrowId } })).status).toBe('REFUNDED');
-        expect(await balances(guest.id)).toEqual({
-            available: expect.closeTo(500 - out.payment.feeUsdc, 6),
-            locked: expect.closeTo(0, 6),
-        });
+        const escrow = await prisma.smartEscrow.findUnique({ where: { id: out.payment.escrowId } });
+        expect(escrow.status).toBe('REFUNDED');
+        expect(await balances(guest.id)).toEqual({ available: expect.closeTo(500, 6), locked: expect.closeTo(0, 6) });
+        expect(await bucket()).toBeCloseTo(0, 6);
+        const history = await prisma.transactionHistory.findUnique({ where: { txHash: escrow.refundTxHash } });
+        expect(Number(history.amountUsdc)).toBeCloseTo(out.payment.totalUsdc, 6);
+
+        // The fees were withdrawn: the next hotel cancellation still refunds
+        // the price, and the fee is recorded as owed.
+        const again = await pay(ctx, guest, 'h4-b');
+        await prisma.systemProfitFees.update({ where: { id: 1 }, data: { balance: 0 } });
+        await lifecycle.businessCancelReservation(prisma, { reservationId: again.reservation.id, businessProfileId: ctx.biz.id, reason: 'Flooded' });
+        const owedEscrow = await prisma.smartEscrow.findUnique({ where: { id: again.payment.escrowId } });
+        expect(owedEscrow.status).toBe('REFUNDED');
+        expect(await balances(guest.id)).toEqual({ available: expect.closeTo(500 - again.payment.feeUsdc, 6), locked: expect.closeTo(0, 6) });
+        const owed = await prisma.transactionHistory.findUnique({ where: { txHash: owedEscrow.refundTxHash } });
+        expect(owed.metadata).toEqual(expect.objectContaining({ feeRefundedUsdc: 0, feeRefundOwedUsdc: again.payment.feeUsdc }));
+        expect(await bucket()).toBe(0);
     });
 
     test('H5: through the real idempotency middleware: a retry replays, a different stay under the key is refused, a short balance frees the key', async () => {

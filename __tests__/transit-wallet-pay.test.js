@@ -555,3 +555,47 @@ describe('round three: reschedule stays in step with the trip', () => {
             .toBe(later.getTime() + COMPLETION_GRACE_DAYS * DAY);
     });
 });
+
+describe('who cancels decides the fee', () => {
+    const cancel = (db, res, by) => {
+        db.transitBooking.rows[0].seats = [];
+        db.transitBooking.rows[0].businessProfile = { userId: 20 };
+        return cancelTransitBooking(db, { bookingId: res.booking.id, cancelledBy: by });
+    };
+    beforeEach(() => ledger.post.mockClear());
+
+    test('the operator cancelling gives the fee back too', async () => {
+        const db = makeDb();
+        const res = await pay(db, ['1A']); // fare 2, fee 0.5% = 0.01
+        expect(res.payment.feeUsdc).toBeGreaterThan(0);
+        const out = await cancel(db, res, 20);
+        expect(out.refund).toEqual(expect.objectContaining({ outcome: 'REFUNDED', feeRefundedUsdc: res.payment.feeUsdc }));
+        expect(user(db, 10).availableBalance).toBeCloseTo(100, 9);
+        expect(user(db, 10).escrowLockedBalance).toBeCloseTo(0, 9);
+        expect(db.systemProfitFees.rows[0].balance).toBeCloseTo(0, 9);
+        const post = ledger.post.mock.calls.map((c) => c[1]).find((e) => e.entryType === 'ESCROW_REFUND');
+        expect(post.lines).toContainEqual({ account: 'revenue:fees', debit: res.payment.feeUsdc.toFixed(8) });
+    });
+
+    test('the passenger cancelling keeps the fee', async () => {
+        const db = makeDb();
+        const res = await pay(db, ['1A']);
+        const out = await cancel(db, res, 10);
+        expect(out.refund).toEqual(expect.objectContaining({ outcome: 'REFUNDED', feeRefundedUsdc: 0 }));
+        expect(user(db, 10).availableBalance).toBeCloseTo(100 - res.payment.feeUsdc, 9);
+        expect(db.systemProfitFees.rows[0].balance).toBeCloseTo(res.payment.feeUsdc, 9);
+        const post = ledger.post.mock.calls.map((c) => c[1]).find((e) => e.entryType === 'ESCROW_REFUND');
+        expect(post.lines.some((l) => l.account === 'revenue:fees')).toBe(false);
+    });
+
+    test("an emptied profit bucket never blocks the operator's cancellation", async () => {
+        const db = makeDb();
+        const res = await pay(db, ['1A']);
+        db.systemProfitFees.rows[0].balance = 0;
+        const out = await cancel(db, res, 20);
+        expect(out.refund).toEqual(expect.objectContaining({ outcome: 'REFUNDED', feeRefundedUsdc: 0 }));
+        expect(user(db, 10).availableBalance).toBeCloseTo(100 - res.payment.feeUsdc, 9);
+        const history = db.transactionHistory.rows.find((h) => h.type === 'TICKET_ESCROW_REFUND');
+        expect(history.metadata.feeRefundOwedUsdc).toBe(res.payment.feeUsdc);
+    });
+});

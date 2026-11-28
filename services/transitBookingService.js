@@ -18,6 +18,7 @@
 //     to the operator, in one transaction
 // =============================================================================
 
+const { REFUND_CAUSE, refundsFee } = require('./feeRefundPolicy');
 const crypto = require('crypto');
 const { randomUUID } = require('crypto');
 const logger = require('../src/config/logger');
@@ -697,8 +698,19 @@ const cancelTransitBooking = async (prisma, { bookingId, cancelledBy, note, only
             const escrow = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
             if (escrow && REFUND_CLAIMABLE.includes(escrow.status)) {
                 const reference = randomUUID();
-                await _refundBookingEscrowTx(tx, { escrowId: escrow.id, reference });
-                refund = { outcome: 'REFUNDED', reference, amountUsdc: Number(escrow.amountUsdc) };
+                // The operator cancelling gives the fee back too; the
+                // passenger cancelling keeps it (feeRefundPolicy).
+                const refunded = await _refundBookingEscrowTx(tx, {
+                    escrowId: escrow.id,
+                    reference,
+                    refundFee: refundsFee(isOwner && !isCustomer
+                        ? REFUND_CAUSE.BUSINESS_CANCELLED
+                        : REFUND_CAUSE.CUSTOMER_CANCELLED),
+                });
+                refund = {
+                    outcome: 'REFUNDED', reference, amountUsdc: Number(escrow.amountUsdc),
+                    feeRefundedUsdc: refunded ? refunded.feeRefundedUsdc : 0,
+                };
             } else if (escrow && escrow.status === 'DISPUTED') {
                 // The dispute channel owns the money — never mutate it here.
                 // Cancelling still removes the booking from the no-show

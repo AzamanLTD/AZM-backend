@@ -284,8 +284,8 @@ exports.confirmReservation = async (req, res) => {
 
 // ── PATCH /api/reservations/:reservationId/decline ───────────────────────────
 // The hotel declines a request or cancels a stay it cannot honour. A stay
-// paid in the app has its price refunded in the same transaction (the Azaman
-// fee is not refunded).
+// paid in the app is refunded in the same transaction, the Azaman fee
+// included (feeRefundPolicy: the business cancelled).
 exports.declineReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
@@ -301,11 +301,25 @@ exports.declineReservation = async (req, res) => {
             const notifier = req.app.get('notificationService');
             if (notifier && typeof notifier.sendNotification === 'function') {
                 const escrow = reservation.escrowId
-                    ? await prisma.smartEscrow.findUnique({ where: { id: reservation.escrowId }, select: { status: true, amountUsdc: true } })
+                    ? await prisma.smartEscrow.findUnique({ where: { id: reservation.escrowId }, select: { status: true, amountUsdc: true, feeUsdc: true, refundTxHash: true } })
                     : null;
-                const refunded = escrow && escrow.status === 'REFUNDED'
-                    ? `The price you paid (${Number(escrow.amountUsdc).toFixed(2)} USDC) is back in your wallet; the Azaman fee is not refunded.`
-                    : 'Nothing was charged.';
+                // What came back, as the refund recorded it.
+                const refundRow = escrow && escrow.status === 'REFUNDED' && escrow.refundTxHash
+                    ? await prisma.transactionHistory.findUnique({ where: { txHash: escrow.refundTxHash }, select: { amountUsdc: true, metadata: true } })
+                    : null;
+                const meta = refundRow && refundRow.metadata && typeof refundRow.metadata === 'object' ? refundRow.metadata : {};
+                const usdc = (n) => `${Number(n).toFixed(2)} USDC`;
+                let refunded = 'Nothing was charged.';
+                if (escrow && escrow.status === 'REFUNDED') {
+                    if (Number(meta.feeRefundOwedUsdc) > 0) {
+                        refunded = `The price you paid (${usdc(escrow.amountUsdc)}) is back in your wallet. `
+                            + `The Azaman fee (${usdc(meta.feeRefundOwedUsdc)}) will be refunded to you separately.`;
+                    } else if (Number(meta.feeRefundedUsdc) > 0) {
+                        refunded = `Everything you paid (${usdc(refundRow.amountUsdc)}, the Azaman fee included) is back in your wallet.`;
+                    } else {
+                        refunded = `The ${usdc(escrow.amountUsdc)} you paid is back in your wallet.`;
+                    }
+                }
                 await notifier.sendNotification({
                     userId: reservation.customerId,
                     title: 'Your stay was cancelled',

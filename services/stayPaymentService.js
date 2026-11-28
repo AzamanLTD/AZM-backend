@@ -21,10 +21,10 @@
 // The money is released to the hotel when the guest checks in with their QR
 // (reservationLifecycleService.checkInReservation, called by the QR path),
 // within the paid-stay window (paidStayPolicy: from 24 hours before the
-// check-in day to noon on the check-out day). The price is refunded (the
-// Azaman fee is not) if the guest cancels before check-in, if the hotel
-// cancels, or if the stay passes that window with no check-in (the no-show
-// sweep). Staff cannot check a paid stay in by hand (QR_CHECKIN_REQUIRED),
+// check-in day to noon on the check-out day). If the hotel cancels,
+// everything is refunded, the Azaman fee included; if the guest cancels
+// before check-in, or the stay passes that window with no check-in (the
+// no-show sweep), the price is refunded and the fee kept (feeRefundPolicy). Staff cannot check a paid stay in by hand (QR_CHECKIN_REQUIRED),
 // and its dates cannot be moved (PAID_DATES_FIXED): cancel and book again.
 //
 // The price is the server's per-night pricing (hotelPricingService), and the

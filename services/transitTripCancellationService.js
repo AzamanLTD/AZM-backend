@@ -36,6 +36,7 @@
 // The route holds NO refund/ledger logic of its own.
 // =============================================================================
 
+const { REFUND_CAUSE, refundsFee } = require('./feeRefundPolicy');
 const { randomUUID } = require('crypto');
 const {
     _refundBookingEscrowTx,
@@ -91,8 +92,17 @@ const _resolveBookings = async (prisma, bookings) => {
                     const escrow = await tx.smartEscrow.findUnique({ where: { id: booking.escrowId } });
                     if (escrow && REFUND_CLAIMABLE.includes(escrow.status)) {
                         const reference = randomUUID();
-                        await _refundBookingEscrowTx(tx, { escrowId: escrow.id, reference });
-                        return { outcome: 'REFUNDED', escrowStatus: 'REFUNDED', refundReference: reference };
+                        // The operator cancelled the trip: the fee comes
+                        // back too (feeRefundPolicy).
+                        const refunded = await _refundBookingEscrowTx(tx, {
+                            escrowId: escrow.id,
+                            reference,
+                            refundFee: refundsFee(REFUND_CAUSE.BUSINESS_CANCELLED),
+                        });
+                        return {
+                            outcome: 'REFUNDED', escrowStatus: 'REFUNDED', refundReference: reference,
+                            feeRefundedUsdc: refunded ? refunded.feeRefundedUsdc : 0,
+                        };
                     }
                     if (escrow && escrow.status === 'DISPUTED') {
                         // Dispute resolution owns the money; never mutate it

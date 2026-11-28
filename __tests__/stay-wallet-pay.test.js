@@ -10,8 +10,10 @@
 //     charged
 //   • the guest's QR check-in releases the price to the hotel
 //   • staff cannot check a paid stay in by hand (QR_CHECKIN_REQUIRED)
-//   • the hotel declining or cancelling, the guest cancelling, and a stay
-//     that ends with no check-in all refund the price
+//   • the hotel declining or cancelling refunds everything, the fee included
+//     (if the profit bucket was emptied, the fee is recorded as owed and the
+//     refund still goes through); the guest cancelling or a stay that ends
+//     with no check-in refunds the price and keeps the fee
 //   • a paid stay's no-show terms cannot change afterwards
 //   • the escrow outlives the stay; the quote charges what the payment does
 //   • a retry finds its stay before anything is re-priced
@@ -225,8 +227,9 @@ describe('after paying', () => {
         expect(escrow(db).status).toBe('FUNDED');
     });
 
-    test('the hotel cancelling refunds the price, and the guest is told', async () => {
+    test('the hotel cancelling refunds everything, the fee included, and the guest is told', async () => {
         const db = makeDb();
+        require('../services/ledgerService').post.mockClear();
         const out = await payStay(db);
         const sendNotification = jest.fn().mockResolvedValue(undefined);
         let status = null; let payload = null;
@@ -237,13 +240,42 @@ describe('after paying', () => {
         expect(status).toBe(200);
         expect(payload.reservation.status).toBe('CANCELLED_BUSINESS');
         expect(escrow(db).status).toBe('REFUNDED');
-        expect(user(db, 10).availableBalance).toBeCloseTo(500 - out.payment.feeUsdc, 9);
+        expect(user(db, 10).availableBalance).toBeCloseTo(500, 9);
         expect(user(db, 10).escrowLockedBalance).toBeCloseTo(0, 9);
+        // The fee's revenue is reversed everywhere it was booked.
+        expect(db.systemProfitFees.rows[0].balance).toBeCloseTo(0, 9);
+        expect(db.adminProfitLog.rows.map((r) => r.amountUsdc)).toEqual([out.payment.feeUsdc, -out.payment.feeUsdc]);
+        const ledger = require('../services/ledgerService');
+        const refundPost = ledger.post.mock.calls.map((c) => c[1]).find((e) => e.entryType === 'ESCROW_REFUND');
+        expect(refundPost.lines).toEqual([
+            { account: `escrow:escrow-${escrow(db).id}:locked`, debit: out.payment.amountUsdc.toFixed(8) },
+            { account: 'revenue:fees', debit: out.payment.feeUsdc.toFixed(8) },
+            { account: 'user:10:liability', credit: out.payment.totalUsdc.toFixed(8) },
+        ]);
         expect(sendNotification).toHaveBeenCalledWith(expect.objectContaining({ userId: 10, title: 'Your stay was cancelled' }));
-        // The notice says what came back: the price, not the fee.
         const { body } = sendNotification.mock.calls[0][0];
-        expect(body).toContain(`The price you paid (${out.payment.amountUsdc.toFixed(2)} USDC) is back in your wallet`);
-        expect(body).toContain('the Azaman fee is not refunded');
+        expect(body).toContain(`Everything you paid (${out.payment.totalUsdc.toFixed(2)} USDC, the Azaman fee included) is back in your wallet.`);
+    });
+
+    test('an emptied profit bucket never blocks the refund: the fee is recorded as owed', async () => {
+        const db = makeDb();
+        const out = await payStay(db);
+        db.systemProfitFees.rows[0].balance = 0; // the fees were withdrawn
+        const sendNotification = jest.fn().mockResolvedValue(undefined);
+        let status = null;
+        await require('../controllers/reservationController').declineReservation({
+            app: { get: (k) => ({ prisma: db, notificationService: { sendNotification } }[k]) },
+            user: { id: 20 }, params: { reservationId: out.reservation.id }, body: {},
+        }, { status(c) { status = c; return this; }, json() { return this; } });
+        expect(status).toBe(200);
+        expect(escrow(db).status).toBe('REFUNDED');
+        expect(user(db, 10).availableBalance).toBeCloseTo(500 - out.payment.feeUsdc, 9);
+        expect(db.systemProfitFees.rows[0].balance).toBe(0);
+        const history = db.transactionHistory.rows.find((h) => h.type === 'TICKET_ESCROW_REFUND');
+        expect(history.metadata).toEqual({ priceUsdc: out.payment.amountUsdc, feeRefundedUsdc: 0, feeRefundOwedUsdc: out.payment.feeUsdc });
+        expect(sendNotification.mock.calls[0][0].body).toContain(
+            `The Azaman fee (${out.payment.feeUsdc.toFixed(2)} USDC) will be refunded to you separately.`,
+        );
     });
 
     test('the guest cancelling refunds the price', async () => {
@@ -253,6 +285,9 @@ describe('after paying', () => {
         expect(reservation(db).status).toBe('CANCELLED_CUSTOMER');
         expect(escrow(db).status).toBe('REFUNDED');
         expect(user(db, 10).escrowLockedBalance).toBeCloseTo(0, 9);
+        // The guest cancelled: the price comes back, the fee is kept.
+        expect(user(db, 10).availableBalance).toBeCloseTo(500 - out.payment.feeUsdc, 9);
+        expect(db.systemProfitFees.rows[0].balance).toBeCloseTo(out.payment.feeUsdc, 9);
     });
 
     test('a stay that ends with no check-in is refunded', async () => {

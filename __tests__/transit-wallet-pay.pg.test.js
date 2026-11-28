@@ -17,7 +17,8 @@
 //       no-op.
 //   W5. The expiry worker's cancel (pinned to PENDING) refuses a booking
 //       that was paid in between: it stays CONFIRMED and FUNDED.
-//   W6. Cancelling the trip refunds a paid booking (fare back, fee kept).
+//   W6. Cancelling the trip refunds a paid booking: fare and fee back (the
+//       operator cancelled), the fee's revenue reversed.
 //   W7. A paid trip cannot be completed before it departs.
 //   W8. A paid booking cannot be boarded manually or completed without
 //       QR boarding; nothing reaches the operator.
@@ -212,16 +213,21 @@ run('transit wallet pay (PostgreSQL)', () => {
 
     test('W6: cancelling the trip refunds a paid booking', async () => {
         const { biz, customer, trip } = await seedTrip();
+        const bucket = async () => Number((await prisma.systemProfitFees.findUnique({ where: { id: 1 } }))?.balance ?? 0);
+        const bucketBefore = await bucket();
         const res = await pay(trip.id, customer.id, ['1A']);
         const fee = Number((await prisma.smartEscrow.findUnique({ where: { id: res.payment.escrowId } })).feeUsdc);
+        expect(fee).toBeGreaterThan(0);
+        expect(await bucket()).toBeCloseTo(bucketBefore + fee, 8);
         const { cancelTripWithRefunds } = require('../services/transitTripCancellationService');
         const out = await cancelTripWithRefunds(prisma, { tripId: trip.id, businessProfileId: biz.id });
         expect(out.cancelled).toBe(true);
         expect(out.summary.refunded).toBe(1);
         expect((await prisma.smartEscrow.findUnique({ where: { id: res.payment.escrowId } })).status).toBe('REFUNDED');
         const after = await balances(customer.id);
-        expect(after.available).toBeCloseTo(500 - fee, 8);
+        expect(after.available).toBeCloseTo(500, 8);
         expect(after.locked).toBeCloseTo(0, 8);
+        expect(await bucket()).toBeCloseTo(bucketBefore, 8);
         // And nothing more can be booked on it.
         const other = await seedUser(prisma, { availableBalance: 50 });
         await expect(svc.bookSeats(prisma, { tripId: trip.id, customerId: other.id, seatIds: ['1B'] }))

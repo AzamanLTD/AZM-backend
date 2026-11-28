@@ -8,6 +8,7 @@
 // through inverted locks and exactly one economic fact can win.
 // =============================================================================
 
+const { REFUND_CAUSE, refundsFee } = require('./feeRefundPolicy');
 const { isPaidStay, noShowCutoff } = require('./paidStayPolicy');
 const { randomUUID } = require('crypto');
 const {
@@ -133,7 +134,8 @@ const cancelReservation = async (prisma, { reservationId, customerId }) =>
     });
 
 // The hotel cancels a stay it cannot honour (or declines a request): a paid
-// stay is refunded in full, in the same transaction as the claim.
+// stay is refunded in the same transaction as the claim, the Azaman fee
+// included (feeRefundPolicy: the business cancelled).
 const businessCancelReservation = async (prisma, { reservationId, businessProfileId, reason = null }) =>
     runConvergent(prisma, reservationId, 'CANCELLED_BUSINESS', async (tx) => {
         const reservation = await loadAggregate(tx, reservationId);
@@ -149,7 +151,11 @@ const businessCancelReservation = async (prisma, { reservationId, businessProfil
             throw fail('ESCROW_IN_DISPUTE', 'Reservation funds are in dispute custody.');
         }
         if (escrow && REFUND_CLAIMABLE.includes(escrow.status)) {
-            await _refundBookingEscrowTx(tx, { escrowId: escrow.id, reference: randomUUID() });
+            await _refundBookingEscrowTx(tx, {
+                escrowId: escrow.id,
+                reference: randomUUID(),
+                refundFee: refundsFee(REFUND_CAUSE.BUSINESS_CANCELLED),
+            });
         } else if (escrow?.status === 'DRAFT') {
             await expireDraftEscrow(tx, escrow);
         } else if (escrow && !['REFUNDED', 'EXPIRED'].includes(escrow.status)) {
