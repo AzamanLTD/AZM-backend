@@ -704,7 +704,7 @@ const resolveDispute = async (prisma, { escrowId, adminId, ruling, rulingNotes, 
         }
 
         if (ruling === 'FULL_REFUND') {
-            const updatedEscrow = await _refundEscrowTx(tx, escrow, 'REFUNDED');
+            const updatedEscrow = await _refundEscrowTx(tx, escrow, 'REFUNDED', { feeCause: 'DISPUTE_REFUNDED' });
             const updatedDispute = await tx.escrowDispute.update({
                 where: { id: escrow.dispute.id, status: { not: 'RESOLVED' } },
                 data: {
@@ -1044,7 +1044,13 @@ const _releaseEscrowTx = async (tx, escrow, finalStatus = 'SETTLED') => {
 };
 
 // Refund (return the principal to the payer) on the caller's transaction.
-const _refundEscrowTx = async (tx, escrow, finalStatus = 'REFUNDED') => {
+// feeCause (services/feeRefundPolicy REFUND_CAUSE): why it is refunded; the
+// published rule for that cause decides whether the Azaman fee realized at
+// funding comes back too (taken out of the profit bucket by a guarded
+// decrement; if the bucket is short, the fee is recorded as owed on the
+// reconciliation queue and the refund still goes through). No cause: the
+// principal only, as before.
+const _refundEscrowTx = async (tx, escrow, finalStatus = 'REFUNDED', { feeCause = null } = {}) => {
     const amount = Number(escrow.amountUsdc);
     const fromDispute =
         escrow.status === 'DISPUTED' || escrow.status === 'ADMIN_REVIEW';
@@ -1081,6 +1087,26 @@ const _refundEscrowTx = async (tx, escrow, finalStatus = 'REFUNDED') => {
         );
     }
 
+    const feeExact = new Prisma.Decimal(escrow.feeUsdc == null ? 0 : String(escrow.feeUsdc));
+    let feeBack = new Prisma.Decimal(0);
+    let feeOwed = new Prisma.Decimal(0);
+    if (feeCause && feeExact.gt(0)) {
+        const { refundsFeeNow } = require('./feeRefundPolicy');
+        if (await refundsFeeNow(tx, feeCause)) {
+            const taken = await tx.systemProfitFees.updateMany({
+                where: { id: 1, balance: { gte: feeExact } },
+                data: { balance: { decrement: feeExact } },
+            });
+            if (taken.count === 1) {
+                feeBack = feeExact;
+                await tx.user.update({ where: { id: escrow.payerId }, data: { availableBalance: { increment: feeExact } } });
+            } else {
+                feeOwed = feeExact;
+            }
+        }
+    }
+    const creditedExact = new Prisma.Decimal(String(escrow.amountUsdc)).add(feeBack);
+
     // §P.4 AUTHORITATIVE LEDGER — restricted principal returned to the payer,
     // same tx, idempotent on (escrow, final status):
     //   D escrow:{id}:locked | user:{payer}:dispute  — restriction released
@@ -1096,23 +1122,48 @@ const _refundEscrowTx = async (tx, escrow, finalStatus = 'REFUNDED') => {
         userId: escrow.payerId,
         relatedEntity: 'smartEscrow',
         relatedEntityId: escrow.id,
-        metadata: { source: refundSourceAccount },
+        metadata: { source: refundSourceAccount, ...(feeCause ? { feeCause } : {}) },
         lines: [
             { account: refundSourceAccount, debit: _exact(amount) },
-            { account: `user:${escrow.payerId}:liability`, credit: _exact(amount) },
+            // When the fee comes back, its revenue is reversed.
+            ...(feeBack.gt(0) ? [{ account: 'revenue:fees', debit: _exact(feeBack) }] : []),
+            { account: `user:${escrow.payerId}:liability`, credit: _exact(feeBack.gt(0) ? creditedExact : amount) },
         ],
     });
+    if (feeBack.gt(0)) {
+        await tx.adminProfitLog.create({
+            data: { amountUsdc: feeBack.negated(), source: 'SMART_ESCROW_FEE', relatedTxId: `escrow_fee_refund_${escrow.id}` },
+        });
+    }
 
     await tx.transactionHistory.create({
         data: {
             userId: escrow.payerId,
             type: 'TICKET_ESCROW_REFUND',
-            amountUsdc: amount,
+            amountUsdc: feeBack.gt(0) ? creditedExact : amount,
             feeUsdc: 0,
             txHash: reference,
-            status: 'COMPLETED'
+            status: 'COMPLETED',
+            ...(feeCause && feeExact.gt(0)
+                ? { metadata: { priceUsdc: amount, feeRefundedUsdc: feeBack.toNumber(), feeRefundOwedUsdc: feeOwed.toNumber(), feeCause } }
+                : {}),
         }
     });
+    if (feeOwed.gt(0)) {
+        const { recordReconciliationExceptionLoud } = require('./reconciliationExceptionService');
+        await recordReconciliationExceptionLoud(tx, {
+            entityType: 'ESCROW_FEE_REFUND',
+            entityId: escrow.id,
+            reference,
+            reason: 'FEE_REFUND_OWED',
+            details: {
+                payerId: escrow.payerId,
+                feeUsdc: feeOwed.toFixed(8),
+                cause: feeCause,
+                action: 'The payment was refunded and the fee is owed back, but the profit bucket could not cover it. Pay the customer the fee, then resolve this.',
+            },
+        });
+    }
 
     return tx.smartEscrow.findUnique({ where: { id: escrow.id } });
 };
@@ -1214,12 +1265,12 @@ const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
 //   Source bucket depends on whether the escrow passed through a dispute.
 //   finalStatus 'REFUNDED' (admin/auto refund) or 'EXPIRED' (worker sweep).
 // =============================================================================
-const _refundEscrow = async (prisma, escrowId, finalStatus = 'REFUNDED') => {
+const _refundEscrow = async (prisma, escrowId, finalStatus = 'REFUNDED', opts = {}) => {
     // Authoritative read inside the claiming transaction (TOCTOU-safe).
     const updated = await prisma.$transaction(async (tx) => {
         const escrow = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
         if (!escrow) throw new Error('Escrow not found.');
-        return _refundEscrowTx(tx, escrow, finalStatus);
+        return _refundEscrowTx(tx, escrow, finalStatus, opts);
     });
 
     // The transaction callback has completed, so the financial claim is
@@ -1374,7 +1425,8 @@ const cancelEscrow = async (prisma, { escrowId, userId }) => {
 
     if (['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'].includes(escrow.status)) {
         // _refundEscrow performs the atomic claim + balance move + history row.
-        return _refundEscrow(prisma, escrowId, 'REFUNDED');
+        // The payer cancelled: the fee follows the customer-cancel rule.
+        return _refundEscrow(prisma, escrowId, 'REFUNDED', { feeCause: 'CUSTOMER_CANCELLED' });
     }
 
     throw new Error(`Escrow cannot be cancelled from status ${escrow.status}.`);
@@ -1403,6 +1455,7 @@ module.exports = {
     // reimplement escrow money movement in another service.
     _claimEscrowStatusTx,
     _releaseEscrowTx,
+    _afterReleaseCommitted,
     _refundEscrowTx,
     refundEscrowInTransaction,
     // Constants for reuse/testing.

@@ -22,6 +22,8 @@ describe('EscrowExpiryWorker refund convergence', () => {
         const emitBalanceUpdate = jest.fn().mockResolvedValue(undefined);
         const prisma = {
             smartEscrow: { findMany: jest.fn().mockResolvedValue([escrow]) },
+            // Not a QR-boarded transit fare (those complete instead of refunding).
+            transitBooking: { findFirst: jest.fn().mockResolvedValue(null) },
             ticket: { update: jest.fn().mockResolvedValue({}) },
             ticketMessage: { create: jest.fn().mockResolvedValue({ id: 'message-1', type: 'SYSTEM' }) },
         };
@@ -30,7 +32,8 @@ describe('EscrowExpiryWorker refund convergence', () => {
         const worker = new EscrowExpiryWorker(prisma, io, null, { emitBalanceUpdate });
         await worker._expireInactiveFunded(new Date('2026-08-30T00:00:00.000Z'));
 
-        expect(escrowService._refundEscrow).toHaveBeenCalledWith(prisma, 'escrow-1', 'EXPIRED');
+        // Expired with nothing done: the fee comes back too (feeRefundPolicy EXPIRED).
+        expect(escrowService._refundEscrow).toHaveBeenCalledWith(prisma, 'escrow-1', 'EXPIRED', { feeCause: 'EXPIRED' });
         expect(emitBalanceUpdate).toHaveBeenCalledWith(11);
         expect(emit).not.toHaveBeenCalledWith('escrow_refunded', expect.anything());
         expect(emit).not.toHaveBeenCalledWith('balance_update', expect.anything());
@@ -42,7 +45,10 @@ describe('EscrowExpiryWorker refund convergence', () => {
         const emit = jest.fn();
         const io = { to: jest.fn(() => ({ emit })) };
         const emitBalanceUpdate = jest.fn();
-        const prisma = { smartEscrow: { findMany: jest.fn().mockResolvedValue([escrow]) } };
+        const prisma = {
+            smartEscrow: { findMany: jest.fn().mockResolvedValue([escrow]) },
+            transitBooking: { findFirst: jest.fn().mockResolvedValue(null) },
+        };
         escrowService._refundEscrow.mockRejectedValue(new Error('ESCROW_ALREADY_FINALIZED'));
 
         const worker = new EscrowExpiryWorker(prisma, io, null, { emitBalanceUpdate });

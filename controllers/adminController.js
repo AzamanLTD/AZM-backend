@@ -1916,6 +1916,16 @@ exports.rejectWithdrawal = async (req, res) => {
             // path in the repository's history) is gone, and no
             // prefix/startsWith guessing remains anywhere on this path.
             const activeObligation = await restrictedObligations.findActiveForSource(tx, 'withdrawal', withdrawal.id);
+            // A wallet withdrawal reserved the amount less its platform fee;
+            // the fee went to revenue at the request. The customer gets the
+            // full amount back: the reserve returns what it holds, and the
+            // fee comes back out of revenue (equity, the profit bucket, and a
+            // reversing profit-log entry), so Azaman never books a fee it
+            // returned.
+            const reservedExact = activeObligation ? new Prisma.Decimal(activeObligation.amount) : null;
+            const feeBackExact = reservedExact && refundExact.gt(reservedExact)
+                ? refundExact.minus(reservedExact)
+                : new Prisma.Decimal(0);
             const refundPost = await ledger.post(tx, {
                 idempotencyKey: `ledger:admin:reject-withdrawal:${withdrawal.id}`,
                 entryType: 'WITHDRAWAL',
@@ -1925,10 +1935,14 @@ exports.rejectWithdrawal = async (req, res) => {
                 userId: withdrawal.userId,
                 relatedEntity: 'withdrawal',
                 relatedEntityId: String(withdrawal.id),
-                metadata: { status: 'REJECTED', reason: reason || null, reserved: Boolean(activeObligation) },
+                metadata: {
+                    status: 'REJECTED', reason: reason || null, reserved: Boolean(activeObligation),
+                    ...(feeBackExact.gt(0) ? { platformFeeRefundedUsdc: feeBackExact.toFixed(8) } : {}),
+                },
                 lines: activeObligation
                     ? [
-                        { account: 'restricted:reserves', debit: refundExact.toFixed(8) },
+                        { account: 'restricted:reserves', debit: (feeBackExact.gt(0) ? reservedExact : refundExact).toFixed(8) },
+                        ...(feeBackExact.gt(0) ? [{ account: 'equity:treasury', debit: feeBackExact.toFixed(8) }] : []),
                         { account: `user:${withdrawal.userId}:liability`, credit: refundExact.toFixed(8) },
                     ]
                     : [
@@ -1936,6 +1950,35 @@ exports.rejectWithdrawal = async (req, res) => {
                         { account: `user:${withdrawal.userId}:liability`, credit: refundExact.toFixed(8) },
                     ],
             });
+            if (feeBackExact.gt(0)) {
+                const bucket = await tx.systemProfitFees.updateMany({
+                    where: { id: 1, balance: { gte: feeBackExact } },
+                    data: { balance: { decrement: feeBackExact } },
+                });
+                await tx.adminProfitLog.create({
+                    data: {
+                        amountUsdc: feeBackExact.negated(),
+                        source: 'WITHDRAWAL_FEE',
+                        relatedTxId: `wallet_wd_fee_reversal_${withdrawal.id}`,
+                    },
+                });
+                if (bucket.count !== 1) {
+                    // The fee already left the profit bucket (swept): the
+                    // customer is refunded in full either way; finance
+                    // settles the bucket.
+                    const { recordReconciliationExceptionLoud } = require('../services/reconciliationExceptionService');
+                    await recordReconciliationExceptionLoud(tx, {
+                        entityType: 'WITHDRAWAL',
+                        entityId: String(withdrawal.id),
+                        reference: `wallet_wd_fee_reversal_${withdrawal.id}`,
+                        reason: 'PROFIT_BUCKET_SHORT',
+                        details: {
+                            feeUsdc: feeBackExact.toFixed(8),
+                            action: 'A rejected withdrawal returned its platform fee, but the profit bucket no longer held it. Reduce the bucket by this amount when funds allow, then resolve this.',
+                        },
+                    });
+                }
+            }
             if (activeObligation) {
                 await restrictedObligations.cancelOnReversal(tx, {
                     reference: activeObligation.reference,

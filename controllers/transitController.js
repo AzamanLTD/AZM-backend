@@ -11,6 +11,11 @@ const logger = require('../src/config/logger');
 //   GET    /api/transit/bookings          — list caller's bookings
 //   GET    /api/transit/bookings/:id      — booking detail
 //   PATCH  /api/transit/bookings/:id/status — update status (cancel/complete)
+//   GET    /api/transit/trips/:id/manifest — who is on the trip (operator)
+//   POST   /api/transit/bookings/:id/board-by-id — board after an ID check
+//   POST   /api/transit/bookings/:id/boarding/confirm — passenger: "That was me"
+//   POST   /api/transit/bookings/:id/boarding/report  — passenger: "Not me"
+//   GET/PUT /api/transit/boarding-policy — owner: allow ID checks, or QR only
 // =============================================================================
 
 const VALID_TRANSITIONS = {
@@ -97,7 +102,10 @@ exports.createBooking = async (req, res) => {
                 amountUsdc: parseFloat(amountUsdc),
                 customerNote: customerNote || null,
                 bookingRef,
-                metadata: metadata || null
+                // A client never writes how a booking was boarded.
+                metadata: metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+                    ? (({ boarding, ...rest }) => rest)(metadata)
+                    : null
             },
             include: {
                 vehicle: true,
@@ -146,6 +154,20 @@ exports.listBookings = async (req, res) => {
         const hasMore = bookings.length > limit;
         const slice = hasMore ? bookings.slice(0, limit) : bookings;
         const nextCursor = hasMore ? slice[slice.length - 1].id : null;
+
+        // Where each fare is: HELD, PAID_OUT, REFUNDED, REPORTED or UNPAID.
+        const escrowIds = slice.map(b => b.escrowId).filter(Boolean);
+        if (escrowIds.length > 0) {
+            const { paymentOf } = require('../services/transitBoardingService');
+            const escrows = await prisma.smartEscrow.findMany({
+                where: { id: { in: escrowIds } },
+                select: { id: true, status: true },
+            });
+            const statusOf = new Map(escrows.map(e => [e.id, e.status]));
+            slice.forEach((b) => { b.payment = paymentOf(b.escrowId ? statusOf.get(b.escrowId) : null); });
+        } else {
+            slice.forEach((b) => { b.payment = 'UNPAID'; });
+        }
 
         return res.status(200).json({ success: true, bookings: slice, hasMore, nextCursor });
     } catch (err) {
@@ -230,6 +252,35 @@ exports.updateBookingStatus = async (req, res) => {
             });
         }
 
+        // A paid passenger is a no-show only once the boarding window has
+        // closed (penalty split or refund alike): before that they can still
+        // board with a valid code.
+        if (nextStatus === 'NO_SHOW') {
+            const { isPaidTransitBooking } = require('../services/qrCheckInService');
+            if (await isPaidTransitBooking(prisma, booking)) {
+                const { assertNoShowWindowClosed } = require('../services/transitBookingService');
+                try {
+                    await assertNoShowWindowClosed(prisma, booking);
+                } catch (err) {
+                    return res.status(err.httpStatus || 409).json({ success: false, code: err.code, message: err.message });
+                }
+            }
+        }
+
+        // A paid booking boards only by the passenger's QR or an ID check
+        // (that boarding is what releases the fare at completion), never by
+        // a status write.
+        if (nextStatus === 'IN_PROGRESS') {
+            const { isPaidTransitBooking } = require('../services/qrCheckInService');
+            if (await isPaidTransitBooking(prisma, booking)) {
+                return res.status(409).json({
+                    success: false,
+                    code: 'QR_BOARDING_REQUIRED',
+                    message: 'This booking is paid. Board it by scanning the passenger\'s boarding QR, or by an ID check.',
+                });
+            }
+        }
+
         // r28 / P0-C: CANCELLED is delegated to the canonical transactional
         // cancellation service — booking claim, seat release, capacity
         // restore, escrow refund, ledger and TransactionHistory all commit
@@ -304,15 +355,66 @@ exports.updateBookingStatus = async (req, res) => {
                     }
                     return res.status(200).json({ success: true, booking: splitUpdated });
                 }
+                // No penalty set: the passenger is refunded in full, with the
+                // NO_SHOW claim, in one transaction (a bare status flip left
+                // the fare locked until the 30-day expiry refund).
+                const { noShowTransitBookingWithRefund } = require('../services/transitBookingService');
+                try {
+                    const result = await noShowTransitBookingWithRefund(prisma, {
+                        bookingId: booking.id,
+                        driverNote: driverNote || null,
+                    });
+                    if (io) {
+                        io.to(`user_${booking.customerId}`).emit('transit_booking_update', result.booking);
+                        if (booking.businessProfile.userId !== booking.customerId) {
+                            io.to(`user_${booking.businessProfile.userId}`).emit('transit_booking_update', result.booking);
+                        }
+                    }
+                    return res.status(200).json({ success: true, booking: result.booking, refund: result.refund });
+                } catch (err) {
+                    if (err.httpStatus) {
+                        return res.status(err.httpStatus).json({ success: false, message: err.message });
+                    }
+                    logger.error({ err: err.message }, '[transit.updateBookingStatus] no-show refund failed');
+                    return res.status(500).json({ success: false, message: 'No-show failed and was fully rolled back; no state changed. Retry is safe.' });
+                }
+            }
+        }
+
+        // COMPLETED releases a wallet-paid fare to the operator in the same
+        // transaction as the status claim (completeTransitBooking). Without
+        // it the fare stayed locked in escrow and the expiry worker refunded
+        // the passenger 30 days later: a completed trip the operator was
+        // never paid for.
+        if (nextStatus === 'COMPLETED') {
+            const { completeTransitBooking } = require('../services/transitBookingService');
+            try {
+                const result = await completeTransitBooking(prisma, { bookingId: booking.id });
+                if (io) {
+                    io.to(`user_${booking.customerId}`).emit('transit_booking_update', result.booking);
+                    if (booking.businessProfile.userId !== booking.customerId) {
+                        io.to(`user_${booking.businessProfile.userId}`).emit('transit_booking_update', result.booking);
+                    }
+                }
+                return res.status(200).json({
+                    success: true,
+                    booking: result.booking,
+                    release: result.release,
+                    escrowNotReleased: result.escrowNotReleased,
+                    alreadyCompleted: result.alreadyCompleted,
+                });
+            } catch (err) {
+                if (err.httpStatus) {
+                    return res.status(err.httpStatus).json({ success: false, message: err.message });
+                }
+                logger.error({ err: err.message }, '[transit.updateBookingStatus] completion failed');
+                return res.status(500).json({ success: false, message: 'Completion failed and was fully rolled back; no state changed. Retry is safe.' });
             }
         }
 
         const updateData = { status: nextStatus };
         if (nextStatus === 'CONFIRMED' && !booking.pickupTime) {
             updateData.pickupTime = new Date();
-        }
-        if (nextStatus === 'COMPLETED') {
-            updateData.dropoffTime = new Date();
         }
         if (nextStatus === 'NO_SHOW') {
             updateData.driverNote = driverNote || null;
@@ -396,8 +498,13 @@ exports.transitBoarding = async (req, res) => {
             return res.status(400).json({ success: false, message: 'QR code is required.' });
         }
 
+        // The owner, or staff with transit.manifests.manage (drivers,
+        // conductors), board for the business.
+        const { resolveBusinessActor } = require('../services/businessActor');
+        const boardingActor = await resolveBusinessActor(prisma, req.user, { anyOf: ['transit.manifests.manage'] });
+        const boardAs = boardingActor ? boardingActor.ownerUserId : req.user.id;
         const svc = require('../services/qrCheckInService');
-        const result = await svc.verifyTransitTokenAndBoard(prisma, { token, businessUserId: userId });
+        const result = await svc.verifyTransitTokenAndBoard(prisma, { token, businessUserId: boardAs });
         return res.status(200).json(result);
     } catch (err) {
         if (err && err.code && String(err.code).startsWith('QR_SIGNING_KEY')) {
@@ -413,5 +520,150 @@ exports.transitBoarding = async (req, res) => {
         }
         logger.error({ err: err }, '[transit.transitBoarding] error');
         return res.status(400).json({ success: false, message: err.message });
+    }
+};
+
+// ── Boarding: manifest, ID check, the passenger's answer, policy ─────────────
+const _boardingFail = (res, err, tag) => {
+    if (err && err.httpStatus) {
+        return res.status(err.httpStatus).json({ success: false, code: err.code, message: err.message });
+    }
+    logger.error({ err: err && err.message }, tag);
+    return res.status(500).json({ success: false, message: 'Something went wrong. Try again.' });
+};
+
+// GET /api/transit/trips/:id/manifest — the operator's passenger list, by seat.
+exports.tripManifest = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const { buildTripManifest } = require('../services/transitBoardingService');
+        const manifest = await buildTripManifest(prisma, { tripId: req.params.id, businessUserId: req.user.id });
+        return res.status(200).json({ success: true, manifest });
+    } catch (err) {
+        return _boardingFail(res, err, '[transit.tripManifest] error');
+    }
+};
+
+// POST /api/transit/bookings/:id/board-by-id  { azamanId }
+// Staff checked the passenger's photo and ID against the booking.
+exports.boardById = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    let result;
+    try {
+        // The owner, or staff with transit.manifests.manage (drivers,
+        // conductors), board for the business.
+        const { resolveBusinessActor } = require('../services/businessActor');
+        const boardingActor = await resolveBusinessActor(prisma, req.user, { anyOf: ['transit.manifests.manage'] });
+        const boardAs = boardingActor ? boardingActor.ownerUserId : req.user.id;
+        const { boardByIdCheck } = require('../services/transitBoardingService');
+        result = await boardByIdCheck(prisma, {
+            bookingId: req.params.id,
+            businessUserId: boardAs,
+            azamanId: req.body && req.body.azamanId,
+        });
+    } catch (err) {
+        return _boardingFail(res, err, '[transit.boardById] error');
+    }
+    await _noticeIdCheckBoarding(req.app, result);
+    return res.status(200).json(result);
+};
+
+// Post-commit and best effort: the boarding stands either way. The passenger
+// hears at once, so a boarding that was not them is reported before the held
+// fare is released. Used by this route and the business routes' manifest.
+const _noticeIdCheckBoarding = async (app, result) => {
+    try {
+        const io = app.get('socketio');
+        if (io) io.to(`user_${result.booking.customerId}`).emit('transit_booking_update', result.booking);
+        const notifier = app.get('notificationService');
+        if (notifier && typeof notifier.sendNotification === 'function') {
+            await notifier.sendNotification({
+                userId: result.booking.customerId,
+                title: 'You were boarded by ID check',
+                body: `${result.businessName || 'Your operator'} checked your ID and boarded you. `
+                    + 'Was this you? Confirm it or report it in Your trips.',
+                category: 'GENERAL',
+                actionPayload: { action: 'OPEN_TRANSIT_TRIPS', bookingId: result.booking.id },
+            });
+        }
+    } catch (err) {
+        // The trip's "Was this you?" card in the app (from the booking's
+        // boarding record) still asks them; the push is the prompt.
+        logger.error({ err: err && err.message, bookingId: result && result.booking && result.booking.id }, '[transit.boardById] passenger notice failed');
+    }
+};
+exports._noticeIdCheckBoarding = _noticeIdCheckBoarding;
+
+// POST /api/transit/bookings/:id/boarding/confirm — the passenger: "That was me".
+exports.confirmBoarding = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const { confirmIdCheckBoarding } = require('../services/transitBoardingService');
+        const out = await confirmIdCheckBoarding(prisma, { bookingId: req.params.id, customerId: req.user.id });
+        return res.status(200).json(out);
+    } catch (err) {
+        return _boardingFail(res, err, '[transit.confirmBoarding] error');
+    }
+};
+
+// POST /api/transit/bookings/:id/boarding/report  { reason } — the passenger: "Not me".
+exports.reportBoarding = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const { reportIdCheckBoarding } = require('../services/transitBoardingService');
+        const out = await reportIdCheckBoarding(prisma, {
+            bookingId: req.params.id,
+            customerId: req.user.id,
+            reason: req.body && req.body.reason,
+        });
+        // The operator hears that the fare is held for review (best effort).
+        if (!out.alreadyReported && out.operatorUserId) {
+            try {
+                const notifier = req.app.get('notificationService');
+                if (notifier && typeof notifier.sendNotification === 'function') {
+                    await notifier.sendNotification({
+                        userId: out.operatorUserId,
+                        title: 'A passenger reported a boarding',
+                        body: `Booking ${out.bookingRef}: the passenger says they were not the one boarded. `
+                            + 'The fare is held while Azaman reviews it.',
+                        category: 'GENERAL',
+                        actionPayload: { action: 'OPEN_DISPUTE', disputeId: out.disputeId },
+                    });
+                }
+            } catch (err) {
+                logger.warn({ err: err && err.message }, '[transit.reportBoarding] operator notice failed');
+            }
+        }
+        const { operatorUserId, ...body } = out;
+        return res.status(200).json(body);
+    } catch (err) {
+        return _boardingFail(res, err, '[transit.reportBoarding] error');
+    }
+};
+
+// GET /api/transit/boarding-policy
+exports.getBoardingPolicy = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const { getTransitBoardingPolicy } = require('../services/transitBoardingService');
+        const policy = await getTransitBoardingPolicy(prisma, { businessUserId: req.user.id });
+        return res.status(200).json({ success: true, policy });
+    } catch (err) {
+        return _boardingFail(res, err, '[transit.getBoardingPolicy] error');
+    }
+};
+
+// PUT /api/transit/boarding-policy  { allowIdCheck: boolean }
+exports.setBoardingPolicy = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const { setTransitBoardingPolicy } = require('../services/transitBoardingService');
+        const policy = await setTransitBoardingPolicy(prisma, {
+            businessUserId: req.user.id,
+            allowIdCheck: req.body && req.body.allowIdCheck,
+        });
+        return res.status(200).json({ success: true, policy });
+    } catch (err) {
+        return _boardingFail(res, err, '[transit.setBoardingPolicy] error');
     }
 };

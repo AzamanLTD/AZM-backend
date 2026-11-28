@@ -772,7 +772,10 @@ exports.getFriends = async (req, res) => {
                             ? latest.content
                             : `[${latest.messageType.replace(/_/g, ' ')}]`,
                         createdAt: latest.createdAt,
-                        isFromMe: latest.senderId === userId
+                        isFromMe: latest.senderId === userId,
+                        // The app's inbox shows money and request messages
+                        // with their own signal; it needs the type.
+                        messageType: latest.messageType,
                     } : null,
                     unreadCount: unreadByFriendship.get(f.id) || 0,
                     friendSince: f.createdAt

@@ -174,7 +174,7 @@ describeOrSkip('r29 reservation lifecycle economic authority (real PostgreSQL)',
         const ctx = await seedReservation();
         const escrowId = await fund(ctx);
         const before = await balances(ctx);
-        await lifecycle.checkInReservation(prisma, { reservationId: ctx.reservation.id, businessUserId: ctx.owner.id });
+        await lifecycle.checkInReservation(prisma, { method: 'QR', reservationId: ctx.reservation.id, businessUserId: ctx.owner.id });
         const [reservation, escrow, after, counts] = await Promise.all([
             prisma.reservation.findUnique({ where: { id: ctx.reservation.id } }),
             prisma.smartEscrow.findUnique({ where: { id: escrowId } }), balances(ctx), economicCounts(escrowId),
@@ -190,18 +190,18 @@ describeOrSkip('r29 reservation lifecycle economic authority (real PostgreSQL)',
         const ctx = await seedReservation();
         const escrowId = await fund(ctx);
         await installHistoryFailure();
-        await expect(lifecycle.checkInReservation(prisma, { reservationId: ctx.reservation.id, businessUserId: ctx.owner.id })).rejects.toThrow('r29 injected');
+        await expect(lifecycle.checkInReservation(prisma, { method: 'QR', reservationId: ctx.reservation.id, businessUserId: ctx.owner.id })).rejects.toThrow('r29 injected');
         expect((await prisma.reservation.findUnique({ where: { id: ctx.reservation.id } })).status).toBe('CONFIRMED');
         expect((await prisma.smartEscrow.findUnique({ where: { id: escrowId } })).status).toBe('FUNDED');
         await prisma.$executeRawUnsafe('DROP TRIGGER "r29_fail_history" ON "TransactionHistory"');
-        await lifecycle.checkInReservation(prisma, { reservationId: ctx.reservation.id, businessUserId: ctx.owner.id });
+        await lifecycle.checkInReservation(prisma, { method: 'QR', reservationId: ctx.reservation.id, businessUserId: ctx.owner.id });
         expect((await prisma.reservation.findUnique({ where: { id: ctx.reservation.id } })).status).toBe('CHECKED_IN');
     });
 
     test('B3 concurrent check-ins produce one settlement', async () => {
         const ctx = await seedReservation();
         const escrowId = await fund(ctx);
-        const outcomes = await Promise.allSettled([1, 2].map(() => lifecycle.checkInReservation(prisma, { reservationId: ctx.reservation.id, businessUserId: ctx.owner.id })));
+        const outcomes = await Promise.allSettled([1, 2].map(() => lifecycle.checkInReservation(prisma, { method: 'QR', reservationId: ctx.reservation.id, businessUserId: ctx.owner.id })));
         expect(outcomes.every(x => x.status === 'fulfilled')).toBe(true);
         expect((await prisma.reservation.findUnique({ where: { id: ctx.reservation.id } })).status).toBe('CHECKED_IN');
         expect(await economicCounts(escrowId)).toMatchObject({ releases: 1, releaseLedgers: 1 });
@@ -210,8 +210,8 @@ describeOrSkip('r29 reservation lifecycle economic authority (real PostgreSQL)',
     test('B4 unfunded/no-escrow check-in remains valid and unauthorized business is rejected', async () => {
         const ctx = await seedReservation();
         const stranger = await seedUser(prisma);
-        await expect(lifecycle.checkInReservation(prisma, { reservationId: ctx.reservation.id, businessUserId: stranger.id })).rejects.toMatchObject({ code: 'RESERVATION_NOT_FOUND' });
-        const result = await lifecycle.checkInReservation(prisma, { reservationId: ctx.reservation.id, businessUserId: ctx.owner.id });
+        await expect(lifecycle.checkInReservation(prisma, { method: 'QR', reservationId: ctx.reservation.id, businessUserId: stranger.id })).rejects.toMatchObject({ code: 'RESERVATION_NOT_FOUND' });
+        const result = await lifecycle.checkInReservation(prisma, { method: 'QR', reservationId: ctx.reservation.id, businessUserId: ctx.owner.id });
         expect(result.status).toBe('CHECKED_IN');
     });
 
@@ -296,7 +296,7 @@ describeOrSkip('r29 reservation lifecycle economic authority (real PostgreSQL)',
         const ctx = await seedReservation({ penaltyPct: 0.25, endPast: true });
         const escrowId = await fund(ctx);
         await Promise.allSettled([
-            lifecycle.checkInReservation(prisma, { reservationId: ctx.reservation.id, businessUserId: ctx.owner.id }),
+            lifecycle.checkInReservation(prisma, { method: 'QR', reservationId: ctx.reservation.id, businessUserId: ctx.owner.id }),
             lifecycle.markNoShowReservation(prisma, { reservationId: ctx.reservation.id, worker: true }),
         ]);
         const [reservation, escrow, counts] = await Promise.all([
@@ -476,6 +476,7 @@ describeOrSkip('r29 reservation lifecycle economic authority (real PostgreSQL)',
             businessProfileId: ctx.biz.id,
         });
         await lifecycle.checkInReservation(prisma, {
+            method: 'QR',
             reservationId: ctx.reservation.id,
             businessUserId: ctx.owner.id,
         });

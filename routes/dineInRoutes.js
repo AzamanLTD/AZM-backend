@@ -27,6 +27,7 @@ router.get('/guests/search',          protect, kybGate, dineInManage, ctrl.searc
 // Customer-side. This deliberately uses a distinct path from the KYB-gated
 // business item endpoint so a customer can never be granted business access
 // merely by reaching the same URL.
+router.get('/my-tabs',                     protect, ctrl.getMyTabs);
 router.post('/tabs/:tabId/customer-items', protect, ctrl.addCustomerItem);
 router.get('/tabs/:tabId',                 protect, ctrl.getTab);
 router.post('/tabs/:tabId/pay',            protect, requireKyc('pay'), require2FA(), ctrl.confirmAndPay);

@@ -20,4 +20,12 @@ router.patch('/bookings/:id/status', protect, transitController.updateBookingSta
 router.get('/bookings/:id/checkin-qr', protect, transitController.generateTransitCheckInQR);
 router.post('/boarding', protect, transitController.transitBoarding);
 
+// ── Boarding by ID check (beside the QR), manifest, the passenger's answer ──
+router.get('/trips/:id/manifest', protect, transitController.tripManifest);
+router.post('/bookings/:id/board-by-id', protect, transitController.boardById);
+router.post('/bookings/:id/boarding/confirm', protect, transitController.confirmBoarding);
+router.post('/bookings/:id/boarding/report', protect, transitController.reportBoarding);
+router.get('/boarding-policy', protect, transitController.getBoardingPolicy);
+router.put('/boarding-policy', protect, transitController.setBoardingPolicy);
+
 module.exports = router;

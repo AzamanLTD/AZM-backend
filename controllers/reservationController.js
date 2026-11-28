@@ -177,6 +177,9 @@ exports.listMyReservations = async (req, res) => {
                 businessProfile: {
                     select: { bizId: true, businessName: true, logoUrl: true, category: true },
                 },
+                // A stay paid in the app: where its money is (held until
+                // check-in, paid to the hotel, refunded) and what was paid.
+                escrow: { select: { status: true, amountUsdc: true, feeUsdc: true } },
             },
             ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
         });
@@ -211,16 +214,30 @@ exports.cancelReservation = async (req, res) => {
     }
 };
 
-// ── GET /api/reservations/business/:bizId — business owner sees all incoming ─
+// ── Who acts for the business ───────────────────────────────────────────────
+// The owner, or staff whose permissions cover the job (services/businessActor).
+// Front-desk work (confirm, decline, check in, check out, no-show) needs
+// reservations.manage or hotel.front_desk.manage; the list needs any
+// reservations or front-desk right. The lifecycle is called with the
+// business's owner id (what it compares), so staff act for the business.
+const RESERVATION_WORK = ['reservations.manage', 'hotel.front_desk.manage'];
+const RESERVATION_READ = ['reservations.view', 'reservations.manage', 'hotel.front_desk.manage'];
+const _reservationActor = async (prisma, req, anyOf) => {
+    const { resolveBusinessActor } = require('../services/businessActor');
+    return resolveBusinessActor(prisma, req.user, { anyOf });
+};
+const _notPermitted = (res) => res.status(403).json({ success: false, code: 'NOT_PERMITTED', message: 'You do not have permission to manage reservations for this business.' });
+
+// ── GET /api/reservations/business/:bizId — the business sees all incoming ──
 exports.listBusinessReservations = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const userId = req.user.id;
         const { status, limit, cursor } = req.query;
         const take = Math.min(parseInt(limit, 10) || 20, 50);
 
-        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
-        if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
+        const actor = await _reservationActor(prisma, req, RESERVATION_READ);
+        if (!actor) return _notPermitted(res);
+        const profile = { id: actor.businessProfileId };
 
         const where = { businessProfileId: profile.id };
         if (status) where.status = status;
@@ -250,9 +267,9 @@ exports.listBusinessReservations = async (req, res) => {
 exports.confirmReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const userId  = req.user.id;
-        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
-        if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
+        const actor = await _reservationActor(prisma, req, RESERVATION_WORK);
+        if (!actor) return _notPermitted(res);
+        const profile = { id: actor.businessProfileId };
 
         const { reservationId } = req.params;
         const updated = await reservationLifecycle.confirmReservation(prisma, {
@@ -279,19 +296,200 @@ exports.confirmReservation = async (req, res) => {
     }
 };
 
+// ── PATCH /api/reservations/:reservationId/decline ───────────────────────────
+// The hotel declines a request or cancels a stay it cannot honour. A stay
+// paid in the app is refunded in the same transaction, the Azaman fee
+// included (feeRefundPolicy: the business cancelled).
+exports.declineReservation = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const actor = await _reservationActor(prisma, req, RESERVATION_WORK);
+        if (!actor) return _notPermitted(res);
+        const profile = { id: actor.businessProfileId };
+        const reason = req.body && typeof req.body.reason === 'string' ? req.body.reason : null;
+        const reservation = await reservationLifecycle.businessCancelReservation(prisma, {
+            reservationId: req.params.reservationId,
+            businessProfileId: profile.id,
+            reason,
+        });
+        try {
+            const notifier = req.app.get('notificationService');
+            if (notifier && typeof notifier.sendNotification === 'function') {
+                const escrow = reservation.escrowId
+                    ? await prisma.smartEscrow.findUnique({ where: { id: reservation.escrowId }, select: { status: true, amountUsdc: true, feeUsdc: true, refundTxHash: true } })
+                    : null;
+                // What came back, as the refund recorded it.
+                const refundRow = escrow && escrow.status === 'REFUNDED' && escrow.refundTxHash
+                    ? await prisma.transactionHistory.findUnique({ where: { txHash: escrow.refundTxHash }, select: { amountUsdc: true, metadata: true } })
+                    : null;
+                const meta = refundRow && refundRow.metadata && typeof refundRow.metadata === 'object' ? refundRow.metadata : {};
+                // 2 to 6 decimals: a sub-cent fee is shown, not rounded away.
+                const usdc = (n) => {
+                    const t = Number(n).toFixed(6).replace(/0+$/, '');
+                    const [w, f = ''] = t.split('.');
+                    return `${w}.${f.padEnd(2, '0')} USDC`;
+                };
+                let refunded = 'Nothing was charged.';
+                if (escrow && escrow.status === 'REFUNDED') {
+                    if (Number(meta.feeRefundOwedUsdc) > 0) {
+                        refunded = `The price you paid (${usdc(escrow.amountUsdc)}) is back in your wallet. `
+                            + `Our team will refund the Azaman fee (${usdc(meta.feeRefundOwedUsdc)}) to you separately.`;
+                    } else if (Number(meta.feeRefundedUsdc) > 0) {
+                        refunded = `Everything you paid (${usdc(refundRow.amountUsdc)}, the Azaman fee included) is back in your wallet.`;
+                    } else if (Number(escrow.feeUsdc) > 0) {
+                        refunded = `The price you paid (${usdc(escrow.amountUsdc)}) is back in your wallet; the Azaman fee (${usdc(escrow.feeUsdc)}) is kept.`;
+                    } else {
+                        refunded = `The ${usdc(escrow.amountUsdc)} you paid is back in your wallet.`;
+                    }
+                }
+                await notifier.sendNotification({
+                    userId: reservation.customerId,
+                    title: 'Your stay was cancelled',
+                    body: `${profile.businessName} cancelled ${reservation.reservationRef}. ${refunded}`
+                        + (reason ? ` Reason: ${String(reason).slice(0, 140)}` : ''),
+                    category: 'MONEY',
+                    actionPayload: { route: '/bookings?tab=reservations' },
+                });
+            }
+        } catch (_) { /* the cancellation stands either way */ }
+        return res.status(200).json({ success: true, reservation });
+    } catch (err) {
+        if (err.code === 'RESERVATION_NOT_FOUND') return res.status(404).json({ success: false, message: err.message });
+        if (['RESERVATION_NOT_CANCELLABLE', 'RESERVATION_STATE_CONFLICT', 'ESCROW_IN_DISPUTE', 'ESCROW_ECONOMIC_CONFLICT', 'ESCROW_ALREADY_FINALIZED'].includes(err.code)) {
+            return res.status(409).json({ success: false, code: err.code, message: err.message });
+        }
+        logger.error({ err }, '[reservation.decline] atomic lifecycle failure');
+        return res.status(500).json({ success: false, message: 'The cancellation failed and nothing changed. Try again.' });
+    }
+};
+
+// ── Check-in by ID check (stayCheckInService) ───────────────────────────────
+const _stayFail = (res, err, tag) => {
+    if (err && err.httpStatus) return res.status(err.httpStatus).json({ success: false, code: err.code, message: err.message });
+    logger.error({ err: err && err.message }, tag);
+    return res.status(500).json({ success: false, message: 'Something went wrong. Try again.' });
+};
+const FRONT_DESK = ['reservations.manage', 'hotel.front_desk.manage'];
+
+// POST /api/reservations/:reservationId/checkin-by-id  { azamanId }
+// The owner, or staff with reservations.manage or hotel.front_desk.manage.
+exports.checkInById = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    let result;
+    try {
+        const { resolveBusinessActor } = require('../services/businessActor');
+        const actor = await resolveBusinessActor(prisma, req.user, { anyOf: FRONT_DESK });
+        if (!actor) return res.status(403).json({ success: false, code: 'NOT_PERMITTED', message: 'You cannot check guests in for this business.' });
+        const { checkInByIdCheck } = require('../services/stayCheckInService');
+        result = await checkInByIdCheck(prisma, {
+            reservationId: req.params.reservationId,
+            businessProfileId: actor.businessProfileId,
+            actorUserId: actor.actorUserId,
+            azamanId: req.body && req.body.azamanId,
+        });
+    } catch (err) {
+        return _stayFail(res, err, '[reservation.checkInById] error');
+    }
+    // The guest hears at once (best effort): a check-in that was not them is
+    // reported before the money is released.
+    try {
+        const notifier = req.app.get('notificationService');
+        if (notifier && typeof notifier.sendNotification === 'function') {
+            await notifier.sendNotification({
+                userId: result.customerId,
+                title: 'You were checked in by ID check',
+                body: (result.businessName || 'Your hotel') + ' checked your ID and checked you in. '
+                    + (result.paymentHeld ? 'Was this you? Confirm it or report it in Orders & bookings.' : 'Enjoy your stay.'),
+                category: 'MARKETPLACE',
+                actionPayload: { route: '/bookings?tab=reservations', reservationId: result.reservation.id },
+            });
+        }
+    } catch (err) {
+        logger.error({ err: err && err.message, reservationId: result.reservation.id }, '[reservation.checkInById] guest notice failed');
+    }
+    return res.status(200).json({
+        success: true,
+        reservation: result.reservation,
+        paymentHeld: result.paymentHeld,
+        holdUntil: result.holdUntil,
+    });
+};
+
+// POST /api/reservations/:reservationId/checkin/confirm — the guest: "That was me".
+exports.confirmIdCheckIn = async (req, res) => {
+    try {
+        const { confirmStayCheckIn } = require('../services/stayCheckInService');
+        const out = await confirmStayCheckIn(req.app.get('prisma'), { reservationId: req.params.reservationId, customerId: req.user.id });
+        return res.status(200).json(out);
+    } catch (err) {
+        return _stayFail(res, err, '[reservation.confirmIdCheckIn] error');
+    }
+};
+
+// POST /api/reservations/:reservationId/checkin/report  { reason } — the guest: "Not me".
+exports.reportIdCheckIn = async (req, res) => {
+    try {
+        const { reportStayCheckIn } = require('../services/stayCheckInService');
+        const out = await reportStayCheckIn(req.app.get('prisma'), {
+            reservationId: req.params.reservationId, customerId: req.user.id, reason: req.body && req.body.reason,
+        });
+        return res.status(200).json(out);
+    } catch (err) {
+        return _stayFail(res, err, '[reservation.reportIdCheckIn] error');
+    }
+};
+
+// GET/PUT /api/reservations/policy/checkin — may staff check guests in by ID?
+// Read: anyone acting for the business. Change: the owner or settings.manage.
+exports.getCheckInPolicy = async (req, res) => {
+    try {
+        const prisma = req.app.get('prisma');
+        const { resolveBusinessActor } = require('../services/businessActor');
+        const actor = await resolveBusinessActor(prisma, req.user);
+        if (!actor) return res.status(404).json({ success: false, message: 'Business profile not found.' });
+        const profile = await prisma.businessProfile.findUnique({ where: { id: actor.businessProfileId } });
+        const { stayCheckInPolicy } = require('../services/stayCheckInService');
+        return res.status(200).json({ success: true, policy: stayCheckInPolicy(profile) });
+    } catch (err) {
+        return _stayFail(res, err, '[reservation.getCheckInPolicy] error');
+    }
+};
+exports.setCheckInPolicy = async (req, res) => {
+    try {
+        const prisma = req.app.get('prisma');
+        const { resolveBusinessActor } = require('../services/businessActor');
+        const actor = await resolveBusinessActor(prisma, req.user, { anyOf: ['settings.manage'] });
+        if (!actor) return res.status(403).json({ success: false, code: 'NOT_PERMITTED', message: 'Only the owner or a manager with settings rights can change this.' });
+        const { setStayCheckInPolicy } = require('../services/stayCheckInService');
+        const policy = await setStayCheckInPolicy(prisma, { businessProfileId: actor.businessProfileId, allowIdCheck: req.body && req.body.allowIdCheck });
+        return res.status(200).json({ success: true, policy });
+    } catch (err) {
+        return _stayFail(res, err, '[reservation.setCheckInPolicy] error');
+    }
+};
+
 // ── PATCH /api/reservations/:reservationId/checkin ───────────────────────────
+// A stay paid in the app checks in only by the guest's QR (that is what
+// releases the money to the hotel); staff cannot check it in by hand.
 exports.checkInReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
+        const actor = await _reservationActor(prisma, req, RESERVATION_WORK);
+        if (!actor) return _notPermitted(res);
+        const { isPaidReservation, qrCheckInRequiredError } = require('../services/stayPaymentService');
+        if (await isPaidReservation(prisma, req.params.reservationId)) {
+            const e = qrCheckInRequiredError();
+            return res.status(e.httpStatus).json({ success: false, code: e.code, message: e.message });
+        }
         const reservation = await reservationLifecycle.checkInReservation(prisma, {
             reservationId: req.params.reservationId,
-            businessUserId: req.user.id,
+            businessUserId: actor.ownerUserId,
         });
         return res.status(200).json({ success: true, reservation });
     } catch (err) {
         if (err.code === 'RESERVATION_NOT_FOUND') return res.status(404).json({ success: false, message: err.message });
-        if (['RESERVATION_NOT_CHECKIN_READY', 'RESERVATION_STATE_CONFLICT', 'ESCROW_IN_DISPUTE', 'ESCROW_ECONOMIC_CONFLICT', 'ESCROW_ALREADY_FINALIZED'].includes(err.code)) {
-            return res.status(409).json({ success: false, message: err.message });
+        if (['RESERVATION_NOT_CHECKIN_READY', 'RESERVATION_STATE_CONFLICT', 'ESCROW_IN_DISPUTE', 'ESCROW_ECONOMIC_CONFLICT', 'ESCROW_ALREADY_FINALIZED', 'QR_CHECKIN_REQUIRED'].includes(err.code)) {
+            return res.status(409).json({ success: false, code: err.code, message: err.message });
         }
         logger.error({ err }, '[reservation.checkin] atomic lifecycle failure');
         return res.status(500).json({ success: false, message: err.message });
@@ -304,9 +502,11 @@ exports.checkInReservation = async (req, res) => {
 exports.markNoShowReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
+        const actor = await _reservationActor(prisma, req, RESERVATION_WORK);
+        if (!actor) return _notPermitted(res);
         const reservation = await reservationLifecycle.markNoShowReservation(prisma, {
             reservationId: req.params.reservationId,
-            businessUserId: req.user.id,
+            businessUserId: actor.ownerUserId,
         });
         return res.status(200).json({ success: true, reservation });
     } catch (err) {
@@ -322,9 +522,11 @@ exports.markNoShowReservation = async (req, res) => {
 exports.checkOutReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
+        const actor = await _reservationActor(prisma, req, RESERVATION_WORK);
+        if (!actor) return _notPermitted(res);
         const updated = await reservationLifecycle.checkOutReservation(prisma, {
             reservationId: req.params.reservationId,
-            businessUserId: req.user.id,
+            businessUserId: actor.ownerUserId,
         });
         return res.status(200).json({ success: true, reservation: updated });
     } catch (err) {
@@ -422,17 +624,23 @@ exports.counterProposeReservation = async (req, res) => {
             return res.status(400).json({ success: false, message: `Cannot counter-propose on a ${reservation.status} reservation.` });
         }
 
-        // Update the reservation with the proposed alternative
-        const updated = await req.prisma.reservation.update({
-            where: { id: reservationId },
-            data: {
-                // Keep status as PENDING but store the counter-proposal
-                // The customer will see the proposed alternative and can accept or decline
-                proposedStartDatetime: new Date(proposedStartDatetime),
-                proposedEndDatetime: proposedEndDatetime ? new Date(proposedEndDatetime) : null,
-                counterProposeMessage: message || null,
-                counterProposedAt: new Date(),
-            }
+        // Update the reservation with the proposed alternative. A booking
+        // paid in Azaman keeps its dates (PAID_DATES_FIXED), checked under
+        // the reservation's row lock.
+        const { assertDatesMovableTx } = require('../services/stayPaymentService');
+        const updated = await req.prisma.$transaction(async (tx) => {
+            await assertDatesMovableTx(tx, reservation.id);
+            return tx.reservation.update({
+                where: { id: reservation.id },
+                data: {
+                    // Keep status as PENDING but store the counter-proposal
+                    // The customer will see the proposed alternative and can accept or decline
+                    proposedStartDatetime: new Date(proposedStartDatetime),
+                    proposedEndDatetime: proposedEndDatetime ? new Date(proposedEndDatetime) : null,
+                    counterProposeMessage: message || null,
+                    counterProposedAt: new Date(),
+                }
+            });
         });
 
         // Notify the customer
@@ -461,6 +669,7 @@ exports.counterProposeReservation = async (req, res) => {
 
         res.json({ success: true, reservation: updated });
     } catch (err) {
+        if (err && err.code === 'PAID_DATES_FIXED') return res.status(409).json({ success: false, code: err.code, message: err.message });
         logger.error({ err: err }, '[counterProposeReservation]');
         res.status(500).json({ success: false, message: err.message });
     }
@@ -483,16 +692,21 @@ exports.acceptCounterProposal = async (req, res) => {
             return res.status(400).json({ success: false, message: 'No counter-proposal to accept.' });
         }
 
-        // Apply the proposed times
-        const updated = await req.prisma.reservation.update({
-            where: { id: reservationId },
-            data: {
-                startDatetime: reservation.proposedStartDatetime,
-                endDatetime: reservation.proposedEndDatetime || reservation.endDatetime,
-                proposedStartDatetime: null,
-                proposedEndDatetime: null,
-                counterProposeMessage: null,
-            }
+        // Apply the proposed times. A booking paid in Azaman keeps its dates
+        // (PAID_DATES_FIXED), checked under the reservation's row lock.
+        const { assertDatesMovableTx } = require('../services/stayPaymentService');
+        const updated = await req.prisma.$transaction(async (tx) => {
+            await assertDatesMovableTx(tx, reservation.id);
+            return tx.reservation.update({
+                where: { id: reservation.id },
+                data: {
+                    startDatetime: reservation.proposedStartDatetime,
+                    endDatetime: reservation.proposedEndDatetime || reservation.endDatetime,
+                    proposedStartDatetime: null,
+                    proposedEndDatetime: null,
+                    counterProposeMessage: null,
+                }
+            });
         });
 
         // Notify the business
@@ -510,6 +724,7 @@ exports.acceptCounterProposal = async (req, res) => {
 
         res.json({ success: true, reservation: updated });
     } catch (err) {
+        if (err && err.code === 'PAID_DATES_FIXED') return res.status(409).json({ success: false, code: err.code, message: err.message });
         logger.error({ err: err }, '[acceptCounterProposal]');
         if (err.code === 'P2002' && err.meta?.target === null)
             return res.status(409).json({ success: false, message: 'The proposed time is no longer available.' });

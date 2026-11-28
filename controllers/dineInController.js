@@ -117,6 +117,21 @@ exports.confirmAndPay = async (req, res) => {
     } catch (err) { res.status(400).json({ success: false, message: err.message }); }
 };
 
+// GET /api/dine-in/my-tabs?set=active|closed — the caller's own tabs.
+exports.getMyTabs = async (req, res) => {
+    try {
+        const prisma = req.prisma || req.app.get('prisma');
+        const tabs = await dineInTabService.listCustomerTabs(prisma, {
+            customerId: req.user.id,
+            set: req.query.set || 'active',
+            limit: req.query.limit,
+        });
+        return res.json({ success: true, tabs });
+    } catch (err) {
+        return res.status(err.httpStatus || 500).json({ success: false, message: err.httpStatus ? err.message : 'Your tabs could not load.' });
+    }
+};
+
 exports.getTab = async (req, res) => {
     try {
         const prisma = req.prisma || req.app.get('prisma');

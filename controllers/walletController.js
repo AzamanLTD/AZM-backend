@@ -197,22 +197,6 @@ exports.requestWithdrawal = async (req, res) => {
                 throw err;
             }
 
-            // --- Phase ADMIN-CONTROL-2 FIX 2: Credit platform fee ---
-            if (platformFeeUsdcDec.gt(0)) {
-                await tx.systemProfitFees.upsert({
-                    where: { id: 1 },
-                    update: { balance: { increment: platformFeeUsdcDec } },
-                    create: { id: 1, balance: platformFeeUsdcDec }
-                });
-                await tx.adminProfitLog.create({
-                    data: {
-                        amountUsdc: platformFeeUsdcDec,
-                        source: 'CRYPTO_WITHDRAWAL_FEE',
-                        relatedTxId: `crypto_pfee_${userId}_${Date.now()}`
-                    }
-                });
-            }
-
             // Create the heavily detailed withdrawal ticket
             const withdrawal = await tx.withdrawal.create({
                 data: {
@@ -227,6 +211,27 @@ exports.requestWithdrawal = async (req, res) => {
                     status: "PENDING"
                 }
             });
+
+            // The platform fee (GlobalSettings.cryptoPlatformFeePct, set in the
+            // Fee Lab): realized at the request, booked under WITHDRAWAL_FEE
+            // and linked to this withdrawal (wallet_wd_fee_{id}), so a
+            // rejection can give exactly this fee back. It was booked under
+            // CRYPTO_WITHDRAWAL_FEE, which is not a ProfitSource value, so any
+            // fee above 0% made every one of these withdrawals fail.
+            if (platformFeeUsdcDec.gt(0)) {
+                await tx.systemProfitFees.upsert({
+                    where: { id: 1 },
+                    update: { balance: { increment: platformFeeUsdcDec } },
+                    create: { id: 1, balance: platformFeeUsdcDec }
+                });
+                await tx.adminProfitLog.create({
+                    data: {
+                        amountUsdc: platformFeeUsdcDec,
+                        source: 'WITHDRAWAL_FEE',
+                        relatedTxId: `wallet_wd_fee_${withdrawal.id}`
+                    }
+                });
+            }
             // r25 P0 FIX (found by the concurrency suite): the Withdrawal model
             // has no platformFeeUsdc column — passing it made tx.withdrawal.create
             // throw "Unknown argument platformFeeUsdc" on EVERY request, rolling

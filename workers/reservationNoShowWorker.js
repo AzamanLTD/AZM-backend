@@ -12,8 +12,13 @@
 //   (default 30 minutes after departure, no check-in).
 // =============================================================================
 
+const { REFUND_CAUSE, refundsFeeNow } = require('../services/feeRefundPolicy');
 const logger = require('../src/config/logger');
-const GRACE_PERIOD_MINS = 30; // grace after departure before marking transit no-show
+// Grace after departure before marking a transit passenger a no-show. It
+// must outlast the QR boarding window (departure + 60 min, qrCheckInService
+// TRANSIT_WINDOW_MS): a passenger still holding a valid boarding code is
+// never swept first. 75 min = the window + a margin.
+const GRACE_PERIOD_MINS = require('../services/transitBookingService').NO_SHOW_GRACE_MS / 60000;
 
 // =============================================================================
 // sweepNoShowReservations — finds past-due reservations without check-in.
@@ -22,10 +27,13 @@ const sweepNoShowReservations = async (prisma) => {
     const now = new Date();
     // Include both escrow-backed and unescrowed bookings. The lifecycle
     // authority decides whether to refund/split/expire or transition only.
-    const overdue = await prisma.reservation.findMany({
+    const { noShowCutoff } = require('../services/paidStayPolicy');
+    const overdue = (await prisma.reservation.findMany({
         where: { status: 'CONFIRMED', checkedInAt: null, endDatetime: { lt: now } },
         include: { escrow: true }
-    });
+    })).filter((r) => new Date(r.endDatetime) < noShowCutoff(r, now.getTime()));
+    // ^ A stay paid in the app waits for a late arrival until noon on its
+    //   check-out day (paidStayPolicy); it is swept on a later run.
 
     const results = { processed: 0, penalized: 0, errors: 0, details: [] };
     const { markNoShowReservation } = require('../services/reservationLifecycleService');
@@ -165,7 +173,11 @@ const sweepNoShowTransitBookings = async (prisma) => {
                         }
                         // No penalty: the FULL refund is part of the same atomic
                         // transition — the escrow can never be stranded FUNDED.
-                        await _refundBookingEscrowTx(tx, { escrowId: escrow.id, reference: randomUUID() });
+                        await _refundBookingEscrowTx(tx, {
+                            escrowId: escrow.id,
+                            reference: randomUUID(),
+                            refundFee: await refundsFeeNow(tx, REFUND_CAUSE.NO_SHOW),
+                        });
                         escrowEconomicsExecuted = true;
                     } else if (escrow && escrow.status === 'DRAFT') {
                         // Unfunded escrow: expire it in the same transaction.
@@ -319,10 +331,130 @@ const sweepNoShowTransitBookings = async (prisma) => {
 // =============================================================================
 // sweepAll — convenience function to run both sweeps.
 // =============================================================================
-const sweepAll = async (prisma) => {
-    const reservationResults = await sweepNoShowReservations(prisma);
-    const transitResults = await sweepNoShowTransitBookings(prisma);
-    return { reservations: reservationResults, transit: transitResults };
+// =============================================================================
+// sweepUnansweredRequests — a reservation REQUEST the business never confirmed
+// holds its room or table (the capacity trigger counts PENDING). It is closed
+// when its start time arrives unconfirmed, or 72 hours after it was made,
+// whichever comes first, through the lifecycle authority as CANCELLED_BUSINESS
+// with the reason in businessNotes. The claim re-checks "still unanswered"
+// (businessCancelReservation unansweredAsOf), so a confirmation at the same
+// moment wins. A request that cannot be closed (its deposit in dispute, say)
+// is passed over, never retried in front of the rest: each run pages past it,
+// up to maxScan requests. The guest and the business are told, for requests
+// made in the last 30 days (older ones, closed by the first run after this
+// shipped, are closed quietly).
+// =============================================================================
+const { REQUEST_ANSWER_WINDOW_MS } = require('../services/reservationLifecycleService');
+const UNANSWERED_REASON = 'Not confirmed by the business in time (request expired).';
+const NOTIFY_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
+
+const sweepUnansweredRequests = async (prisma, { now = new Date(), pageSize = 100, maxScan = 500, notify = null } = {}) => {
+    const cutoff = new Date(now.getTime() - REQUEST_ANSWER_WINDOW_MS);
+    const results = { expired: 0, errors: 0, scanned: 0 };
+    const seen = [];
+    const { businessCancelReservation } = require('../services/reservationLifecycleService');
+    while (results.scanned < maxScan) {
+        const page = await prisma.reservation.findMany({
+            where: {
+                status: 'PENDING',
+                OR: [{ startDatetime: { lte: now } }, { createdAt: { lte: cutoff } }],
+                ...(seen.length ? { id: { notIn: seen } } : {}),
+            },
+            select: { id: true, businessProfileId: true, customerId: true, reservationRef: true, createdAt: true },
+            orderBy: { createdAt: 'asc' },
+            take: Math.min(pageSize, maxScan - results.scanned),
+        });
+        if (!page.length) break;
+        for (const r of page) {
+            seen.push(r.id);
+            results.scanned++;
+            let done;
+            try {
+                done = await businessCancelReservation(prisma, {
+                    reservationId: r.id, businessProfileId: r.businessProfileId,
+                    reason: UNANSWERED_REASON, unansweredAsOf: now,
+                });
+            } catch (err) {
+                // Answered meanwhile, or not closable (deposit in dispute):
+                // skip it; the next page goes on past it.
+                results.errors++;
+                logger.warn({ err: err.message, code: err.code, reservationId: r.id }, '[NoShowWorker] request expiry skipped');
+                continue;
+            }
+            if (!done || done.status !== 'CANCELLED_BUSINESS') continue;
+            results.expired++;
+            const recent = r.createdAt && now.getTime() - new Date(r.createdAt).getTime() <= NOTIFY_WINDOW_MS;
+            if (typeof notify !== 'function' || !recent) continue;
+            try {
+                await notify({
+                    userId: r.customerId,
+                    title: 'Your request was not confirmed',
+                    body: `${r.reservationRef}: the business did not confirm in time, so the request was closed. `
+                        + 'Anything you paid for it is back in your wallet.',
+                    category: 'MARKETPLACE',
+                    actionPayload: { route: '/bookings?tab=reservations' },
+                });
+            } catch (_) { /* the expiry stands either way */ }
+            try {
+                const business = await prisma.businessProfile.findUnique({ where: { id: r.businessProfileId }, select: { userId: true } });
+                if (business && business.userId) {
+                    await notify({
+                        userId: business.userId,
+                        title: 'A request expired',
+                        body: `${r.reservationRef} was not confirmed in time, so it was closed and the time is free again.`,
+                        category: 'MARKETPLACE',
+                        actionPayload: { route: '/business/notifications', reservationId: r.id },
+                    });
+                }
+            } catch (_) { /* best effort */ }
+        }
+    }
+    return results;
 };
 
-module.exports = { sweepNoShowReservations, sweepNoShowTransitBookings, sweepAll, GRACE_PERIOD_MINS };
+const sweepAll = async (prisma, { notify = null } = {}) => {
+    let reservationResults;
+    let transitResults;
+    let sweepError = null;
+    try {
+        reservationResults = await sweepNoShowReservations(prisma);
+        transitResults = await sweepNoShowTransitBookings(prisma);
+    } catch (err) {
+        sweepError = err;
+    }
+    // ID-check boardings whose report window has passed: release the held
+    // fare to the operator (a reported one is DISPUTED and stays).
+    let payouts;
+    try {
+        const { sweepHeldTransitPayouts } = require('../services/transitBookingService');
+        payouts = await sweepHeldTransitPayouts(prisma);
+    } catch (err) {
+        logger.error({ err: err.message }, '[NoShowWorker] held payout sweep failed');
+        payouts = { error: err.message };
+    }
+    // Hotel stays checked in by ID check: pay the hotel once the guest's
+    // report window has passed (a reported one is DISPUTED and stays).
+    let stayPayouts;
+    try {
+        const { sweepHeldStayPayouts } = require('../services/stayCheckInService');
+        stayPayouts = await sweepHeldStayPayouts(prisma);
+    } catch (err) {
+        logger.error({ err: err.message }, '[NoShowWorker] held stay payout sweep failed');
+        stayPayouts = { error: err.message };
+    }
+    // Requests the business never answered stop holding rooms and tables.
+    let requests;
+    try {
+        requests = await sweepUnansweredRequests(prisma, { notify });
+    } catch (err) {
+        logger.error({ err: err.message }, '[NoShowWorker] request expiry sweep failed');
+        requests = { error: err.message };
+    }
+    if (sweepError) throw sweepError; // after the payouts ran
+    return { reservations: reservationResults, transit: transitResults, payouts, stayPayouts, requests };
+};
+
+module.exports = {
+    sweepNoShowReservations, sweepNoShowTransitBookings, sweepUnansweredRequests, sweepAll,
+    GRACE_PERIOD_MINS, REQUEST_ANSWER_WINDOW_MS, NOTIFY_WINDOW_MS,
+};

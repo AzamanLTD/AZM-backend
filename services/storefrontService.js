@@ -40,6 +40,22 @@ function validateStudioExperience(layoutJson) {
   }
 }
 
+// layoutJson.experience belongs to Experience Studio: the category-native
+// blueprint (schemaVersion 1) the app renders. A Storefront Studio V2 page
+// document (schemaVersion 2) is not taken into it: decided 28 Nov 2026 —
+// Studio V2 is parked (the app has no renderer for its pages, and it shared
+// this slot, so either save replaced the other). One already stored is kept
+// and still validated at publish; a new one is refused.
+function refuseStudioDocument(layoutJson) {
+  const experience = layoutJson?.experience;
+  if (experience && typeof experience === 'object' && experience.schemaVersion === 2) {
+    const err = new Error('Storefront Studio V2 pages are not supported. Set how your store works in Experience Studio.');
+    err.code = 'STOREFRONT_STUDIO_PARKED';
+    err.statusCode = 422;
+    throw err;
+  }
+}
+
 function preserveExperienceSnapshot(nextLayout, currentDraftLayout) {
   if (
     !hasOwnExperience(nextLayout) &&
@@ -82,8 +98,11 @@ function generateDefaultLayout(businessProfileId, category = 'UNIVERSAL') {
     props: { showHours: true, showRating: true, showCategory: true, customInfo: '' },
   });
 
-  // Category-specific tiles
-  if (category === 'RESTAURANT' || category === 'FOOD') {
+  // Category-specific tiles. BusinessCategory values are FOOD_BEVERAGE and
+  // HOSPITALITY; the older names are kept for layouts made before the enum.
+  // (Only the older names were matched, so every restaurant and hotel got the
+  // retail layout.)
+  if (category === 'FOOD_BEVERAGE' || category === 'RESTAURANT' || category === 'FOOD') {
     tiles.push({
       id: `tile_${Math.random().toString(36).substring(2, 10)}`,
       widgetType: 'product_grid',
@@ -96,7 +115,7 @@ function generateDefaultLayout(businessProfileId, category = 'UNIVERSAL') {
       position: { row: 6, col: 0, rowSpan: 2, colSpan: 4 },
       props: { title: 'What People Say', maxReviews: 5, minRating: 4 },
     });
-  } else if (category === 'HOTEL' || category === 'LODGING') {
+  } else if (category === 'HOSPITALITY' || category === 'HOTEL' || category === 'LODGING') {
     tiles.push({
       id: `tile_${Math.random().toString(36).substring(2, 10)}`,
       widgetType: 'showcase_gallery',
@@ -211,17 +230,21 @@ async function getPublishedLayout(prisma, businessProfileId) {
  * @param {string} [expectedUpdatedAt]
  */
 async function saveDraft(prisma, businessProfileId, layoutJson, themeId, expectedUpdatedAt) {
+  const existing = await prisma.businessStorefrontLayout.findUnique({
+    where: { businessProfileId_status: { businessProfileId, status: 'DRAFT' } },
+  });
   // Optimistic concurrency: reject if draft changed since client loaded it
-  if (expectedUpdatedAt) {
-    const existing = await prisma.businessStorefrontLayout.findUnique({
-      where: { businessProfileId_status: { businessProfileId, status: 'DRAFT' } },
-    });
-    if (existing && existing.updatedAt.toISOString() !== expectedUpdatedAt) {
-      throw new Error('Draft was modified by another editor. Please refresh.');
-    }
+  if (expectedUpdatedAt && existing && existing.updatedAt.toISOString() !== expectedUpdatedAt) {
+    throw new Error('Draft was modified by another editor. Please refresh.');
   }
 
-  const migratedLayout = migrateLayout(layoutJson);
+  // The draft schema (saveDraftSchema) keeps only the tile grid, so an editor
+  // save never carries layoutJson.experience: keep the draft's own (the
+  // Experience Studio blueprint or Studio document). It used to be replaced
+  // by the stripped layout, so every tile edit wiped a saved Experience.
+  const incomingLayout = migrateLayout(layoutJson);
+  refuseStudioDocument(incomingLayout);
+  const migratedLayout = preserveExperienceSnapshot(incomingLayout, existing && existing.layoutJson);
   validateStudioExperience(migratedLayout);
 
   const draft = await prisma.businessStorefrontLayout.upsert({

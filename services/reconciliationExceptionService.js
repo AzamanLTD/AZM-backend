@@ -15,6 +15,12 @@ const VALID_ENTITY_TYPES = new Set([
     'WITHDRAWAL', 'TRANSACTION', 'PROVIDER_ATTEMPT',
     'FIAT_LIQUIDITY_RESERVATION', 'FIAT_LIQUIDITY_RECEIPT',
     'FIAT_PROVIDER_EVENT', 'FIAT_LIQUIDITY_STATE',
+    // A booking refund whose Azaman fee is owed to the customer
+    // (bookingEscrowService._refundBookingEscrowTx).
+    'BOOKING_FEE_REFUND',
+    // A general escrow refund whose Azaman fee is owed back
+    // (escrowService._refundEscrowTx).
+    'ESCROW_FEE_REFUND',
 ]);
 
 const recordReconciliationException = async (prisma, {

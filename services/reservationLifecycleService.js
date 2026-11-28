@@ -8,6 +8,8 @@
 // through inverted locks and exactly one economic fact can win.
 // =============================================================================
 
+const { REFUND_CAUSE, refundsFeeNow } = require('./feeRefundPolicy');
+const { isPaidStay, noShowCutoff } = require('./paidStayPolicy');
 const { randomUUID } = require('crypto');
 const {
     _refundBookingEscrowTx,
@@ -117,7 +119,11 @@ const cancelReservation = async (prisma, { reservationId, customerId }) =>
             throw fail('ESCROW_IN_DISPUTE', 'Reservation funds are in dispute custody.');
         }
         if (escrow && REFUND_CLAIMABLE.includes(escrow.status)) {
-            await _refundBookingEscrowTx(tx, { escrowId: escrow.id, reference: randomUUID() });
+            await _refundBookingEscrowTx(tx, {
+                escrowId: escrow.id,
+                reference: randomUUID(),
+                refundFee: await refundsFeeNow(tx, REFUND_CAUSE.CUSTOMER_CANCELLED),
+            });
         } else if (escrow?.status === 'DRAFT') {
             await expireDraftEscrow(tx, escrow);
         } else if (escrow && !['REFUNDED', 'EXPIRED'].includes(escrow.status)) {
@@ -131,7 +137,76 @@ const cancelReservation = async (prisma, { reservationId, customerId }) =>
         });
     });
 
-const checkInReservation = async (prisma, { reservationId, businessUserId, requireFreshClaim = false }) => {
+// The hotel cancels a stay it cannot honour (or declines a request): a paid
+// stay is refunded in the same transaction as the claim, the Azaman fee
+// included (feeRefundPolicy: the business cancelled).
+//
+// unansweredAsOf (the request-expiry sweep): close it only while it is still
+// an unanswered request at that moment (PENDING, and started or 72h old),
+// re-checked in the claim's own conditional UPDATE, so a business confirming
+// (or a guest's deposit confirming it) at the same instant wins and the
+// refund rolls back with the refused claim.
+const REQUEST_ANSWER_WINDOW_MS = 72 * 60 * 60 * 1000;
+const _unansweredWhere = (asOf) => ({
+    OR: [
+        { startDatetime: { lte: asOf } },
+        { createdAt: { lte: new Date(asOf.getTime() - REQUEST_ANSWER_WINDOW_MS) } },
+    ],
+});
+const _isUnanswered = (r, asOf) => r.status === 'PENDING'
+    && ((r.startDatetime && new Date(r.startDatetime) <= asOf)
+        || (r.createdAt && new Date(r.createdAt).getTime() <= asOf.getTime() - REQUEST_ANSWER_WINDOW_MS));
+
+const businessCancelReservation = async (prisma, { reservationId, businessProfileId, reason = null, unansweredAsOf = null }) =>
+    runConvergent(prisma, reservationId, 'CANCELLED_BUSINESS', async (tx) => {
+        const reservation = await loadAggregate(tx, reservationId);
+        if (!reservation || reservation.businessProfileId !== businessProfileId) {
+            throw fail('RESERVATION_NOT_FOUND', 'Reservation not found.');
+        }
+        if (reservation.status === 'CANCELLED_BUSINESS') return reservation;
+        if (unansweredAsOf && !_isUnanswered(reservation, unansweredAsOf)) {
+            throw fail('RESERVATION_ANSWERED', 'This request was answered or changed; it is not expired.');
+        }
+        if (!['PENDING', 'CONFIRMED'].includes(reservation.status)) {
+            throw fail('RESERVATION_NOT_CANCELLABLE', `Cannot cancel a reservation with status ${reservation.status}.`);
+        }
+        const escrow = reservation.escrow;
+        if (escrow && CUSTODY_STATES.has(escrow.status)) {
+            throw fail('ESCROW_IN_DISPUTE', 'Reservation funds are in dispute custody.');
+        }
+        // An expired request did not take place (REFUND_CAUSE.EXPIRED);
+        // otherwise the business cancelled. Both give the fee back by
+        // default; each is set separately in the Fee Lab.
+        if (escrow && REFUND_CLAIMABLE.includes(escrow.status)) {
+            await _refundBookingEscrowTx(tx, {
+                escrowId: escrow.id,
+                reference: randomUUID(),
+                refundFee: await refundsFeeNow(tx, unansweredAsOf ? REFUND_CAUSE.EXPIRED : REFUND_CAUSE.BUSINESS_CANCELLED),
+            });
+        } else if (escrow?.status === 'DRAFT') {
+            await expireDraftEscrow(tx, escrow);
+        } else if (escrow && !['REFUNDED', 'EXPIRED'].includes(escrow.status)) {
+            throw fail('ESCROW_ECONOMIC_CONFLICT', `Escrow is already ${escrow.status}.`);
+        }
+        return claimReservation(tx, {
+            reservationId,
+            from: unansweredAsOf ? ['PENDING'] : ['PENDING', 'CONFIRMED'],
+            where: unansweredAsOf ? _unansweredWhere(unansweredAsOf) : {},
+            data: {
+                status: 'CANCELLED_BUSINESS',
+                cancelledAt: new Date(),
+                ...(reason ? { businessNotes: String(reason).slice(0, 500) } : {}),
+            },
+        });
+    });
+
+// method: 'QR' (the guest's own QR, qrCheckInService) or 'MANUAL' (staff by
+// hand). A reservation whose money is held in Azaman (a paid stay, a funded
+// deposit) never checks in by hand: its check-in is what pays the business,
+// so it takes the guest's QR, or an ID check (stayCheckInService, which holds
+// the money until the guest confirms). The rule lives here so no caller can
+// skip it.
+const checkInReservation = async (prisma, { reservationId, businessUserId, requireFreshClaim = false, method = 'MANUAL' }) => {
     // A QR token is a ONE-USE credential; a staff retry on the same reservation
     // is not. `requireFreshClaim` keeps the convergent default for the manual
     // path and makes the token path refuse any use that did not itself perform
@@ -158,6 +233,9 @@ const checkInReservation = async (prisma, { reservationId, businessUserId, requi
         const escrow = reservation.escrow;
         if (escrow && CUSTODY_STATES.has(escrow.status)) {
             throw fail('ESCROW_IN_DISPUTE', 'Reservation funds are in dispute custody.');
+        }
+        if (method !== 'QR' && escrow && RELEASE_CLAIMABLE.includes(escrow.status)) {
+            throw fail('QR_CHECKIN_REQUIRED', "This stay is paid in Azaman. Scan the guest's check-in QR, or check them in by ID check.");
         }
         if (escrow && RELEASE_CLAIMABLE.includes(escrow.status)) {
             await _releaseBookingEscrowTx(tx, { escrowId: escrow.id, reference: randomUUID() });
@@ -186,8 +264,14 @@ const markNoShowReservation = async (prisma, { reservationId, businessUserId = n
         if (reservation.status !== 'CONFIRMED') {
             throw fail('RESERVATION_NOT_NO_SHOW_READY', `Reservation is ${reservation.status}, cannot mark no-show.`);
         }
-        if (reservation.checkedInAt || reservation.endDatetime >= new Date()) {
-            throw fail('RESERVATION_NOT_NO_SHOW_READY', 'Reservation cannot be marked no-show before its end time.');
+        // A stay paid in the app stays open for a late arrival until noon on
+        // the check-out day (paidStayPolicy); any other reservation is a
+        // no-show from its end.
+        const cutoff = noShowCutoff(reservation);
+        if (reservation.checkedInAt || reservation.endDatetime >= cutoff) {
+            throw fail('RESERVATION_NOT_NO_SHOW_READY', isPaidStay(reservation)
+                ? 'A paid stay can be marked no-show from noon on its check-out day.'
+                : 'Reservation cannot be marked no-show before its end time.');
         }
 
         const escrow = reservation.escrow;
@@ -212,12 +296,16 @@ const markNoShowReservation = async (prisma, { reservationId, businessUserId = n
                     refundRef: randomUUID(),
                     reservationClaimWhere: {
                         checkedInAt: null,
-                        endDatetime: { lt: new Date() },
+                        endDatetime: { lt: cutoff },
                     },
                 });
                 return tx.reservation.findUnique({ where: { id: reservationId } });
             }
-            await _refundBookingEscrowTx(tx, { escrowId: escrow.id, reference: randomUUID() });
+            await _refundBookingEscrowTx(tx, {
+                escrowId: escrow.id,
+                reference: randomUUID(),
+                refundFee: await refundsFeeNow(tx, REFUND_CAUSE.NO_SHOW),
+            });
         } else if (escrow?.status === 'DRAFT') {
             await expireDraftEscrow(tx, escrow);
         } else if (escrow && !['REFUNDED', 'EXPIRED'].includes(escrow.status)) {
@@ -229,7 +317,7 @@ const markNoShowReservation = async (prisma, { reservationId, businessUserId = n
             from: ['CONFIRMED'],
             where: {
                 checkedInAt: null,
-                endDatetime: { lt: new Date() },
+                endDatetime: { lt: cutoff },
             },
             data: {
                 status: 'NO_SHOW',
@@ -257,8 +345,10 @@ const checkOutReservation = async (prisma, { reservationId, businessUserId }) =>
     });
 
 module.exports = {
+    REQUEST_ANSWER_WINDOW_MS,
     confirmReservation,
     cancelReservation,
+    businessCancelReservation,
     checkInReservation,
     checkOutReservation,
     markNoShowReservation,
