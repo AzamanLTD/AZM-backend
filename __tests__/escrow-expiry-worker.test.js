@@ -22,6 +22,8 @@ describe('EscrowExpiryWorker refund convergence', () => {
         const emitBalanceUpdate = jest.fn().mockResolvedValue(undefined);
         const prisma = {
             smartEscrow: { findMany: jest.fn().mockResolvedValue([escrow]) },
+            // Not a QR-boarded transit fare (those complete instead of refunding).
+            transitBooking: { findFirst: jest.fn().mockResolvedValue(null) },
             ticket: { update: jest.fn().mockResolvedValue({}) },
             ticketMessage: { create: jest.fn().mockResolvedValue({ id: 'message-1', type: 'SYSTEM' }) },
         };
@@ -42,7 +44,10 @@ describe('EscrowExpiryWorker refund convergence', () => {
         const emit = jest.fn();
         const io = { to: jest.fn(() => ({ emit })) };
         const emitBalanceUpdate = jest.fn();
-        const prisma = { smartEscrow: { findMany: jest.fn().mockResolvedValue([escrow]) } };
+        const prisma = {
+            smartEscrow: { findMany: jest.fn().mockResolvedValue([escrow]) },
+            transitBooking: { findFirst: jest.fn().mockResolvedValue(null) },
+        };
         escrowService._refundEscrow.mockRejectedValue(new Error('ESCROW_ALREADY_FINALIZED'));
 
         const worker = new EscrowExpiryWorker(prisma, io, null, { emitBalanceUpdate });

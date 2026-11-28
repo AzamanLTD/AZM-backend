@@ -65,50 +65,11 @@ const _summary = (outcomes) => {
     };
 };
 
-/**
- * cancelTripWithRefunds — cancel a business transit trip and resolve every
- * funded customer escrow through the canonical refund authority.
- *
- * @param {PrismaClient} prisma
- * @param {object} args
- *   tripId: the trip's id
- *   businessProfileId: the caller's resolved business profile (tenant scope)
- *
- * @returns {object} {
- *   notFound?: true,                                  // trip not in tenant scope
- *   cancelled: boolean,                               // trip reached CANCELLED
- *   tripId, tripStatus,
- *   summary: { refunded, cancelledWithoutEscrow, escrowAlreadyFinalized,
- *              escrowDisputed, alreadyResolved, failed },
- *   bookings: [{ bookingId, customerId, amountUsdc, outcome, escrowStatus,
- *                 refundReference?, error? }],
- * }
- */
-const cancelTripWithRefunds = async (prisma, { tripId, businessProfileId }) => {
-    // Tenant-scoped load. Eligible bookings: still active, OR already
-    // CANCELLED with a still-claimable escrow (legacy stranding recovery —
-    // the old route could cancel a booking while leaving its escrow funded).
-    const trip = await prisma.transitTrip.findFirst({
-        where: { id: tripId, businessProfileId },
-        include: {
-            bookings: {
-                where: {
-                    OR: [
-                        { status: { in: ACTIVE_BOOKING_STATUSES } },
-                        { status: 'CANCELLED', escrow: { status: { in: REFUND_CLAIMABLE } } },
-                    ],
-                },
-                include: { escrow: true },
-            },
-        },
-    });
-    if (!trip) {
-        return { notFound: true };
-    }
-
+// Resolves each booking (claim + canonical refund) in its own transaction.
+const _resolveBookings = async (prisma, bookings) => {
     const outcomes = [];
 
-    for (const booking of trip.bookings) {
+    for (const booking of bookings) {
         const entry = {
             bookingId: booking.id,
             customerId: booking.customerId,
@@ -169,7 +130,53 @@ const cancelTripWithRefunds = async (prisma, { tripId, businessProfileId }) => {
         }
     }
 
-    const summary = _summary(outcomes);
+    return outcomes;
+};
+
+/**
+ * cancelTripWithRefunds — cancel a business transit trip and resolve every
+ * funded customer escrow through the canonical refund authority.
+ *
+ * @param {PrismaClient} prisma
+ * @param {object} args
+ *   tripId: the trip's id
+ *   businessProfileId: the caller's resolved business profile (tenant scope)
+ *
+ * @returns {object} {
+ *   notFound?: true,                                  // trip not in tenant scope
+ *   cancelled: boolean,                               // trip reached CANCELLED
+ *   tripId, tripStatus,
+ *   summary: { refunded, cancelledWithoutEscrow, escrowAlreadyFinalized,
+ *              escrowDisputed, alreadyResolved, failed },
+ *   bookings: [{ bookingId, customerId, amountUsdc, outcome, escrowStatus,
+ *                 refundReference?, error? }],
+ * }
+ */
+const cancelTripWithRefunds = async (prisma, { tripId, businessProfileId }) => {
+    // Tenant-scoped load. Eligible bookings: still active, OR already
+    // CANCELLED with a still-claimable escrow (legacy stranding recovery —
+    // the old route could cancel a booking while leaving its escrow funded).
+    const trip = await prisma.transitTrip.findFirst({
+        where: { id: tripId, businessProfileId },
+        include: {
+            bookings: {
+                where: {
+                    OR: [
+                        { status: { in: ACTIVE_BOOKING_STATUSES } },
+                        { status: 'CANCELLED', escrow: { status: { in: REFUND_CLAIMABLE } } },
+                    ],
+                },
+                include: { escrow: true },
+            },
+        },
+    });
+    if (!trip) {
+        return { notFound: true };
+    }
+
+    const outcomes = await _resolveBookings(prisma, trip.bookings);
+
+    let summary = _summary(outcomes);
 
     // 3. Flip the trip to CANCELLED only when every eligible booking resolved.
     //    CAS-guarded: a racing cancellation that already flipped the trip is
@@ -180,12 +187,37 @@ const cancelTripWithRefunds = async (prisma, { tripId, businessProfileId }) => {
             where: { id: tripId, status: { not: 'CANCELLED' } },
             data: { status: 'CANCELLED' },
         });
+
+        // 4. A booking that committed between the load above and the flip
+        //    (a wallet payment racing this cancellation) is not in the
+        //    snapshot. Once the trip is CANCELLED no new booking can commit
+        //    (bookSeats' capacity claim requires a bookable trip), so ONE
+        //    fresh sweep resolves every straggler.
+        const late = await prisma.transitBooking.findMany({
+            where: {
+                tripId,
+                OR: [
+                    { status: { in: ACTIVE_BOOKING_STATUSES } },
+                    { status: 'CANCELLED', escrow: { status: { in: REFUND_CLAIMABLE } } },
+                ],
+                id: { notIn: outcomes.map(o => o.bookingId) },
+            },
+            include: { escrow: true },
+        });
+        if (late.length > 0) {
+            outcomes.push(...await _resolveBookings(prisma, late));
+            summary = _summary(outcomes);
+        }
     }
 
     const tripAfter = await prisma.transitTrip.findUnique({ where: { id: tripId }, select: { status: true } });
 
     return {
-        cancelled: tripAfter?.status === 'CANCELLED',
+        // Cancelled means the trip flipped AND every booking resolved. A
+        // failure in the post-flip sweep leaves the trip CANCELLED with an
+        // unresolved booking; that is a partial failure (retry is safe: a
+        // cancelled trip's active bookings are reprocessed), never success.
+        cancelled: tripAfter?.status === 'CANCELLED' && summary.failed === 0,
         tripId,
         tripStatus: tripAfter?.status,
         summary,

@@ -52,10 +52,13 @@ exports.businessCheckIn = async (req, res) => {
             });
             return res.status(200).json(result);
         } else if (azamanId) {
-            // Manual AZM-ID search path
-            const result = await qrSvc.searchByAzamanId(prisma, {
-                azamanId, businessUserId: req.user.id,
+            // Manual AZM-ID search path: reservations, and the passenger's
+            // transit bookings with what staff need for an ID check.
+            const boarding = require('../services/transitBoardingService');
+            const found = await qrSvc.searchByAzamanId(prisma, {
+                azamanId: boarding.normalizeAzamanId(azamanId), businessUserId: req.user.id,
             });
+            const result = await boarding.enrichAzamanIdSearch(prisma, { businessUserId: req.user.id, result: found });
             return res.status(200).json({ success: true, ...result });
         } else if (reservationId) {
             // Direct compatibility path delegates to the exact same atomic
@@ -123,7 +126,7 @@ exports.bookTripSeats = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const transitSvc = require('../services/transitBookingService');
-        const { seatIds, passengerNames, customerNote } = req.body;
+        const { seatIds, passengerNames, customerNote, payWith, expectedTotalUsdc } = req.body;
 
         const result = await transitSvc.bookSeats(prisma, {
             tripId: req.params.id,
@@ -131,6 +134,8 @@ exports.bookTripSeats = async (req, res) => {
             seatIds,
             passengerNames,
             customerNote,
+            payWith: payWith || null,
+            expectedTotalUsdc: expectedTotalUsdc ?? null,
             businessProfileId: req.body.businessProfileId,
             // §r42 wired claim (2026-10-01): present only when the caller sent
             // an Idempotency-Key (idempotency authority mounted on the route).
@@ -142,7 +147,39 @@ exports.bookTripSeats = async (req, res) => {
         });
         return res.status(201).json(result);
     } catch (err) {
-        return res.status(400).json({ success: false, message: err.message });
+        // Domain refusals (thrown before or inside the booking transaction,
+        // which then rolled back) are 4xx with their code, so the RELEASE
+        // policy frees the key for a corrected retry. A short balance is 402
+        // so the app can offer a top-up. bookSeats swallows its post-commit
+        // work, so a committed booking never reaches this branch.
+        const status = err.code === 'INSUFFICIENT_BALANCE' ? 402 : (err.httpStatus || 400);
+        return res.status(status).json({
+            success: false,
+            // Our own codes reach the app; Prisma's (P2002 …) stay internal.
+            ...(typeof err.code === 'string' && !/^P\d{4}$/.test(err.code) ? { code: err.code } : {}),
+            message: err.message,
+        });
+    }
+};
+
+// GET /api/marketplace/transit/trips/:id/quote?seats=1A,1B — read-only quote
+// for wallet pay: fare, booking fee, total, the payer's available balance.
+exports.quoteTripSeats = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const transitSvc = require('../services/transitBookingService');
+        const seatIds = String(req.query.seats || '')
+            .split(',')
+            .map(s => s.trim())
+            .filter(Boolean);
+        const result = await transitSvc.quoteSeats(prisma, {
+            tripId: req.params.id,
+            customerId: req.user.id,
+            seatIds,
+        });
+        return res.status(200).json(result);
+    } catch (err) {
+        return res.status(err.httpStatus || 400).json({ success: false, code: err.code, message: err.message });
     }
 };
 
@@ -157,7 +194,7 @@ exports.transitCheckIn = async (req, res) => {
         });
         return res.status(200).json(result);
     } catch (err) {
-        return res.status(400).json({ success: false, message: err.message });
+        return res.status(err.httpStatus || 400).json({ success: false, code: err.code, message: err.message });
     }
 };
 
@@ -246,6 +283,26 @@ exports.setPenaltyPolicy = async (req, res) => {
             if (!b || b.businessProfileId !== profile.id)
                 return res.status(403).json({ success: false, message: 'Not your booking.' });
 
+            // A paid booking's no-show terms are fixed when it is paid. Setting
+            // a penalty afterwards would let the operator collect the fare by
+            // marking a no-show, without the passenger's QR boarding.
+            const { isPaidTransitBooking } = require('../services/qrCheckInService');
+            if (await isPaidTransitBooking(prisma, b)) {
+                return res.status(409).json({
+                    success: false,
+                    code: 'PENALTY_LOCKED',
+                    message: 'A paid booking\'s no-show terms cannot be changed.',
+                });
+            }
+            // The flat penalty is capped like the percentage.
+            if (noShowPenaltyUsdc != null
+                && (Number(noShowPenaltyUsdc) < 0 || Number(noShowPenaltyUsdc) > MAX_PENALTY_PCT * Number(b.amountUsdc))) {
+                return res.status(400).json({
+                    success: false,
+                    message: `Penalty cannot exceed ${MAX_PENALTY_PCT * 100}% of the fare.`,
+                });
+            }
+
             const updated = await prisma.transitBooking.update({
                 where: { id: transitBookingId },
                 data: { noShowPenaltyPct: noShowPenaltyPct || null, noShowPenaltyUsdc: noShowPenaltyUsdc || null }
@@ -329,6 +386,10 @@ exports.listMyTransitTrips = async (req, res) => {
 // PATCH /api/marketplace/business/trips/:id — update a trip's schedule/fare/status.
 // vehicleId is intentionally immutable after creation (the seat map + any
 // existing bookings are keyed off the original vehicle's layout).
+// A departure edit may be up to this far in the past (clock skew, a form
+// opened a minute before departure), never more.
+const DEPARTURE_EDIT_SKEW_MS = 5 * 60 * 1000;
+
 exports.updateTransitTrip = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
@@ -343,6 +404,11 @@ exports.updateTransitTrip = async (req, res) => {
             return res.status(403).json({ success: false, message: 'This trip does not belong to your business.' });
 
         const { routeName, origin, destination, departureAt, arrivalAt, fareUsdc, status } = req.body;
+        // Cancelling a trip refunds its paid bookings: route it through the
+        // canonical cancellation (never a bare status write, which stranded
+        // every funded escrow on a CANCELLED trip).
+        const normalizedStatus = status !== undefined ? String(status).trim().toUpperCase() : undefined;
+        const cancelling = normalizedStatus === 'CANCELLED';
         const data = {};
         if (routeName !== undefined) data.routeName = routeName;
         if (origin !== undefined) data.origin = origin;
@@ -350,9 +416,61 @@ exports.updateTransitTrip = async (req, res) => {
         if (departureAt !== undefined) data.departureAt = new Date(departureAt);
         if (arrivalAt !== undefined) data.arrivalAt = arrivalAt ? new Date(arrivalAt) : null;
         if (fareUsdc !== undefined) data.fareUsdc = parseFloat(fareUsdc);
-        if (status !== undefined) data.status = status;
+        if (normalizedStatus !== undefined && !cancelling) data.status = normalizedStatus;
 
-        const updated = await prisma.transitTrip.update({ where: { id }, data });
+        // A changed departure moves boarding windows, no-show sweeps and
+        // payout holds. It may not be set in the past, and once a passenger
+        // is on board (or carried) it may only move later: pulling it
+        // earlier would shorten what protects those passengers.
+        if (data.departureAt && data.departureAt.getTime() !== new Date(trip.departureAt).getTime()) {
+            if (Number.isNaN(data.departureAt.getTime())) {
+                return res.status(400).json({ success: false, code: 'DEPARTURE_INVALID', message: 'departureAt is not a valid date.' });
+            }
+            if (data.departureAt.getTime() < Date.now() - DEPARTURE_EDIT_SKEW_MS) {
+                return res.status(400).json({ success: false, code: 'DEPARTURE_IN_PAST', message: 'A departure cannot be moved into the past.' });
+            }
+            if (data.departureAt.getTime() < new Date(trip.departureAt).getTime()) {
+                const underway = await prisma.transitBooking.count({
+                    where: { tripId: id, status: { in: ['IN_PROGRESS', 'COMPLETED'] } },
+                });
+                if (underway > 0) {
+                    return res.status(409).json({
+                        success: false,
+                        code: 'TRIP_UNDERWAY',
+                        message: 'Passengers are already on board. The departure can only move later.',
+                    });
+                }
+            }
+        }
+
+        // The trip write and its bookings' reschedule commit together: a
+        // departure in the body always re-syncs the bookings and paid escrows
+        // (idempotent), so a failed attempt is simply retried.
+        const { _rescheduleTripBookingsTx } = require('../services/transitBookingService');
+        let updated = Object.keys(data).length > 0
+            ? await prisma.$transaction(async (tx) => {
+                const t = await tx.transitTrip.update({ where: { id }, data });
+                if (data.departureAt) {
+                    await _rescheduleTripBookingsTx(tx, { tripId: id, departureAt: data.departureAt });
+                }
+                return t;
+            })
+            : trip;
+        if (cancelling) {
+            const { cancelTripWithRefunds } = require('../services/transitTripCancellationService');
+            const result = await cancelTripWithRefunds(prisma, { tripId: id, businessProfileId: profile.id });
+            updated = await prisma.transitTrip.findUnique({ where: { id } });
+            if (!result.cancelled || result.summary.failed > 0) {
+                return res.status(409).json({
+                    success: false,
+                    code: 'TRIP_CANCELLATION_INCOMPLETE',
+                    message: 'Some bookings could not be refunded yet. Retry is safe: unresolved bookings are reprocessed.',
+                    trip: updated,
+                    summary: result.summary,
+                });
+            }
+            return res.status(200).json({ success: true, trip: updated, summary: result.summary });
+        }
         return res.status(200).json({ success: true, trip: updated });
     } catch (err) {
         return res.status(500).json({ success: false, message: err.message });

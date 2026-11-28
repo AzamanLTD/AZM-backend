@@ -13,7 +13,11 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
-const GRACE_PERIOD_MINS = 30; // grace after departure before marking transit no-show
+// Grace after departure before marking a transit passenger a no-show. It
+// must outlast the QR boarding window (departure + 60 min, qrCheckInService
+// TRANSIT_WINDOW_MS): a passenger still holding a valid boarding code is
+// never swept first. 75 min = the window + a margin.
+const GRACE_PERIOD_MINS = require('../services/transitBookingService').NO_SHOW_GRACE_MS / 60000;
 
 // =============================================================================
 // sweepNoShowReservations — finds past-due reservations without check-in.
@@ -320,9 +324,27 @@ const sweepNoShowTransitBookings = async (prisma) => {
 // sweepAll — convenience function to run both sweeps.
 // =============================================================================
 const sweepAll = async (prisma) => {
-    const reservationResults = await sweepNoShowReservations(prisma);
-    const transitResults = await sweepNoShowTransitBookings(prisma);
-    return { reservations: reservationResults, transit: transitResults };
+    let reservationResults;
+    let transitResults;
+    let sweepError = null;
+    try {
+        reservationResults = await sweepNoShowReservations(prisma);
+        transitResults = await sweepNoShowTransitBookings(prisma);
+    } catch (err) {
+        sweepError = err;
+    }
+    // ID-check boardings whose report window has passed: release the held
+    // fare to the operator (a reported one is DISPUTED and stays).
+    let payouts;
+    try {
+        const { sweepHeldTransitPayouts } = require('../services/transitBookingService');
+        payouts = await sweepHeldTransitPayouts(prisma);
+    } catch (err) {
+        logger.error({ err: err.message }, '[NoShowWorker] held payout sweep failed');
+        payouts = { error: err.message };
+    }
+    if (sweepError) throw sweepError; // after the payouts ran
+    return { reservations: reservationResults, transit: transitResults, payouts };
 };
 
 module.exports = { sweepNoShowReservations, sweepNoShowTransitBookings, sweepAll, GRACE_PERIOD_MINS };
