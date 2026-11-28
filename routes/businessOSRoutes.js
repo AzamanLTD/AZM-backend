@@ -1357,6 +1357,13 @@ router.get('/transit/fleet', requirePermission('transit.fleet.view'), wrap(async
     res.json({ success: true, fleet });
 }));
 
+router.put('/transit/vehicles/:id/seat-map', requirePermission('transit.fleet.manage'), wrap(async (req, res) => {
+    const svc = getServices(req);
+    const bpId = await getBusinessProfileId(req);
+    const seatMap = await svc.transitOpsService.saveSeatMap(req.params.id, req.body || {}, bpId);
+    res.json({ success: true, seatMap });
+}));
+
 router.post('/transit/fleet', requirePermission('transit.fleet.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
@@ -1404,8 +1411,14 @@ router.get('/transit/manifests', requirePermission('transit.manifests.view'), wr
 router.post('/transit/manifests/board', requirePermission('transit.manifests.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
-    const result = await svc.transitOpsService.boardPassenger(req.body.reservationId, bpId);
-    res.json({ success: true, result });
+    const result = await svc.transitOpsService.boardPassenger({
+        bookingId: req.body && req.body.bookingId,
+        azamanId: req.body && req.body.azamanId,
+    }, bpId);
+    // The passenger hears at once (best effort): a boarding that was not them
+    // is reported before the held fare is released.
+    await require('../controllers/transitController')._noticeIdCheckBoarding(req.app, result);
+    res.json({ success: true, ...result });
 }));
 
 // ═══════════════════════════════════════════════════════════════════════════

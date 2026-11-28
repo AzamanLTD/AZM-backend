@@ -5,6 +5,14 @@
 // route/trip management, and live manifests.
 // =============================================================================
 
+const _status = (err, statusCode, code) => Object.assign(err, { statusCode, ...(code ? { code } : {}) });
+const _withStatus = async (fn) => {
+    try { return await fn(); } catch (err) {
+        if (err && Number.isInteger(err.httpStatus) && !err.statusCode) err.statusCode = err.httpStatus;
+        throw err;
+    }
+};
+
 class TransitOpsService {
     constructor(prisma) {
         this.prisma = prisma;
@@ -222,6 +230,7 @@ class TransitOpsService {
                     where: { status: { in: ['ASSIGNED', 'CHECKED_IN', 'ON_DUTY'] } },
                     take: 1,
                 },
+                seatMap: { select: { layout: true, rows: true, cols: true, updatedAt: true } },
             },
         });
 
@@ -242,83 +251,82 @@ class TransitOpsService {
             activeAssignment: v.driverAssignments?.[0] || null,
             pendingMaintenance: v.maintenances || [],
             needsMaintenance: (v.maintenances || []).length > 0,
+            seatMap: v.seatMap || null,
         }));
+    }
+
+    // A vehicle's seat map, saved from the fleet page. Same checks as the
+    // trip seat-map save (transitSeatLayout): a valid grid, and never
+    // removing, blanking or blocking a seat that has an active booking.
+    async saveSeatMap(vehicleId, { layout, rows, cols } = {}, businessProfileId) {
+        if (!businessProfileId) throw new Error('Business profile context is required.');
+        const vehicle = await this.prisma.transitVehicle.findFirst({
+            where: { id: vehicleId, businessProfileId },
+            select: { id: true },
+        });
+        if (!vehicle) throw _status(new Error('Vehicle not found.'), 404);
+        const { validateLayout, bookedSeatsLost } = require('../transitSeatLayout');
+        let clean;
+        try { clean = validateLayout({ layout, rows, cols }); } catch (err) {
+            throw _status(err, err.httpStatus || 400);
+        }
+        const lost = await bookedSeatsLost(this.prisma, { vehicleId, layout: clean.layout });
+        if (lost.length) {
+            throw _status(new Error(`Seats ${lost.join(', ')} have active bookings. Move or cancel those bookings before removing or blocking them.`), 409, 'SEAT_MAP_BOOKED_SEATS');
+        }
+        return this.prisma.transitSeatMap.upsert({
+            where: { vehicleId },
+            create: { vehicleId, layout: clean.layout, rows: clean.rows, cols: clean.cols },
+            update: { layout: clean.layout, rows: clean.rows, cols: clean.cols },
+        });
     }
 
     // ═══ LIVE MANIFESTS ═══════════════════════════════════════════════════════
 
+    // The business's passenger list for one of its trips: the same manifest
+    // the owner's app shows (transitBoardingService.buildTripManifest), built
+    // from the trip's transit bookings, by seat. Staff reach it through the
+    // business routes' permission check (transit.manifests.view); the trip
+    // must belong to the business in context. (It used to read
+    // trip.reservations, a relation transit trips do not have, so every
+    // manifest request failed.)
     async getTripManifest(tripId, businessProfileId) {
         if (!businessProfileId) throw new Error('Business profile context is required.');
         const trip = await this.prisma.transitTrip.findFirst({
             where: { id: tripId, businessProfileId },
-            include: {
-                vehicle: { select: { id: true, capacity: true } },
-                reservations: {
-                    where: { status: { in: ['CONFIRMED', 'CHECKED_IN', 'BOARDED'] } },
-                    include: {
-                        customer: { select: { username: true, email: true, phone: true } },
-                    },
-                    orderBy: { seatNumber: 'asc' },
-                },
-                driverAssignments: {
-                    where: { businessProfileId, status: { in: ['ASSIGNED', 'CHECKED_IN', 'ON_DUTY'] } },
-                    include: {
-                        employee: { include: { user: { select: { username: true, phone: true } } } },
-                        vehicle: true,
-                    },
-                },
-            },
+            select: { id: true },
         });
-        if (!trip) throw new Error('Trip not found.');
-
-        const totalSeats = trip.totalSeats || (trip.vehicle?.capacity || 0);
-        const bookedSeats = trip.reservations.length;
-        const availableSeats = totalSeats - bookedSeats;
-
-        return {
-            trip,
-            driver: trip.driverAssignments[0]?.employee || null,
-            vehicle: trip.driverAssignments[0]?.vehicle || null,
-            passengers: trip.reservations.map(r => ({
-                id: r.id,
-                name: r.customer?.username || 'Unknown',
-                phone: r.customer?.phone || null,
-                seatNumber: r.seatNumber,
-                status: r.status,
-                checkedIn: r.status === 'CHECKED_IN' || r.status === 'BOARDED',
-                azamanId: r.customer?.azamanId || null,
-            })),
-            stats: {
-                totalSeats,
-                bookedSeats,
-                availableSeats,
-                checkedIn: trip.reservations.filter(r => r.status === 'CHECKED_IN' || r.status === 'BOARDED').length,
-                occupancyRate: totalSeats > 0 ? (bookedSeats / totalSeats) * 100 : 0,
-            },
-        };
+        if (!trip) throw _status(new Error('Trip not found.'), 404);
+        const ownerId = await this._ownerUserId(businessProfileId);
+        const { buildTripManifest } = require('../transitBoardingService');
+        return _withStatus(() => buildTripManifest(this.prisma, { tripId, businessUserId: ownerId }));
     }
 
-    // Boarding — mark passenger as boarded (called by driver scanner)
-    async boardPassenger(reservationId, businessProfileId) {
+    // Boarding from the manifest by ID check: staff compared the passenger's
+    // photo and ID with the booking. Same rule as the owner's app
+    // (transitBoardingService.boardByIdCheck): the business must allow ID
+    // check boarding, the AZM-ID must be the passenger's, and the booking must
+    // be CONFIRMED. The booking must belong to the business in context.
+    async boardPassenger({ bookingId, azamanId } = {}, businessProfileId) {
         if (!businessProfileId) throw new Error('Business profile context is required.');
-        const reservation = await this.prisma.reservation.findFirst({
-            where: { id: reservationId, businessProfileId },
-            include: { trip: { select: { id: true, businessProfileId: true } } },
+        if (!bookingId) throw _status(new Error('bookingId is required.'), 400);
+        const booking = await this.prisma.transitBooking.findFirst({
+            where: { id: bookingId, businessProfileId },
+            select: { id: true },
         });
-        if (!reservation) throw new Error('Reservation not found.');
-        if (reservation.trip && reservation.trip.businessProfileId !== businessProfileId) {
-            throw new Error('Reservation does not belong to this business.');
-        }
-        if (reservation.status === 'BOARDED') throw new Error('Passenger already boarded.');
-        if (reservation.status === 'CANCELLED') throw new Error('Reservation was cancelled.');
-        if (!['CONFIRMED', 'CHECKED_IN'].includes(reservation.status)) {
-            throw new Error('Passenger is not eligible for boarding.');
-        }
+        if (!booking) throw _status(new Error('Booking not found.'), 404);
+        const ownerId = await this._ownerUserId(businessProfileId);
+        const { boardByIdCheck } = require('../transitBoardingService');
+        return _withStatus(() => boardByIdCheck(this.prisma, { bookingId, businessUserId: ownerId, azamanId }));
+    }
 
-        return this.prisma.reservation.update({
-            where: { id: reservationId },
-            data: { status: 'BOARDED' },
+    async _ownerUserId(businessProfileId) {
+        const profile = await this.prisma.businessProfile.findUnique({
+            where: { id: businessProfileId },
+            select: { userId: true },
         });
+        if (!profile || !profile.userId) throw _status(new Error('Business not found.'), 404);
+        return profile.userId;
     }
 
     // Get all manifests for a date

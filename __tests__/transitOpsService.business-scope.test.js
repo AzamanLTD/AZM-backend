@@ -51,49 +51,29 @@ describe('TransitOpsService business scoping', () => {
             .rejects.toThrow('Trip not found.');
         expect(prisma.transitTrip.findFirst).toHaveBeenCalledWith({
             where: { id: 'trip-b', businessProfileId: bpA },
-            include: expect.any(Object),
+            select: { id: true },
         });
     });
 
-    test('rejects boarding a reservation outside the business', async () => {
+    // Boarding is by the trip's transit booking (not a Reservation): another
+    // business's booking reads as missing and nothing is written. The
+    // same-business path is in transit-manifest-vehicle-capacity.test.js.
+    test('rejects boarding a booking outside the business', async () => {
         const prisma = {
-            reservation: {
+            transitBooking: {
                 findFirst: jest.fn().mockResolvedValue(null),
                 update: jest.fn(),
             },
         };
         const svc = new TransitOpsService(prisma);
 
-        await expect(svc.boardPassenger('reservation-b', bpA))
-            .rejects.toThrow('Reservation not found.');
-        expect(prisma.reservation.findFirst).toHaveBeenCalledWith({
-            where: { id: 'reservation-b', businessProfileId: bpA },
-            include: { trip: { select: { id: true, businessProfileId: true } } },
+        await expect(svc.boardPassenger({ bookingId: 'booking-b', azamanId: 'AZM-1' }, bpA))
+            .rejects.toThrow('Booking not found.');
+        expect(prisma.transitBooking.findFirst).toHaveBeenCalledWith({
+            where: { id: 'booking-b', businessProfileId: bpA },
+            select: { id: true },
         });
-        expect(prisma.reservation.update).not.toHaveBeenCalled();
-    });
-
-    test('allows same-business boarding only for confirmed or checked-in passengers', async () => {
-        const reservation = {
-            id: 'reservation-a',
-            businessProfileId: bpA,
-            status: 'CHECKED_IN',
-            trip: { id: 'trip-a', businessProfileId: bpA },
-        };
-        const prisma = {
-            reservation: {
-                findFirst: jest.fn().mockResolvedValue(reservation),
-                update: jest.fn().mockResolvedValue({ ...reservation, status: 'BOARDED' }),
-            },
-        };
-        const svc = new TransitOpsService(prisma);
-
-        await expect(svc.boardPassenger('reservation-a', bpA))
-            .resolves.toEqual({ ...reservation, status: 'BOARDED' });
-        expect(prisma.reservation.update).toHaveBeenCalledWith({
-            where: { id: 'reservation-a' },
-            data: { status: 'BOARDED' },
-        });
+        expect(prisma.transitBooking.update).not.toHaveBeenCalled();
     });
 
     test('rejects assignment to a foreign trip or vehicle', async () => {

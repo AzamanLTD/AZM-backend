@@ -554,13 +554,18 @@ exports.boardById = async (req, res) => {
     } catch (err) {
         return _boardingFail(res, err, '[transit.boardById] error');
     }
-    // Post-commit and best effort: the boarding stands either way. The
-    // passenger hears at once, so a boarding that was not them is reported
-    // before the held fare is released.
+    await _noticeIdCheckBoarding(req.app, result);
+    return res.status(200).json(result);
+};
+
+// Post-commit and best effort: the boarding stands either way. The passenger
+// hears at once, so a boarding that was not them is reported before the held
+// fare is released. Used by this route and the business routes' manifest.
+const _noticeIdCheckBoarding = async (app, result) => {
     try {
-        const io = req.app.get('socketio');
+        const io = app.get('socketio');
         if (io) io.to(`user_${result.booking.customerId}`).emit('transit_booking_update', result.booking);
-        const notifier = req.app.get('notificationService');
+        const notifier = app.get('notificationService');
         if (notifier && typeof notifier.sendNotification === 'function') {
             await notifier.sendNotification({
                 userId: result.booking.customerId,
@@ -574,10 +579,10 @@ exports.boardById = async (req, res) => {
     } catch (err) {
         // The trip's "Was this you?" card in the app (from the booking's
         // boarding record) still asks them; the push is the prompt.
-        logger.error({ err: err && err.message, bookingId: result.booking.id }, '[transit.boardById] passenger notice failed');
+        logger.error({ err: err && err.message, bookingId: result && result.booking && result.booking.id }, '[transit.boardById] passenger notice failed');
     }
-    return res.status(200).json(result);
 };
+exports._noticeIdCheckBoarding = _noticeIdCheckBoarding;
 
 // POST /api/transit/bookings/:id/boarding/confirm — the passenger: "That was me".
 exports.confirmBoarding = async (req, res) => {
