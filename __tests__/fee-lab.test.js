@@ -37,6 +37,7 @@ function makeDb() {
             businessInvoiceFeePct: new Prisma.Decimal('0.015'),
             p2pFeePct: new Prisma.Decimal('0.02'),
             susuProfitPct: new Prisma.Decimal('0.03'),
+            cryptoPlatformFeePct: new Prisma.Decimal('0'),
             withdrawalFeeByRiskTier: { STANDARD: 0.02, TRUSTED: 0.005, HIGH_RISK: 0.05 },
             feeByPaymentMethod: { ZELLE: 0.02, PAYPAL: 0.04 },
             liveUsdToGhs: new Prisma.Decimal('15'),
@@ -72,7 +73,9 @@ describe('live values', () => {
         expect(param(cat, 'feeRefund.CUSTOMER_CANCELLED').live).toBe('KEEP');
         // Modelled points: their model default, never publishable.
         expect(param(cat, 'fee.transfer.pct')).toEqual(expect.objectContaining({ live: 0, publishable: false, writesTo: null }));
-        expect(param(cat, 'fee.walletPlatform.pct').notPublishableReason).toMatch(/break these withdrawals/);
+        // The wallet withdrawal platform fee is live and settable (it was
+        // locked at 0%: its profit source was not an enum value).
+        expect(param(cat, 'fee.walletPlatform.pct')).toEqual(expect.objectContaining({ live: 0, publishable: true, writesTo: 'GlobalSettings.cryptoPlatformFeePct' }));
         expect(param(cat, 'fee.p2p.azamanShare')).toEqual(expect.objectContaining({ live: 6000, role: 'share', publishable: false }));
     });
 
@@ -121,6 +124,12 @@ describe('publishing', () => {
         expect(param(out.catalog, 'feeRefund.CUSTOMER_CANCELLED').live).toBe('REFUND');
     });
 
+    test('the wallet withdrawal fee is set from here (no longer locked at 0%)', async () => {
+        const db = makeDb();
+        await publish(db, [{ key: 'fee.walletPlatform.pct', from: 0, to: 50 }]);
+        expect(db.globalSettings.rows[0].cryptoPlatformFeePct.toString()).toBe('0.005');
+    });
+
     test('a published refund rule is what refunds then use', async () => {
         const db = makeDb();
         expect(await publishedFeeRefund(db, NOW)).toBe(null);
@@ -138,7 +147,6 @@ describe('publishing', () => {
         ['an unknown key', [{ key: 'fee.nope', from: 0, to: 1 }], 'FEE_LAB_UNKNOWN_KEY'],
         ['the same key twice', [{ key: 'fee.escrow.pct', from: 50, to: 60 }, { key: 'fee.escrow.pct', from: 50, to: 70 }], 'FEE_LAB_DUPLICATE_KEY'],
         ['a fee the app does not charge', [{ key: 'fee.transfer.pct', from: 0, to: 50 }], 'FEE_NOT_PUBLISHABLE'],
-        ['a fee that would break withdrawals', [{ key: 'fee.walletPlatform.pct', from: 0, to: 50 }], 'FEE_NOT_PUBLISHABLE'],
         ['above the bound', [{ key: 'fee.escrow.pct', from: 50, to: 1001 }], 'FEE_LAB_OUT_OF_BOUNDS'],
         ['not whole basis points', [{ key: 'fee.escrow.pct', from: 50, to: 7.5 }], 'FEE_LAB_OUT_OF_BOUNDS'],
         ['not a policy', [{ key: 'feeRefund.NO_SHOW', from: 'KEEP', to: 'MAYBE' }], 'FEE_LAB_OUT_OF_BOUNDS'],

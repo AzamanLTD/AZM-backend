@@ -201,14 +201,14 @@ const FEE_POINTS = Object.freeze([
         flow: 'WALLET',
         name: 'Wallet withdrawal platform fee',
         status: 'LIVE',
-        summary: 'A percentage on POST /api/wallet/withdraw. It is set to 0% today.',
+        summary: 'A percentage on every wallet withdrawal (MoMo, Binance ID or an external wallet), taken out of the amount.',
         when: 'At the request, taken out of the amount.',
         payer: 'Customer',
-        refunds: ['An admin rejection returns the full amount; the fee bookkeeping on that path is unclear.'],
-        params: [pct('fee.walletPlatform.pct', 'Fee on the amount', none('Turning this above 0% would break these withdrawals today: the profit log has no source for it (CRYPTO_WITHDRAWAL_FEE is not in the enum). Fix that first.'), { modelDefault: 0 })],
-        revenueSources: [],
-        volume: null,
-        caveats: ['Do not raise this from the old Fee Engine either until the profit-source bug is fixed.'],
+        refunds: ['An admin rejection returns the full amount, fee included; the fee comes back out of revenue.'],
+        params: [pct('fee.walletPlatform.pct', 'Fee on the amount', gs('cryptoPlatformFeePct'), { modelDefault: 0 })],
+        revenueSources: ['WITHDRAWAL_FEE'],
+        volume: 'walletWithdrawals',
+        caveats: ['Network gas on external wallets is a separate fee (above).'],
     },
 
     // ── P2P ─────────────────────────────────────────────────────────────────
@@ -394,6 +394,12 @@ const VOLUME_SOURCES = Object.freeze({
     peerTransfers: { sql: (from, to) => Prisma.sql`
         SELECT "amount" AS amt FROM "PeerTransfer"
         WHERE "status" = 'COMPLETED' AND "createdAt" >= ${from} AND "createdAt" < ${to}` },
+    // Wallet withdrawals requested (the platform fee is taken at the request);
+    // rejected and failed ones are left out.
+    walletWithdrawals: { sql: (from, to) => Prisma.sql`
+        SELECT "amount" AS amt FROM "Withdrawal"
+        WHERE "status" NOT IN ('REJECTED', 'FAILED')
+          AND "createdAt" >= ${from} AND "createdAt" < ${to}` },
     cryptoWithdrawals: { sql: (from, to) => Prisma.sql`
         SELECT ABS("amountUsdc") AS amt FROM "TransactionHistory"
         WHERE "type" = 'WITHDRAWAL_CRYPTO' AND "status" = 'COMPLETED'
