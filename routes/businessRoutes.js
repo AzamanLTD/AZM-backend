@@ -68,7 +68,7 @@ router.delete('/products/:productId', protect, productCtrl.deleteProduct);
 router.get('/orders/stats',                 protect, orderCtrl.getBusinessStats);
 router.get('/orders',                       protect, orderCtrl.listBusinessOrders);
 router.get('/orders/:orderId',              protect, orderCtrl.getOrder);
-router.patch('/orders/:orderId/delivered',  protect, orderCtrl.markDelivered);
+router.patch('/orders/:orderId/delivered',  protectActive, orderCtrl.markDelivered);
 
 // Customer order history (any authenticated user)
 router.get('/my-orders', protect, orderCtrl.listMyOrders);

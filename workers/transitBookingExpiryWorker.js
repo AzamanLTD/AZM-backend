@@ -74,11 +74,16 @@ class TransitBookingExpiryWorker {
                     // resolves any escrow through the canonical economics.
                     // PENDING bookings are unpaid, so no money can move; a
                     // racing confirmation simply makes the claim lose.
-                    await cancelTransitBooking(this.prisma, {
+                    // PENDING only: a booking paid since the read above is
+                    // CONFIRMED and must not be cancelled (and refunded) out
+                    // from under the passenger who just paid.
+                    const result = await cancelTransitBooking(this.prisma, {
                         bookingId: booking.id,
                         cancelledBy: booking.customerId,
                         note: 'Payment not completed within 15 minutes',
+                        onlyFromStatuses: ['PENDING'],
                     });
+                    if (result && result.alreadyCancelled) continue;
 
                     logger.info({ bookingId: booking.id, bookingRef: booking.bookingRef },
                         '[TransitBookingExpiryWorker] expired pending booking');
@@ -107,6 +112,13 @@ class TransitBookingExpiryWorker {
                         }
                     }
                 } catch (err) {
+                    // Paid (or otherwise moved on) since the read: nothing to
+                    // expire. Not an error.
+                    if (err && err.code === 'NOT_CANCELLABLE') {
+                        logger.info({ bookingId: booking.id },
+                            '[TransitBookingExpiryWorker] booking left PENDING before expiry; skipped');
+                        continue;
+                    }
                     logger.error({ err, bookingId: booking.id },
                         '[TransitBookingExpiryWorker] failed to expire booking');
                 }

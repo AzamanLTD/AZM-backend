@@ -548,6 +548,12 @@ router.post('/:businessProfileId/checkout', protect, protectActive, wrap(async (
   // The server is authoritative: never trust the client's paymentMode alone.
   // Omitted paymentMode defaults to DIRECT for backward compatibility.
   const mode = (paymentMode || 'DIRECT').toUpperCase();
+  if (mode === 'ESCROW' && business.userId === userId) {
+    // The escrow is created here directly (not through createEscrow), so its
+    // payer != payee rule is checked here: an owner paying their own store
+    // would pay themselves and inflate the store's completed-escrow stats.
+    return res.status(409).json({ success: false, code: 'SELF_PAYMENT', message: 'You cannot buy from your own store.' });
+  }
   if (mode === 'ESCROW') {
     const { _escrowProtectionAvailable } = require('../services/storefrontRenderService');
     if (!_escrowProtectionAvailable(business)) {

@@ -1403,6 +1403,7 @@ module.exports = {
     // reimplement escrow money movement in another service.
     _claimEscrowStatusTx,
     _releaseEscrowTx,
+    _afterReleaseCommitted,
     _refundEscrowTx,
     refundEscrowInTransaction,
     // Constants for reuse/testing.
