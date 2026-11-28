@@ -1,5 +1,6 @@
 const logger = require('../src/config/logger');
 const { getReadPrisma } = require('../src/config/readReplica');
+const profitRevenue = require('../services/profitRevenueService');
 
 const PERIODS = Object.freeze({
     '24h': 1,
@@ -22,11 +23,34 @@ function dayKey(value) {
     return new Date(value).toISOString().slice(0, 10);
 }
 
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+/** Every UTC day from `from` to `to`, inclusive, as YYYY-MM-DD. */
+function daysBetween(from, to) {
+    const out = [];
+    const last = dayKey(to);
+    let cursor = Date.UTC(from.getUTCFullYear(), from.getUTCMonth(), from.getUTCDate());
+    for (;;) {
+        const key = new Date(cursor).toISOString().slice(0, 10);
+        out.push(key);
+        if (key >= last) break;
+        cursor += DAY_MS;
+    }
+    return out;
+}
+
 /**
  * GET /api/admin/profit-breakdown?period=24h|7d|30d|90d
  *
  * The dashboard's period selector is an API contract: every period changes
  * the source query, totals, chart data, and returned period metadata.
+ *
+ * Revenue is what Azaman keeps (services/profitRevenueService): withdrawal
+ * principal, profit liquidations and referrer payouts are left out and
+ * reported under `excluded`; reversals net against their source. The daily
+ * profit comes from the same rows, so the chart adds up to the total. Volume
+ * and active users come from the daily snapshot when one exists for the day
+ * (null otherwise).
  */
 exports.getProfitBreakdown = async (req, res) => {
     const prisma = getReadPrisma(req.app);
@@ -43,75 +67,37 @@ exports.getProfitBreakdown = async (req, res) => {
     try {
         const now = new Date();
         const periodDays = getPeriodDays(requestedPeriod);
-        const from = new Date(now.getTime() - periodDays * 24 * 60 * 60 * 1000);
+        const from = new Date(now.getTime() - periodDays * DAY_MS);
 
         const fiatPoolMode = await require('../src/services/fiatLiquidityActivationService').readModeAndPool(prisma);
-        const [profitFees, fiatPool, hotWallet, masterCrypto, profitLogs, dailySnapshots] = await Promise.all([
+        const [profitFees, hotWallet, masterCrypto, revenue, dailySnapshots] = await Promise.all([
             prisma.systemProfitFees.findUnique({ where: { id: 1 } }).catch(() => ({ balance: 0 })),
-            prisma.systemFiatPool.findUnique({ where: { id: 1 } }).catch(() => ({ balance: 0 })),
             prisma.systemHotWallet.findUnique({ where: { id: 1 } }).catch(() => ({ balance: 0 })),
             prisma.systemMasterCrypto.findUnique({ where: { id: 1 } }).catch(() => ({ balance: 0 })),
-            prisma.adminProfitLog.groupBy({
-                by: ['source'],
-                where: { createdAt: { gte: from } },
-                _sum: { amountUsdc: true },
-                _count: true,
-            }),
+            profitRevenue.readRevenue(prisma, { from, to: now }),
             prisma.dailySnapshot.findMany({
                 where: { date: { gte: from } },
                 orderBy: { date: 'asc' },
                 select: {
                     date: true,
-                    totalProfitUsdc: true,
                     totalVolumeUsdc: true,
                     activeUsers: true,
-                    profitBySource: true,
                 },
             }),
         ]);
 
-        const sourceBreakdown = {};
-        let totalProfit = 0;
-        let totalTransactions = 0;
-        for (const log of profitLogs) {
-            const totalUsdc = asNumber(log._sum?.amountUsdc);
-            const count = Number(log._count || 0);
-            sourceBreakdown[log.source] = { totalUsdc, count };
-            totalProfit += totalUsdc;
-            totalTransactions += count;
-        }
-
-        let dailyPnl = dailySnapshots.map((snapshot) => ({
-            date: snapshot.date,
-            profit: asNumber(snapshot.totalProfitUsdc),
-            volume: asNumber(snapshot.totalVolumeUsdc),
-            users: Number(snapshot.activeUsers || 0),
-            bySource: snapshot.profitBySource,
-        }));
-
-        if (dailyPnl.length === 0) {
-            const recentLogs = await prisma.adminProfitLog.findMany({
-                where: { createdAt: { gte: from } },
-                orderBy: { createdAt: 'asc' },
-                select: { amountUsdc: true, source: true, createdAt: true },
-            });
-
-            const dayMap = new Map();
-            for (const log of recentLogs) {
-                const date = dayKey(log.createdAt);
-                const entry = dayMap.get(date) || { profit: 0, count: 0 };
-                entry.profit += asNumber(log.amountUsdc);
-                entry.count += 1;
-                dayMap.set(date, entry);
-            }
-
-            dailyPnl = [...dayMap.entries()].map(([date, data]) => ({
+        const snapshotByDay = new Map(dailySnapshots.map((snapshot) => [dayKey(snapshot.date), snapshot]));
+        const dailyPnl = daysBetween(from, now).map((date) => {
+            const day = revenue.daily.get(date);
+            const snapshot = snapshotByDay.get(date);
+            return {
                 date,
-                profit: data.profit,
-                volume: 0,
-                users: 0,
-            }));
-        }
+                profit: day ? day.profit : 0,
+                volume: snapshot ? asNumber(snapshot.totalVolumeUsdc) : null,
+                users: snapshot ? Number(snapshot.activeUsers || 0) : null,
+                bySource: day ? day.bySource : {},
+            };
+        });
 
         return res.status(200).json({
             success: true,
@@ -128,10 +114,12 @@ exports.getProfitBreakdown = async (req, res) => {
                     masterCrypto: asNumber(masterCrypto?.balance),
                     };
                 })(),
-                sourceBreakdown,
+                sourceBreakdown: revenue.sourceBreakdown,
                 dailyPnl,
-                totalProfit,
-                totalTransactions,
+                totalProfit: revenue.totalUsdc,
+                totalTransactions: revenue.count,
+                reversals: revenue.reversals,
+                excluded: revenue.excluded,
                 period: {
                     key: requestedPeriod,
                     from: from.toISOString(),

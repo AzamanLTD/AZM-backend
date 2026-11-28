@@ -31,6 +31,7 @@ const { Prisma } = require('@prisma/client');
 const catalogLib = require('../src/lib/feeLabCatalog');
 const { audit } = require('../utils/audit');
 const { DEFAULT_FEE_REFUND } = require('./feeRefundPolicy');
+const profitRevenue = require('./profitRevenueService');
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const PERIODS = Object.freeze({ '7d': 7, '30d': 30, '90d': 90 });
@@ -132,18 +133,19 @@ async function readCatalog(db, { now = new Date() } = {}) {
 
 // ── volumes and booked revenue ───────────────────────────────────────────────
 
-/** Booked revenue per profit source in [from, to). */
+/**
+ * Booked revenue per profit source in [from, to): what Azaman keeps, by the
+ * same rule as the profit breakdown (services/profitRevenueService). Cash-out
+ * principal, profit liquidations and the referrer's half of an exit fee are
+ * not revenue; refunds net against their source. count is the number of
+ * charges.
+ */
 async function _actuals(db, from, to) {
-    const rows = await db.adminProfitLog.groupBy({
-        by: ['source'],
-        where: { createdAt: { gte: from, lt: to } },
-        _sum: { amountUsdc: true },
-        _count: { _all: true },
-    });
+    const { sourceBreakdown } = await profitRevenue.readRevenue(db, { from, to });
     /** @type {Record<string, {revenueUsdc: number, count: number}>} */
     const out = {};
-    for (const r of rows) {
-        out[r.source] = { revenueUsdc: Number(r._sum.amountUsdc || 0), count: r._count._all };
+    for (const [source, s] of Object.entries(sourceBreakdown)) {
+        out[source] = { revenueUsdc: s.totalUsdc, count: s.count };
     }
     return out;
 }
