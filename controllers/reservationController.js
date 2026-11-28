@@ -214,16 +214,30 @@ exports.cancelReservation = async (req, res) => {
     }
 };
 
-// ── GET /api/reservations/business/:bizId — business owner sees all incoming ─
+// ── Who acts for the business ───────────────────────────────────────────────
+// The owner, or staff whose permissions cover the job (services/businessActor).
+// Front-desk work (confirm, decline, check in, check out, no-show) needs
+// reservations.manage or hotel.front_desk.manage; the list needs any
+// reservations or front-desk right. The lifecycle is called with the
+// business's owner id (what it compares), so staff act for the business.
+const RESERVATION_WORK = ['reservations.manage', 'hotel.front_desk.manage'];
+const RESERVATION_READ = ['reservations.view', 'reservations.manage', 'hotel.front_desk.manage'];
+const _reservationActor = async (prisma, req, anyOf) => {
+    const { resolveBusinessActor } = require('../services/businessActor');
+    return resolveBusinessActor(prisma, req.user, { anyOf });
+};
+const _notPermitted = (res) => res.status(403).json({ success: false, code: 'NOT_PERMITTED', message: 'You do not have permission to manage reservations for this business.' });
+
+// ── GET /api/reservations/business/:bizId — the business sees all incoming ──
 exports.listBusinessReservations = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const userId = req.user.id;
         const { status, limit, cursor } = req.query;
         const take = Math.min(parseInt(limit, 10) || 20, 50);
 
-        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
-        if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
+        const actor = await _reservationActor(prisma, req, RESERVATION_READ);
+        if (!actor) return _notPermitted(res);
+        const profile = { id: actor.businessProfileId };
 
         const where = { businessProfileId: profile.id };
         if (status) where.status = status;
@@ -253,9 +267,9 @@ exports.listBusinessReservations = async (req, res) => {
 exports.confirmReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const userId  = req.user.id;
-        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
-        if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
+        const actor = await _reservationActor(prisma, req, RESERVATION_WORK);
+        if (!actor) return _notPermitted(res);
+        const profile = { id: actor.businessProfileId };
 
         const { reservationId } = req.params;
         const updated = await reservationLifecycle.confirmReservation(prisma, {
@@ -289,8 +303,9 @@ exports.confirmReservation = async (req, res) => {
 exports.declineReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const profile = await prisma.businessProfile.findFirst({ where: { userId: req.user.id } });
-        if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
+        const actor = await _reservationActor(prisma, req, RESERVATION_WORK);
+        if (!actor) return _notPermitted(res);
+        const profile = { id: actor.businessProfileId };
         const reason = req.body && typeof req.body.reason === 'string' ? req.body.reason : null;
         const reservation = await reservationLifecycle.businessCancelReservation(prisma, {
             reservationId: req.params.reservationId,
@@ -459,6 +474,8 @@ exports.setCheckInPolicy = async (req, res) => {
 exports.checkInReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
+        const actor = await _reservationActor(prisma, req, RESERVATION_WORK);
+        if (!actor) return _notPermitted(res);
         const { isPaidReservation, qrCheckInRequiredError } = require('../services/stayPaymentService');
         if (await isPaidReservation(prisma, req.params.reservationId)) {
             const e = qrCheckInRequiredError();
@@ -466,7 +483,7 @@ exports.checkInReservation = async (req, res) => {
         }
         const reservation = await reservationLifecycle.checkInReservation(prisma, {
             reservationId: req.params.reservationId,
-            businessUserId: req.user.id,
+            businessUserId: actor.ownerUserId,
         });
         return res.status(200).json({ success: true, reservation });
     } catch (err) {
@@ -485,9 +502,11 @@ exports.checkInReservation = async (req, res) => {
 exports.markNoShowReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
+        const actor = await _reservationActor(prisma, req, RESERVATION_WORK);
+        if (!actor) return _notPermitted(res);
         const reservation = await reservationLifecycle.markNoShowReservation(prisma, {
             reservationId: req.params.reservationId,
-            businessUserId: req.user.id,
+            businessUserId: actor.ownerUserId,
         });
         return res.status(200).json({ success: true, reservation });
     } catch (err) {
@@ -503,9 +522,11 @@ exports.markNoShowReservation = async (req, res) => {
 exports.checkOutReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
+        const actor = await _reservationActor(prisma, req, RESERVATION_WORK);
+        if (!actor) return _notPermitted(res);
         const updated = await reservationLifecycle.checkOutReservation(prisma, {
             reservationId: req.params.reservationId,
-            businessUserId: req.user.id,
+            businessUserId: actor.ownerUserId,
         });
         return res.status(200).json({ success: true, reservation: updated });
     } catch (err) {

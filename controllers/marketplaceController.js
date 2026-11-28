@@ -612,9 +612,14 @@ exports.transitBoarding = async (req, res) => {
     const prisma = req.prisma || req.app.get('prisma');
     try {
         const token = req.body.token || req.body.code;
+        // The owner, or staff with transit.manifests.manage (drivers,
+        // conductors), board for the business.
+        const { resolveBusinessActor } = require('../services/businessActor');
+        const boardingActor = await resolveBusinessActor(prisma, req.user, { anyOf: ['transit.manifests.manage'] });
+        const boardAs = boardingActor ? boardingActor.ownerUserId : req.user.id;
         const { verifyTransitTokenAndBoard } = require('../services/qrCheckInService');
         const result = await verifyTransitTokenAndBoard(prisma, {
-            token, businessUserId: req.user.id
+            token, businessUserId: boardAs
         });
         res.json(result);
     } catch (err) {

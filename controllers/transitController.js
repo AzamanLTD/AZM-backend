@@ -498,8 +498,13 @@ exports.transitBoarding = async (req, res) => {
             return res.status(400).json({ success: false, message: 'QR code is required.' });
         }
 
+        // The owner, or staff with transit.manifests.manage (drivers,
+        // conductors), board for the business.
+        const { resolveBusinessActor } = require('../services/businessActor');
+        const boardingActor = await resolveBusinessActor(prisma, req.user, { anyOf: ['transit.manifests.manage'] });
+        const boardAs = boardingActor ? boardingActor.ownerUserId : req.user.id;
         const svc = require('../services/qrCheckInService');
-        const result = await svc.verifyTransitTokenAndBoard(prisma, { token, businessUserId: userId });
+        const result = await svc.verifyTransitTokenAndBoard(prisma, { token, businessUserId: boardAs });
         return res.status(200).json(result);
     } catch (err) {
         if (err && err.code && String(err.code).startsWith('QR_SIGNING_KEY')) {
@@ -545,10 +550,15 @@ exports.boardById = async (req, res) => {
     const prisma = req.app.get('prisma');
     let result;
     try {
+        // The owner, or staff with transit.manifests.manage (drivers,
+        // conductors), board for the business.
+        const { resolveBusinessActor } = require('../services/businessActor');
+        const boardingActor = await resolveBusinessActor(prisma, req.user, { anyOf: ['transit.manifests.manage'] });
+        const boardAs = boardingActor ? boardingActor.ownerUserId : req.user.id;
         const { boardByIdCheck } = require('../services/transitBoardingService');
         result = await boardByIdCheck(prisma, {
             bookingId: req.params.id,
-            businessUserId: req.user.id,
+            businessUserId: boardAs,
             azamanId: req.body && req.body.azamanId,
         });
     } catch (err) {

@@ -123,8 +123,10 @@ router.post('/checkin/verify', protect, async (req, res) => {
         const { token } = req.body;
         if (!token) return res.status(400).json({ success: false, message: 'Token required' });
 
+        // The owner, or front-desk staff with reservations.manage, act for
+        // the business (marketplaceController._checkInActor).
         const result = await qrSvc.verifyAndCheckIn(prisma, {
-            token, businessUserId: req.user.id,
+            token, businessUserId: await ctrl._checkInActorOwnerId(prisma, req.user),
         });
         res.json(result);
     } catch (e) {
@@ -145,10 +147,15 @@ router.get('/checkin/search', protect, async (req, res) => {
         if (!azamanId) return res.status(400).json({ success: false, message: 'azamanId required' });
 
         const boarding = require('../services/transitBoardingService');
+        const actor = await ctrl._checkInActor(prisma, req.user);
         const found = await qrSvc.searchByAzamanId(prisma, {
-            azamanId: boarding.normalizeAzamanId(String(azamanId)), businessUserId: req.user.id,
+            azamanId: boarding.normalizeAzamanId(String(azamanId)), businessUserId: actor.ownerId,
         });
-        res.json(await boarding.enrichAzamanIdSearch(prisma, { businessUserId: req.user.id, result: found }));
+        // Transit bookings and ID details only for the owner or staff with a
+        // transit manifest right.
+        res.json(actor.transit
+            ? await boarding.enrichAzamanIdSearch(prisma, { businessUserId: actor.ownerId, result: found })
+            : found);
     } catch (e) { res.status(400).json({ success: false, message: e.message }); }
 });
 
