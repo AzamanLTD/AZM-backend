@@ -97,7 +97,10 @@ exports.createBooking = async (req, res) => {
                 amountUsdc: parseFloat(amountUsdc),
                 customerNote: customerNote || null,
                 bookingRef,
-                metadata: metadata || null
+                // A client never writes how a booking was boarded.
+                metadata: metadata && typeof metadata === 'object' && !Array.isArray(metadata)
+                    ? (({ boarding, ...rest }) => rest)(metadata)
+                    : null
             },
             include: {
                 vehicle: true,
@@ -228,6 +231,21 @@ exports.updateBookingStatus = async (req, res) => {
                 success: false,
                 message: `Cannot transition from ${booking.status} to ${nextStatus}.`
             });
+        }
+
+        // A paid passenger is a no-show only once the boarding window has
+        // closed (penalty split or refund alike): before that they can still
+        // board with a valid code.
+        if (nextStatus === 'NO_SHOW') {
+            const { isPaidTransitBooking } = require('../services/qrCheckInService');
+            if (await isPaidTransitBooking(prisma, booking)) {
+                const { assertNoShowWindowClosed } = require('../services/transitBookingService');
+                try {
+                    await assertNoShowWindowClosed(prisma, booking);
+                } catch (err) {
+                    return res.status(err.httpStatus || 409).json({ success: false, code: err.code, message: err.message });
+                }
+            }
         }
 
         // A paid booking boards only by the passenger's QR (that boarding is

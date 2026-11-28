@@ -13,7 +13,11 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
-const GRACE_PERIOD_MINS = 30; // grace after departure before marking transit no-show
+// Grace after departure before marking a transit passenger a no-show. It
+// must outlast the QR boarding window (departure + 60 min, qrCheckInService
+// TRANSIT_WINDOW_MS): a passenger still holding a valid boarding code is
+// never swept first. 75 min = the window + a margin.
+const GRACE_PERIOD_MINS = 75;
 
 // =============================================================================
 // sweepNoShowReservations — finds past-due reservations without check-in.

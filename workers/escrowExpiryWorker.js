@@ -165,6 +165,30 @@ class EscrowExpiryWorker {
 
         for (const escrow of expired) {
             try {
+                // A transit fare whose passenger was boarded by their QR was
+                // carried: complete the booking and release the fare to the
+                // operator instead of refunding (the operator only forgot to
+                // complete the trip). completeTransitBooking re-checks QR
+                // boarding and departure inside its own transaction.
+                const boarded = await this.prisma.transitBooking.findFirst({
+                    where: { escrowId: escrow.id, status: 'IN_PROGRESS' },
+                    select: { id: true, metadata: true },
+                });
+                if (boarded && boarded.metadata && boarded.metadata.boarding
+                    && boarded.metadata.boarding.method === 'QR_TOKEN') {
+                    const { completeTransitBooking } = require('../services/transitBookingService');
+                    try {
+                        await completeTransitBooking(this.prisma, { bookingId: boarded.id });
+                        logger.info({ escrowId: escrow.id, bookingId: boarded.id },
+                            '[EscrowExpiryWorker] completed a QR-boarded transit booking at escrow expiry');
+                        continue;
+                    } catch (err) {
+                        logger.error({ err: err.message, escrowId: escrow.id, bookingId: boarded.id },
+                            '[EscrowExpiryWorker] auto-completion failed; leaving the escrow for the next tick');
+                        continue;
+                    }
+                }
+
                 // Refund the payer and stamp EXPIRED (transactional inside service).
                 const refunded = await escrowService._refundEscrow(this.prisma, escrow.id, 'EXPIRED');
 

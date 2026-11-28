@@ -27,11 +27,12 @@ jest.mock('../src/config/logger', () => ({ error: jest.fn(), warn: jest.fn(), in
 jest.mock('../utils/securityCheck', () => ({ runDoubleCheck: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('../services/messagingChannels', () => ({ notifyBookingConfirmed: jest.fn().mockResolvedValue(undefined) }));
 jest.mock('../services/ledgerService', () => ({ post: jest.fn().mockResolvedValue({ replayed: false }) }));
+jest.mock('../services/escrowService', () => ({ _refundEscrow: jest.fn().mockResolvedValue({ id: 'refunded' }) }));
 
 const ledger = require('../services/ledgerService');
 const {
     bookSeats, quoteSeats, completeTransitBooking, cancelTransitBooking,
-    noShowTransitBookingWithRefund, COMPLETION_GRACE_DAYS,
+    noShowTransitBookingWithRefund, COMPLETION_GRACE_DAYS, rescheduleTripBookings,
 } = require('../services/transitBookingService');
 
 // ── a tiny in-memory Prisma ──────────────────────────────────────────────────
@@ -44,6 +45,8 @@ function matches(row, where = {}) {
             if ('in' in cond) return cond.in.includes(v);
             if ('notIn' in cond) return !cond.notIn.includes(v);
             if ('gte' in cond) return num(v) >= num(cond.gte);
+            if ('lt' in cond) return v != null && +new Date(v) < +new Date(cond.lt);
+            if ('not' in cond) return cond.not === null ? v !== null && v !== undefined : v !== cond.not;
             return Object.entries(cond).every(([ck, cv]) => matches(v || {}, { [ck]: cv }));
         }
         return v === cond;
@@ -113,6 +116,7 @@ function makeDb({ passengerBalance = 100, operatorId = 20, fee = null, departInD
         transactionHistory: table([]),
         adminProfitLog: table([]),
         financialOperation: table([{ id: 'op-1', status: 'IN_PROGRESS' }]),
+        businessProfile: table([{ id: 'bp-1', userId: operatorId }]),
         $executeRaw: jest.fn(async () => 1),
     };
     db.$transaction = jest.fn(async (cb) => cb(db));
@@ -327,10 +331,14 @@ describe('completeTransitBooking', () => {
 });
 
 describe('business no-show without a penalty', () => {
-    test('refunds the passenger with the NO_SHOW claim', async () => {
+    test('refunds the passenger with the NO_SHOW claim (after the window)', async () => {
         const db = makeDb();
         const res = await pay(db, ['1A']);
+        db.transitBooking.rows[0].driverNote = 'seat 1A, blue bag';
+        trip(db).departureAt = new Date(Date.now() - 2 * 60 * 60 * 1000);
         const out = await noShowTransitBookingWithRefund(db, { bookingId: res.booking.id });
+        // An existing note survives a no-show without one.
+        expect(db.transitBooking.rows[0].driverNote).toBe('seat 1A, blue bag');
         expect(out.booking.status).toBe('NO_SHOW');
         expect(out.refund).toEqual(expect.objectContaining({ amountUsdc: 2 }));
         expect(db.smartEscrow.rows[0].status).toBe('REFUNDED');
@@ -475,6 +483,112 @@ describe('a paid booking boards only by the passenger QR', () => {
         trip(db).departureAt = new Date(Date.now() - 60 * 1000);
         const out = await completeTransitBooking(db, { bookingId });
         expect(out.release).toEqual(expect.objectContaining({ amountUsdc: 2 }));
+        expect(user(db, 20).availableBalance).toBe(2);
+    });
+});
+
+describe('re-review: no way around the QR rule', () => {
+    const ctrlT = require('../controllers/transitController');
+    const ctrlM = require('../controllers/marketplaceController');
+    const call = async (fn, req) => {
+        let status = null; let payload = null;
+        await fn(req, {
+            locals: {},
+            status(c) { status = c; return this; },
+            json(p) { payload = p; return this; },
+        });
+        return { status, payload };
+    };
+    async function paidBooking() {
+        const db = makeDb();
+        const res = await pay(db, ['1A']);
+        const row = db.transitBooking.rows[0];
+        row.businessProfile = { userId: 20 };
+        return { db, row, bookingId: res.booking.id };
+    }
+
+    test('a paid booking\'s penalty cannot be set after payment', async () => {
+        const { db, bookingId, row } = await paidBooking();
+        const out = await call(ctrlM.setPenaltyPolicy, {
+            app: { get: () => db }, user: { id: 20 },
+            body: { transitBookingId: bookingId, noShowPenaltyUsdc: 2 },
+        });
+        expect(out.status).toBe(409);
+        expect(out.payload.code).toBe('PENALTY_LOCKED');
+        expect(row.noShowPenaltyUsdc).toBeUndefined();
+    });
+
+    test('an unpaid booking\'s flat penalty is capped like the percentage', async () => {
+        const db = makeDb();
+        const res = await bookSeats(db, { tripId: 'trip-1', customerId: 10, seatIds: ['1A'] });
+        const out = await call(ctrlM.setPenaltyPolicy, {
+            app: { get: () => db }, user: { id: 20 },
+            body: { transitBookingId: res.booking.id, noShowPenaltyUsdc: 2 },
+        });
+        expect(out.status).toBe(400);
+    });
+
+    test('a paid passenger is not a no-show while the boarding window is open', async () => {
+        const { db, bookingId, row } = await paidBooking();
+        trip(db).departureAt = new Date(Date.now() - 30 * 60 * 1000); // QR still valid
+        const out = await call(ctrlT.updateBookingStatus, {
+            app: { get: (k) => (k === 'prisma' ? db : null) },
+            params: { id: bookingId }, user: { id: 20 }, body: { status: 'NO_SHOW' },
+        });
+        expect(out.status).toBe(409);
+        expect(out.payload.code).toBe('TOO_EARLY');
+        expect(row.status).toBe('CONFIRMED');
+        expect(db.smartEscrow.rows[0].status).toBe('FUNDED');
+    });
+
+    test('the approved total must be an exact decimal', async () => {
+        const db = makeDb();
+        for (const bad of ['7.0349996', ['7.035'], '0x7', '7e0']) {
+            await expect(bookSeats(db, {
+                tripId: 'trip-1', customerId: 10, seatIds: ['1A', '2A'], payWith: 'WALLET', expectedTotalUsdc: bad,
+            })).rejects.toMatchObject({ code: 'EXPECTED_TOTAL_INVALID' });
+        }
+        const ok = await bookSeats(db, {
+            tripId: 'trip-1', customerId: 10, seatIds: ['1A', '2A'], payWith: 'WALLET', expectedTotalUsdc: '7.035',
+        });
+        expect(ok.payment.totalUsdc).toBe(7.035);
+    });
+
+    test('a moved departure moves the bookings and extends the escrow', async () => {
+        const { db, row } = await paidBooking();
+        const later = new Date(Date.now() + 40 * DAY);
+        trip(db).departureAt = later;
+        row.tripId = 'trip-1';
+        await rescheduleTripBookings(db, { tripId: 'trip-1', departureAt: later });
+        expect(new Date(row.scheduledAt).getTime()).toBe(later.getTime());
+        expect(new Date(db.smartEscrow.rows[0].expiresAt).getTime())
+            .toBe(later.getTime() + COMPLETION_GRACE_DAYS * DAY);
+    });
+
+    test('wallet pay accepts only the header the idempotency middleware claims on', () => {
+        const fs = require('fs');
+        const path = require('path');
+        const src = fs.readFileSync(path.join(__dirname, '../routes/marketplaceRoutes.js'), 'utf-8');
+        const gate = src.slice(src.indexOf('const requireIdempotencyKey'), src.indexOf('const walletPayGates'));
+        expect(gate).toContain("req.get('idempotency-key')");
+        expect(gate).not.toContain('x-idempotency-key');
+    });
+
+    test('escrow expiry completes a QR-boarded passenger instead of refunding', async () => {
+        const escrowService = require('../services/escrowService');
+        escrowService._refundEscrow.mockClear();
+        const { db, row } = await paidBooking();
+        row.status = 'IN_PROGRESS';
+        row.metadata = { boarding: { method: 'QR_TOKEN' } };
+        trip(db).departureAt = new Date(Date.now() - 8 * DAY);
+        db.smartEscrow.rows[0].expiresAt = new Date(Date.now() - 1000);
+        const EscrowExpiryWorker = require('../workers/escrowExpiryWorker');
+        const Worker = EscrowExpiryWorker.EscrowExpiryWorker || EscrowExpiryWorker;
+        const worker = new Worker(db, null, null, {});
+        await worker._expireInactiveFunded(new Date());
+        expect(escrowService._refundEscrow).not.toHaveBeenCalled();
+        expect(row.status).toBe('COMPLETED');
+        expect(db.smartEscrow.rows[0].status).toBe('SETTLED');
         expect(user(db, 20).availableBalance).toBe(2);
     });
 });

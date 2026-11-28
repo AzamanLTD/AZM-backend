@@ -1556,6 +1556,8 @@ router.post('/transit/irops/reassign', requirePermission('transit.trips.manage')
             where: { id: sourceTripId },
             data: { status: 'CANCELLED' },
         });
+        // NOTE: moved bookings take the replacement's departure below
+        // (rescheduleTripBookings), after this transaction commits.
         let passengerCount = 0;
         if (sourceTrip.bookings.length > 0) {
             const moved = await tx.transitBooking.updateMany({
@@ -1574,6 +1576,12 @@ router.post('/transit/irops/reassign', requirePermission('transit.trips.manage')
         }
         return { newTrip, passengerCount, cargoCount };
     });
+    // The moved passengers depart with the replacement: their bookings and
+    // paid escrows follow its departure (no-show sweep, escrow expiry).
+    {
+        const { rescheduleTripBookings } = require('../services/transitBookingService');
+        await rescheduleTripBookings(prisma, { tripId: result.newTrip.id, departureAt: result.newTrip.departureAt });
+    }
 
     res.json({
         success: true,
@@ -1684,8 +1692,10 @@ router.post('/transit/trips/:id/cancel', requirePermission('transit.trips.manage
     const result = await cancelTripWithRefunds(prisma, { tripId: req.params.id, businessProfileId: bpId });
     if (result.notFound) return res.status(404).json({ success: false, message: 'Trip not found' });
     if (result.summary.failed > 0) {
-        // Explicit partial failure: the trip stays active, failed bookings
-        // remain in their prior state, and nothing was silently stranded.
+        // Explicit partial failure: failed bookings remain in their prior
+        // state (the trip may already be CANCELLED if a late booking failed
+        // in the second sweep), nothing was silently stranded, and retrying
+        // reprocesses them.
         return res.status(502).json({
             success: false,
             message: 'Trip cancellation partially failed — retry to resolve the remaining bookings. No booking was cancelled without its escrow being resolved.',

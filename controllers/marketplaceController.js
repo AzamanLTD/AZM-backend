@@ -280,6 +280,26 @@ exports.setPenaltyPolicy = async (req, res) => {
             if (!b || b.businessProfileId !== profile.id)
                 return res.status(403).json({ success: false, message: 'Not your booking.' });
 
+            // A paid booking's no-show terms are fixed when it is paid. Setting
+            // a penalty afterwards would let the operator collect the fare by
+            // marking a no-show, without the passenger's QR boarding.
+            const { isPaidTransitBooking } = require('../services/qrCheckInService');
+            if (await isPaidTransitBooking(prisma, b)) {
+                return res.status(409).json({
+                    success: false,
+                    code: 'PENALTY_LOCKED',
+                    message: 'A paid booking\'s no-show terms cannot be changed.',
+                });
+            }
+            // The flat penalty is capped like the percentage.
+            if (noShowPenaltyUsdc != null
+                && (Number(noShowPenaltyUsdc) < 0 || Number(noShowPenaltyUsdc) > MAX_PENALTY_PCT * Number(b.amountUsdc))) {
+                return res.status(400).json({
+                    success: false,
+                    message: `Penalty cannot exceed ${MAX_PENALTY_PCT * 100}% of the fare.`,
+                });
+            }
+
             const updated = await prisma.transitBooking.update({
                 where: { id: transitBookingId },
                 data: { noShowPenaltyPct: noShowPenaltyPct || null, noShowPenaltyUsdc: noShowPenaltyUsdc || null }
@@ -380,7 +400,8 @@ exports.updateTransitTrip = async (req, res) => {
         // Cancelling a trip refunds its paid bookings: route it through the
         // canonical cancellation (never a bare status write, which stranded
         // every funded escrow on a CANCELLED trip).
-        const cancelling = status !== undefined && String(status).toUpperCase() === 'CANCELLED';
+        const normalizedStatus = status !== undefined ? String(status).trim().toUpperCase() : undefined;
+        const cancelling = normalizedStatus === 'CANCELLED';
         const data = {};
         if (routeName !== undefined) data.routeName = routeName;
         if (origin !== undefined) data.origin = origin;
@@ -388,16 +409,21 @@ exports.updateTransitTrip = async (req, res) => {
         if (departureAt !== undefined) data.departureAt = new Date(departureAt);
         if (arrivalAt !== undefined) data.arrivalAt = arrivalAt ? new Date(arrivalAt) : null;
         if (fareUsdc !== undefined) data.fareUsdc = parseFloat(fareUsdc);
-        if (status !== undefined && !cancelling) data.status = status;
+        if (normalizedStatus !== undefined && !cancelling) data.status = normalizedStatus;
 
         let updated = Object.keys(data).length > 0
             ? await prisma.transitTrip.update({ where: { id }, data })
             : trip;
+        // A moved departure moves its bookings and paid escrows with it.
+        if (data.departureAt && new Date(data.departureAt).getTime() !== new Date(trip.departureAt).getTime()) {
+            const { rescheduleTripBookings } = require('../services/transitBookingService');
+            await rescheduleTripBookings(prisma, { tripId: id, departureAt: data.departureAt });
+        }
         if (cancelling) {
             const { cancelTripWithRefunds } = require('../services/transitTripCancellationService');
             const result = await cancelTripWithRefunds(prisma, { tripId: id, businessProfileId: profile.id });
             updated = await prisma.transitTrip.findUnique({ where: { id } });
-            if (!result.cancelled) {
+            if (!result.cancelled || result.summary.failed > 0) {
                 return res.status(409).json({
                     success: false,
                     code: 'TRIP_CANCELLATION_INCOMPLETE',

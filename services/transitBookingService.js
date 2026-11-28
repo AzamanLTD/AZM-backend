@@ -41,9 +41,21 @@ const COMPLETION_GRACE_DAYS = 7;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const UNBOOKABLE_TRIP_STATUSES = ['CANCELLED', 'DEPARTED', 'COMPLETED'];
 
-// The exact total a passenger approved, compared at 6 decimals (the
-// precision the fare and fee are computed at).
-const _sameUsdc = (a, b) => Number(a).toFixed(6) === Number(b).toFixed(6);
+// The exact total a passenger approved: a plain decimal string (or number)
+// with at most 6 decimals, compared as integer micro-units. Anything else
+// (arrays, exponents, hex, 7 decimals) is not an approval.
+const _microsOf = (value) => {
+    const text = typeof value === 'number' && Number.isFinite(value)
+        ? value.toFixed(6)
+        : (typeof value === 'string' ? value.trim() : null);
+    if (!text || !/^\d+(\.\d{1,6})?$/.test(text)) return null;
+    const [whole, frac = ''] = text.split('.');
+    return BigInt(whole) * 1000000n + BigInt((frac + '000000').slice(0, 6));
+};
+const _usdcMicros = (n) => BigInt(Math.round(Number(n) * 1e6));
+// The transit no-show grace (workers/reservationNoShowWorker.js): a paid
+// passenger cannot be marked a no-show while their boarding code is valid.
+const NO_SHOW_GRACE_MS = 75 * 60 * 1000;
 const _departureOf = (trip, booking) => {
     const at = (trip && trip.departureAt) || (booking && booking.scheduledAt);
     return at ? new Date(at) : null;
@@ -162,8 +174,12 @@ const bookSeats = async (prisma, {
         if (expectedTotalUsdc == null || expectedTotalUsdc === '') {
             throw _bookingError('EXPECTED_TOTAL_REQUIRED', 'Send the total you are paying (from the quote).');
         }
+        const approved = _microsOf(expectedTotalUsdc);
+        if (approved == null) {
+            throw _bookingError('EXPECTED_TOTAL_INVALID', 'The total must be a decimal amount with at most 6 decimals.');
+        }
         const total = _round6(totalFare + feeUsdc);
-        if (!_sameUsdc(expectedTotalUsdc, total)) {
+        if (approved !== _usdcMicros(total)) {
             throw _bookingError(
                 'PRICE_CHANGED',
                 `The price changed: the total is now ${total.toFixed(6)} USDC. Nothing was charged.`,
@@ -794,22 +810,27 @@ const completeTransitBooking = async (prisma, { bookingId } = {}) => {
 //    flip left the escrow FUNDED outside every sweep until the 30-day expiry.
 //    Same escrow-first lock order and linkage-pinned CAS as cancellation.
 // =============================================================================
-const noShowTransitBookingWithRefund = async (prisma, { bookingId, driverNote = null } = {}) => {
+const noShowTransitBookingWithRefund = async (prisma, { bookingId, driverNote = null, now = Date.now() } = {}) => {
     if (!bookingId) throw new TransitCancellationError('BAD_REQUEST', 'bookingId is required.', 400);
     const include = {
         vehicle: { select: { id: true, type: true, make: true, model: true, licensePlate: true, driverName: true } },
         businessProfile: { select: { id: true, businessName: true } },
     };
     return prisma.$transaction(async (tx) => {
-        const link = await tx.transitBooking.findUnique({ where: { id: bookingId }, select: { escrowId: true } });
+        const link = await tx.transitBooking.findUnique({
+            where: { id: bookingId },
+            select: { escrowId: true, scheduledAt: true, tripId: true },
+        });
         if (!link) throw new TransitCancellationError('NOT_FOUND', 'Booking not found.', 404);
         const escrowId = link.escrowId ?? null;
         if (escrowId) {
             await tx.$executeRaw`SELECT id FROM "SmartEscrow" WHERE "id" = ${escrowId} FOR UPDATE`;
         }
+        await assertNoShowWindowClosed(tx, link, now);
         const claim = await tx.transitBooking.updateMany({
             where: { id: bookingId, status: 'CONFIRMED', escrowId },
-            data: { status: 'NO_SHOW', driverNote },
+            // A missing note keeps whatever note the booking already has.
+            data: driverNote != null ? { status: 'NO_SHOW', driverNote } : { status: 'NO_SHOW' },
         });
         if (claim.count !== 1) {
             const current = await tx.transitBooking.findUnique({ where: { id: bookingId }, select: { status: true } });
@@ -841,8 +862,65 @@ const noShowTransitBookingWithRefund = async (prisma, { bookingId, driverNote = 
     });
 };
 
+// =============================================================================
+// No-show timing for a paid booking: only once the boarding window has
+// closed (departure + the sweep's grace). Before that the passenger can still
+// board with a valid code, and a no-show would refund or penalize them early.
+// =============================================================================
+const assertNoShowWindowClosed = async (db, booking, now = Date.now()) => {
+    const trip = booking.tripId
+        ? await db.transitTrip.findUnique({ where: { id: booking.tripId }, select: { departureAt: true } })
+        : null;
+    const departure = _departureOf(trip, booking);
+    if (!departure || now < departure.getTime() + NO_SHOW_GRACE_MS) {
+        throw new TransitCancellationError(
+            'TOO_EARLY',
+            'A paid passenger can be marked a no-show only after the boarding window closes.',
+            409
+        );
+    }
+};
+
+// =============================================================================
+// 6. RESCHEDULE — a trip's departure moved (PATCH, or IROPS reassignment).
+//    The bookings and their escrows follow it: active bookings take the new
+//    scheduledAt (the no-show sweep reads it), and a paid fare's escrow is
+//    extended to at least the new departure + the completion grace (so a
+//    postponed trip is never refunded by the expiry sweep before it runs).
+// =============================================================================
+const rescheduleTripBookings = async (prisma, { tripId, departureAt }) => {
+    if (!tripId || !departureAt) return { rescheduled: 0, extended: 0 };
+    const at = new Date(departureAt);
+    const active = ['PENDING', 'CONFIRMED', 'IN_PROGRESS'];
+    return prisma.$transaction(async (tx) => {
+        const moved = await tx.transitBooking.updateMany({
+            where: { tripId, status: { in: active } },
+            data: { scheduledAt: at },
+        });
+        const paid = await tx.transitBooking.findMany({
+            where: { tripId, status: { in: active }, escrowId: { not: null } },
+            select: { escrowId: true },
+        });
+        let extended = 0;
+        if (paid.length > 0) {
+            const until = new Date(at.getTime() + COMPLETION_GRACE_DAYS * DAY_MS);
+            const res = await tx.smartEscrow.updateMany({
+                where: {
+                    id: { in: paid.map(b => b.escrowId) },
+                    status: { in: RELEASE_CLAIMABLE },
+                    expiresAt: { lt: until },
+                },
+                data: { expiresAt: until },
+            });
+            extended = res.count;
+        }
+        return { rescheduled: moved.count, extended };
+    });
+};
+
 module.exports = {
     bookSeats, quoteSeats, getTripSeatAvailability, cancelTransitBooking, completeTransitBooking,
     noShowTransitBookingWithRefund, COMPLETION_GRACE_DAYS,
+    rescheduleTripBookings, assertNoShowWindowClosed, NO_SHOW_GRACE_MS,
     CANCELLABLE_STATUSES, TransitCancellationError, PAY_WITH,
 };

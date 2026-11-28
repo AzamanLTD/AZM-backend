@@ -213,7 +213,11 @@ const cancelTripWithRefunds = async (prisma, { tripId, businessProfileId }) => {
     const tripAfter = await prisma.transitTrip.findUnique({ where: { id: tripId }, select: { status: true } });
 
     return {
-        cancelled: tripAfter?.status === 'CANCELLED',
+        // Cancelled means the trip flipped AND every booking resolved. A
+        // failure in the post-flip sweep leaves the trip CANCELLED with an
+        // unresolved booking; that is a partial failure (retry is safe: a
+        // cancelled trip's active bookings are reprocessed), never success.
+        cancelled: tripAfter?.status === 'CANCELLED' && summary.failed === 0,
         tripId,
         tripStatus: tripAfter?.status,
         summary,

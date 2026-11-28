@@ -24,7 +24,9 @@ const whenPayingWithWallet = (mw) => (req, res, next) =>
 // A paid booking must be reconcilable after a lost response, so wallet pay
 // requires an Idempotency-Key (a plain reservation keeps the legacy opt-out).
 const requireIdempotencyKey = (req, res, next) => {
-    const key = req.get('idempotency-key') || req.get('x-idempotency-key');
+    // Exactly the header the idempotency middleware claims on: an
+    // X-Idempotency-Key alone would pass a looser check and run unclaimed.
+    const key = req.get('idempotency-key');
     if (key) return next();
     return res.status(400).json({
         success: false,
