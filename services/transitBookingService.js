@@ -58,6 +58,30 @@ const _usdcMicros = (n) => BigInt(Math.round(Number(n) * 1e6));
 // The transit no-show grace (workers/reservationNoShowWorker.js): a paid
 // passenger cannot be marked a no-show while their boarding code is valid.
 const NO_SHOW_GRACE_MS = 75 * 60 * 1000;
+
+// How a paid passenger may be boarded, and when the fare is then released.
+//   QR_TOKEN: their own signed code. Released when the trip completes.
+//   ID_CHECK: staff checked their AZM-ID and photo ID (transitBoardingService).
+//     Released at completion if the passenger confirmed the boarding;
+//     otherwise held until departure + ID_CHECK_PAYOUT_HOLD_MS so they can
+//     report it ("Not me"), then released by sweepHeldTransitPayouts.
+const BOARDED_METHODS = ['QR_TOKEN', 'ID_CHECK'];
+const ID_CHECK_PAYOUT_HOLD_MS = 24 * 60 * 60 * 1000;
+const _boardingOf = (booking) => {
+    const meta = booking && booking.metadata;
+    const b = meta && typeof meta === 'object' && !Array.isArray(meta) ? meta.boarding : null;
+    return b && typeof b === 'object' ? b : null;
+};
+const _metaObject = (m) => (m && typeof m === 'object' && !Array.isArray(m) ? m : {});
+/** When a paid fare may be released for this boarding (ms), or null. */
+const payoutReadyAt = (boarding, departureMs) => {
+    if (!boarding || !Number.isFinite(departureMs)) return null;
+    if (boarding.method === 'QR_TOKEN') return departureMs;
+    if (boarding.method === 'ID_CHECK') {
+        return boarding.passengerConfirmedAt ? departureMs : departureMs + ID_CHECK_PAYOUT_HOLD_MS;
+    }
+    return null;
+};
 const _departureOf = (trip, booking) => {
     const at = (trip && trip.departureAt) || (booking && booking.scheduledAt);
     return at ? new Date(at) : null;
@@ -712,38 +736,43 @@ const _round6 = (n) => parseFloat(Number(n).toFixed(6));
 //    the booking is claimed with the pinned linkage in the CAS, so this
 //    serializes with every other escrow-backed lifecycle operation.
 // =============================================================================
-const completeTransitBooking = async (prisma, { bookingId } = {}) => {
+const completeTransitBooking = async (prisma, { bookingId, now = Date.now() } = {}) => {
     if (!bookingId) throw new TransitCancellationError('BAD_REQUEST', 'bookingId is required.', 400);
     const include = {
         vehicle: { select: { id: true, type: true, make: true, model: true, licensePlate: true, driverName: true } },
         businessProfile: { select: { id: true, businessName: true } },
     };
     return prisma.$transaction(async (tx) => {
+        const pre = await tx.transitBooking.findUnique({ where: { id: bookingId }, select: { escrowId: true } });
+        if (!pre) throw new TransitCancellationError('NOT_FOUND', 'Booking not found.', 404);
+        const escrowId = pre.escrowId ?? null;
+        if (escrowId) {
+            await tx.$executeRaw`SELECT id FROM "SmartEscrow" WHERE "id" = ${escrowId} FOR UPDATE`;
+        }
+        // Read the booking AFTER the escrow lock: a passenger confirmation
+        // (which takes the same lock) that committed while this waited is
+        // seen, and its metadata is not overwritten.
         const link = await tx.transitBooking.findUnique({
             where: { id: bookingId },
             select: { escrowId: true, scheduledAt: true, tripId: true, status: true, metadata: true },
         });
         if (!link) throw new TransitCancellationError('NOT_FOUND', 'Booking not found.', 404);
-        const escrowId = link.escrowId ?? null;
-        if (escrowId) {
-            await tx.$executeRaw`SELECT id FROM "SmartEscrow" WHERE "id" = ${escrowId} FOR UPDATE`;
-        }
 
         // A paid fare is released only to a passenger boarded by their own QR
-        // (the owner's decision: the signed code is the evidence of
-        // carriage), and only once the trip has actually left. Manual
-        // boarding of a paid booking is refused upstream; this is the last
-        // guard, before anything changes.
+        // or by a staff ID check (transitBoardingService), and only once the
+        // trip has actually left. Manual boarding of a paid booking is
+        // refused upstream; this is the last guard, before anything changes.
         const held = escrowId
             ? await tx.smartEscrow.findUnique({ where: { id: escrowId }, select: { status: true } })
             : null;
         const paid = !!held && RELEASE_CLAIMABLE.includes(held.status);
+        let holdUntil = null;
         if (paid && link.status !== 'COMPLETED') {
-            const boarding = link.metadata && link.metadata.boarding;
-            if (!boarding || boarding.method !== 'QR_TOKEN') {
+            const boarding = _boardingOf(link);
+            if (!boarding || !BOARDED_METHODS.includes(boarding.method)) {
                 throw new TransitCancellationError(
                     'QR_BOARDING_REQUIRED',
-                    'A paid trip completes only for a passenger boarded by their QR code.',
+                    'A paid trip completes only for a passenger boarded by their QR code or an ID check.',
                     409
                 );
             }
@@ -751,18 +780,30 @@ const completeTransitBooking = async (prisma, { bookingId } = {}) => {
                 ? await tx.transitTrip.findUnique({ where: { id: link.tripId }, select: { departureAt: true } })
                 : null;
             const departure = _departureOf(trip, link);
-            if (!departure || departure.getTime() > Date.now()) {
+            if (!departure || departure.getTime() > now) {
                 throw new TransitCancellationError(
                     'TOO_EARLY',
                     'A paid trip can be completed only after it departs.',
                     409
                 );
             }
+            // An unconfirmed ID check: the trip completes, the fare waits
+            // out the passenger's window to report it.
+            const readyAt = payoutReadyAt(boarding, departure.getTime());
+            if (readyAt > now) holdUntil = new Date(readyAt);
         }
 
+        const data = { status: 'COMPLETED', dropoffTime: new Date(now) };
+        if (holdUntil) {
+            const meta = _metaObject(link.metadata);
+            data.metadata = {
+                ...meta,
+                payout: { ..._metaObject(meta.payout), heldUntil: holdUntil.toISOString(), reason: 'ID_CHECK_UNCONFIRMED' },
+            };
+        }
         const claim = await tx.transitBooking.updateMany({
             where: { id: bookingId, status: 'IN_PROGRESS', escrowId },
-            data: { status: 'COMPLETED', dropoffTime: new Date() },
+            data,
         });
         if (claim.count !== 1) {
             const current = await tx.transitBooking.findUnique({ where: { id: bookingId }, select: { status: true } });
@@ -784,7 +825,8 @@ const completeTransitBooking = async (prisma, { bookingId } = {}) => {
 
         let release = null;
         let escrowNotReleased = null;
-        if (escrowId) {
+        const payoutHeld = holdUntil ? { escrowId, until: holdUntil } : null;
+        if (escrowId && !holdUntil) {
             const escrow = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
             if (escrow && RELEASE_CLAIMABLE.includes(escrow.status)) {
                 const reference = randomUUID();
@@ -804,9 +846,87 @@ const completeTransitBooking = async (prisma, { bookingId } = {}) => {
             alreadyCompleted: false,
             release,
             escrowNotReleased,
+            payoutHeld,
             booking: await tx.transitBooking.findUnique({ where: { id: bookingId }, include }),
         };
     });
+};
+
+// =============================================================================
+// 4b. HELD PAYOUT — release a completed booking's fare once its boarding
+//     allows it (an ID check the passenger confirmed, or whose report window
+//     has passed). Never releases a disputed, refunded or settled escrow.
+//     `_releaseHeldPayoutTx` runs with the escrow row lock already held.
+// =============================================================================
+const _releaseHeldPayoutTx = async (tx, { bookingId, escrowId, now = Date.now() }) => {
+    const b = await tx.transitBooking.findUnique({
+        where: { id: bookingId },
+        select: { status: true, escrowId: true, metadata: true, tripId: true, scheduledAt: true },
+    });
+    if (!b || b.status !== 'COMPLETED' || (b.escrowId ?? null) !== escrowId) {
+        return { released: false, reason: 'NOT_COMPLETED' };
+    }
+    const boarding = _boardingOf(b);
+    const trip = b.tripId
+        ? await tx.transitTrip.findUnique({ where: { id: b.tripId }, select: { departureAt: true } })
+        : null;
+    const departure = _departureOf(trip, b);
+    const readyAt = departure ? payoutReadyAt(boarding, departure.getTime()) : null;
+    if (readyAt == null) return { released: false, reason: 'NOT_BOARDED' };
+    if (now < readyAt) return { released: false, reason: 'HELD', heldUntil: new Date(readyAt) };
+
+    const escrow = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
+    if (!escrow || !RELEASE_CLAIMABLE.includes(escrow.status)) {
+        return { released: false, reason: `ESCROW_${escrow ? escrow.status : 'MISSING'}` };
+    }
+    const reference = randomUUID();
+    await _releaseBookingEscrowTx(tx, { escrowId, reference });
+    const meta = _metaObject(b.metadata);
+    await tx.transitBooking.update({
+        where: { id: bookingId },
+        data: { metadata: { ...meta, payout: { ..._metaObject(meta.payout), releasedAt: new Date(now).toISOString() } } },
+    });
+    return { released: true, release: { escrowId, amountUsdc: Number(escrow.amountUsdc), reference } };
+};
+
+const releaseHeldTransitPayout = async (prisma, { bookingId, now = Date.now() } = {}) => {
+    if (!bookingId) throw new TransitCancellationError('BAD_REQUEST', 'bookingId is required.', 400);
+    return prisma.$transaction(async (tx) => {
+        const pre = await tx.transitBooking.findUnique({ where: { id: bookingId }, select: { escrowId: true } });
+        if (!pre) throw new TransitCancellationError('NOT_FOUND', 'Booking not found.', 404);
+        if (!pre.escrowId) return { released: false, reason: 'NO_ESCROW' };
+        await tx.$executeRaw`SELECT id FROM "SmartEscrow" WHERE "id" = ${pre.escrowId} FOR UPDATE`;
+        return _releaseHeldPayoutTx(tx, { bookingId, escrowId: pre.escrowId, now });
+    });
+};
+
+// Hourly (no-show sweep): completed, paid bookings whose fare is still held
+// and whose departure is at least the hold ago. A disputed escrow is not
+// claimable, so a passenger's report keeps the fare for dispute review.
+const sweepHeldTransitPayouts = async (prisma, { now = Date.now(), limit = 100 } = {}) => {
+    const due = await prisma.transitBooking.findMany({
+        where: {
+            status: 'COMPLETED',
+            escrowId: { not: null },
+            scheduledAt: { lte: new Date(now - ID_CHECK_PAYOUT_HOLD_MS) },
+            escrow: { is: { status: { in: RELEASE_CLAIMABLE } } },
+        },
+        select: { id: true },
+        orderBy: { scheduledAt: 'asc' },
+        take: limit,
+    });
+    const out = { checked: due.length, released: 0, held: 0, failed: 0 };
+    for (const b of due) {
+        try {
+            const r = await releaseHeldTransitPayout(prisma, { bookingId: b.id, now });
+            if (r.released) out.released += 1;
+            else out.held += 1;
+        } catch (err) {
+            out.failed += 1;
+            logger.error({ err: err.message, bookingId: b.id }, '[transitBooking] held payout release failed');
+        }
+    }
+    return out;
 };
 
 // =============================================================================
@@ -935,5 +1055,7 @@ module.exports = {
     bookSeats, quoteSeats, getTripSeatAvailability, cancelTransitBooking, completeTransitBooking,
     noShowTransitBookingWithRefund, COMPLETION_GRACE_DAYS,
     rescheduleTripBookings, _rescheduleTripBookingsTx, assertNoShowWindowClosed, NO_SHOW_GRACE_MS,
+    BOARDED_METHODS, ID_CHECK_PAYOUT_HOLD_MS, payoutReadyAt,
+    releaseHeldTransitPayout, _releaseHeldPayoutTx, sweepHeldTransitPayouts,
     CANCELLABLE_STATUSES, TransitCancellationError, PAY_WITH,
 };

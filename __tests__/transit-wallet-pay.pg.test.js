@@ -21,6 +21,12 @@
 //   W7. A paid trip cannot be completed before it departs.
 //   W8. A paid booking cannot be boarded manually or completed without
 //       QR boarding; nothing reaches the operator.
+//   W9. Boarded by an ID check and not confirmed: completion holds the fare;
+//       the hourly sweep (its relation filter on the escrow, real SQL)
+//       releases it only after departure + 24h.
+//  W10. The passenger reports the ID check: the real dispute moves the
+//       escrow to DISPUTED and the sweep never releases it.
+//  W11. The passenger confirms after completion: released at once.
 // =============================================================================
 
 const { seedUser, seedBusiness } = require('./helpers/factories');
@@ -35,7 +41,7 @@ run('transit wallet pay (PostgreSQL)', () => {
     const truncate = () => prisma.$executeRawUnsafe(
         'TRUNCATE TABLE "User", "BusinessProfile", "TransitVehicle", "TransitTrip", "TransitSeatMap", ' +
         '"TransitBooking", "TransitBookingSeat", "Ticket", "SmartEscrow", "SystemProfitFees", ' +
-        '"AdminProfitLog", "FinancialOperation" RESTART IDENTITY CASCADE'
+        '"AdminProfitLog", "FinancialOperation", "EscrowDispute" RESTART IDENTITY CASCADE'
     );
 
     beforeAll(async () => {
@@ -51,7 +57,7 @@ run('transit wallet pay (PostgreSQL)', () => {
 
     const SEATS = ['1A', '1B', '1C', '1D'];
 
-    async function seedTrip({ balance = 500 } = {}) {
+    async function seedTrip({ balance = 500, azamanId } = {}) {
         const { owner, biz } = await seedBusiness(prisma, { owner: { availableBalance: 0 } });
         const vehicle = await prisma.transitVehicle.create({
             data: { businessProfileId: biz.id, type: 'VAN', capacity: 4 },
@@ -70,7 +76,7 @@ run('transit wallet pay (PostgreSQL)', () => {
                 rows: 1, cols: 4,
             },
         });
-        const customer = await seedUser(prisma, { availableBalance: balance });
+        const customer = await seedUser(prisma, { availableBalance: balance, ...(azamanId ? { azamanId } : {}) });
         return { owner, biz, trip, customer };
     }
 
@@ -248,5 +254,64 @@ run('transit wallet pay (PostgreSQL)', () => {
         await expect(svc.completeTransitBooking(prisma, { bookingId: res.booking.id }))
             .rejects.toMatchObject({ code: 'QR_BOARDING_REQUIRED' });
         expect((await balances(owner.id)).available).toBe(0);
+    });
+
+    // ── ID-check boarding (beside the QR) ───────────────────────────────────
+    const AZM = 'AZM-000004242';
+    async function idChecked() {
+        const ctx = await seedTrip({ azamanId: AZM });
+        const res = await pay(ctx.trip.id, ctx.customer.id, ['1A']);
+        const boarding = require('../services/transitBoardingService');
+        // The trip leaves in an hour: boarding is open.
+        await boarding.boardByIdCheck(prisma, {
+            bookingId: res.booking.id, businessUserId: ctx.owner.id, azamanId: 'azm 4242',
+        });
+        await depart(ctx.trip.id);
+        await prisma.transitBooking.update({
+            where: { id: res.booking.id }, data: { scheduledAt: new Date(Date.now() - 3600_000) },
+        });
+        const done = await svc.completeTransitBooking(prisma, { bookingId: res.booking.id });
+        return { ...ctx, res, boarding, done };
+    }
+    const DAY_MS = 24 * 3600_000;
+
+    test('W9: an unconfirmed ID check holds the fare until departure + 24h', async () => {
+        const { owner, res, done } = await idChecked();
+        expect(done.booking.status).toBe('COMPLETED');
+        expect(done.payoutHeld).toBeTruthy();
+        expect((await balances(owner.id)).available).toBe(0);
+
+        const early = await svc.sweepHeldTransitPayouts(prisma);
+        expect(early.checked).toBe(0);
+        const later = await svc.sweepHeldTransitPayouts(prisma, { now: Date.now() + DAY_MS });
+        expect(later.released).toBe(1);
+        expect((await balances(owner.id)).available).toBe(10);
+        expect((await prisma.smartEscrow.findUnique({ where: { id: res.payment.escrowId } })).status).toBe('SETTLED');
+        expect((await svc.sweepHeldTransitPayouts(prisma, { now: Date.now() + 2 * DAY_MS })).checked).toBe(0);
+    });
+
+    test('W10: a reported ID check is disputed and never released', async () => {
+        const { owner, customer, res, boarding } = await idChecked();
+        const out = await boarding.reportIdCheckBoarding(prisma, {
+            bookingId: res.booking.id, customerId: customer.id, reason: 'Not me',
+        });
+        expect(out.alreadyReported).toBe(false);
+        expect((await prisma.smartEscrow.findUnique({ where: { id: res.payment.escrowId } })).status).toBe('DISPUTED');
+        const swept = await svc.sweepHeldTransitPayouts(prisma, { now: Date.now() + 2 * DAY_MS });
+        expect(swept.released).toBe(0);
+        expect((await balances(owner.id)).available).toBe(0);
+        await expect(boarding.reportIdCheckBoarding(prisma, { bookingId: res.booking.id, customerId: customer.id }))
+            .resolves.toMatchObject({ alreadyReported: true });
+    });
+
+    test('W11: the passenger confirms after completion: released at once', async () => {
+        const { owner, customer, res, boarding } = await idChecked();
+        const out = await boarding.confirmIdCheckBoarding(prisma, { bookingId: res.booking.id, customerId: customer.id });
+        expect(out.release).toBeTruthy();
+        expect((await balances(owner.id)).available).toBe(10);
+        expect((await balances(customer.id)).locked).toBe(0);
+        const meta = (await prisma.transitBooking.findUnique({ where: { id: res.booking.id } })).metadata;
+        expect(meta.boarding.method).toBe('ID_CHECK');
+        expect(meta.boarding.passengerConfirmedAt).toBeTruthy();
     });
 });

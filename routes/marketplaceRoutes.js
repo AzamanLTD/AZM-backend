@@ -137,10 +137,11 @@ router.get('/checkin/search', protect, async (req, res) => {
         const { azamanId } = req.query;
         if (!azamanId) return res.status(400).json({ success: false, message: 'azamanId required' });
 
-        const result = await qrSvc.searchByAzamanId(prisma, {
-            azamanId, businessUserId: req.user.id,
+        const boarding = require('../services/transitBoardingService');
+        const found = await qrSvc.searchByAzamanId(prisma, {
+            azamanId: boarding.normalizeAzamanId(String(azamanId)), businessUserId: req.user.id,
         });
-        res.json(result);
+        res.json(await boarding.enrichAzamanIdSearch(prisma, { businessUserId: req.user.id, result: found }));
     } catch (e) { res.status(400).json({ success: false, message: e.message }); }
 });
 

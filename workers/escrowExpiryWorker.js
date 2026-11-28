@@ -165,22 +165,29 @@ class EscrowExpiryWorker {
 
         for (const escrow of expired) {
             try {
-                // A transit fare whose passenger was boarded by their QR was
-                // carried: complete the booking and release the fare to the
-                // operator instead of refunding (the operator only forgot to
-                // complete the trip). completeTransitBooking re-checks QR
-                // boarding and departure inside its own transaction.
+                // A transit fare whose passenger was boarded (their QR, or an
+                // ID check they never reported) was carried: complete the
+                // booking if the operator forgot to, and release the fare
+                // instead of refunding. Both service calls re-check boarding,
+                // departure and the escrow inside their own transactions; a
+                // reported (DISPUTED) escrow is not FUNDED, so never here.
                 const boarded = await this.prisma.transitBooking.findFirst({
-                    where: { escrowId: escrow.id, status: 'IN_PROGRESS' },
-                    select: { id: true, metadata: true },
+                    where: { escrowId: escrow.id, status: { in: ['IN_PROGRESS', 'COMPLETED'] } },
+                    select: { id: true, status: true, metadata: true },
                 });
-                if (boarded && boarded.metadata && boarded.metadata.boarding
-                    && boarded.metadata.boarding.method === 'QR_TOKEN') {
-                    const { completeTransitBooking } = require('../services/transitBookingService');
+                const boardedBy = boarded && boarded.metadata && boarded.metadata.boarding
+                    ? boarded.metadata.boarding.method : null;
+                if (boarded && (boardedBy === 'QR_TOKEN' || boardedBy === 'ID_CHECK')) {
+                    const { completeTransitBooking, releaseHeldTransitPayout } = require('../services/transitBookingService');
                     try {
-                        await completeTransitBooking(this.prisma, { bookingId: boarded.id });
-                        logger.info({ escrowId: escrow.id, bookingId: boarded.id },
-                            '[EscrowExpiryWorker] completed a QR-boarded transit booking at escrow expiry');
+                        if (boarded.status === 'IN_PROGRESS') {
+                            await completeTransitBooking(this.prisma, { bookingId: boarded.id, now: now.getTime() });
+                        }
+                        // A completed ID check whose fare was held is released
+                        // here too (no-op when completion already released it).
+                        await releaseHeldTransitPayout(this.prisma, { bookingId: boarded.id, now: now.getTime() });
+                        logger.info({ escrowId: escrow.id, bookingId: boarded.id, boardedBy },
+                            '[EscrowExpiryWorker] completed a boarded transit booking at escrow expiry');
                         continue;
                     } catch (err) {
                         logger.error({ err: err.message, escrowId: escrow.id, bookingId: boarded.id },

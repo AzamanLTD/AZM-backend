@@ -326,7 +326,17 @@ const sweepNoShowTransitBookings = async (prisma) => {
 const sweepAll = async (prisma) => {
     const reservationResults = await sweepNoShowReservations(prisma);
     const transitResults = await sweepNoShowTransitBookings(prisma);
-    return { reservations: reservationResults, transit: transitResults };
+    // ID-check boardings whose report window has passed: release the held
+    // fare to the operator (a reported one is DISPUTED and stays).
+    let payouts;
+    try {
+        const { sweepHeldTransitPayouts } = require('../services/transitBookingService');
+        payouts = await sweepHeldTransitPayouts(prisma);
+    } catch (err) {
+        logger.error({ err: err.message }, '[NoShowWorker] held payout sweep failed');
+        payouts = { error: err.message };
+    }
+    return { reservations: reservationResults, transit: transitResults, payouts };
 };
 
 module.exports = { sweepNoShowReservations, sweepNoShowTransitBookings, sweepAll, GRACE_PERIOD_MINS };

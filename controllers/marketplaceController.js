@@ -52,10 +52,13 @@ exports.businessCheckIn = async (req, res) => {
             });
             return res.status(200).json(result);
         } else if (azamanId) {
-            // Manual AZM-ID search path
-            const result = await qrSvc.searchByAzamanId(prisma, {
-                azamanId, businessUserId: req.user.id,
+            // Manual AZM-ID search path: reservations, and the passenger's
+            // transit bookings with what staff need for an ID check.
+            const boarding = require('../services/transitBoardingService');
+            const found = await qrSvc.searchByAzamanId(prisma, {
+                azamanId: boarding.normalizeAzamanId(azamanId), businessUserId: req.user.id,
             });
+            const result = await boarding.enrichAzamanIdSearch(prisma, { businessUserId: req.user.id, result: found });
             return res.status(200).json({ success: true, ...result });
         } else if (reservationId) {
             // Direct compatibility path delegates to the exact same atomic

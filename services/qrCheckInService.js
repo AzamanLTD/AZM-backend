@@ -354,16 +354,17 @@ const searchByAzamanId = async (prisma, { azamanId, businessUserId }) => {
 };
 
 // How a transit booking was boarded, recorded on TransitBooking.metadata.
-// A paid fare is released to the operator only after QR_TOKEN boarding:
-// the passenger's own signed code is the evidence they were carried.
-const BOARDING_METHOD = Object.freeze({ QR_TOKEN: 'QR_TOKEN', MANUAL: 'MANUAL' });
+// A paid fare is released to the operator only after QR_TOKEN boarding (the
+// passenger's own signed code) or ID_CHECK boarding (staff checked their
+// AZM-ID and photo ID; transitBoardingService). MANUAL is unpaid-only.
+const BOARDING_METHOD = Object.freeze({ QR_TOKEN: 'QR_TOKEN', ID_CHECK: 'ID_CHECK', MANUAL: 'MANUAL' });
 const PAID_ESCROW_STATUSES = ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'];
 const _withBoarding = (metadata, boarding) => ({
     ...(metadata && typeof metadata === 'object' && !Array.isArray(metadata) ? metadata : {}),
     boarding,
 });
 const _boardingRequiredError = () => Object.assign(
-    new Error('This booking is paid. Board it by scanning the passenger\'s boarding QR.'),
+    new Error('This booking is paid. Board it by scanning the passenger\'s boarding QR, or by an ID check.'),
     { code: 'QR_BOARDING_REQUIRED', httpStatus: 409 }
 );
 /** True when the booking carries a fare held in escrow (wallet-paid). */
@@ -565,6 +566,8 @@ const verifyTransitTokenAndBoard = async (prisma, { token, businessUserId, now =
 
 module.exports = {
     BOARDING_METHOD,
+    TRANSIT_WINDOW_MS,
+    _withBoarding,
     isPaidTransitBooking,
     generateCheckInToken,
     generateTransitCheckInToken,
