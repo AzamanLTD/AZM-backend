@@ -145,7 +145,7 @@ const FEE_POINTS = Object.freeze([
         revenueSources: ['EXIT_FEE'],
         volume: 'momoWithdrawals',
         caveats: [
-            'Booked exit-fee revenue includes the referrer\'s half; the projection counts the full fee.',
+            'Booked exit-fee revenue is Azaman\'s share only (the referrer\'s half is left out); the projection counts the full fee.',
             'Volume is split by each account\'s risk tier today, not the tier it had when it withdrew.',
         ],
     },

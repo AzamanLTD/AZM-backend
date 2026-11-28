@@ -24,6 +24,17 @@ const { publishedFeeRefund, refundsFeeNow, REFUND_CAUSE } = require('../services
 
 const NOW = new Date('2026-11-28T12:00:00Z');
 
+// The booked-revenue read (services/profitRevenueService) is the only query on
+// AdminProfitLog; its rows are already grouped by day, source and kind.
+const isRevenueQuery = (strings) => Array.isArray(strings) && strings.join('').includes('"AdminProfitLog"');
+const REVENUE_ROWS = [
+    { day: '2026-11-01', source: 'SMART_ESCROW_FEE', kind: 'REVENUE', n: 25, amount: '12.5' },
+    // Not revenue: a cash-out's principal and the referrer's half of its fee.
+    { day: '2026-11-01', source: 'ARBITRAGE_SPREAD', kind: 'WITHDRAWAL_PRINCIPAL', n: 1, amount: '500' },
+    { day: '2026-11-01', source: 'EXIT_FEE', kind: 'REFERRER_PAYOUT', n: 1, amount: '5' },
+    { day: '2026-11-01', source: 'EXIT_FEE', kind: 'REVENUE', n: 1, amount: '5' },
+];
+
 function makeDb() {
     const revisions = table([]);
     const sorted = revisions.findMany;
@@ -44,10 +55,9 @@ function makeDb() {
         adminMoneySettingRevision: revisions,
         adminSettingsAuditLog: table([]),
         auditLog: table([]),
-        adminProfitLog: { groupBy: jest.fn(async () => [{ source: 'SMART_ESCROW_FEE', _sum: { amountUsdc: new Prisma.Decimal('12.5') }, _count: { _all: 25 } }]) },
         $executeRaw: jest.fn(async () => 1),
         $executeRawUnsafe: jest.fn(async () => 0),
-        $queryRaw: jest.fn(async () => []),
+        $queryRaw: jest.fn(async (strings) => (isRevenueQuery(strings) ? REVENUE_ROWS : [])),
     };
     // Interactive (callback) and batch (array) transactions.
     db.$transaction = jest.fn(async (arg) => (Array.isArray(arg) ? Promise.all(arg) : arg(db)));
@@ -175,6 +185,7 @@ describe('overview', () => {
     test('booked revenue, volumes per bucket and per segment', async () => {
         const db = makeDb();
         db.$queryRaw = jest.fn(async (strings, ...values) => {
+            if (isRevenueQuery(strings)) return REVENUE_ROWS;
             const inner = values.find((v) => v && typeof v.sql === 'string' && v.sql.includes('FROM'));
             if (inner && inner.sql.includes('"Trade"')) {
                 return [
@@ -190,7 +201,12 @@ describe('overview', () => {
         });
         const out = await feeLab.getOverview(db, { period: '30d', now: NOW });
         expect(out.periodDays).toBe(30);
-        expect(out.actuals).toEqual({ SMART_ESCROW_FEE: { revenueUsdc: 12.5, count: 25 } });
+        // Revenue only: the cash-out principal and the referrer's half are not
+        // Azaman's money and do not appear in booked revenue.
+        expect(out.actuals).toEqual({
+            EXIT_FEE: { revenueUsdc: 5, count: 1 },
+            SMART_ESCROW_FEE: { revenueUsdc: 12.5, count: 25 },
+        });
         expect(out.volumes['escrow.fee']).toEqual({ count: 10, volumeUsdc: 150, buckets: [{ bucket: 3, upToUsdc: 25, count: 10, volumeUsdc: 150 }] });
         expect(out.volumes['p2p.fee'].count).toBe(4);
         expect(out.volumes['p2p.fee'].volumeUsdc).toBe(500);
@@ -208,7 +224,10 @@ describe('overview', () => {
 
     test('one unreadable source is reported, not fatal', async () => {
         const db = makeDb();
-        db.$queryRaw = jest.fn(async () => { throw new Error('relation does not exist'); });
+        db.$queryRaw = jest.fn(async (strings) => {
+            if (isRevenueQuery(strings)) return REVENUE_ROWS;
+            throw new Error('relation does not exist');
+        });
         const out = await feeLab.getOverview(db, { period: '7d', now: NOW });
         expect(out.volumeErrors['escrow.fee']).toBe('Volume unavailable');
         expect(out.catalog.length).toBe(catalog.FEE_POINTS.length);

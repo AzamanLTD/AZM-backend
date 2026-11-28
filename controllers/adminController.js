@@ -946,116 +946,13 @@ exports.getPlatformStats = async (req, res) => {
 
 /**
  * 12. PROFIT BREAKDOWN
- *     GET /api/admin/profit-breakdown
- *     Returns real PnL data from AdminProfitLog + SystemProfitFees.
- *     Includes daily breakdown for charting and source categorization.
+ *     GET /api/admin/profit-breakdown is served by
+ *     controllers/adminProfitBreakdownController (period-aware, revenue only).
+ *     This export delegates to it so no second, older calculation exists: the
+ *     one that lived here summed every AdminProfitLog row, withdrawal
+ *     principal and referrer payouts included.
  */
-exports.getProfitBreakdown = async (req, res) => {
-    const prisma = getReadPrisma(req.app);
-
-    try {
-        const now = new Date();
-        const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
-
-        // §P.5-D: this handler published fiatPoolUnit from an undeclared
-        // variable (a ReferenceError on every call, latent until the unit was
-        // added). The snapshot read makes the unit and the balance consistent
-        // and the endpoint working.
-        const fiatPoolMode = await require('../src/services/fiatLiquidityActivationService').readModeAndPool(prisma);
-
-        const [profitFees, fiatPool, hotWallet, masterCrypto, profitLogs, dailySnapshots] = await Promise.all([
-            prisma.systemProfitFees.findUnique({ where: { id: 1 } }).catch(() => ({ balance: 0 })),
-            prisma.systemFiatPool.findUnique({ where: { id: 1 } }).catch(() => ({ balance: 0 })),
-            prisma.systemHotWallet.findUnique({ where: { id: 1 } }).catch(() => ({ balance: 0 })),
-            prisma.systemMasterCrypto.findUnique({ where: { id: 1 } }).catch(() => ({ balance: 0 })),
-            // Last 30 days of profit logs grouped by source
-            prisma.adminProfitLog.groupBy({
-                by: ['source'],
-                where: { createdAt: { gte: thirtyDaysAgo } },
-                _sum: { amountUsdc: true },
-                _count: true
-            }),
-            // Daily snapshots for charting
-            prisma.dailySnapshot.findMany({
-                where: { date: { gte: thirtyDaysAgo } },
-                orderBy: { date: 'asc' },
-                select: { date: true, totalProfitUsdc: true, totalVolumeUsdc: true, activeUsers: true, profitBySource: true }
-            })
-        ]);
-
-        // Build source breakdown
-        const sourceBreakdown = {};
-        for (const log of profitLogs) {
-            sourceBreakdown[log.source] = {
-                totalUsdc: log._sum.amountUsdc || 0,
-                count: log._count
-            };
-        }
-
-        // Build daily PnL array for charting (last 30 days)
-        const dailyPnl = dailySnapshots.map(s => ({
-            date: s.date,
-            profit: s.totalProfitUsdc,
-            volume: s.totalVolumeUsdc,
-            users: s.activeUsers,
-            bySource: s.profitBySource
-        }));
-
-        // If no daily snapshots exist, generate from profit logs
-        if (dailyPnl.length === 0) {
-            const recentLogs = await prisma.adminProfitLog.findMany({
-                where: { createdAt: { gte: thirtyDaysAgo } },
-                orderBy: { createdAt: 'asc' },
-                select: { amountUsdc: true, source: true, createdAt: true }
-            });
-
-            // Group by day
-            const dayMap = {};
-            for (const log of recentLogs) {
-                const dayKey = log.createdAt.toISOString().split('T')[0];
-                if (!dayMap[dayKey]) dayMap[dayKey] = { profit: 0, count: 0 };
-                dayMap[dayKey].profit += log.amountUsdc;
-                dayMap[dayKey].count += 1;
-            }
-
-            for (const [date, data] of Object.entries(dayMap)) {
-                dailyPnl.push({ date, profit: data.profit, volume: 0, users: 0 });
-            }
-        }
-
-        return res.status(200).json({
-            success: true,
-            data: {
-                // Current system pool balances
-                pools: {
-                    profitFees: profitFees?.balance || 0,
-                    fiatPool: fiatPoolMode.balance,
-                    fiatPoolUnit: fiatPoolMode.currency,
-                    hotWallet: hotWallet?.balance || 0,
-                    masterCrypto: masterCrypto?.balance || 0
-                },
-
-                // Revenue by source (last 30 days)
-                sourceBreakdown,
-
-                // Daily PnL for charting
-                dailyPnl,
-
-                // Summary
-                totalProfitLast30Days: profitLogs.reduce((sum, l) => sum + (l._sum.amountUsdc || 0), 0),
-                totalTransactionsLast30Days: profitLogs.reduce((sum, l) => sum + l._count, 0),
-
-                period: {
-                    from: thirtyDaysAgo.toISOString(),
-                    to: now.toISOString()
-                }
-            }
-        });
-    } catch (error) {
-        logger.error({ err: error }, '[getProfitBreakdown] error');
-        return res.status(500).json({ success: false, message: error.message });
-    }
-};
+exports.getProfitBreakdown = (req, res) => require('./adminProfitBreakdownController').getProfitBreakdown(req, res);
 
 
 /**
