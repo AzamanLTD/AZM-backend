@@ -283,7 +283,9 @@ exports.createTicket = async (req, res) => {
                             body:     `${cleanName} -- ${Number(escrowAmount).toFixed(2)} USDC. Awaiting payment.`,
                             category: 'GENERAL',
                             actionPayload: {
-                                route:   '/business/orders',
+                                // The app's owner surface for this (there is no
+                                // '/business/orders' route: it matched /business/:bizId).
+                                route:   '/business/notifications',
                                 action:  'VIEW_BUSINESS_ORDER',
                                 orderId: businessOrder.id
                             }
