@@ -40,6 +40,22 @@ function validateStudioExperience(layoutJson) {
   }
 }
 
+// layoutJson.experience belongs to Experience Studio: the category-native
+// blueprint (schemaVersion 1) the app renders. A Storefront Studio V2 page
+// document (schemaVersion 2) is not taken into it: decided 28 Nov 2026 —
+// Studio V2 is parked (the app has no renderer for its pages, and it shared
+// this slot, so either save replaced the other). One already stored is kept
+// and still validated at publish; a new one is refused.
+function refuseStudioDocument(layoutJson) {
+  const experience = layoutJson?.experience;
+  if (experience && typeof experience === 'object' && experience.schemaVersion === 2) {
+    const err = new Error('Storefront Studio V2 pages are not supported. Set how your store works in Experience Studio.');
+    err.code = 'STOREFRONT_STUDIO_PARKED';
+    err.statusCode = 422;
+    throw err;
+  }
+}
+
 function preserveExperienceSnapshot(nextLayout, currentDraftLayout) {
   if (
     !hasOwnExperience(nextLayout) &&
@@ -226,7 +242,9 @@ async function saveDraft(prisma, businessProfileId, layoutJson, themeId, expecte
   // save never carries layoutJson.experience: keep the draft's own (the
   // Experience Studio blueprint or Studio document). It used to be replaced
   // by the stripped layout, so every tile edit wiped a saved Experience.
-  const migratedLayout = preserveExperienceSnapshot(migrateLayout(layoutJson), existing && existing.layoutJson);
+  const incomingLayout = migrateLayout(layoutJson);
+  refuseStudioDocument(incomingLayout);
+  const migratedLayout = preserveExperienceSnapshot(incomingLayout, existing && existing.layoutJson);
   validateStudioExperience(migratedLayout);
 
   const draft = await prisma.businessStorefrontLayout.upsert({

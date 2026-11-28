@@ -83,6 +83,8 @@ describe('an editor save keeps the draft Experience', () => {
 });
 
 describe('Storefront Studio server validation boundary', () => {
+  // Studio V2 is parked (28 Nov): a page document is refused before anything
+  // else, unsafe or not, and nothing is written.
   test('saveDraft rejects unsafe Studio experience before persistence', async () => {
     const upsert = jest.fn();
     const prisma = {
@@ -91,7 +93,7 @@ describe('Storefront Studio server validation boundary', () => {
 
     await expect(
       saveDraft(prisma, 'business-1', { experience: invalidExperience }, 'theme-1'),
-    ).rejects.toMatchObject({ statusCode: 422, code: 'STOREFRONT_UNSAFE_FIELD' });
+    ).rejects.toMatchObject({ statusCode: 422, code: 'STOREFRONT_STUDIO_PARKED' });
     expect(upsert).not.toHaveBeenCalled();
   });
 
@@ -120,13 +122,22 @@ describe('Storefront Studio server validation boundary', () => {
     expect(prisma.businessStorefrontLayout.create).not.toHaveBeenCalled();
   });
 
-  test('valid schemaVersion 2 experience continues through save validation', async () => {
+  test('a valid Studio V2 document is refused too: the slot belongs to Experience Studio', async () => {
     const upsert = jest.fn().mockResolvedValue({ id: 'draft-1' });
     const prisma = { businessStorefrontLayout: { upsert, findUnique: jest.fn().mockResolvedValue(null) } };
 
     await expect(
       saveDraft(prisma, 'business-1', { experience: validExperience }, 'theme-1'),
-    ).resolves.toEqual({ id: 'draft-1' });
-    expect(upsert).toHaveBeenCalledTimes(1);
+    ).rejects.toMatchObject({ statusCode: 422, code: 'STOREFRONT_STUDIO_PARKED' });
+    expect(upsert).not.toHaveBeenCalled();
+  });
+
+  test('an Experience Studio blueprint (version 1) still saves', async () => {
+    const upsert = jest.fn(async ({ update }) => ({ id: 'draft-1', ...update }));
+    const prisma = { businessStorefrontLayout: { upsert, findUnique: jest.fn().mockResolvedValue(null) } };
+    const blueprint = { schemaVersion: 1, preset: 'DINING_JOURNEY' };
+
+    const saved = await saveDraft(prisma, 'business-1', { experience: blueprint }, 'theme-1');
+    expect(saved.layoutJson.experience).toEqual(blueprint);
   });
 });
