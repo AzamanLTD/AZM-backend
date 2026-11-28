@@ -202,6 +202,110 @@ exports.getBusinessDetail = async (req, res) => {
     });
 };
 
+// =============================================================================
+// GET /api/marketplace/business/:bizId/stay-quote?checkIn&checkOut&guests
+//
+// Read-only. For the chosen dates and guests, every room's exact total (the
+// same per-night pricing the reservation charges: overrides, weekend rate,
+// base rate) and whether it can be booked, with the reason when not. The app
+// showed nights x base rate, which differed from the server total whenever a
+// weekend or an override fell inside the stay, and offered rooms that the
+// reservation then refused (too small, blocked, already booked).
+// Mirrors createHotelReservation's checks and reservationController's
+// double-booking rule (active reservation on the same room overlapping).
+// =============================================================================
+const MAX_QUOTE_NIGHTS = 60;
+const ACTIVE_RESERVATION_STATUSES = ['PENDING', 'CONFIRMED', 'CHECKED_IN'];
+
+exports.getStayQuote = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const { bizId } = req.params;
+        const checkInDay = startOfUtcDay(req.query.checkIn);
+        const checkOutDay = startOfUtcDay(req.query.checkOut);
+        if (!checkInDay || !checkOutDay || checkOutDay <= checkInDay) {
+            return res.status(400).json({ success: false, code: 'DATES_INVALID', message: 'Check-out must be after check-in.' });
+        }
+        if (checkInDay < startOfUtcDay(Date.now())) {
+            return res.status(400).json({ success: false, code: 'DATES_PAST', message: 'Check-in cannot be in the past.' });
+        }
+        const nightsCount = Math.round((checkOutDay - checkInDay) / 86400000);
+        if (nightsCount > MAX_QUOTE_NIGHTS) {
+            return res.status(400).json({ success: false, code: 'STAY_TOO_LONG', message: `A stay can be at most ${MAX_QUOTE_NIGHTS} nights.` });
+        }
+        const guests = Math.min(Math.max(parseInt(req.query.guests, 10) || 1, 1), 50);
+
+        const business = await prisma.businessProfile.findUnique({
+            where: { bizId },
+            select: { id: true, category: true, isSuspended: true, isPausedByOwner: true },
+        });
+        if (!business || business.isSuspended) {
+            return res.status(404).json({ success: false, message: 'Business not found.' });
+        }
+        if (business.category !== 'HOSPITALITY') {
+            return res.status(409).json({ success: false, message: 'This business is not configured as a hotel.' });
+        }
+
+        const rooms = await prisma.hotelRoom.findMany({
+            where: { businessProfileId: business.id },
+            orderBy: [{ floor: 'asc' }, { roomNumber: 'asc' }],
+        });
+        const ids = rooms.map((r) => r.id);
+        const [blocks, booked] = ids.length === 0 ? [[], []] : await Promise.all([
+            prisma.hotelRoomBlock.findMany({
+                where: { roomId: { in: ids }, startDate: { lt: checkOutDay }, endDate: { gt: checkInDay } },
+                select: { roomId: true },
+            }),
+            prisma.reservation.findMany({
+                where: {
+                    businessProfileId: business.id,
+                    serviceItemId: { in: ids },
+                    status: { in: ACTIVE_RESERVATION_STATUSES },
+                    startDatetime: { lt: checkOutDay },
+                    endDatetime: { gt: checkInDay },
+                },
+                select: { serviceItemId: true },
+            }),
+        ]);
+        const blocked = new Set(blocks.map((b) => b.roomId));
+        const taken = new Set(booked.map((b) => b.serviceItemId));
+
+        const quoted = [];
+        for (const room of rooms) {
+            const nightly = await findNightlyRates(prisma, room, checkInDay, checkOutDay);
+            const total = nightly.reduce((sum, n) => sum.add(n.priceUsdc), new Prisma.Decimal(0));
+            const reason = room.status !== 'AVAILABLE' ? 'ROOM_UNAVAILABLE'
+                : guests > room.capacity ? 'TOO_SMALL'
+                    : blocked.has(room.id) ? 'BLOCKED'
+                        : taken.has(room.id) ? 'BOOKED'
+                            : total.lte(0) ? 'NO_PRICE'
+                                : null;
+            quoted.push({
+                roomId: room.id,
+                bookable: reason === null,
+                reason,
+                capacity: room.capacity,
+                totalUsdc: Number(total.toFixed(8)),
+                nightly: nightly.map((n) => ({ date: n.date, priceUsdc: Number(n.priceUsdc), source: n.source })),
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            checkIn: checkInDay.toISOString().slice(0, 10),
+            checkOut: checkOutDay.toISOString().slice(0, 10),
+            nights: nightsCount,
+            guests,
+            // A stay is requested here and confirmed by the hotel; it is paid
+            // at the hotel (no in-app payment for stays yet).
+            payAt: 'HOTEL',
+            rooms: quoted,
+        });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: 'Could not price this stay. Try again.' });
+    }
+};
+
 exports.createHotelReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     const { bizId } = req.params;

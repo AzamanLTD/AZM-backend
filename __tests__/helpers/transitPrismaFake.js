@@ -24,6 +24,8 @@ const OPS = {
 
 function matches(row, where = {}, rel = null) {
     return Object.entries(where).every(([k, cond]) => {
+        if (k === 'OR' && Array.isArray(cond)) return cond.some((c) => matches(row, c, rel));
+        if (k === 'AND' && Array.isArray(cond)) return cond.every((c) => matches(row, c, rel));
         const v = row[k];
         if (cond === null) return v === null || v === undefined;
         if (cond && typeof cond === 'object' && !Array.isArray(cond) && !(cond instanceof Date)) {

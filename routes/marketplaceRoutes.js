@@ -50,6 +50,8 @@ router.post('/business/checkin', protect, ctrl.businessCheckIn);
 // experiences. Hotel detail includes the authoritative HotelRoom inventory.
 router.get('/business/:bizId', hotelCtrl.getBusinessDetail);
 router.post('/business/:bizId/reservations', protect, hotelCtrl.createHotelReservation);
+// Read-only: each room's exact total and availability for dates + guests.
+router.get('/business/:bizId/stay-quote', hotelCtrl.getStayQuote);
 
 // ── Transit Trips + Seat Booking ─────────────────────────────────────────────
 router.get('/transit/trips', protect, ctrl.listTransitTrips);
