@@ -8,6 +8,7 @@
 // through inverted locks and exactly one economic fact can win.
 // =============================================================================
 
+const { isPaidStay, noShowCutoff } = require('./paidStayPolicy');
 const { randomUUID } = require('crypto');
 const {
     _refundBookingEscrowTx,
@@ -220,8 +221,14 @@ const markNoShowReservation = async (prisma, { reservationId, businessUserId = n
         if (reservation.status !== 'CONFIRMED') {
             throw fail('RESERVATION_NOT_NO_SHOW_READY', `Reservation is ${reservation.status}, cannot mark no-show.`);
         }
-        if (reservation.checkedInAt || reservation.endDatetime >= new Date()) {
-            throw fail('RESERVATION_NOT_NO_SHOW_READY', 'Reservation cannot be marked no-show before its end time.');
+        // A stay paid in the app stays open for a late arrival until noon on
+        // the check-out day (paidStayPolicy); any other reservation is a
+        // no-show from its end.
+        const cutoff = noShowCutoff(reservation);
+        if (reservation.checkedInAt || reservation.endDatetime >= cutoff) {
+            throw fail('RESERVATION_NOT_NO_SHOW_READY', isPaidStay(reservation)
+                ? 'A paid stay can be marked no-show from noon on its check-out day.'
+                : 'Reservation cannot be marked no-show before its end time.');
         }
 
         const escrow = reservation.escrow;
@@ -246,7 +253,7 @@ const markNoShowReservation = async (prisma, { reservationId, businessUserId = n
                     refundRef: randomUUID(),
                     reservationClaimWhere: {
                         checkedInAt: null,
-                        endDatetime: { lt: new Date() },
+                        endDatetime: { lt: cutoff },
                     },
                 });
                 return tx.reservation.findUnique({ where: { id: reservationId } });
@@ -263,7 +270,7 @@ const markNoShowReservation = async (prisma, { reservationId, businessUserId = n
             from: ['CONFIRMED'],
             where: {
                 checkedInAt: null,
-                endDatetime: { lt: new Date() },
+                endDatetime: { lt: cutoff },
             },
             data: {
                 status: 'NO_SHOW',

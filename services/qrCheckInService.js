@@ -215,7 +215,9 @@ const generateCheckInToken = async (prisma, { reservationId, customerId, now = D
         throw new Error(`Reservation must be CONFIRMED to check in (current: ${reservation.status}).`);
     }
 
-    const windowEnd = reservation.endDatetime ? new Date(reservation.endDatetime).getTime() : null;
+    // A stay paid in the app stays open for a late arrival until noon on the
+    // check-out day (paidStayPolicy); any other reservation closes at its end.
+    const windowEnd = require('./paidStayPolicy').checkInClosesAt(reservation);
     if (windowEnd !== null && now > windowEnd) {
         throw new Error('This reservation has already ended — check-in is closed.');
     }
@@ -278,8 +280,21 @@ const verifyAndCheckIn = async (prisma, { token, businessUserId, now = Date.now(
     if (payload.ref && reservation.reservationRef !== payload.ref) {
         throw new Error('Token does not match this reservation.');
     }
-    if (reservation.endDatetime && now > new Date(reservation.endDatetime).getTime()) {
+    // The check-in pays a paid stay's hotel, so it is held to the stay's
+    // window: from 24 hours before the check-in day to noon on the check-out
+    // day (paidStayPolicy). Any other reservation closes at its end.
+    const policy = require('./paidStayPolicy');
+    const closesAt = policy.checkInClosesAt(reservation);
+    if (closesAt !== null && now > closesAt) {
         throw new Error('This reservation has already ended — check-in is closed.');
+    }
+    const opensAt = policy.checkInOpensAt(reservation);
+    if (opensAt !== null && now < opensAt) {
+        throw new QrTokenError(
+            'QR_CHECKIN_NOT_OPEN',
+            `This paid stay starts on ${new Date(reservation.startDatetime).toISOString().slice(0, 10)}. `
+            + `Check-in opens at ${new Date(opensAt).toISOString().slice(0, 16).replace('T', ' ')} UTC; nothing was paid out.`,
+        );
     }
     if (reservation.status === 'CHECKED_IN') {
         // A one-use QR is refused on reuse. The convergent/idempotent behaviour

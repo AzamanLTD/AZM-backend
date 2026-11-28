@@ -26,13 +26,30 @@ const { audit } = require('../utils/audit');
 async function _loadEscrowForParticipant(prisma, escrowId, userId) {
     const escrow = await prisma.smartEscrow.findUnique({
         where: { id: escrowId },
-        include: { ticket: true }
+        include: { ticket: true, reservation: { select: { id: true } }, transitBooking: { select: { id: true } } }
     });
     if (!escrow) return { ok: false, code: 404, message: 'Escrow not found.' };
     if (escrow.payerId !== userId && escrow.payeeId !== userId) {
         return { ok: false, code: 403, message: 'Not a participant in this escrow.' };
     }
     return { ok: true, escrow };
+}
+
+/**
+ * A stay's or a trip's escrow is settled by the booking itself: the guest's
+ * QR check-in, the passenger's boarding, a cancellation or the no-show sweep.
+ * Marking it complete or disputing it here would pay the hotel before
+ * check-in, or freeze a refund the guest is owed. Store orders still use
+ * these endpoints.
+ */
+function _bookingEscrowRefusal(escrow) {
+    if (escrow && escrow.reservation) {
+        return "This stay's payment is released when the guest checks in with their QR, and refunded if the stay is cancelled. It can't be completed or disputed here.";
+    }
+    if (escrow && escrow.transitBooking) {
+        return "This trip's fare is released when the passenger boards. Report a boarding problem from the trip itself.";
+    }
+    return null;
 }
 
 /** Inject a SYSTEM TicketMessage and fan it out on the ticket room. */
@@ -190,6 +207,11 @@ exports.markSatisfied = async (req, res) => {
 
         const loaded = await _loadEscrowForParticipant(prisma, escrowId, userId);
         if (!loaded.ok) return res.status(loaded.code).json({ success: false, message: loaded.message });
+        const bookingRefusal = _bookingEscrowRefusal(loaded.escrow);
+        if (bookingRefusal) {
+            if (res.locals) res.locals.financialClaimRelease = true; // nothing ran
+            return res.status(409).json({ success: false, code: 'BOOKING_ESCROW', message: bookingRefusal });
+        }
 
         const result = await escrowService.markSatisfied(prisma, {
             escrowId, userId,
@@ -299,6 +321,11 @@ exports.raiseDispute = async (req, res) => {
 
         const loaded = await _loadEscrowForParticipant(prisma, escrowId, userId);
         if (!loaded.ok) return res.status(loaded.code).json({ success: false, message: loaded.message });
+        const bookingRefusal = _bookingEscrowRefusal(loaded.escrow);
+        if (bookingRefusal) {
+            if (res.locals) res.locals.financialClaimRelease = true; // nothing ran
+            return res.status(409).json({ success: false, code: 'BOOKING_ESCROW', message: bookingRefusal });
+        }
 
         const result = await escrowService.raiseDispute(prisma, {
             escrowId, raisedById: userId, reason: cleanReason, evidenceUrls: urls

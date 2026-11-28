@@ -2384,15 +2384,27 @@ router.post('/reservations/:id/propose-reschedule', requirePermission('reservati
     if (reservation.status !== 'PENDING' && reservation.status !== 'CONFIRMED') {
         return res.status(400).json({ success: false, message: 'Can only reschedule PENDING or CONFIRMED reservations.' });
     }
-    const updated = await prisma.reservation.update({
-        where: { id: req.params.id },
-        data: {
-            proposedStartDatetime: new Date(proposedStartDatetime),
-            proposedEndDatetime: proposedEndDatetime ? new Date(proposedEndDatetime) : null,
-            counterProposeMessage: message || null,
-            counterProposedAt: new Date(),
-        },
-    });
+    // A booking paid in Azaman keeps its dates: its price, its escrow's expiry
+    // and its no-show timing were fixed for them. Checked under the row lock.
+    const { assertDatesMovableTx } = require('../services/stayPaymentService');
+    let updated;
+    try {
+        updated = await prisma.$transaction(async (tx) => {
+            await assertDatesMovableTx(tx, reservation.id);
+            return tx.reservation.update({
+                where: { id: reservation.id },
+                data: {
+                    proposedStartDatetime: new Date(proposedStartDatetime),
+                    proposedEndDatetime: proposedEndDatetime ? new Date(proposedEndDatetime) : null,
+                    counterProposeMessage: message || null,
+                    counterProposedAt: new Date(),
+                },
+            });
+        });
+    } catch (err) {
+        if (err && err.code === 'PAID_DATES_FIXED') return res.status(409).json({ success: false, code: err.code, message: err.message });
+        throw err;
+    }
     res.json({ success: true, reservation: updated });
 }));
 
@@ -2409,18 +2421,29 @@ router.post('/reservations/:id/respond-reschedule', requirePermission('reservati
         return res.status(400).json({ success: false, message: 'No pending reschedule proposal.' });
     }
     if (accept) {
-        // Apply the proposed times
-        const updated = await prisma.reservation.update({
-            where: { id: req.params.id },
-            data: {
-                startDatetime: reservation.proposedStartDatetime,
-                endDatetime: reservation.proposedEndDatetime || reservation.endDatetime,
-                proposedStartDatetime: null,
-                proposedEndDatetime: null,
-                counterProposeMessage: null,
-                counterProposedAt: null,
-            },
-        });
+        // Apply the proposed times. A booking paid in Azaman keeps its dates
+        // (PAID_DATES_FIXED), checked under the reservation's row lock.
+        const { assertDatesMovableTx } = require('../services/stayPaymentService');
+        let updated;
+        try {
+            updated = await prisma.$transaction(async (tx) => {
+                await assertDatesMovableTx(tx, reservation.id);
+                return tx.reservation.update({
+                    where: { id: reservation.id },
+                    data: {
+                        startDatetime: reservation.proposedStartDatetime,
+                        endDatetime: reservation.proposedEndDatetime || reservation.endDatetime,
+                        proposedStartDatetime: null,
+                        proposedEndDatetime: null,
+                        counterProposeMessage: null,
+                        counterProposedAt: null,
+                    },
+                });
+            });
+        } catch (err) {
+            if (err && err.code === 'PAID_DATES_FIXED') return res.status(409).json({ success: false, code: err.code, message: err.message });
+            throw err;
+        }
         res.json({ success: true, reservation: updated, action: 'accepted' });
     } else {
         // Reject the proposal

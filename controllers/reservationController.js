@@ -177,6 +177,9 @@ exports.listMyReservations = async (req, res) => {
                 businessProfile: {
                     select: { bizId: true, businessName: true, logoUrl: true, category: true },
                 },
+                // A stay paid in the app: where its money is (held until
+                // check-in, paid to the hotel, refunded) and what was paid.
+                escrow: { select: { status: true, amountUsdc: true, feeUsdc: true } },
             },
             ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
         });
@@ -281,7 +284,8 @@ exports.confirmReservation = async (req, res) => {
 
 // ── PATCH /api/reservations/:reservationId/decline ───────────────────────────
 // The hotel declines a request or cancels a stay it cannot honour. A stay
-// paid in the app is refunded in full, in the same transaction.
+// paid in the app has its price refunded in the same transaction (the Azaman
+// fee is not refunded).
 exports.declineReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
@@ -296,11 +300,16 @@ exports.declineReservation = async (req, res) => {
         try {
             const notifier = req.app.get('notificationService');
             if (notifier && typeof notifier.sendNotification === 'function') {
+                const escrow = reservation.escrowId
+                    ? await prisma.smartEscrow.findUnique({ where: { id: reservation.escrowId }, select: { status: true, amountUsdc: true } })
+                    : null;
+                const refunded = escrow && escrow.status === 'REFUNDED'
+                    ? `The price you paid (${Number(escrow.amountUsdc).toFixed(2)} USDC) is back in your wallet; the Azaman fee is not refunded.`
+                    : 'Nothing was charged.';
                 await notifier.sendNotification({
                     userId: reservation.customerId,
                     title: 'Your stay was cancelled',
-                    body: `${profile.businessName} cancelled ${reservation.reservationRef}. `
-                        + 'Anything you paid in Azaman is back in your wallet.'
+                    body: `${profile.businessName} cancelled ${reservation.reservationRef}. ${refunded}`
                         + (reason ? ` Reason: ${String(reason).slice(0, 140)}` : ''),
                     category: 'MONEY',
                     actionPayload: { route: '/bookings?tab=reservations' },
@@ -468,17 +477,23 @@ exports.counterProposeReservation = async (req, res) => {
             return res.status(400).json({ success: false, message: `Cannot counter-propose on a ${reservation.status} reservation.` });
         }
 
-        // Update the reservation with the proposed alternative
-        const updated = await req.prisma.reservation.update({
-            where: { id: reservationId },
-            data: {
-                // Keep status as PENDING but store the counter-proposal
-                // The customer will see the proposed alternative and can accept or decline
-                proposedStartDatetime: new Date(proposedStartDatetime),
-                proposedEndDatetime: proposedEndDatetime ? new Date(proposedEndDatetime) : null,
-                counterProposeMessage: message || null,
-                counterProposedAt: new Date(),
-            }
+        // Update the reservation with the proposed alternative. A booking
+        // paid in Azaman keeps its dates (PAID_DATES_FIXED), checked under
+        // the reservation's row lock.
+        const { assertDatesMovableTx } = require('../services/stayPaymentService');
+        const updated = await req.prisma.$transaction(async (tx) => {
+            await assertDatesMovableTx(tx, reservation.id);
+            return tx.reservation.update({
+                where: { id: reservation.id },
+                data: {
+                    // Keep status as PENDING but store the counter-proposal
+                    // The customer will see the proposed alternative and can accept or decline
+                    proposedStartDatetime: new Date(proposedStartDatetime),
+                    proposedEndDatetime: proposedEndDatetime ? new Date(proposedEndDatetime) : null,
+                    counterProposeMessage: message || null,
+                    counterProposedAt: new Date(),
+                }
+            });
         });
 
         // Notify the customer
@@ -507,6 +522,7 @@ exports.counterProposeReservation = async (req, res) => {
 
         res.json({ success: true, reservation: updated });
     } catch (err) {
+        if (err && err.code === 'PAID_DATES_FIXED') return res.status(409).json({ success: false, code: err.code, message: err.message });
         logger.error({ err: err }, '[counterProposeReservation]');
         res.status(500).json({ success: false, message: err.message });
     }
@@ -529,16 +545,21 @@ exports.acceptCounterProposal = async (req, res) => {
             return res.status(400).json({ success: false, message: 'No counter-proposal to accept.' });
         }
 
-        // Apply the proposed times
-        const updated = await req.prisma.reservation.update({
-            where: { id: reservationId },
-            data: {
-                startDatetime: reservation.proposedStartDatetime,
-                endDatetime: reservation.proposedEndDatetime || reservation.endDatetime,
-                proposedStartDatetime: null,
-                proposedEndDatetime: null,
-                counterProposeMessage: null,
-            }
+        // Apply the proposed times. A booking paid in Azaman keeps its dates
+        // (PAID_DATES_FIXED), checked under the reservation's row lock.
+        const { assertDatesMovableTx } = require('../services/stayPaymentService');
+        const updated = await req.prisma.$transaction(async (tx) => {
+            await assertDatesMovableTx(tx, reservation.id);
+            return tx.reservation.update({
+                where: { id: reservation.id },
+                data: {
+                    startDatetime: reservation.proposedStartDatetime,
+                    endDatetime: reservation.proposedEndDatetime || reservation.endDatetime,
+                    proposedStartDatetime: null,
+                    proposedEndDatetime: null,
+                    counterProposeMessage: null,
+                }
+            });
         });
 
         // Notify the business
@@ -556,6 +577,7 @@ exports.acceptCounterProposal = async (req, res) => {
 
         res.json({ success: true, reservation: updated });
     } catch (err) {
+        if (err && err.code === 'PAID_DATES_FIXED') return res.status(409).json({ success: false, code: err.code, message: err.message });
         logger.error({ err: err }, '[acceptCounterProposal]');
         if (err.code === 'P2002' && err.meta?.target === null)
             return res.status(409).json({ success: false, message: 'The proposed time is no longer available.' });

@@ -26,10 +26,13 @@ const sweepNoShowReservations = async (prisma) => {
     const now = new Date();
     // Include both escrow-backed and unescrowed bookings. The lifecycle
     // authority decides whether to refund/split/expire or transition only.
-    const overdue = await prisma.reservation.findMany({
+    const { noShowCutoff } = require('../services/paidStayPolicy');
+    const overdue = (await prisma.reservation.findMany({
         where: { status: 'CONFIRMED', checkedInAt: null, endDatetime: { lt: now } },
         include: { escrow: true }
-    });
+    })).filter((r) => new Date(r.endDatetime) < noShowCutoff(r, now.getTime()));
+    // ^ A stay paid in the app waits for a late arrival until noon on its
+    //   check-out day (paidStayPolicy); it is swept on a later run.
 
     const results = { processed: 0, penalized: 0, errors: 0, details: [] };
     const { markNoShowReservation } = require('../services/reservationLifecycleService');

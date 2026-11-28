@@ -10,6 +10,10 @@
 //       the room lock lets exactly one through; the other is refused and
 //       charged nothing.
 //   H4. The hotel cancelling refunds the price (the fee stays realized).
+//   H5. Through the route's real idempotency middleware and the controller:
+//       the claim commits with the stay; a same-key retry replays it and
+//       charges nothing; a different stay under the key is refused; a short
+//       balance releases the key, so the same key pays once topped up.
 // =============================================================================
 
 const { seedUser, seedBusiness } = require('./helpers/factories');
@@ -125,5 +129,83 @@ run('hotel stay paid from the wallet (PostgreSQL)', () => {
             available: expect.closeTo(500 - out.payment.feeUsdc, 6),
             locked: expect.closeTo(0, 6),
         });
+    });
+
+    test('H5: through the real idempotency middleware: a retry replays, a different stay under the key is refused, a short balance frees the key', async () => {
+        const ctx = await seedHotel();
+        const guest = await seedUser(prisma, { availableBalance: 500 });
+        const p = await stay.priceStay(prisma, { bizId: ctx.biz.bizId, roomId: ctx.room.id, checkInDate: IN, checkOutDate: OUT, partySize: 2 });
+        const { idempotency } = require('../middleware/idempotency');
+        const ctrl = require('../controllers/hotelMarketplaceController');
+        // The route's own declaration (routes/marketplaceRoutes.js).
+        const claim = idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true, required: false });
+        const ROUTE = '/business/:bizId/reservations';
+        const drive = ({ userId, key, body }) => new Promise((resolve, reject) => {
+            const settings = { prisma };
+            const app = { get: (k) => settings[k] ?? null };
+            const headers = { 'idempotency-key': key };
+            const req = {
+                method: 'POST', baseUrl: '/api/marketplace', route: { path: ROUTE },
+                path: `/business/${ctx.biz.bizId}/reservations`,
+                originalUrl: `/api/marketplace/business/${ctx.biz.bizId}/reservations`,
+                headers, get: (h) => headers[String(h).toLowerCase()],
+                params: { bizId: ctx.biz.bizId }, query: {}, body, ip: '127.0.0.1',
+                app, user: { id: userId, username: 'guest' },
+            };
+            const res = {
+                app, locals: {}, statusCode: 200, headersSent: false,
+                status(c) { this.statusCode = c; return this; },
+                json(b) {
+                    if (!this.headersSent) {
+                        this.headersSent = true;
+                        resolve({ status: this.statusCode, body: b === undefined ? undefined : JSON.parse(JSON.stringify(b)) });
+                    }
+                    return this;
+                },
+                setHeader() {},
+                end() { this.headersSent = true; resolve({ status: this.statusCode, body: null }); return this; },
+            };
+            claim(req, res, (err) => (err ? reject(err) : Promise.resolve(ctrl.createHotelReservation(req, res)).catch(reject)));
+        });
+        const body = {
+            payWith: 'WALLET', roomId: ctx.room.id, checkInDate: IN, checkOutDate: OUT, partySize: 2,
+            expectedTotalUsdc: p.totalUsdc.toFixed(6),
+        };
+
+        const first = await drive({ userId: guest.id, key: 'h5-a', body });
+        expect(first.status).toBe(201);
+        expect(first.body.payment).toEqual(expect.objectContaining({ method: 'WALLET', heldUntil: 'CHECK_IN' }));
+        const op = await prisma.financialOperation.findFirst({ where: { userId: guest.id, key: 'h5-a' } });
+        expect(op).toEqual(expect.objectContaining({ status: 'COMMITTED', statusCode: 201 }));
+        const charged = await balances(guest.id);
+        expect(charged.available).toBeCloseTo(500 - p.totalUsdc, 6);
+
+        // The same request again: replayed from the claim, nothing more charged.
+        const again = await drive({ userId: guest.id, key: 'h5-a', body });
+        expect(again.status).toBe(201);
+        expect(again.body.reservation.id).toBe(first.body.reservation.id);
+        expect(await prisma.smartEscrow.count()).toBe(1);
+        expect(await balances(guest.id)).toEqual(charged);
+
+        // A different stay under the same key: refused, nothing charged.
+        const other = await drive({ userId: guest.id, key: 'h5-a', body: { ...body, partySize: 1 } });
+        expect(other.status).toBe(409);
+        expect(await prisma.reservation.count()).toBe(1);
+        expect(await balances(guest.id)).toEqual(charged);
+
+        // A short balance: 402, nothing charged, and the key is free again.
+        const poor = await seedUser(prisma, { availableBalance: 5 });
+        const later = { ...body, checkInDate: day(14), checkOutDate: day(16) };
+        const lp = await stay.priceStay(prisma, { bizId: ctx.biz.bizId, roomId: ctx.room.id, checkInDate: later.checkInDate, checkOutDate: later.checkOutDate, partySize: 2 });
+        later.expectedTotalUsdc = lp.totalUsdc.toFixed(6);
+        const short = await drive({ userId: poor.id, key: 'h5-b', body: later });
+        expect(short.status).toBe(402);
+        expect(short.body.code).toBe('INSUFFICIENT_BALANCE');
+        expect(await prisma.financialOperation.count({ where: { userId: poor.id, key: 'h5-b' } })).toBe(0);
+        expect(await balances(poor.id)).toEqual({ available: 5, locked: 0 });
+        await prisma.user.update({ where: { id: poor.id }, data: { availableBalance: 500 } });
+        const topped = await drive({ userId: poor.id, key: 'h5-b', body: later });
+        expect(topped.status).toBe(201);
+        expect(await prisma.smartEscrow.count({ where: { status: 'FUNDED' } })).toBe(2);
     });
 });

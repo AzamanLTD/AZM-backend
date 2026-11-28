@@ -113,7 +113,7 @@ const RELEASE_EVIDENCE = [
             'services/stayPaymentService.js',
             'The wired idempotency claim commits with the stay',
             "const committed = await tx.financialOperation.updateMany({ where: { id: financialOperation.id, status: 'IN_PROGRESS' },",
-            { file: '__tests__/stay-wallet-pay.test.js', name: 'a retry with the same key charges nothing more; a different stay under it is refused' },
+            { file: '__tests__/stay-wallet-pay.pg.test.js', name: 'H5: through the real idempotency middleware: a retry replays, a different stay under the key is refused, a short balance frees the key' },
             'Only payWith WALLET mounts the claim; a plain stay request is unchanged.',
         ),
     },

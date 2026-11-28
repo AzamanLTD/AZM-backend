@@ -9,6 +9,7 @@
  * canonical reservationController after authoritative room/rate validation.
  */
 
+const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client');
 const reservationController = require('./reservationController');
 // One pricing for the quote, the reservation and the paid stay.
@@ -307,11 +308,29 @@ exports.createHotelReservation = async (req, res) => {
             }
             return res.status(result.replayed ? 200 : 201).json(result);
         } catch (err) {
-            const status = err.code === 'INSUFFICIENT_BALANCE' ? 402 : (err.httpStatus || 400);
-            return res.status(status).json({
+            const code = err && typeof err.code === 'string' ? err.code : null;
+            if (code === 'INSUFFICIENT_BALANCE') {
+                return res.status(402).json({ success: false, code, message: 'Not enough in your wallet for this stay. Nothing was charged.' });
+            }
+            // The capacity trigger (P2004) or a unique index (P2002) refused
+            // the insert: the transaction rolled back, so nothing was charged.
+            if (code === 'P2002' || (code === 'P2004' && String(err.message).includes('reservation_'))) {
+                return res.status(409).json({ success: false, code: 'BOOKED', message: 'This room was just booked for those dates. Nothing was charged.' });
+            }
+            // Our own refusals carry a code and an HTTP status.
+            if (code && !/^P\d{4}$/.test(code) && Number.isInteger(err.httpStatus) && err.httpStatus >= 400 && err.httpStatus < 500) {
+                return res.status(err.httpStatus).json({ success: false, code, message: err.message });
+            }
+            // Anything else: never a raw database message, and no claim that
+            // nothing was charged (the outcome is not proven). A retry with
+            // the same Idempotency-Key cannot pay twice: if the stay was
+            // paid, its reservation carries that key and the retry replays it
+            // (stayPaymentService), whatever the claim's disposition.
+            logger.error({ err: err && err.message, code, bizId }, '[createHotelReservation] paid stay failed');
+            return res.status(500).json({
                 success: false,
-                ...(typeof err.code === 'string' && !/^P\d{4}$/.test(err.code) ? { code: err.code } : {}),
-                message: err.message,
+                code: 'PAYMENT_UNCONFIRMED',
+                message: 'We could not confirm the payment. Check Orders & bookings before trying again; retrying the same stay never charges twice.',
             });
         }
     }
