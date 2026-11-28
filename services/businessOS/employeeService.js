@@ -42,6 +42,12 @@ const EMPLOYEE_UPDATE_FORBIDDEN_FIELDS = ['role', 'permissions', 'status', 'term
 // mutation. It lives on the dedicated role authority (updateRole) behind
 // employees.permissions, with its own delegation ceiling.
 const EMPLOYEE_UPDATE_ALLOWED_FIELDS = ['title', 'department', 'payrollType', 'salaryAmount', 'hourlyRate', 'paymentPreference', 'emergencyContact', 'notes', 'ewaEligible'];
+// Pay fields decide how much of the owner's money an employee earns and can
+// draw early (EWA). Changing them needs the payroll right (payroll.process),
+// and nobody but the owner changes their own: a manager holding
+// employees.update could otherwise raise their own rate and draw it.
+const EMPLOYEE_PAY_FIELDS = ['payrollType', 'salaryAmount', 'hourlyRate', 'ewaEligible'];
+const PAY_AUTHORITY = 'payroll.process';
 
 // r26/P0-B (follow-up review) — ROLE CHANGES ARE AUTHORITY-BEARING. Changing
 // an employee's role reseeds their permission set from the role template, so
@@ -243,7 +249,9 @@ class EmployeeService {
     }
 
     // ── Update Employee ────────────────────────────────────────────────────
-    async updateEmployee(employeeId, businessProfileId, updates) {
+    // actor ({ id, permissions }, server-derived) — the routes always pass it;
+    // it decides who may change pay fields (EMPLOYEE_PAY_FIELDS).
+    async updateEmployee(employeeId, businessProfileId, updates, { actor = null } = {}) {
         if (!businessProfileId) throw new Error('Business context required.');
 
         // r26/P0-3 — the generic PATCH has an EXPLICIT, narrow contract.
@@ -276,9 +284,21 @@ class EmployeeService {
 
         const existing = await this.prisma.businessEmployee.findFirst({
             where: { id: employeeId, businessProfileId },
-            select: { id: true },
+            select: { id: true, userId: true },
         });
         if (!existing) throw new Error('Employee not found.');
+
+        const touchesPay = EMPLOYEE_PAY_FIELDS.some((k) => k in data);
+        if (touchesPay && actor) {
+            const perms = Array.isArray(actor.permissions) ? actor.permissions : [];
+            const unlimited = perms.includes('*');
+            if (!unlimited && existing.userId != null && existing.userId === actor.id) {
+                throw Object.assign(new Error('You cannot change your own pay or early-wage access. Ask the owner.'), { statusCode: 403, code: 'OWN_PAY_LOCKED' });
+            }
+            if (!unlimited && !normalizePermissions(perms).includes(PAY_AUTHORITY)) {
+                throw Object.assign(new Error('Changing pay needs the payroll permission (Process payroll).'), { statusCode: 403, code: 'PAY_AUTHORITY_REQUIRED' });
+            }
+        }
 
         return this.prisma.businessEmployee.update({
             where: { id: existing.id },

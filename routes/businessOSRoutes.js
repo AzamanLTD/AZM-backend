@@ -431,7 +431,9 @@ router.get('/employees/:id', requirePermission('employees.view'), wrap(async (re
 router.patch('/employees/:id', requirePermission('employees.update'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
-    const employee = await svc.employeeService.updateEmployee(req.params.id, bpId, req.body);
+    // The actor decides who may change pay fields (never their own).
+    const actor = { id: req.user.id, permissions: req.resolvedPermissions || [] };
+    const employee = await svc.employeeService.updateEmployee(req.params.id, bpId, req.body, { actor });
     res.json({ success: true, employee });
 }));
 
@@ -4619,9 +4621,13 @@ router.post('/finance/payout', requirePermission('settings.manage'), wrap(async 
         return res.status(400).json({ success: false, message: 'Destination required' });
     }
 
-    // Look up the payout destination (user-scoped)
+    // The business's money goes to the OWNER's own payout destinations only.
+    // (It looked the destination up among the caller's own, so a staff member
+    // with settings.manage could direct a business payout to their account.)
+    const business = await prisma.businessProfile.findUnique({ where: { id: bpId }, select: { userId: true } });
+    if (!business || !business.userId) return res.status(404).json({ success: false, message: 'No business profile found.' });
     const dest = await prisma.payoutDestination.findFirst({
-        where: { id: destination, userId: req.user.id },
+        where: { id: destination, userId: business.userId },
     });
     if (!dest) return res.status(404).json({ success: false, message: 'Payout destination not found' });
 
