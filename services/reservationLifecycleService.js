@@ -8,7 +8,7 @@
 // through inverted locks and exactly one economic fact can win.
 // =============================================================================
 
-const { REFUND_CAUSE, refundsFee } = require('./feeRefundPolicy');
+const { REFUND_CAUSE, refundsFeeNow } = require('./feeRefundPolicy');
 const { isPaidStay, noShowCutoff } = require('./paidStayPolicy');
 const { randomUUID } = require('crypto');
 const {
@@ -154,7 +154,7 @@ const businessCancelReservation = async (prisma, { reservationId, businessProfil
             await _refundBookingEscrowTx(tx, {
                 escrowId: escrow.id,
                 reference: randomUUID(),
-                refundFee: refundsFee(REFUND_CAUSE.BUSINESS_CANCELLED),
+                refundFee: await refundsFeeNow(tx, REFUND_CAUSE.BUSINESS_CANCELLED),
             });
         } else if (escrow?.status === 'DRAFT') {
             await expireDraftEscrow(tx, escrow);

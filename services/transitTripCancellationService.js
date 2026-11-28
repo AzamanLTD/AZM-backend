@@ -36,7 +36,7 @@
 // The route holds NO refund/ledger logic of its own.
 // =============================================================================
 
-const { REFUND_CAUSE, refundsFee } = require('./feeRefundPolicy');
+const { REFUND_CAUSE, refundsFeeNow } = require('./feeRefundPolicy');
 const { randomUUID } = require('crypto');
 const {
     _refundBookingEscrowTx,
@@ -97,7 +97,7 @@ const _resolveBookings = async (prisma, bookings) => {
                         const refunded = await _refundBookingEscrowTx(tx, {
                             escrowId: escrow.id,
                             reference,
-                            refundFee: refundsFee(REFUND_CAUSE.BUSINESS_CANCELLED),
+                            refundFee: await refundsFeeNow(tx, REFUND_CAUSE.BUSINESS_CANCELLED),
                         });
                         return {
                             outcome: 'REFUNDED', escrowStatus: 'REFUNDED', refundReference: reference,

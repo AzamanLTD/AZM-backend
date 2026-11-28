@@ -18,7 +18,7 @@
 //     to the operator, in one transaction
 // =============================================================================
 
-const { REFUND_CAUSE, refundsFee } = require('./feeRefundPolicy');
+const { REFUND_CAUSE, refundsFeeNow } = require('./feeRefundPolicy');
 const crypto = require('crypto');
 const { randomUUID } = require('crypto');
 const logger = require('../src/config/logger');
@@ -703,7 +703,7 @@ const cancelTransitBooking = async (prisma, { bookingId, cancelledBy, note, only
                 const refunded = await _refundBookingEscrowTx(tx, {
                     escrowId: escrow.id,
                     reference,
-                    refundFee: refundsFee(isOwner && !isCustomer
+                    refundFee: await refundsFeeNow(tx, isOwner && !isCustomer
                         ? REFUND_CAUSE.BUSINESS_CANCELLED
                         : REFUND_CAUSE.CUSTOMER_CANCELLED),
                 });

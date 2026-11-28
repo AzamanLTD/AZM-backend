@@ -113,6 +113,7 @@ const REGISTRY = {
     'adminRoutes.js|POST|/fee-profiles': R(CLASS.OPERATOR, OPERATOR_REASON),
     'adminRoutes.js|PUT|/fee-profiles/:id': R(CLASS.OPERATOR, OPERATOR_REASON),
     'adminRoutes.js|DELETE|/fee-profiles/:id': R(CLASS.OPERATOR, OPERATOR_REASON),
+    'adminRoutes.js|POST|/fee-lab/publish': R(CLASS.OPERATOR, `${OPERATOR_REASON}; changes live fee settings: fees.manage + require2FA re-auth + strict audit, one transaction`),
     'adminRoutes.js|POST|/trade-accounts/:id/approve': R(CLASS.OPERATOR, OPERATOR_REASON),
     'adminRoutes.js|POST|/trade-accounts/:id/reject': R(CLASS.OPERATOR, OPERATOR_REASON),
     'adminRoutes.js|POST|/payouts/batch-process': R(CLASS.OPERATOR, OPERATOR_REASON),

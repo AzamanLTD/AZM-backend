@@ -12,8 +12,10 @@
 //     comes back and the fee is kept (the service was provided: the booking
 //     was held for them).
 //
-// These are the defaults. The admin Fee Lab edits them as part of the
-// published fee settings; until a published value exists, these apply.
+// These are the defaults. The admin Fee Lab publishes changes to them as
+// AdminMoneySettingRevision rows (key feeRefund.<CAUSE>, valueEnum REFUND or
+// KEEP); publishedFeeRefund reads the latest one in effect, and a cause with
+// no published value keeps its default.
 // =============================================================================
 
 const REFUND_CAUSE = Object.freeze({
@@ -45,4 +47,30 @@ const refundsFee = (cause, published = null) => {
     return DEFAULT_FEE_REFUND[cause];
 };
 
-module.exports = { REFUND_CAUSE, DEFAULT_FEE_REFUND, refundsFee };
+const policyKey = (cause) => `feeRefund.${cause}`;
+
+/**
+ * The published fee-refund rules in effect, as { CAUSE: true|false }, or null
+ * when none are published. Read inside the refund's own transaction.
+ */
+const publishedFeeRefund = async (db, now = new Date()) => {
+    if (!db || !db.adminMoneySettingRevision) return null;
+    const keys = Object.keys(DEFAULT_FEE_REFUND).map(policyKey);
+    const rows = await db.adminMoneySettingRevision.findMany({
+        where: { key: { in: keys }, effectiveAt: { lte: now } },
+        orderBy: [{ effectiveAt: 'desc' }, { createdAt: 'desc' }],
+    });
+    const out = {};
+    for (const r of rows) {
+        const cause = r.key.slice('feeRefund.'.length);
+        if (Object.prototype.hasOwnProperty.call(out, cause)) continue;
+        if (r.valueEnum === 'REFUND') out[cause] = true;
+        else if (r.valueEnum === 'KEEP') out[cause] = false;
+    }
+    return Object.keys(out).length ? out : null;
+};
+
+/** refundsFee with the published rules, read through `db` (a transaction). */
+const refundsFeeNow = async (db, cause, now = new Date()) => refundsFee(cause, await publishedFeeRefund(db, now));
+
+module.exports = { REFUND_CAUSE, DEFAULT_FEE_REFUND, refundsFee, publishedFeeRefund, refundsFeeNow, policyKey };
