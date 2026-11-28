@@ -2,9 +2,10 @@
 'use strict';
 
 const invoiceService = require('../businessInvoiceService');
+const { Prisma } = require('@prisma/client');
 const {
     validateConfiguredProduct,
-    configuredUnitPrice,
+    configuredUnitPriceExact,
     normalizedSelection,
 } = require('../storefrontProductConfigurationService');
 
@@ -39,8 +40,12 @@ const transactionScopedPrisma = (prisma, tx) => new Proxy(prisma, {
 class DineInService {
     constructor(prisma, io) { this.prisma = prisma; this.io = io; }
 
-    async openTab({ businessProfileId, azamanId, locationId, tableId }) {
+    async openTab({ businessProfileId, azamanId, locationId, tableId, currency = null }) {
         if (!businessProfileId) throw new Error('businessProfileId is required.');
+        const tabCurrency = currency == null || currency === '' ? null : String(currency).trim().toUpperCase();
+        if (tabCurrency !== null && !['GHS', 'USDC'].includes(tabCurrency)) {
+            throw new Error('currency must be GHS or USDC.');
+        }
         if (!azamanId) throw new Error('azamanId is required.');
         if (tableId && !locationId) throw new Error('tableId requires locationId.');
 
@@ -76,6 +81,7 @@ class DineInService {
                             locationId: locationId || null,
                             tableId: tableId || null,
                             status: 'OPEN',
+                            ...(tabCurrency ? { currency: tabCurrency } : {}),
                         },
                         include: { items: true },
                     });
@@ -118,6 +124,7 @@ class DineInService {
 
         let itemName = name;
         let authoritativePrice = priceNum;
+        let productPriceText = null;
         if (productId) {
             const product = await this.prisma.businessProduct.findFirst({
                 where: await this._productWhereForTab(tab, productId),
@@ -125,19 +132,34 @@ class DineInService {
             });
             if (!product) throw new Error('Product is unavailable for this restaurant/location.');
             authoritativePrice = Number(product.priceUsdc);
+            productPriceText = String(product.priceUsdc);
             itemName = product.name;
         }
         if (!itemName) throw new Error('name is required.');
         if (!Number.isFinite(authoritativePrice) || authoritativePrice <= 0) throw new Error('price must be positive.');
+
+        // Money is arithmetic on Decimals, never on JS numbers. The old path
+        // wrote `authoritativePrice * qty` into a Decimal(20,8) column, so three
+        // 0.10 items stored 0.30000000000000004 and every total built from it
+        // inherited the error. The unit price is taken from the durable product
+        // row as text when there is one (authoritative), and from the caller's
+        // exact text when there is not.
+        const unitDec = productPriceText != null
+            ? new Prisma.Decimal(productPriceText)
+            : new Prisma.Decimal(typeof price === 'string' ? price.trim() : String(price));
+        const lineDec = unitDec.times(qty);
 
         const item = await this.prisma.dineInTabItem.create({
             data: {
                 dineInTabId: tabId,
                 productId: productId || null,
                 name: String(itemName).slice(0, 200),
-                unitPriceUsdc: authoritativePrice,
+                // Persisted as Decimals. Exactness must survive persistence and
+                // serialisation; converting back to Number here would hand the
+                // column a double again and throw away the guarantee upstream.
+                unitPriceUsdc: unitDec,
                 quantity: qty,
-                lineTotalUsdc: authoritativePrice * qty,
+                lineTotalUsdc: lineDec,
                 addedBy: addedBy || tab.customerId,
             },
         });
@@ -158,18 +180,23 @@ class DineInService {
         const validation = validateConfiguredProduct(product, selection);
         if (validation.error) throw new Error(validation.error);
         const normalized = normalizedSelection(product, selection);
-        const unitPrice = configuredUnitPrice(product, normalized);
-        if (!(unitPrice > 0)) throw new Error('Product price must be positive.');
+        // Exact: the configured price is a Decimal built from the product's own
+        // price text plus each charged option's text, so variant/modifier deltas
+        // are never summed as doubles.
+        const unitPriceDec = configuredUnitPriceExact(product, normalized);
+        if (!unitPriceDec.gt(0)) throw new Error('Product price must be positive.');
         const label = selectionLabel(normalized);
+        const lineQty = Number(quantity || 1);
+        if (!Number.isInteger(lineQty) || lineQty < 1) throw new Error('quantity must be a positive integer.');
 
         const configuredItem = await this.prisma.dineInTabItem.create({
             data: {
                 dineInTabId: tabId,
                 productId: product.id,
                 name: String(label ? `${product.name} — ${label}` : product.name).slice(0, 200),
-                unitPriceUsdc: unitPrice,
-                quantity: Number(quantity || 1),
-                lineTotalUsdc: unitPrice * Number(quantity || 1),
+                unitPriceUsdc: unitPriceDec,
+                quantity: lineQty,
+                lineTotalUsdc: unitPriceDec.times(lineQty),
                 addedBy: customerId,
             },
         });
@@ -197,15 +224,61 @@ class DineInService {
                         throw new Error('Tab not found.');
                     }
                     if (tab.status !== 'OPEN') throw new Error('Tab is not OPEN.');
-                    const total = tab.items.reduce((sum, item) => sum + Number(item.unitPriceUsdc) * item.quantity, 0);
+                    // Exact, and deliberately the same authority the cash-close
+                    // path sums (the durable item line totals), so finalize and
+                    // close can never disagree about what a tab is worth.
+                    // The tab's currency decides WHICH durable line values are
+                    // summed. A cedi tab's money is in the cedi columns; summing
+                    // the USDC columns there would finalise it at 0.00.
+                    const tabIsGhs = tab.currency === 'GHS';
+                    const total = tab.items.reduce((sum, item) => {
+                        if (tabIsGhs) {
+                            if (item.lineTotalGhs != null) {
+                                return sum.plus(new Prisma.Decimal(String(item.lineTotalGhs)));
+                            }
+                            const unitGhs = new Prisma.Decimal(String(item.unitPriceGhs ?? 0));
+                            return sum.plus(unitGhs.times(new Prisma.Decimal(String(item.quantity ?? 0))));
+                        }
+                        if (item.lineTotalUsdc != null) {
+                            return sum.plus(new Prisma.Decimal(String(item.lineTotalUsdc)));
+                        }
+                        // A row without a stored line total still totals exactly:
+                        // the fallback is Decimal multiplication, not float math.
+                        const unit = new Prisma.Decimal(String(item.unitPriceUsdc));
+                        return sum.plus(unit.times(new Prisma.Decimal(String(item.quantity ?? 0))));
+                    }, new Prisma.Decimal(0));
+                    const totalQ = tabIsGhs
+                        ? total.toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP)
+                        : total;
                     const claimed = await tx.dineInTab.updateMany({
                         where: { id: tabId, status: 'OPEN' },
-                        data: { status: 'FINALIZED', closedAt: new Date(), grandTotalUsdc: total, subtotalUsdc: total },
+                        data: tabIsGhs ? {
+                            status: 'FINALIZED',
+                            closedAt: new Date(),
+                            // Cedis in the cedi columns at 2dp; the USDC columns
+                            // stay at their zero defaults.
+                            grandTotalGhs: totalQ,
+                            subtotalGhs: totalQ,
+                        } : {
+                            status: 'FINALIZED',
+                            closedAt: new Date(),
+                            // The exact Decimal itself (see addItem): no Number
+                            // round-trip between the sum and the money column.
+                            grandTotalUsdc: totalQ,
+                            subtotalUsdc: totalQ,
+                        },
                     });
                     if (claimed.count !== 1) throw new Error('Tab was finalized by another request.');
                     return tx.dineInTab.findUnique({ where: { id: tabId }, include: { items: true } });
                 }, { isolationLevel: 'Serializable' });
-                this.io?.to(`user_${finalized.customerId}`).emit('dine_in_tab_finalized', { tabId, totalAmount: finalized.grandTotalUsdc, items: finalized.items });
+                this.io?.to(`user_${finalized.customerId}`).emit('dine_in_tab_finalized', {
+                    tabId,
+                    currency: finalized.currency || null,
+                    // The total a client displays must be the total that was stored,
+                    // in its own currency.
+                    totalAmount: finalized.currency === 'GHS' ? finalized.grandTotalGhs : finalized.grandTotalUsdc,
+                    items: finalized.items,
+                });
                 return finalized;
             } catch (error) {
                 if (!isSerializableConflict(error) || attempt === SERIALIZABLE_RETRY_LIMIT - 1) throw error;
@@ -230,10 +303,21 @@ class DineInService {
             if (!tab.items.length) throw new Error('Cannot pay an empty dine-in tab.');
             const idempotencyKey = `DINE_IN_TAB:${tabId}`;
             try {
+                const tabIsGhs = tab.currency === 'GHS';
                 invoice = await invoiceService.createInvoice(this.prisma, {
                     businessProfileId: tab.businessProfileId, customerId: tab.customerId,
                     locationId: tab.locationId, tableId: tab.tableId,
-                    lineItems: tab.items.map(item => ({ description: item.name, quantity: item.quantity, unitPrice: Number(item.unitPriceUsdc) })),
+                    // The bill inherits the tab's currency, and the line price is
+                    // taken from the column that actually holds the money: a GHS
+                    // tab's cedi price, as an exact decimal string. Number() here
+                    // used to read 0.00 from the zeroed USDC column of a cedi tab
+                    // and bill the customer nothing.
+                    currency: tab.currency || null,
+                    lineItems: tab.items.map(item => ({
+                        description: item.name,
+                        quantity: item.quantity,
+                        unitPrice: String(tabIsGhs ? (item.unitPriceGhs ?? 0) : item.unitPriceUsdc),
+                    })),
                     // A missing taxLines argument lets the invoice service use the
                     // business's current default tax preset. Explicit tax-free
                     // callers can continue to pass taxLines: [].

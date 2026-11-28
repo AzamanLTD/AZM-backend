@@ -95,8 +95,23 @@ class BusinessLedgerService {
     //     follow this one rule; cash-flow stays literal signed flow.
     // INCOME reversals already followed the rule (income buckets report
     // the signed sum as-is, so a -50 income reversal reports -50).
+    // A native-GHS row has amount = NULL on purpose: its money is in amountGhs.
+    // Summing USDC must therefore IGNORE those rows rather than coerce them —
+    // `new Prisma.Decimal(null)` throws, which would take down the whole report
+    // for any merchant who has ever taken cash in cedis.
     _sumSigned(entries) {
-        return entries.reduce((acc, e) => acc.plus(new Prisma.Decimal(e.amount)), new Prisma.Decimal(0));
+        return entries.reduce(
+            (acc, e) => (e.amount == null ? acc : acc.plus(new Prisma.Decimal(e.amount))),
+            new Prisma.Decimal(0),
+        );
+    }
+
+    // Native-GHS totals, kept in their own currency and never added to USDC.
+    _sumGhs(entries, isIncome) {
+        return entries
+            .filter((e) => e.currency === 'GHS' && e.amountGhs != null)
+            .filter((e) => (isIncome ? e.type === 'INCOME' : e.type !== 'INCOME'))
+            .reduce((acc, e) => acc.plus(new Prisma.Decimal(e.amountGhs)), new Prisma.Decimal(0));
     }
 
     // bucket value = Σ income − Σ non-income, per the cross-period rule.
@@ -163,7 +178,17 @@ class BusinessLedgerService {
                 throw this._fail(409, 'NOT_REVERSIBLE', 'Reversal entries cannot be reversed.');
             }
 
-            const originalAmount = new Prisma.Decimal(original.amount);
+            // A reversal is the exact negation IN THE ENTRY'S OWN CURRENCY. A
+            // native-GHS row carries its cedis in amountGhs with amount NULL
+            // (ck_businessledgerentry_currency_shape); reading amount threw on
+            // NULL, so no GHS entry could ever be reversed, and a reversal that
+            // dropped currency/amountGhs would have broken the GHS shape check.
+            const isGhs = original.currency === 'GHS';
+            const sourceAmount = isGhs ? original.amountGhs : original.amount;
+            if (sourceAmount === null || sourceAmount === undefined) {
+                throw this._fail(409, 'NOT_REVERSIBLE', 'Entry cannot be reversed.');
+            }
+            const originalAmount = new Prisma.Decimal(sourceAmount);
             if (!originalAmount.isFinite() || originalAmount.isZero()) {
                 throw this._fail(409, 'NOT_REVERSIBLE', 'Entry cannot be reversed.');
             }
@@ -182,14 +207,17 @@ class BusinessLedgerService {
                         type: original.type,
                         category: original.category,
                         description: `Reversal: ${original.description}`.slice(0, 500),
-                        amount: originalAmount.neg(), // exact negation, full Decimal precision
+                        ...(isGhs
+                            ? { currency: 'GHS', amount: null, amountGhs: originalAmount.neg() }
+                            : { currency: original.currency, amount: originalAmount.neg() }), // exact negation, full precision
                         sourceType: original.sourceType,
                         sourceId: original.sourceId,
                         reversalOfId: original.id,
                         metadata: {
                             reversalOf: original.id,
                             reversal: true,
-                            reversedAmount: _fixed(original.amount),
+                            reversedAmount: _fixed(sourceAmount),
+                            ...(isGhs ? { reversedCurrency: 'GHS' } : {}),
                             ...(reason ? { reversalReason: String(reason).slice(0, 500) } : {}),
                         },
                     },
@@ -240,11 +268,19 @@ class BusinessLedgerService {
         const income = this._num(incomeDec);
         const expenses = this._num(expensesDec);
 
+        // Standalone cedi totals: present even when the merchant has never used
+        // USDC, and never folded into the USDC figures above.
+        const ghsIncomeDec = this._sumGhs(entries, true);
+        const ghsExpenseDec = this._sumGhs(entries, false);
+
         const byTypeDec = {};
         const byCategoryIncomeDec = {};
         const byCategoryExpenseDec = {};
 
         entries.forEach(e => {
+            // Currency-partitioned: a cedi row contributes to the GHS report
+            // below, never to a USDC bucket.
+            if (e.amount == null) return;
             const amount = new Prisma.Decimal(e.amount);
             const typeKey = e.type;
             const categoryKey = e.category || 'Uncategorized';
@@ -286,6 +322,15 @@ class BusinessLedgerService {
                 return o;
             }, {}),
             entryCount: entries.length,
+            // Native GHS is reported as its own money, at exact 2dp. It is never
+            // added to the USDC figures above and is present even when the
+            // merchant has no USDC activity at all.
+            nativeGhs: {
+                currency: 'GHS',
+                totalIncome: ghsIncomeDec.toFixed(2),
+                totalExpenses: ghsExpenseDec.toFixed(2),
+                netProfit: ghsIncomeDec.minus(ghsExpenseDec).toFixed(2),
+            },
         };
     }
 
@@ -307,7 +352,9 @@ class BusinessLedgerService {
         let runningBalance = new Prisma.Decimal(0);
         const dailyFlow = {};
         const flow = entries.map(e => {
-            const amount = new Prisma.Decimal(e.amount);
+            // A native-GHS row contributes to its own cedi totals, never to the
+            // USDC running balance; coercing NULL would throw.
+            const amount = e.amount == null ? new Prisma.Decimal(0) : new Prisma.Decimal(e.amount);
             runningBalance = runningBalance.plus(amount);
             const dateKey = new Date(e.createdAt).toISOString().split('T')[0];
             if (!dailyFlow[dateKey]) {
@@ -322,8 +369,11 @@ class BusinessLedgerService {
             };
         });
 
-        const totalInflow = this._sumSigned(entries.filter(e => new Prisma.Decimal(e.amount).isPositive()));
-        const totalOutflow = this._sumSigned(entries.filter(e => new Prisma.Decimal(e.amount).isNegative())).abs();
+        // Amount-less (native-GHS) rows are excluded from the USDC inflow/outflow
+        // arithmetic entirely rather than treated as zero movement.
+        const usdcEntries = entries.filter((e) => e.amount != null);
+        const totalInflow = this._sumSigned(usdcEntries.filter(e => new Prisma.Decimal(e.amount).isPositive()));
+        const totalOutflow = this._sumSigned(usdcEntries.filter(e => new Prisma.Decimal(e.amount).isNegative())).abs();
 
         return {
             entries: flow,
@@ -345,6 +395,7 @@ class BusinessLedgerService {
         const entries = await this.prisma.businessLedgerEntry.findMany({ where });
         const byCategory = {};
         entries.forEach(e => {
+            if (e.amount == null) return; // native-GHS: see nativeGhs totals
             const key = e.category || 'Uncategorized';
             if (!byCategory[key]) byCategory[key] = { category: key, sum: new Prisma.Decimal(0), count: 0 };
             // r39: the negated signed net per category — a same-period

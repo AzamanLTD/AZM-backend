@@ -1,8 +1,21 @@
 'use strict';
 
+const { Prisma } = require('@prisma/client');
+
 function numeric(value) {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : 0;
+}
+
+// Decimal counterpart to numeric(): same tolerance (unparseable -> 0), but the
+// value never passes through a JS double on its way to a money column.
+function dec(value) {
+  try {
+    const parsed = new Prisma.Decimal(String(value ?? 0));
+    return parsed.isFinite() ? parsed : new Prisma.Decimal(0);
+  } catch (error) {
+    return new Prisma.Decimal(0);
+  }
 }
 
 function optionLabel(option) {
@@ -18,6 +31,8 @@ function normalizedOptionList(options) {
     id: option && typeof option === 'object' ? String(option.id ?? option.value ?? option.name ?? '') : optionLabel(option),
     name: optionLabel(option),
     priceDelta: numeric(option && typeof option === 'object' ? option.priceDelta : 0),
+    // The exact path reads this rather than re-widening the rounded Number.
+    priceDeltaText: String((option && typeof option === 'object' ? option.priceDelta : 0) ?? 0),
   })).filter(option => option.name);
 }
 
@@ -102,27 +117,41 @@ function validateConfiguredProduct(product, selected) {
   return { error: null };
 }
 
-function configuredUnitPrice(product, selected) {
-  const base = numeric(product.priceUsdc);
+// The single traversal that decides what a configured item costs. Both the
+// legacy Number contract and the exact Decimal contract read these components,
+// so the two can never disagree about which options are charged.
+function configuredPriceComponents(product, selected) {
+  const parts = [dec(product.priceUsdc)];
   const selection = selected && typeof selected === 'object' ? selected : {};
-  let total = base;
 
   for (const group of normalizeVariantGroups(product.variants)) {
     const isSizeGroup = group.name.toLowerCase() === 'size';
     const chosen = selectionNames(selection[group.name] ?? (isSizeGroup ? selection.size : selection.variant));
     if (!chosen.length) continue;
     const option = group.options.find(candidate => candidate.name === chosen[0]);
-    if (option) total += option.priceDelta;
+    if (option) parts.push(dec(option.priceDeltaText ?? option.priceDelta));
   }
 
   for (const group of normalizeModifierGroups(product.modifierGroups)) {
     const chosen = new Set(selectionNames(selection[group.name]));
     for (const option of group.options) {
-      if (chosen.has(option.name)) total += option.priceDelta;
+      if (chosen.has(option.name)) parts.push(dec(option.priceDeltaText ?? option.priceDelta));
     }
   }
 
+  return parts;
+}
+
+function configuredUnitPrice(product, selected) {
+  const total = configuredPriceComponents(product, selected)
+    .reduce((sum, part) => sum.plus(part), new Prisma.Decimal(0));
   return Number(total.toFixed(6));
+}
+
+// Exact price for money paths: full precision, no Number, no 6dp ceiling.
+function configuredUnitPriceExact(product, selected) {
+  return configuredPriceComponents(product, selected)
+    .reduce((sum, part) => sum.plus(part), new Prisma.Decimal(0));
 }
 
 function normalizedSelection(product, selected) {
@@ -143,5 +172,6 @@ function normalizedSelection(product, selected) {
 module.exports = {
   validateConfiguredProduct,
   configuredUnitPrice,
+  configuredUnitPriceExact,
   normalizedSelection,
 };

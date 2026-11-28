@@ -4,7 +4,7 @@
 
 ## 1. Executive summary
 
-The Claude review flagged six endpoints whose balance mutation was an
+The review identified six endpoints whose balance mutation was an
 unconditional `decrement` guarded only by a prior read. One correction
 matters: the production release chain installs `User_availableBalance_nonneg`
 as a database CHECK, so a **negative availableBalance can never commit** — the

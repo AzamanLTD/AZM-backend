@@ -3395,20 +3395,29 @@ router.post('/pos/cash-sale', requirePermission('orders.manage'), wrap(async (re
     const bpId = await getBusinessProfileId(req);
     const { items, idempotencyKey, cashReceived, tipAmount, source, locationId, tableId, customerId } = req.body;
 
-    const { PosOrderService } = require('../services/businessOS/posOrderService');
-    const result = await new PosOrderService(prisma).createOrder({
-        businessProfileId: bpId,
-        actorId: req.user.id,
-        items,
-        paymentMethod: 'CASH',
-        cashGiven: cashReceived,
-        idempotencyKey,
-        tipAmount,
-        source: source || 'POS_CASH_SALE',
-        locationId,
-        tableId,
-        customerId,
-    });
+    const { PosOrderService, applyPosErrorResponse, isPosOrderError } = require('../services/businessOS/posOrderService');
+    let result;
+    try {
+        result = await new PosOrderService(prisma).createOrder({
+            businessProfileId: bpId,
+            actorId: req.user.id,
+            items,
+            paymentMethod: 'CASH',
+            cashGiven: cashReceived,
+            idempotencyKey,
+            tipAmount,
+            source: source || 'POS_CASH_SALE',
+            locationId,
+            tableId,
+            customerId,
+        });
+    } catch (err) {
+        // WP-POS-C0 — this legacy alias delegates to the same settlement
+        // authority, so it must answer with the same typed contract instead of
+        // flattening the refusal into the generic 400 below.
+        if (isPosOrderError(err)) return applyPosErrorResponse(res, err);
+        throw err;
+    }
 
     const payload = {
         success: true,
@@ -3436,7 +3445,7 @@ router.post('/pos/cash-sale', requirePermission('orders.manage'), wrap(async (re
 router.post('/pos/cash-close-tab', requirePermission('orders.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
-    const { tabId, cashReceived, tipAmount, idempotencyKey } = req.body;
+    const { tabId, cashReceived, tipAmount, idempotencyKey, currency } = req.body;
     if (!tabId) return res.status(400).json({ success: false, message: 'Tab ID required' });
 
     const { DineInCashCloseService } = require('../services/businessOS/dineInCashCloseService');
@@ -3448,10 +3457,14 @@ router.post('/pos/cash-close-tab', requirePermission('orders.manage'), wrap(asyn
             cashReceived,
             tipAmount,
             idempotencyKey,
+            // Explicit at the boundary: a Ghana till closes in cedis. Omitted keeps
+            // the legacy behaviour for callers that have not opted in.
+            currency,
         });
         const payload = {
             success: true,
             tab: result.tab,
+            currency: result.currency,
             subtotal: result.subtotal,
             taxTotal: result.taxTotal,
             grandTotal: result.grandTotal,
@@ -3467,10 +3480,12 @@ router.post('/pos/cash-close-tab', requirePermission('orders.manage'), wrap(asyn
             TAB_ALREADY_CLOSED: 409,
             IDEMPOTENCY_KEY_FOREIGN: 409,
             IDEMPOTENCY_KEY_CONFLICT: 409,
+            CURRENCY_MISMATCH: 409,
+            GHS_PRICE_UNAVAILABLE: 422,
         };
         const status = statusByCode[err.code] || 400;
         if (status >= 500) logger.error({ err }, '[pos/cash-close-tab]');
-        res.status(status).json({ success: false, message: err.message });
+        res.status(status).json({ success: false, code: err.code || undefined, message: err.message });
     }
 }));
 
@@ -4178,57 +4193,19 @@ router.post('/sync-outbox', requirePermission('orders.manage'), wrap(async (req,
         
         try {
             if (type === 'create_order') {
-                // Check if already processed — scoped to this business's
-                // outbox (§r42: the durable identity is business + customer +
-                // key; a colliding POS action id from ANOTHER business's
-                // outbox is never silently swallowed as "already processed").
-                const existing = await prisma.businessOrder.findFirst({
-                    where: { idempotencyKey, businessProfileId: bpId },
+                // RETIRED. This branch wrote a COMPLETED order (and a ledger
+                // income row) from a client-supplied float total, with a
+                // default customer id of 1, a client-controlled createdAt and
+                // no transaction, bypassing the POS settlement containment
+                // that /pos/order enforces (POS_SETTLEMENT_NOT_ENABLED). The
+                // portal's offline outbox replays through /pos/order, so no
+                // client relies on it. It now records nothing.
+                results.push({
+                    id: idempotencyKey,
+                    status: 'FAILED',
+                    code: 'POS_SYNC_CREATE_RETIRED',
+                    message: 'Offline orders replay through /api/business-os/pos/order. Nothing was recorded.',
                 });
-                if (existing) {
-                    results.push({ id: idempotencyKey, status: 'SYNCED', message: 'Already processed' });
-                    continue;
-                }
-                
-                // Create order (CASH payments bypass escrow)
-                const order = await prisma.businessOrder.create({
-                    data: {
-                        idempotencyKey,
-                        businessProfileId: bpId,
-                        customerId: payload.customerId || 1, // Fallback if guest
-                        amountUsdc: parseFloat(payload.totalAmount || 0),
-                        title: payload.title || 'POS Order',
-                        status: payload.paymentMethod === 'CASH' ? 'COMPLETED' : 'AWAITING_PAYMENT',
-                        orderRef: `POS-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-                        paymentMethod: payload.paymentMethod, // e.g. "CASH"
-                        cashReceived: payload.cashReceived ? parseFloat(payload.cashReceived) : null,
-                        cashChange: payload.cashChange ? parseFloat(payload.cashChange) : null,
-                        createdAt: timestamp ? new Date(timestamp) : new Date(),
-                    }
-                });
-                
-                // If it's a CASH order, record it in Ledger directly so it shows up in Finance
-                if (payload.paymentMethod === 'CASH') {
-                    await prisma.businessLedgerEntry.create({
-                        data: {
-                            businessProfileId: bpId,
-                            amount: parseFloat(payload.totalAmount || 0),
-                            type: 'INCOME',
-                            category: 'POS Sales',
-                            description: `POS Cash Order - ${order.orderRef}`,
-                            sourceType: 'ORDER',
-                            sourceId: order.id,
-                            createdAt: timestamp ? new Date(timestamp) : new Date()
-                        }
-                    });
-                }
-                // Fire webhook event for synced order
-                webhookDispatcher.dispatch(bpId, 'order.created', {
-                    orderId: order.id, orderRef: order.orderRef,
-                    amount: parseFloat(payload.totalAmount || 0),
-                    paymentMethod: payload.paymentMethod,
-                }).catch(() => {});
-                results.push({ id: idempotencyKey, status: 'SYNCED' });
             } else if (type === 'clock_in' || type === 'clock_out') {
                 // Ignore for now or implement similarly
                 results.push({ id: idempotencyKey, status: 'SYNCED' });
@@ -4483,7 +4460,7 @@ router.get("/group-stats", wrap(async (req, res) => {
 router.get('/export', requirePermission('settings.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = req.businessProfileId;
-    const archiver = require('archiver');
+    const { buildZipStream } = require('../utils/exportZip');
 
     // Fetch data
     const [orders, invoices, reviews, employees, products] = await Promise.all([
@@ -4525,24 +4502,7 @@ router.get('/export', requirePermission('settings.manage'), wrap(async (req, res
         return [header, ...lines].join('\n');
     }
 
-    const zip = archiver('zip', { zlib: { level: 5 } });
-
-    const bizName = (req.businessProfile?.name || 'business').replace(/[^a-zA-Z0-9]/g, '_');
-    const dateStr = new Date().toISOString().split('T')[0];
-    const filename = `${bizName}_export_${dateStr}.zip`;
-
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    zip.pipe(res);
-
-    zip.append(toCSV(orders), { name: 'orders.csv' });
-    zip.append(toCSV(invoices), { name: 'invoices.csv' });
-    zip.append(toCSV(reviews), { name: 'reviews.csv' });
-    zip.append(toCSV(employees), { name: 'employees.csv' });
-    zip.append(toCSV(products), { name: 'products.csv' });
-
-    // Also include a JSON manifest
-    zip.append(JSON.stringify({
+    const manifest = JSON.stringify({
         businessId: bpId,
         businessName: req.businessProfile?.name,
         exportDate: new Date().toISOString(),
@@ -4553,9 +4513,29 @@ router.get('/export', requirePermission('settings.manage'), wrap(async (req, res
             employees: employees.length,
             products: products.length,
         },
-    }, null, 2), { name: 'manifest.json' });
+    }, null, 2);
 
-    await zip.finalize();
+    // Same six documents, same names as before the archiver replacement.
+    const { stream } = buildZipStream([
+        { name: 'orders.csv', data: toCSV(orders) },
+        { name: 'invoices.csv', data: toCSV(invoices) },
+        { name: 'reviews.csv', data: toCSV(reviews) },
+        { name: 'employees.csv', data: toCSV(employees) },
+        { name: 'products.csv', data: toCSV(products) },
+        { name: 'manifest.json', data: manifest },
+    ]);
+
+    const bizName = (req.businessProfile?.name || 'business').replace(/[^a-zA-Z0-9]/g, '_');
+    const dateStr = new Date().toISOString().split('T')[0];
+    const filename = `${bizName}_export_${dateStr}.zip`;
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    stream.on('error', () => {
+        // Headers are already sent; end the response rather than hanging.
+        if (!res.writableEnded) res.end();
+    });
+    stream.pipe(res);
 }));
 
 // ── Missing routes found by route-checker ──────────────────────────────────

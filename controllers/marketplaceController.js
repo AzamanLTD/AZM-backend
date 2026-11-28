@@ -30,6 +30,10 @@ exports.generateCheckInQR = async (req, res) => {
         result.businessLogoUrl = reservation?.businessProfile?.logoUrl;
         return res.status(200).json({ success: true, ...result });
     } catch (err) {
+        if (err && err.code && String(err.code).startsWith('QR_SIGNING_KEY')) {
+            logger.error({ code: err.code }, '[generateCheckInQR] signing key unavailable');
+            return res.status(503).json({ success: false, code: err.code, message: 'QR check-in is temporarily unavailable.' });
+        }
         return res.status(400).json({ success: false, message: err.message });
     }
 };
@@ -65,7 +69,13 @@ exports.businessCheckIn = async (req, res) => {
         }
         return res.status(400).json({ success: false, message: 'Provide token, azamanId, or reservationId.' });
     } catch (err) {
-        return res.status(400).json({ success: false, message: err.message });
+        if (err && err.code && String(err.code).startsWith('QR_SIGNING_KEY')) {
+            logger.error({ code: err.code }, '[businessCheckIn] signing key unavailable');
+            return res.status(503).json({ success: false, code: err.code, message: 'QR check-in is temporarily unavailable.' });
+        }
+        // A refused one-use token is a client conflict, not a bad request body.
+        const status = err && err.code === 'QR_TOKEN_ALREADY_USED' ? 409 : 400;
+        return res.status(status).json({ success: false, code: err.code, message: err.message });
     }
 };
 
@@ -410,31 +420,43 @@ exports.setSeatMap = async (req, res) => {
 
 // ── generateTransitCheckInQR ──────────────────────────────────────────────
 exports.generateTransitCheckInQR = async (req, res) => {
+    const prisma = req.prisma || req.app.get('prisma');
     try {
         const { bookingId } = req.params;
         const { generateTransitCheckInToken } = require('../services/qrCheckInService');
-        const result = await generateTransitCheckInToken(req.prisma, {
+        const result = await generateTransitCheckInToken(prisma, {
             bookingId, customerId: req.user.id
         });
         res.json({ success: true, ...result });
     } catch (err) {
+        if (err && err.code && String(err.code).startsWith('QR_SIGNING_KEY')) {
+            logger.error({ code: err.code }, '[generateTransitCheckInQR] signing key unavailable');
+            return res.status(503).json({ success: false, code: err.code, message: 'QR check-in is temporarily unavailable.' });
+        }
         logger.error({ err: err }, '[generateTransitCheckInQR]');
         res.status(400).json({ success: false, message: err.message });
     }
 };
 
 // ── transitBoarding ────────────────────────────────────────────────────────
+// verifyTransitTokenAndBoard did not exist on the service, so this handler
+// threw a TypeError on every scan. It now verifies the signed token.
 exports.transitBoarding = async (req, res) => {
+    const prisma = req.prisma || req.app.get('prisma');
     try {
-        const { token } = req.body;
+        const token = req.body.token || req.body.code;
         const { verifyTransitTokenAndBoard } = require('../services/qrCheckInService');
-        const result = await verifyTransitTokenAndBoard(req.prisma, {
+        const result = await verifyTransitTokenAndBoard(prisma, {
             token, businessUserId: req.user.id
         });
         res.json(result);
     } catch (err) {
+        if (err && err.code && String(err.code).startsWith('QR_SIGNING_KEY')) {
+            logger.error({ code: err.code }, '[transitBoarding] signing key unavailable');
+            return res.status(503).json({ success: false, code: err.code, message: 'QR check-in is temporarily unavailable.' });
+        }
         logger.error({ err: err }, '[transitBoarding]');
-        res.status(400).json({ success: false, message: err.message });
+        res.status(400).json({ success: false, code: err.code, message: err.message });
     }
 };
 

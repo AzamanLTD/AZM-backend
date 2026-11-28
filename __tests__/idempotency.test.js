@@ -290,4 +290,69 @@ describe('Idempotency middleware (r42 contract)', () => {
         expect(claim.statusCode).toBe(200);
         expect(claim.responseBody).toBe(JSON.stringify({ success: true, handler: 'ran' })); // WIRE text
     });
+    // A client that has the 2xx in hand and retries the same key must get the
+    // committed replay, never IDEMPOTENCY_IN_PROGRESS for an operation that
+    // already succeeded. So COMMITTED must be durable before the 2xx leaves.
+    test('a 2xx is not delivered until its COMMITTED write has landed', async () => {
+        const rows = {};
+        const prisma = mockPrisma(rows);
+        let land;
+        const realUpdate = prisma.financialOperation.updateMany;
+        prisma.financialOperation.updateMany = (args) => new Promise((resolve) => {
+            land = () => resolve(realUpdate(args));
+        });
+        const { req, res } = mockReqRes({ 'idempotency-key': 'ordered-key' });
+        req.app = { get: () => prisma };
+        await idempotency()(req, res, () => res.status(201).json({ success: true, id: 7 }));
+        await new Promise((r) => setTimeout(r, 25));
+        expect(res._json).toBeNull();                         // held: the write is still in flight
+        expect(Object.values(rows)[0].status).toBe('IN_PROGRESS');
+        land();
+        await new Promise((r) => setTimeout(r, 25));
+        expect(Object.values(rows)[0].status).toBe('COMMITTED'); // durable first...
+        expect(res.statusCode).toBe(201);
+        expect(res._json).toEqual({ success: true, id: 7 });   // ...then delivered
+    });
+
+    test('a stalled COMMITTED write never holds the response past its bound', async () => {
+        const rows = {};
+        const prisma = mockPrisma(rows);
+        prisma.financialOperation.updateMany = () => new Promise(() => {}); // never settles
+        const { req, res } = mockReqRes({ 'idempotency-key': 'stalled-key' });
+        req.app = { get: () => prisma };
+        await idempotency({ commitBookkeepingTimeoutMs: 20 })(req, res, () => res.json({ success: true }));
+        await new Promise((r) => setTimeout(r, 60));
+        expect(res._json).toEqual({ success: true });
+        expect(Object.values(rows)[0].status).toBe('IN_PROGRESS'); // replays refuse safely
+    });
+
+    test('a failed COMMITTED write still delivers the response and leaves the claim refusing', async () => {
+        const rows = {};
+        const prisma = mockPrisma(rows);
+        prisma.financialOperation.updateMany = async () => { throw new Error('db down'); };
+        const { req, res } = mockReqRes({ 'idempotency-key': 'failed-key' });
+        req.app = { get: () => prisma };
+        await idempotency()(req, res, () => res.json({ success: true }));
+        await new Promise((r) => setTimeout(r, 25));
+        expect(res._json).toEqual({ success: true });
+        expect(Object.values(rows)[0].status).toBe('IN_PROGRESS');
+    });
+
+    test('the first response wins: a later status or body cannot replace it while it is held', async () => {
+        const rows = {};
+        const prisma = mockPrisma(rows);
+        const { req, res } = mockReqRes({ 'idempotency-key': 'first-wins-key' });
+        req.app = { get: () => prisma };
+        await idempotency()(req, res, () => {
+            res.status(200).json({ success: true, id: 1 });
+            // an outer catch that wrongly answers again after the success
+            if (!res.headersSent) res.status(500).json({ success: false, code: 'LATE' });
+        });
+        await new Promise((r) => setTimeout(r, 25));
+        expect(res.statusCode).toBe(200);
+        expect(res._json).toEqual({ success: true, id: 1 });
+        const claim = Object.values(rows)[0];
+        expect(claim.status).toBe('COMMITTED');
+        expect(claim.responseBody).toBe(JSON.stringify({ success: true, id: 1 }));
+    });
 });

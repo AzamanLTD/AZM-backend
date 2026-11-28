@@ -8,6 +8,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const { requireKyc } = require('../middleware/requireKyc');
 const express = require('express');
 const router = express.Router();
 const authMiddleware = require('../middleware/authMiddleware');
@@ -74,12 +75,16 @@ router.get('/:friendshipId/trust-metrics', protect, chatProfileController.getTru
 // =============================================================================
 // PEER TRANSFERS
 // =============================================================================
-router.post('/transfer/send', protect, require2FA(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), peerTransferController.sendFunds);
+router.post('/transfer/send', protect, requireKyc('p2p'), require2FA(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), peerTransferController.sendFunds);
 router.post('/transfer/request', protect, peerTransferController.requestFunds);
 router.get('/transfer/pending', protect, peerTransferController.getPendingTransferRequests);
 router.get('/transfer/history/:friendshipId', protect, peerTransferController.getTransferHistory);
 router.get('/transfer/:id', protect, peerTransferController.getTransferDetails);
-router.put('/transfer/:id/fulfill', protect, peerTransferController.fulfillTransferRequest);
+// Fulfilling a request debits the payer, so it carries the same second factor
+// as /transfer/send. Without it, anyone holding a payer's session could raise a
+// request from their own account and fulfil it as the payer. Replay safety comes
+// from the request's own single-winner PENDING -> COMPLETED claim.
+router.put('/transfer/:id/fulfill', protect, requireKyc('p2p'), require2FA(), peerTransferController.fulfillTransferRequest);
 router.put('/transfer/:id/decline', protect, peerTransferController.declineTransferRequest);
 
 module.exports = router;

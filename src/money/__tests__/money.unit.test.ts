@@ -1,0 +1,310 @@
+/**
+ * WP-MONEY — runtime proofs for the money core.
+ *
+ * Run with:  npm run test:money
+ * Every assertion is on minutes/units of exact integers; nothing here goes
+ * through a float, which is also why the property-style block uses integer
+ * arithmetic for its own bookkeeping.
+ */
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import * as moneyApi from '../index';
+
+import {
+  MoneyError,
+  add,
+  compare,
+  divideIntoParts,
+  formatMoney,
+  moneyFromMinorUnits,
+  multiplyByQuantity,
+  parseMoney,
+  subtract,
+  ROUNDING_MODES,
+  applyRounding,
+  isRoundingMode,
+  roundMinorUnits,
+  moneyToDecimalString,
+  moneyToJSONValue,
+  moneyFromDecimalString,
+  CURRENCIES,
+  type Money,
+} from '../index';
+
+const ghs = (value: string): Money<'GHS'> => parseMoney(value, 'GHS');
+const usdc = (value: string): Money<'USDC'> => parseMoney(value, 'USDC');
+
+test('GHS holds exactly two decimals', () => {
+  assert.equal(ghs('0.01').minorUnits, 1n);
+  assert.equal(ghs('0.10').minorUnits, 10n);
+  assert.equal(ghs('0.30').minorUnits, 30n);
+  assert.equal(ghs('100').minorUnits, 10000n);
+  assert.equal(ghs('100.5').minorUnits, 10050n);
+
+  // The case that breaks binary floating point: 0.1 + 0.2 === 0.3 exactly.
+  assert.equal(add(ghs('0.10'), ghs('0.20')).minorUnits, 30n);
+  assert.equal(formatMoney(add(ghs('0.10'), ghs('0.20'))), '0.30');
+});
+
+test('large values stay exact because they are bigints, not doubles', () => {
+  const large = ghs('999999999999999999.99');
+  assert.equal(large.minorUnits, 99999999999999999999n);
+
+  // Past Number.MAX_SAFE_INTEGER in minor units (2^53-1 = 9007199254740991).
+  const huge = moneyFromMinorUnits('GHS', 9007199254740993n);
+  assert.equal(huge.minorUnits, 9007199254740993n);
+  assert.equal(huge.toJSON().amount, '90071992547409.93');
+
+  assert.equal(add(large, ghs('0.01')).minorUnits, 100000000000000000000n);
+});
+
+test('USDC keeps its existing eight-decimal precision', () => {
+  assert.equal(usdc('1.00000000').minorUnits, 100000000n);
+  assert.equal(usdc('0.00000001').minorUnits, 1n);
+  assert.equal(usdc('1234.56789012').minorUnits, 123456789012n);
+  assert.equal(formatMoney(usdc('0.00000001')), '0.00000001');
+});
+
+test('negative amounts parse, compare and render exactly', () => {
+  assert.equal(ghs('-0.01').minorUnits, -1n);
+  assert.equal(ghs('-0.01').toJSON().amount, '-0.01');
+  assert.equal(compare(ghs('-0.01'), ghs('0.00')), -1);
+  assert.equal(compare(ghs('0.30'), ghs('0.30')), 0);
+  assert.equal(subtract(ghs('0.30'), ghs('0.10')).minorUnits, 20n);
+  // A negative that nets to zero must not render as "-0.00".
+  assert.equal(formatMoney(subtract(ghs('0.01'), ghs('0.01'))), '0.00');
+});
+
+test('precision boundaries are refused, never rounded implicitly', () => {
+  assert.throws(() => ghs('1.234'), (e: unknown) => e instanceof MoneyError && e.code === 'EXCESS_PRECISION');
+  assert.throws(
+    () => usdc('1.000000001'),
+    (e: unknown) => e instanceof MoneyError && e.code === 'EXCESS_PRECISION',
+  );
+  // Trailing zeros add nothing, so they are normalised rather than refused:
+  // database DECIMAL columns routinely render values that way.
+  assert.equal(ghs('1.230').minorUnits, 123n);
+  assert.equal(ghs('1.2300').minorUnits, 123n);
+  assert.equal(usdc('1.000000000').minorUnits, 100000000n);
+});
+
+test('malformed and lossy inputs are refused with typed codes', () => {
+  const cases: Array<[string, string]> = [
+    ['1e3', 'EXPONENT_NOT_ALLOWED'],
+    ['1E3', 'EXPONENT_NOT_ALLOWED'],
+    ['1,000.00', 'SEPARATOR_NOT_ALLOWED'],
+    ['1_000.00', 'SEPARATOR_NOT_ALLOWED'],
+    [' 1.00', 'MALFORMED_DECIMAL'],
+    ['1.00 ', 'MALFORMED_DECIMAL'],
+    ['+1.00', 'SIGN_PLACED_WRONG'],
+    ['.5', 'MALFORMED_DECIMAL'],
+    ['5.', 'MALFORMED_DECIMAL'],
+    ['1.2.3', 'MALFORMED_DECIMAL'],
+    ['abc', 'MALFORMED_DECIMAL'],
+    ['0x10', 'MALFORMED_DECIMAL'],
+    ['', 'EMPTY_INPUT'],
+  ];
+  for (const [input, code] of cases) {
+    assert.throws(
+      () => ghs(input),
+      (e: unknown) => e instanceof MoneyError && e.code === code,
+      `${JSON.stringify(input)} should be refused with ${code}`,
+    );
+  }
+});
+
+test('an unsupported currency code is a refusal, not a default', () => {
+  assert.throws(
+    () => moneyFromDecimalString('1.00', 'EUR'),
+    (e: unknown) => e instanceof MoneyError && e.code === 'UNSUPPORTED_CURRENCY',
+  );
+  assert.equal(Object.keys(CURRENCIES).length, 2);
+});
+
+test('mixing currencies fails at runtime too, with a typed refusal', () => {
+  // The type system stops this; when a value has crossed a JSON boundary its
+  // type may have widened, so the runtime must also refuse.
+  const widenedGhs = ghs('1.00') as Money<'GHS'>;
+  const widenedUsdc = usdc('1.00000000') as unknown as Money<'GHS'>;
+  assert.throws(
+    () => add(widenedGhs, widenedUsdc),
+    (e: unknown) => e instanceof MoneyError && e.code === 'CURRENCY_MISMATCH',
+  );
+});
+
+test('multiplication is by whole quantities only', () => {
+  assert.equal(multiplyByQuantity(ghs('0.30'), 3).minorUnits, 90n);
+  assert.equal(formatMoney(multiplyByQuantity(ghs('0.30'), 3)), '0.90');
+  assert.equal(multiplyByQuantity(ghs('0.30'), 3n).minorUnits, 90n);
+  assert.equal(multiplyByQuantity(ghs('0.30'), -2).minorUnits, -60n);
+
+  assert.throws(
+    () => multiplyByQuantity(ghs('0.30'), 1.5),
+    (e: unknown) => e instanceof MoneyError && e.code === 'QUANTITY_NOT_INTEGER',
+  );
+  assert.throws(
+    () => multiplyByQuantity(ghs('0.30'), Number.MAX_SAFE_INTEGER + 2),
+    (e: unknown) => e instanceof MoneyError && e.code === 'QUANTITY_UNSAFE',
+  );
+});
+
+test('rounding happens only through the explicit function, and says which way', () => {
+  // applyRounding takes a rational count of MINOR units: 1/2 is half a pesewa.
+  assert.equal(applyRounding(1n, 2n, 'DOWN'), 0n);
+  assert.equal(applyRounding(1n, 2n, 'UP'), 1n);
+  assert.equal(applyRounding(1n, 2n, 'HALF_UP'), 1n);
+  assert.equal(applyRounding(1n, 2n, 'HALF_EVEN'), 0n); // 0 is the even neighbour
+  assert.equal(applyRounding(3n, 2n, 'HALF_EVEN'), 2n); // 2 is the even neighbour
+  assert.equal(applyRounding(1n, 3n, 'HALF_UP'), 0n); // a third rounds down
+  assert.equal(applyRounding(2n, 3n, 'HALF_UP'), 1n);
+
+  // Negative amounts round away from or towards zero by the named mode.
+  assert.equal(applyRounding(-3n, 2n, 'HALF_UP'), -2n);
+  assert.equal(applyRounding(-3n, 2n, 'DOWN'), -1n);
+  assert.equal(applyRounding(-1n, 3n, 'UP'), -1n);
+
+  assert.throws(() => applyRounding(1n, 0n, 'HALF_UP'), (e: unknown) => e instanceof MoneyError);
+});
+
+test('splitting exposes the remainder instead of losing it', () => {
+  const { quotient, remainderMinorUnits } = divideIntoParts(ghs('0.10'), 3n);
+  assert.equal(quotient.minorUnits, 3n); // 0.03 each
+  assert.equal(remainderMinorUnits, 1n); // and one pesewa that must be allocated
+  assert.equal(quotient.minorUnits * 3n + remainderMinorUnits, ghs('0.10').minorUnits);
+});
+
+test('JSON serialisation never leaks a bigint and stays exact', () => {
+  const amount = ghs('0.30');
+  // The default contract is a CURRENCY-TAGGED object: a bare "0.30" would say
+  // nothing about which liability bucket it belongs to.
+  assert.equal(JSON.stringify({ amount }), '{"amount":{"currency":"GHS","amount":"0.30"}}');
+  assert.equal(
+    JSON.stringify({ amount: usdc('0.00000001') }),
+    '{"amount":{"currency":"USDC","amount":"0.00000001"}}',
+  );
+  assert.deepEqual(moneyToJSONValue(ghs('1234.50')), { currency: 'GHS', amount: '1234.50' });
+  assert.equal(moneyToDecimalString(ghs('-0.01')), '-0.01');
+  // Round trip through the boundary representation is lossless.
+  const back = moneyFromDecimalString(moneyToDecimalString(ghs('999999999999999999.99')), 'GHS');
+  assert.equal(back.minorUnits, ghs('999999999999999999.99').minorUnits);
+});
+
+test('property-style: integer arithmetic over a fixed pseudo-random sequence', () => {
+  // A tiny deterministic LCG keeps the test reproducible in CI.
+  let seed = 20261116n;
+  const next = (): bigint => {
+    seed = (seed * 6364136223846793005n + 1442695040888963407n) % (2n ** 63n);
+    return seed;
+  };
+
+  for (let i = 0; i < 200; i += 1) {
+    const aMinor = (next() % 1000000000n) - 500000000n; // +/- 5,000,000.00 GHS
+    const bMinor = (next() % 1000000000n) - 500000000n;
+    const a = moneyFromMinorUnits('GHS', aMinor);
+    const b = moneyFromMinorUnits('GHS', bMinor);
+
+    // (a + b) - b === a
+    assert.equal(subtract(add(a, b), b).minorUnits, a.minorUnits);
+    // rendering then re-parsing is lossless for any amount that fits the scale
+    assert.equal(parseMoney(formatMoney(a), 'GHS').minorUnits, a.minorUnits);
+    // multiplication distributes over addition
+    assert.equal(
+      multiplyByQuantity(add(a, b), 3).minorUnits,
+      add(multiplyByQuantity(a, 3), multiplyByQuantity(b, 3)).minorUnits,
+    );
+    // comparison agrees with integer comparison
+    assert.equal(compare(a, b), a.minorUnits < b.minorUnits ? -1 : a.minorUnits > b.minorUnits ? 1 : 0);
+  }
+});
+
+// ── Correction 1: precision comes from the registry, never from a caller ──────
+
+test('the only constructor derives precision from the currency registry', () => {
+  // Same integer count of minor units, different currency, different rendering:
+  // nothing about precision travels with the caller.
+  assert.equal(moneyFromMinorUnits('GHS', 123n).toJSON().amount, '1.23');
+  assert.equal(moneyFromMinorUnits('USDC', 123n).toJSON().amount, '0.00000123');
+  assert.equal(formatMoney(moneyFromMinorUnits('USDC', 100000000n)), '1.00000000');
+});
+
+test('the public surface exposes no way to choose a precision', () => {
+  // The internal primitive and the old three-argument constructor are gone from
+  // the public surface on purpose: exporting either would let application code
+  // invent 3-decimal cedis. Read through an index signature so this asserts the
+  // ABSENCE at runtime without the compiler objecting to the names.
+  const surface = moneyApi as unknown as Record<string, unknown>;
+  assert.equal(surface['formatMinor'], undefined);
+  assert.equal(surface['makeMoney'], undefined);
+  assert.equal(typeof surface['moneyFromMinorUnits'], 'function');
+  assert.equal(typeof surface['formatMoney'], 'function');
+});
+
+// ── Correction: automatic serialisation carries the currency ──────────────────
+
+test('automatic JSON keeps GHS and USDC apart without a helper call', () => {
+  const payload = JSON.parse(JSON.stringify({
+    receivable: ghs('1.50'),
+    stable: usdc('1.50000000'),
+  })) as Record<string, Record<string, unknown>>;
+
+  // Same numeric value, different buckets — and the wire says which is which.
+  assert.deepEqual(payload['receivable'], { currency: 'GHS', amount: '1.50' });
+  assert.deepEqual(payload['stable'], { currency: 'USDC', amount: '1.50000000' });
+  assert.notDeepEqual(payload['receivable'], payload['stable']);
+
+  // Still exact, still string-typed, still no bigint and no float.
+  for (const entry of Object.values(payload)) {
+    assert.equal(typeof entry['amount'], 'string');
+    assert.equal('minorUnits' in entry, false);
+  }
+});
+
+test('the method and the helper agree, and the Prisma form stays bare', () => {
+  for (const money of [ghs('0.30'), usdc('1234.56789012'), ghs('-0.01')]) {
+    assert.deepEqual(money.toJSON(), moneyToJSONValue(money));
+    // A DECIMAL column is currency-typed by its own definition, so it takes the
+    // bare exact string — an explicit choice, not the default serialisation.
+    assert.equal(moneyToDecimalString(money), money.toJSON().amount);
+    assert.equal(typeof moneyToDecimalString(money), 'string');
+  }
+
+  // Round trip through the tagged shape restores the same amount.
+  const wire = JSON.parse(JSON.stringify(ghs('999999999999999999.99'))) as { currency: string; amount: string };
+  assert.equal(moneyFromDecimalString(wire.amount, wire.currency).minorUnits, ghs('999999999999999999.99').minorUnits);
+});
+
+// ── Correction: an unsupported rounding mode is refused, not guessed ──────────
+
+test('applyRounding refuses any mode it does not implement', () => {
+  const bad: unknown[] = ['BANKERS', 'down', '', 'HALF_DOWN', null, undefined, 1, {}, ['DOWN']];
+  for (const mode of bad) {
+    assert.throws(
+      () => applyRounding(1n, 2n, mode as never),
+      (e: unknown) => e instanceof MoneyError && e.code === 'INVALID_ROUNDING_MODE',
+      `mode ${JSON.stringify(mode)} must be refused`,
+    );
+  }
+  // The previously silent behaviour — falling through to the quotient — is gone:
+  // an unknown mode no longer behaves like DOWN, it refuses.
+  assert.equal(applyRounding(1n, 2n, 'DOWN'), 0n);
+});
+
+test('the public rounding paths refuse an unsupported mode too', () => {
+  assert.equal(isRoundingMode('HALF_EVEN'), true);
+  assert.equal(isRoundingMode('nearest'), false);
+  assert.deepEqual([...ROUNDING_MODES], ['DOWN', 'UP', 'HALF_UP', 'HALF_EVEN']);
+
+  assert.throws(
+    () => roundMinorUnits(1n, 2n, 'GHS', 'NEAREST' as never),
+    (e: unknown) => e instanceof MoneyError && e.code === 'INVALID_ROUNDING_MODE',
+  );
+  assert.throws(
+    () => roundMinorUnits(1n, 2n, 'GHS', undefined as never),
+    (e: unknown) => e instanceof MoneyError && e.code === 'INVALID_ROUNDING_MODE',
+  );
+
+  // Valid modes keep their exact behaviour through the same public path.
+  assert.equal(roundMinorUnits(1n, 2n, 'GHS', 'HALF_UP').toJSON().amount, '0.01');
+  assert.equal(roundMinorUnits(1n, 2n, 'GHS', 'HALF_EVEN').toJSON().amount, '0.00');
+  assert.equal(roundMinorUnits(-3n, 2n, 'GHS', 'HALF_UP').toJSON().amount, '-0.02');
+});

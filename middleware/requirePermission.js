@@ -202,7 +202,47 @@ function requirePermission(key) {
             // EVERY branch, so a handler never has to guess whether the
             // caller is an owner/admin.
             if (context.isAdminImpersonation) {
-                req.resolvedPermissions = ['*'];
+                // An ADMIN-role JWT is not enough to act AS a business. The
+                // acting admin's effective role is resolved from database state
+                // (the same authority as requireEffectivePermission):
+                //   • SUPER_ADMIN, or a legacy ADMIN with no specialised
+                //     assignment, keeps full access (documented legacy policy);
+                //   • a specialised role (finance, support, compliance,
+                //     read-only) may READ a business but never mutate it —
+                //     payroll, EWA, ledger, refunds and payouts included;
+                //   • no resolvable role is refused.
+                // Every impersonated mutation is logged with the acting admin.
+                const rbac = require('../controllers/adminRbacController');
+                let effectiveRole;
+                try {
+                    effectiveRole = await rbac.resolveEffectiveAdminRole(prisma, req.user.id);
+                } catch (err) {
+                    logger.error({ err }, '[requirePermission] admin effective-role resolution failed');
+                    return res.status(503).json({ success: false, message: 'Admin authorization unavailable. Nothing was changed.' });
+                }
+                const roleDef = effectiveRole ? rbac.ADMIN_ROLES[effectiveRole] : null;
+                const fullAccess = effectiveRole === 'ADMIN' || Boolean(roleDef && roleDef.permissions.includes('*'));
+                const isRead = req.method === 'GET' || req.method === 'HEAD';
+                if (!effectiveRole || (!fullAccess && !isRead)) {
+                    return res.status(403).json({
+                        success: false,
+                        code: 'ADMIN_IMPERSONATION_FORBIDDEN',
+                        message: effectiveRole
+                            ? 'Your admin role can view this business but not change it. Nothing was changed.'
+                            : 'Not authorized to act for this business.',
+                    });
+                }
+                if (!isRead) {
+                    logger.warn({
+                        adminUserId: req.user.id,
+                        effectiveRole,
+                        businessProfileId,
+                        method: req.method,
+                        path: req.originalUrl,
+                        permission: key,
+                    }, '[requirePermission] admin impersonation mutation');
+                }
+                req.resolvedPermissions = fullAccess ? ['*'] : [];
                 return runAuthorized();
             }
 

@@ -16,7 +16,10 @@ if (!process.env.NODE_ENV) {
 
 module.exports = {
     testEnvironment: 'node',
-    testPathIgnorePatterns: ['/node_modules/', '/__tests__/helpers/'],
+    // WP-MONEY runs on its own runner (`npm run test:money` through tsx), because
+    // Jest here has no TypeScript transform and its default testMatch would pick
+    // up src/money/__tests__/*.test.ts and fail to parse them.
+    testPathIgnorePatterns: ['/node_modules/', '/__tests__/helpers/', '/src/money/'],
     setupFiles: ['./jest.setup.js'],
     setupFilesAfterEnv: ['./test-support/setup-shift-business-context.js'],
     // Jest 29 has no `hookTimeout` config option — the repo's old
@@ -35,4 +38,22 @@ module.exports = {
     // 30s is the default for both; slower CI runners are covered, and any
     // genuinely hung test merely takes 30s instead of 5s to surface.
     testTimeout: 30000,
+
+    // DB-backed suites share ONE PostgreSQL database: they truncate the same
+    // tables and absolutely reset the same singleton rows (SystemFiatPool id 1,
+    // GlobalSettings id 1). Parallel workers therefore read each other's resets
+    // and debits, which is how an absolute assertion such as
+    // `pool.balance === 99950` produced 99350 or 100000 on a single machine
+    // while CI (both lanes use --runInBand) stayed green. Measured on this
+    // branch: default workers gave 152 failed suites / 1044 failed tests,
+    // serial gave 383/383 and 3714/3714.
+    //
+    // Conditional on purpose: database-free runs keep full parallelism.
+    ...(process.env.TEST_DATABASE_URL ? { maxWorkers: 1 } : {}),
+
+    // Runs once before any suite (CI and local): converges the GlobalSettings
+    // singleton so the battery is order-independent on a freshly-pushed DB.
+    // See test-support/global-setup.js for the full contract.
+    globalSetup: './test-support/global-setup.js',
+
 };

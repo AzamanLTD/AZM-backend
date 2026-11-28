@@ -14,6 +14,8 @@
 
 const { PrismaClient } = require('@prisma/client');
 const logger = require('../src/config/logger');
+const fs = require('fs');
+const path = require('path');
 
 const prisma = new PrismaClient();
 
@@ -31,6 +33,7 @@ const STATEMENTS = [
     "dedupKey" TEXT NOT NULL,
     "amountGhs" DECIMAL(20,2),
     "relatedReference" TEXT,
+    "walletAccount" TEXT,
     "raw" JSONB,
     "receivedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT "FiatProviderEvent_pkey" PRIMARY KEY ("id")
@@ -70,6 +73,14 @@ const STATEMENTS = [
   `CREATE UNIQUE INDEX IF NOT EXISTS "FiatLiquidityReceipt_dedupKey_key"
      ON "FiatLiquidityReceipt"("dedupKey");`,
   `CREATE INDEX IF NOT EXISTS "FiatLiquidityReceipt_status_idx" ON "FiatLiquidityReceipt"("status");`,
+  // WP-I: the wallet account an opening's money lands in, as a real column.
+  // Nullable so existing rows survive; the reconciler refuses a null rather
+  // than guessing, and the backfill below fills it from witnessed evidence.
+  `ALTER TABLE "FiatLiquidityReceipt" ADD COLUMN IF NOT EXISTS "walletAccount" TEXT`,
+  `CREATE INDEX IF NOT EXISTS "FiatLiquidityReceipt_walletAccount_idx" ON "FiatLiquidityReceipt"("walletAccount")`,
+  `UPDATE "FiatLiquidityReceipt" r SET "walletAccount" = w."walletAccount"
+     FROM "ProviderSettlementWitness" w
+    WHERE w."openingDedupKey" = r."dedupKey" AND r."walletAccount" IS NULL`,
   `CREATE INDEX IF NOT EXISTS "FiatLiquidityReceipt_provider_providerRef_idx"
      ON "FiatLiquidityReceipt"("provider", "providerRef");`,
   `CREATE INDEX IF NOT EXISTS "FiatLiquidityReceipt_relatedTransactionId_idx"
@@ -133,6 +144,7 @@ const STATEMENTS = [
     "inTransitGhs" DECIMAL(20,2) NOT NULL DEFAULT 0,
     "paidOutGhs" DECIMAL(20,2) NOT NULL DEFAULT 0,
     "reconciliationHeldGhs" DECIMAL(20,2) NOT NULL DEFAULT 0,
+    "authorityActivatedAt" TIMESTAMP(3),
     "updatedAt" TIMESTAMP(3) NOT NULL,
     CONSTRAINT "FiatLiquidityState_pkey" PRIMARY KEY ("id")
   );`,
@@ -144,11 +156,40 @@ const STATEMENTS = [
   `ALTER TABLE "FiatLiquidityState"
      ADD COLUMN IF NOT EXISTS "reconciliationHeldGhs" DECIMAL(20,2) NOT NULL DEFAULT 0;`,
 
+  // §P.5-D one-way latch. Nullable and additive: NULL means "never activated".
+  // This installer must produce the CURRENT table shape, because a first
+  // install (and any re-provision after a dropped table) is exactly where a
+  // magazine-only column silently disappears — and a missing latch column makes
+  // every later reader fail closed with "the regime could not be read".
+  `ALTER TABLE "FiatLiquidityState"
+     ADD COLUMN IF NOT EXISTS "authorityActivatedAt" TIMESTAMP(3);`,
+
   // Singleton zero-state row (deterministic id=1). No financial data.
   `INSERT INTO "FiatLiquidityState" ("id", "availableGhs", "reservedGhs", "inTransitGhs", "paidOutGhs", "reconciliationHeldGhs", "updatedAt")
      VALUES (1, 0, 0, 0, 0, 0, CURRENT_TIMESTAMP)
    ON CONFLICT ("id") DO NOTHING;`,
 ];
+
+// WP-I trusted wallet - part of THIS table's contract, not a later overlay.
+//
+// `CREATE TABLE IF NOT EXISTS` above only helps a fresh database; a path that
+// recreates the table (the p5d authority suite drops and re-provisions it) would
+// otherwise produce a table without the column, and a wallet-scoped reader would
+// then fail closed on a database the release chain reports as provisioned.
+//
+// The DDL is NOT restated here. prisma/sql/2026-11-18-fiat-provider-event-wallet-account.sql
+// is the single source of truth and is also applied by
+// install-wp-i-observation-wallet-overlay.js (release segment 15), so the two
+// installers converge on one contract instead of drifting.
+const WALLET_COLUMN_SQL = path.join(__dirname, '..', 'prisma', 'sql', '2026-11-18-fiat-provider-event-wallet-account.sql');
+
+/** Statements from a shared .sql file. Comments are stripped BEFORE splitting:
+ *  a comment may contain a semicolon and splitting first yields a broken statement. */
+function statementsFromSqlFile(file) {
+  const raw = fs.readFileSync(file, 'utf8');
+  return raw.split('\n').filter((line) => !line.trim().startsWith('--')).join('\n')
+    .split(';').map((s) => s.trim()).filter(Boolean);
+}
 
 async function installFiatLiquidityOverlay() {
   // r15 R15-A duplicate preflight (READ-ONLY): the partial unique index
@@ -221,7 +262,9 @@ async function installFiatLiquidityOverlay() {
     throw err;
   }
 
-  for (const statement of STATEMENTS) {
+  // The shared wallet-column DDL runs AFTER the CREATE TABLE statements above, so
+  // it can never execute against a table that does not exist yet.
+  for (const statement of [...STATEMENTS, ...statementsFromSqlFile(WALLET_COLUMN_SQL)]) {
     try {
       await prisma.$executeRawUnsafe(statement);
     } catch (err) {

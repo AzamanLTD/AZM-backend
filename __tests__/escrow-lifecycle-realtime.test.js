@@ -113,15 +113,21 @@ describe('escrowService markSatisfied realtime convergence (pending settlement)'
             status: 'PENDING_SETTLEMENT', amountUsdc: 100,
             payerSatisfied: true, payeeSatisfied: false,
         };
+        // markSatisfied is one transaction (§WP-H G): pre-read, then in the
+        // transaction the flag claim, the post-claim read, the
+        // PENDING_SETTLEMENT claim and the final read. The mock stands in for
+        // both the client and the transaction.
         const prisma = {
             smartEscrow: {
                 findUnique: jest.fn()
-                    .mockResolvedValueOnce(escrow)
-                    .mockResolvedValueOnce(pendingEscrow),
+                    .mockResolvedValueOnce(escrow)          // pre-read
+                    .mockResolvedValueOnce(pendingEscrow)   // post-claim read (one party satisfied)
+                    .mockResolvedValueOnce(pendingEscrow),  // after PENDING_SETTLEMENT
                 updateMany: jest.fn().mockResolvedValue({ count: 1 }),
                 update: jest.fn().mockResolvedValue(pendingEscrow),
             },
         };
+        prisma.$transaction = jest.fn(async (callback) => callback(prisma));
 
         const result = await escrowService.markSatisfied(prisma, { escrowId: 'escrow-3', userId: 11 });
 
@@ -152,7 +158,11 @@ describe('escrowService markSatisfied realtime convergence (pending settlement)'
         const tx = {
             smartEscrow: {
                 updateMany: jest.fn().mockResolvedValue({ count: 1 }),
-                findUnique: jest.fn().mockResolvedValue(settledEscrow),
+                // In the one markSatisfied transaction: the post-claim read
+                // sees both flags, then the release reads the settled row.
+                findUnique: jest.fn()
+                    .mockResolvedValueOnce(afterClaim)
+                    .mockResolvedValue(settledEscrow),
             },
             user: { update: jest.fn().mockResolvedValue({}), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
             transactionHistory: { create: jest.fn().mockResolvedValue({}) },
@@ -171,10 +181,7 @@ describe('escrowService markSatisfied realtime convergence (pending settlement)'
         const prisma = {
             smartEscrow: {
                 findUnique: jest.fn()
-                    .mockResolvedValueOnce(escrow)       // initial load
-                    .mockResolvedValueOnce(afterClaim)   // after claim
-                    // _releaseEscrow will also call findUnique
-                    .mockResolvedValueOnce(afterClaim),  // _releaseEscrow's initial load
+                    .mockResolvedValueOnce(escrow),      // pre-read; everything else runs in the transaction
                 updateMany: jest.fn().mockResolvedValue({ count: 1 }),
             },
             $transaction: jest.fn(async (callback) => callback(tx)),

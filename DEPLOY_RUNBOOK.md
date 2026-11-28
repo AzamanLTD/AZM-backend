@@ -2,11 +2,11 @@
 
 ## Deploying schema changes
 
-Push to main → Render runs `npm run release` → the additive overlay
-installers (`infra/install-*-overlay.js` + `install-prod-drift-remediation.js`)
-apply any pending idempotent DDL → server restarts with new features live.
-Boot additionally self-heals via `infra/autoRelease.js` (same installers,
-non-fatal).
+Deploys are MANUAL: the live service has `autoDeploy: false`, so moving `main`
+deploys nothing by itself. Today the live Build Command does not run the release
+chain (see the ACTUAL table below); once the PROPOSED build command is applied,
+a deploy from `main` will run the full chain before the new version receives
+traffic.
 
 **Schema authority (single, unambiguous):** production DDL is deployed
 EXCLUSIVELY by the overlay installers. `prisma migrate deploy` is NOT part
@@ -23,21 +23,305 @@ it. (The `20260920060000_r15_receipt_available_unique` migration file was
 removed for exactly this reason — the fiat-liquidity overlay creates that
 unique index.)
 
-## Free-plan Render deploy path (CURRENT LIVE SERVICE)
+## Deployment state: ACTUAL vs PROPOSED (read this before deploying)
+
+Verified read-only against the Render API on **2026-11-17 12:56 UTC** for service
+`AZM-backend` (`srv-da1pvvrncjis73fru9fg`, Frankfurt).
+
+### ACTUAL live configuration (last verified 2026-11-17 12:56 UTC)
+
+| Setting | Live value |
+| --- | --- |
+| Compute plan | `free` |
+| Auto-deploy | off (`autoDeployTrigger: off`) — deploys are manual |
+| Linked branch | `main` |
+| Build Command | `npm install && npm run build && node infra/install-e2ee-server-blind-overlay.js && node infra/install-inventory-restock-overlay.js && node infra/install-reservation-capacity-overlay.js` |
+| Pre-Deploy Command | `npm run release` is CONFIGURED but the Free plan does NOT execute it |
+| Start Command | `node index.js` |
+| Currently deployed commit | `48c17ab10248` (2026-10-15T16:59:51Z) |
+| Approved production database | host `ep-crimson-cell-ab81e3bp.eu-west-2.aws.neon.tech`, port `5432`, database `neondb` |
+
+**What that means today:** the live Build Command installs only three overlays
+and the Pre-Deploy step never runs, so **the release chain does not execute on
+deploy at all**. Every table the new release needs is therefore NOT provisioned
+by deploying this branch. Do not describe the release chain as a live setting:
+it is not one.
+
+### PROPOSED configuration (NOT APPLIED — requires an operator change)
+
+| Setting | Proposed value |
+| --- | --- |
+| Build Command | `npm install && npm run build && npm run release` |
+| Pre-Deploy Command | none (the Free plan does not execute one) |
+| Deploy trigger | manual only |
+| Chain position | the full 32-step release chain (`npm run release`) runs in the Build Command, after `npm run build` and before the new version receives traffic |
+| Guard | `npm run release` begins with `infra/verify-release-target.js` |
+
+Nothing in this section is live. `render.yaml` is **proposed** configuration
+too: its service name (`azaman-backend`) does not match the live service
+(`AZM-backend`), and applying it blindly would propose creating a second service.
+Treat that file as documentation of the intended state until an operator changes
+the real setting, and never sync it without reading its header.
+
+### Release authorization: one signed release, not a service-wide token
+
+The Build Command's guard checks the Render identity signals — but a local shell
+can export every one of them, so those variables are identity, not proof. The
+production allow therefore also requires a signature that binds ONE release:
+
+| Bound fact | Where it comes from |
+| --- | --- |
+| approved service ID | signed payload, compared with `RENDER_SERVICE_ID` |
+| canonical branch | signed payload, compared with `RENDER_GIT_BRANCH` |
+| **exact deploy commit** | signed payload, compared with `RENDER_GIT_COMMIT` |
+| production database identity | signed payload, compared with `DATABASE_URL` |
+| issuance time + expiry | signed payload, checked against the clock |
+
+`RENDER_GIT_COMMIT` is the commit SHA of the deploy Render is building; Render
+documents it under default environment variables as available at build time and
+runtime. That is what makes the binding real at the phase where `npm run release`
+runs.
+
+**Operator procedure for one release — six steps, in this order**
+
+Render's own semantics decide the order, because saving an environment variable
+and deploying are separate actions:
+
+| Render action | What it does |
+| --- | --- |
+| **Save only** | Stores the changed environment. Does **not** build or deploy; the running instance keeps its current environment. |
+| **Save and deploy** | Stores the change **and** starts a deploy immediately, using the newest commit on the tracked branch. |
+| **Save, rebuild and deploy** | Stores the change, then rebuilds and deploys the current commit. |
+
+1. **Select and verify the exact commit.** Decide the SHA to release and confirm
+   it is the commit you mean: it is on `main` after your approved merge, its CI
+   lanes are green on that SHA, and its tree is the one you reviewed. Convert to
+   the full 40-character SHA; that is what the authorization will name.
+2. **Mint the authorization on an operator-controlled machine.** The private key
+   lives outside the repository, outside CI, outside chat and outside any agent
+   workspace; it is never copied into Render.
+
+   ```
+   node infra/sign-deploy-authorization.js --key /secure/offline/azm-release-auth.key --commit <full-sha> --ttl-minutes 10
+   ```
+
+   The token is printed on stdout, and the signed payload, commit and validity
+   window on stderr. One token authorizes one commit; a second release needs its
+   own token.
+3. **Stage the token in Render without starting an unauthorized build.** The
+   approved service has auto-deploy off, so use **Save only** when adding
+   `AZM_DEPLOY_AUTH_TOKEN`. Nothing is built, and the running instance keeps its
+   previous environment until the next deploy. Do not use Save and deploy here:
+   that path deploys whatever the branch head is, which may not be the commit you
+   signed.
+4. **Trigger the deployment of exactly the signed commit.** Start a manual deploy
+   of that commit. Render runs the Build Command
+   (`npm install && npm run build && npm run release`); because the token is
+   available at build time, the guard can compare the signed commit with
+   `RENDER_GIT_COMMIT` for *this* build. A mismatch fails the build before any
+   installer runs, so no partial DDL is possible.
+5. **Verify the release result.** In the build log confirm the guard's
+   `RELEASE_TARGET_PRODUCTION` line, the installer summary
+   (`installed=true`, `depositClaims`/`witnessClaims`/`quarantined`, `conflicts=0`)
+   and a zero exit. In the dashboard confirm the deployed commit is the SHA you
+   signed.
+6. **Remove the token, and expect the next deploy to need its own.** Delete
+   `AZM_DEPLOY_AUTH_TOKEN` and use **Save only**. That stops future builds from
+   inheriting it, without triggering a deploy and therefore without running the
+   release chain a second time.
+
+**Runtime exposure of the token is real, and bounded.** Render makes environment
+variables available at both build time and runtime, so for the lifetime of the
+instance built in step 4 the token is in the process environment, and a deploy
+that reuses the saved environment would carry it forward. Two things bound the
+exposure: the token expires on its own (10 minutes in the command above, 60 at
+most), and step 6 removes it from the saved environment so later builds do not
+inherit it. It is **not** a build-only secret, and it must never be treated as
+one. Because the value expires, a later deploy on the same service must be
+authorized with a freshly minted token: a build without one fails closed at the
+guard, which is the intended behaviour, not a misconfiguration.
+
+**Replay scope, restated.** A token that is still inside its window can be
+replayed, but only for the same service, branch, commit and database. It cannot
+authorize a different release. It is not single-use.
+
+**Failure behaviour (fail closed, every case).**
+
+| Condition | Code |
+| --- | --- |
+| no token | `RELEASE_REFUSED_NO_DEPLOY_AUTHORIZATION` |
+| malformed token or bad signature | `RELEASE_REFUSED_INVALID_DEPLOY_AUTHORIZATION` |
+| wrong service | `RELEASE_REFUSED_AUTH_SERVICE` |
+| wrong branch | `RELEASE_REFUSED_AUTH_BRANCH` |
+| wrong or missing commit | `RELEASE_REFUSED_AUTH_COMMIT` |
+| wrong database identity | `RELEASE_REFUSED_AUTH_DATABASE` |
+| expired | `RELEASE_REFUSED_AUTH_EXPIRED` |
+| issued in the future | `RELEASE_REFUSED_AUTH_NOT_YET_VALID` |
+| window longer than 60 minutes | `RELEASE_REFUSED_AUTH_WINDOW_TOO_LONG` |
+
+**Replay scope, stated plainly.** This is NOT single-use authorization. There is
+no nonce store: a genuine one-use mechanism would need persistent state in the
+production database before the guard has decided the target is production, or an
+external service the release chain cannot depend on. The residual capability is
+that the SAME token can be replayed — but only for the same service, branch,
+commit and database, and only until it expires (15 minutes by default, 60 at
+most). It cannot authorize any other release. Do not describe it as one-time.
+
+**Trust assumption, not implied.** The signature proves possession of the
+operator's private key. It is NOT cryptographic proof that Render started the
+process; that cannot be established from inside a process. If the private key
+leaks, the guard is defeated, which is why the deploy action keeps independent
+operator authorization, the key lives outside the repository and outside any
+agent workspace, and rotation is a reviewed change to the public key pinned in
+`infra/lib/releaseTargetGuard.js`.
+
+### The release chain is 33 `&&` segments: the guard, then 32 commands
+
+`package.json` `scripts.release` contains 33 `&&` segments — 1 guard
+(`infra/verify-release-target.js`) followed by **32 commands** — so any
+non-zero exit stops the chain before the next step. The last command is
+`infra/verify-authority-boundary.js`; nothing may be appended after it. Every
+document in this repository describes the same count and the same ordering.
+
+### Azaman-New is NOT provisioned by this chain
+
+`bootstrap-azaman-new.yml` previously ran `npm run release` against a different
+database. The guard now refuses that by design, and the workflow step stops with
+an explicit error instead of borrowing production authority. Azaman-New needs its
+own separately reviewed provisioning path; the production guard is not broadened
+to accommodate it.
+
+### What runs where (once the proposal is applied)
+
+| Path | Installers | Barrier? |
+| --- | --- | --- |
+| Build (manual deploy of `main`) | target guard + all 32 release steps | YES — completes before traffic |
+| Pre-Deploy | none (Free plan) | n/a |
+| Boot (`infra/autoRelease.js`) | its own smaller subset, non-fatal | NO |
+
+**Not provisioned at boot, ever:** `ProviderSettlementWitness` (release step 12),
+`ProviderObservationClaim` (step 30), `AppUnlockTotpClaim` (step 31) and
+`ActionStepUpGrant` (step 29). These exist only if a release chain ran. The boot
+path must not be given them: `server.js` calls `bootTreasury` without awaiting
+it and every boot installer failure is non-fatal, so it cannot be the barrier
+money paths depend on.
+
+### Release-chain ordering that must not drift
+
+Step numbers below count COMMANDS, with the guard excluded: segment 15 of the
+`&&` chain is step 14 here. The two conventions differ by one, so a step number
+quoted without saying which convention it uses is ambiguous — say which.
+
+1. `infra/verify-release-target.js` — proves the context: approved Render
+   service, canonical branch, no preview, and the exact approved database
+   identity. It exits non-zero on anything else, so `&&` stops the chain before
+   the first installer.
+2. `infra/install-wp-i-settlement-witness.js` (step 12) — creates
+   `ProviderSettlementWitness`.
+3. `infra/install-wp-i-observation-wallet-overlay.js` (step 14) — adds
+   `FiatProviderEvent.walletAccount`. It must follow step 13
+   (`install-fiat-liquidity-overlay.js`, which creates the table). No step reads
+   this column yet: the backfill at step 30 reads `walletAccount` from
+   `ProviderSettlementWitness`, a different table. Keeping the column ahead of
+   step 30 reserves the slot a wallet-scoped reader will need, and that
+   wallet-scoped identity is a separate all-or-nothing cut-over, not this change.
+4. `infra/install-provider-observation-claim.js` (step 30) — creates
+   `ProviderObservationClaim` and backfills it, so it must follow step 12.
+5. `infra/install-app-unlock-totp-claim.js` (step 31).
+6. `infra/verify-authority-boundary.js` (step 32) — the final gate; nothing may
+   be appended after it.
+
+Schema provisioning activates no authority and starts no provider
+reconciliation. It only creates tables, indexes and constraints.
+
+**One ordering hazard that is not a chain step, and a decision already taken.**
+The column installed by step 14 is deliberately NOT declared in
+`prisma/schema.prisma` yet. Declaring it makes the Prisma client select it on
+EVERY `FiatProviderEvent` read, so any database where the column is absent fails
+all of those reads, not just a future wallet feature. That is measured, not
+theoretical: the p5d authority suite re-provisions the table through
+`install-fiat-liquidity-overlay.js`, which recreates it without the new column, so
+with the field declared that suite's reads returned 500 and `walletAccount` was
+gone from the database afterwards; with the field removed the same provisioning
+path passes 63/63. A model field is added only together with a wallet-scoped
+reader AND with the provisioning that creates the column in every environment,
+including the test suites and the CI installer sequence. Nothing reads the column
+today, so declaring it now would buy nothing and break that path.
+
+### Operations that stay separate DBA / operator procedures
+
+- **Provider-observation backfill review.** `node
+  infra/install-provider-observation-claim.js --dry-run` reports deposits,
+  witnesses, skipped observations and historical collisions without writing.
+- **Historical cross-path collisions.** The backfill QUARANTINES a reference
+  whose money was used on both paths: it writes a claim with no legitimate
+  owner, so both economic paths fail closed (`OBSERVATION_QUARANTINED`) until an
+  operator resolves the history by hand. The installer never picks a winner.
+- **The backfill blocks claim-table writers, so give it a window.** The claim
+  overlay runs inside the same transaction as the claim writes, and PostgreSQL
+  takes a `ShareLock` for its `CREATE INDEX` statements, which conflicts with the
+  `RowExclusiveLock` every `INSERT`/`UPDATE`/`DELETE` takes. Live provider-claim
+  traffic waits for the whole backfill. `IF NOT EXISTS` does not help: the lock is
+  taken before the existing index can make the statement a no-op, so pre-installing
+  the overlay does not remove the window. The installer header records the measured
+  behaviour and what a redesign would cost; none is implemented. Schedule it as a
+  maintenance-window operation until production wait times have been measured.
+- **Known weaknesses in WP-I, with the decision each one needs.** Recorded from
+  an adversarial review of the claim path on 2026-11-18, so they are not
+  rediscovered as new.
+  - *Doubtful evidence is left unclaimed, not blocked.* A deposit whose Moolre
+    evidence is contradictory or ambiguous is reported and skipped; its
+    observation stays free, so the treasury path can still spend it. The safer
+    money default is to quarantine the key, but that must not happen until an
+    operator surface exists (next bullet), or a false positive becomes
+    unbreakable. **Decision required before the backfill runs on production.**
+  - *No operator surface for quarantine.* Nothing in the app reads
+    `QUARANTINE` claim rows, and the recovery sweep rethrows a refused claim, so
+    a paid deposit can sit `PENDING` with only a log line. Needs a parked
+    terminal state, a read-only admin listing and a periodic count.
+  - *The signature protects the release chain, not the database.* Any process
+    holding the production `DATABASE_URL` and DDL rights can run these
+    installers directly, including a compromised dependency. Needs a migration
+    role with DDL and a runtime role without it before the guard can be called
+    the only barrier.
+  - *Moolre reference uniqueness is unproven.* The claim key
+    `moolre|collection|<ref>` has no account dimension, while the service
+    refuses a reference seen against a different account. If references are only
+    unique per account, one legitimate payment can be refused. Needs a provider
+    answer or a trusted dimension in the key (a schema decision).
+- **WP-I provenance role grants.** A least-privilege database role provisioned
+  by an operator, never by the application boot path.
+- **WP-H / WP-I authority activation.** Explicitly not enabled by any installer.
+
+### Historical statements, corrected (do not follow them)
+
+Dated so they cannot be mistaken for current instructions:
+
+- Before 2026-11-17 this runbook described a chain of 18 installers, a working
+  Pre-Deploy Command, and "push to `main` → Render runs `npm run release`". All
+  three were wrong for the live Free-plan service: the chain is 31 steps,
+  Pre-Deploy does not execute, and deploys are manual.
+- The Build Command shown in older copies (three overlay installers) is the
+  ACTUAL live value above, not a recommendation.
+- Earlier prose claimed boot-time installers gave "the same installers" as the
+  release. They do not, and boot is explicitly not a schema barrier.
+
+## Free-plan Render deploy path
 
 The **live azaman-backend Render service is on the Free plan** (verified
 read-only against the Render API on 2026-10-15, alongside the release-path
 preflight for the Marketplace Mix discovery surface). Its actual execution
 paths are:
 
-- **Build Command** (Settings → Build & Deploy):
-  `npm install && npm run build && node infra/install-e2ee-server-blind-overlay.js && node infra/install-inventory-restock-overlay.js && node infra/install-reservation-capacity-overlay.js`
-  — i.e. `prisma generate` plus THREE overlay installers (E2EE server-blind,
-  inventory-restock, reservation-capacity). It does NOT include the other
-  fifteen installers of the release chain.
-- **Pre-Deploy Command**: `npm run release` is CONFIGURED but the Free plan
-  does NOT execute it. The full 18-installer release chain therefore does
-  not run on deploys.
+- **Build Command — ACTUAL (live today):** `npm install && npm run build && node infra/install-e2ee-server-blind-overlay.js && node infra/install-inventory-restock-overlay.js && node infra/install-reservation-capacity-overlay.js`
+  — `prisma generate` plus three overlays. It does NOT include the release
+  chain, so no release-provisioned table exists because of a deploy.
+- **Build Command — PROPOSED (not applied):** `npm install && npm run build && npm run release`
+  — the full 32-step chain, once, after the build. Until an operator applies
+  this, production schema comes from nothing automatic.
+- **Pre-Deploy Command:** configured as `npm run release` but NOT executed on
+  the Free plan, so it is dead configuration today and must be removed rather
+  than relied on. Release must never run through both build and pre-deploy.
 - **Start Command**: `node index.js` → `server.js` → `bootTreasury(app, prisma)`
   → `infra/autoRelease.js` — the boot-time auto-release path runs at EVERY
   process start, in the background, non-fatal. Its current `main` sequence

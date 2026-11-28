@@ -7,7 +7,9 @@
 // The legacy POST /api/trades/release route has been removed.
 // =============================================================================
 
+const { requireActionStepUp, whenStepUpEnforced, exclusiveSecondFactor } = require('../middleware/requireActionStepUp');
 const logger = require('../src/config/logger');
+const { requireKyc } = require('../middleware/requireKyc');
 const express             = require('express');
 const router              = express.Router();
 const tradeController     = require('../controllers/tradeController');
@@ -46,10 +48,39 @@ router.get('/:id',     protect, getTradeDetails);
 // controller's explicit pre-economics guards mark the claim releasable
 // (res.locals.financialClaimRelease), and those provably run before the
 // economic transaction.
-router.post('/initiate', protectActive, require2FA(), idempotency(), initiateTrade);
+// §WP-H G — idempotency before the gate (committed replay needs no new
+// grant), the grant spent inside the trade/queue transaction, require2FA /
+// grant exclusive. The descriptor binds what this route actually executes:
+// the ad, both amounts and the payment method. The handler parses the amounts
+// with parseFloat, so a finite JSON number is bound as String(n), the exact
+// text whose parseFloat is the value executed (refused if not finite).
+const executedNumberText = (v) => (typeof v === 'number' ? (Number.isFinite(v) ? String(v) : null) : (v == null ? null : String(v)));
+const tradeInitiateStepUp = whenStepUpEnforced(requireActionStepUp({
+    actionType: 'TRADE_INITIATE',
+    routeScope: 'POST /api/trades/initiate',
+    currency: () => 'USDC',
+    amount: (req) => executedNumberText(req.body && req.body.amountCrypto),
+    resource: (req) => (req.body && req.body.adId != null ? String(req.body.adId) : null),
+    params: (req) => ({
+        amountFiat: executedNumberText(req.body && req.body.amountFiat),
+        paymentMethod: (req.body && req.body.paymentMethod) || null,
+    }),
+}));
+router.post('/initiate', protectActive, requireKyc('trade'), exclusiveSecondFactor(require2FA),
+    idempotency(), tradeInitiateStepUp, initiateTrade);
 
 // ── Vendor approval actions ──────────────────────────────────────────────────
-router.post('/accept',  protectActive, idempotency(), acceptTrade);
+// Accepting locks escrow (vendor pool or buyer balance), so it now carries a
+// second factor in both enforcement modes (it previously had none).
+const tradeAcceptStepUp = whenStepUpEnforced(requireActionStepUp({
+    actionType: 'TRADE_ACCEPT',
+    routeScope: 'POST /api/trades/accept',
+    currency: () => 'USDC',
+    amount: () => null, // the amount is the trade row's, bound through the resource
+    resource: (req) => (req.body && req.body.tradeId != null ? String(req.body.tradeId) : null),
+}));
+router.post('/accept',  protectActive, requireKyc('trade'), exclusiveSecondFactor(require2FA),
+    idempotency(), tradeAcceptStepUp, acceptTrade);
 router.post('/decline', protectActive, declineTrade);
 
 // ── Time extension ───────────────────────────────────────────────────────────

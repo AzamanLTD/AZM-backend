@@ -1,0 +1,17 @@
+{
+  "status": 1,
+  "code": "SS01",
+  "message": "Transaction status retrieved",
+  "data": {
+    "txstatus": 1,
+    "txtype": 1,
+    "accountnumber": "100000100002",
+    "payer": "233551300186",
+    "amount": "5.00",
+    "value": "4.60",
+    "transactionid": "34008096",
+    "externalref": "AZM-DEP-000123",
+    "thirdpartyref": "55730796319",
+    "ts": "2026-11-10 12:36:28"
+  }
+}

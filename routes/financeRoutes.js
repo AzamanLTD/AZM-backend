@@ -5,6 +5,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const { requireKyc } = require('../middleware/requireKyc');
 const express                  = require('express');
 const router                   = express.Router();
 const financeController        = require('../controllers/finance.controller');
@@ -50,7 +51,7 @@ const withdrawalController     = require('../controllers/withdrawalController');
 // NOTE: `protectActive` (ban guard) is kept as the alias's session guard, one
 // notch stronger than the canonical route's `protect`.
 router.post('/withdraw/fiat',
-    protectActive,
+    protectActive, requireKyc('withdraw'),
     require2FA(),
     idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true, identity: 'POST /api/withdraw/fiat' }),
     validate(fiatWithdrawalSchema),
@@ -65,8 +66,10 @@ router.post(
     financeController.liquidateProfits
 );
 
-// Webhook endpoints (no auth — external providers).
-router.post('/webhook/deposit', financeController.cryptoDepositWebhook);
+// Retired: this path credited a body-supplied userId with no authentication.
+// It stays mounted only to answer 410 so a stale caller gets an explicit,
+// non-mutating refusal. The verified crypto deposit path is /webhook/tatum.
+router.post('/webhook/deposit', financeController.retiredCryptoDepositWebhook);
 
 // Provider settlement callbacks are deliberately routed through the dedicated
 // adapter. The old controller handlers remain available for compatibility, but

@@ -39,8 +39,13 @@ const ADMIN_ROLES = {
   FINANCE_ADMIN: {
     name: 'Finance Admin',
     permissions: [
+      'reconciliation.view',
       'withdrawals.approve', 'withdrawals.review', 'withdrawals.export',
       'trades.view', 'trades.export', 'fees.manage',
+      // Exact money settings: Finance Admin may read AND write quote TTLs, FX
+      // spreads and the step-up threshold. Not general settings: a support or
+      // read-only admin must not reach a money bound through this surface.
+      'money.settings.view', 'money.settings.write',
       'susu.oversee', 'susu.health', 'susu.approve_payout',
       'vaults.view', 'vaults.approve',
       'audit.view', 'audit.export',
@@ -60,6 +65,7 @@ const ADMIN_ROLES = {
   COMPLIANCE_ADMIN: {
     name: 'Compliance Admin',
     permissions: [
+      'reconciliation.view',
       'withdrawals.approve', 'withdrawals.review', 'withdrawals.export',
       'users.view', 'users.kyc_approve', 'users.kyc_reject',
       'audit.view', 'audit.export', 'audit.delete',
@@ -74,6 +80,9 @@ const ADMIN_ROLES = {
       'users.view', 'trades.view', 'withdrawals.review',
       'susu.health', 'vaults.view', 'disputes.view',
       'audit.view', 'reports.view',
+      // Auditors may SEE the current money settings and their history; they may
+      // not change a bound.
+      'money.settings.view',
     ],
     description: 'View-only access for auditors',
   },
@@ -223,16 +232,45 @@ async function resolveEffectiveAdminRole(db, userId) {
     db.adminRoleAssignment.findUnique({ where: { userId } }),
     db.user.findUnique({
       where: { id: userId },
-      select: { role: true, isDeleted: true, banStatus: true },
+      // createdAt is selected for the orphan-assignment guard below.
+      select: { role: true, isDeleted: true, banStatus: true, createdAt: true },
     }),
   ]);
   if (!user || user.isDeleted) return null;
   if (user.banStatus && user.banStatus !== 'ACTIVE') return null;
 
   const storedRole = String(user.role || '').trim().toUpperCase();
-  const assignedRole = assignment
+  let assignedRole = assignment
     ? String(assignment.role || '').trim().toUpperCase()
     : null;
+
+  // ── Orphan-assignment guard (2026-11-15) ────────────────────────────────
+  // AdminRoleAssignment.userId has NO foreign key to User, so an assignment
+  // can OUTLIVE the account it was granted to. If the id sequence is recycled
+  // (the test battery does TRUNCATE "User" RESTART IDENTITY CASCADE, which
+  // cannot reach this table; a restore or sequence reset does the same in
+  // production) then findUnique({ userId }) returns that foreign row and a
+  // brand-new account silently inherits a specialized role nobody granted it.
+  // That is authority widening from a stale row, and it was observed: a fresh
+  // ADMIN was refused users.ban (403) because it inherited a READ_ONLY_ADMIN
+  // assignment from an earlier suite.
+  // An assignment cannot legitimately predate its account: the user row must
+  // exist before a role can be assigned. Ids get recycled; timestamps do not.
+  // So assignedAt < createdAt is proof of an orphan, and it is ignored rather
+  // than trusted. Failing closed here would punish a legitimate account for a
+  // row it never had, so the account's own stored role is used instead.
+  if (assignedRole && assignment.assignedAt && user.createdAt && assignment.assignedAt < user.createdAt) {
+    logger.warn(
+      {
+        userId,
+        orphanedRole: assignedRole,
+        assignmentCreatedAt: assignment.assignedAt,
+        accountCreatedAt: user.createdAt,
+      },
+      '[adminRbac] ignoring AdminRoleAssignment that predates the account (recycled id / orphan row)'
+    );
+    assignedRole = null;
+  }
 
   if (assignedRole && SPECIALIZED_ADMIN_ROLES.has(assignedRole)) {
     return storedRole === 'ADMIN' ? assignedRole : null;

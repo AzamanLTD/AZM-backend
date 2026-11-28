@@ -98,8 +98,27 @@ describe('Phase 2.5 — require2FA on Financial Routes', () => {
             const content = fs.readFileSync(path.join(__dirname, '../../', file), 'utf-8');
             const line = content.split('\n').find(l => l.includes(`'${endpoint}'`) && l.includes('router'));
             expect(line).toBeTruthy();
-            expect(line).toContain('require2FA()');
+            // A second factor is mounted: either require2FA() directly, or the
+            // §WP-H exclusive wrapper that runs require2FA() when action-bound
+            // step-up is off and the bound grant when it is on.
+            expect(line.includes('require2FA()') || line.includes('exclusiveSecondFactor(require2FA)')).toBe(true);
         });
+    });
+
+    test('the exclusive wrapper falls back to require2FA() when step-up is not enforced', () => {
+        const { exclusiveSecondFactor } = require('../../middleware/requireActionStepUp');
+        const prev = process.env.STEP_UP_ENFORCEMENT;
+        delete process.env.STEP_UP_ENFORCEMENT;
+        try {
+            let ran = false;
+            const fake2FA = () => (_req, _res, next) => { ran = true; next(); };
+            let passed = false;
+            exclusiveSecondFactor(fake2FA)({}, {}, () => { passed = true; });
+            expect(ran).toBe(true);
+            expect(passed).toBe(true);
+        } finally {
+            if (prev === undefined) delete process.env.STEP_UP_ENFORCEMENT; else process.env.STEP_UP_ENFORCEMENT = prev;
+        }
     });
 });
 

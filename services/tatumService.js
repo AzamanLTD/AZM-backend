@@ -50,6 +50,8 @@ const PROVIDER_NAME    = 'TATUM_POLYGON';
 const DEFAULT_BASE_URL = 'https://api.tatum.io/v3';
 const CHAIN            = 'MATIC';
 
+const { mockRefused, warnIfMockInProduction, mockRefusedError } = require('../src/config/providerModeGuard');
+
 class TatumService {
     constructor(opts = {}) {
         this.apiKey         = process.env.TATUM_API_KEY         || null;
@@ -74,6 +76,7 @@ class TatumService {
         } else {
             logger.info(`[TatumService] Running in LIVE mode → ${this.baseUrl}`);
         }
+        warnIfMockInProduction('TatumService', this.providerMode);
     }
 
     // ── Public API ──────────────────────────────────────────────────────────
@@ -104,6 +107,9 @@ class TatumService {
         }
 
         if (this.providerMode === 'MOCK') {
+            // A mock address is a deterministic fake nobody controls: real USDC
+            // sent to it would be unrecoverable. Never hand one out in production.
+            if (mockRefused()) throw mockRefusedError('TatumService', 'Deposit address derivation');
             return this._mockDeriveAddress(index);
         }
 
@@ -140,6 +146,7 @@ class TatumService {
         }
 
         if (this.providerMode === 'MOCK') {
+            if (mockRefused()) throw mockRefusedError('TatumService', 'Address subscription');
             const mockSubId = `sub_mock_${crypto.createHash('md5').update(address).digest('hex').slice(0, 16)}`;
             return { subscriptionId: mockSubId, source: 'MOCK' };
         }

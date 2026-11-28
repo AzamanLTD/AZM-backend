@@ -17,6 +17,8 @@ const logger = require('../src/config/logger');
 const crypto = require('crypto');
 const fieldCipher = require('./crypto/fieldCipher');
 
+const { mockRefused, warnIfMockInProduction } = require('../src/config/providerModeGuard');
+
 class KYCService {
     constructor(prisma, notificationService) {
         this.prisma = prisma;
@@ -28,7 +30,12 @@ class KYCService {
         this.dojahPublicKey = process.env.DOJAH_PUBLIC_KEY || '';
         this.dojahSecretKey = process.env.DOJAH_SECRET_KEY || '';
         this.dojahWidgetId = process.env.DOJAH_WIDGET_ID || '';
-        this.dojahWebhookSecret = process.env.DOJAH_WEBHOOK_SECRET || 'mock_webhook_secret';
+        // The public placeholder secret exists only for the local mock harness.
+        // In production an unset secret stays empty, so nobody can compute a
+        // valid signature from a string that is printed in this source file.
+        this.dojahWebhookSecret = process.env.DOJAH_WEBHOOK_SECRET
+            || (mockRefused() ? '' : 'mock_webhook_secret');
+        warnIfMockInProduction('KYCService', this.provider === 'mock' ? 'MOCK' : 'LIVE');
 
         // Confidence threshold for auto-approval (0–100 scale from Dojah)
         this.autoApproveThreshold = Number(process.env.KYC_AUTO_APPROVE_THRESHOLD) || 70;
@@ -70,6 +77,12 @@ class KYCService {
         const referenceId = this._generateReferenceId(userId);
 
         if (this.provider === 'mock') {
+            // A mock KYC session is a test harness. Production must use the
+            // live Dojah adapter (KYC_PROVIDER=dojah); refuse rather than open
+            // a session whose result anyone could post back.
+            if (mockRefused()) {
+                return { success: false, code: 'KYC_PROVIDER_NOT_CONFIGURED', message: 'Identity verification is not available right now.' };
+            }
             return this._mockInitializeSession({ userId, email, referenceId });
         }
 
@@ -420,6 +433,13 @@ class KYCService {
      * keeps working.
      */
     _verifyWebhookSignature(payload, signature, rawBody) {
+        // Production never verifies through this adapter: with no configured
+        // secret there is nothing trustworthy to check a signature against, and
+        // the mock shortcut below must never apply.
+        if (mockRefused() && (this.provider === 'mock' || !process.env.DOJAH_WEBHOOK_SECRET)) {
+            logger.error('[KYC] webhook refused: mock KYC adapter or missing DOJAH_WEBHOOK_SECRET in production');
+            return false;
+        }
         if (this.provider === 'mock') {
             // In mock mode, accept if signature matches secret OR is 'mock_signature'
             if (signature === 'mock_signature' || signature === this.dojahWebhookSecret) {

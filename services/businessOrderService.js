@@ -1,6 +1,12 @@
 // services/businessOrderService.js
 const { emitWebhookEvent } = require('./webhookEmitter');
+const { sumOrdersByCurrency, averageOrderValue } = require('../src/lib/businessRevenueAggregate');
 const { randomBytes } = require('crypto');
+const { Prisma } = require('@prisma/client');
+const { OrderCurrencyError, CODES: CURRENCY_CODES } = require('../src/lib/businessOrderCurrency');
+// Native-GHS pricing authority: a cedi order is priced from the merchant's own
+// confirmed price row, never from a client number and never from a conversion.
+const { resolveEffectiveGhsPrice, BusinessPriceError } = require('./businessPriceService');
 
 const _generateOrderRef = async (prisma) => {
     for (let i = 0; i < 5; i++) {
@@ -57,9 +63,39 @@ const _getRevenueByDay = async (prisma, businessProfileId) => {
     from.setUTCHours(0, 0, 0, 0);
     from.setUTCDate(from.getUTCDate() - 29);
 
+    // PARTITIONED BY CURRENCY, NEVER MERGED (local-fiat-first).
+    //
+    // This series used to be COALESCE(SUM("amountUsdc"), 0) per day. A native-GHS
+    // order carries NO USDC amount at all (the CHECK enforces the pairing), so a
+    // merchant who takes only cedis saw a chart of zeros while their money was
+    // real. A total that omits the customer's money is not a display nuance, it
+    // is a wrong number. Merging the two would be wrong the other way: it would
+    // present cedis as dollars.
+    //
+    // Rules this shape encodes:
+    //  - GHS comes from "amountGhs" (exact pesewas), never from a valuation.
+    //  - USDC comes from "amountUsdc". Rows written before the currency contract
+    //    carry a USDC amount and a NULL currency; they count as USDC, which is
+    //    what they are, and are never re-labelled as cedis.
+    //  - A currency with no activity that day is null, not 0: a merchant with no
+    //    USDC takings simply has no USDC reading. That is the normal state.
+    //  - Sums come back ::text so no value passes through a JS float.
+    //  - a corrupt row (both amounts, or neither for a tagged order, or an
+    //    unknown currency) does NOT get counted into a total and does NOT get
+    //    skipped. The per-order reader refuses such a row outright, and this
+    //    series refuses with it: two different answers to "what is this row
+    //    worth" is how a chart quietly disagrees with a total.
     const rows = await prisma.$queryRaw`
         SELECT DATE_TRUNC('day', "createdAt") AS date,
-               COALESCE(SUM("amountUsdc"), 0) AS revenue
+               COALESCE(SUM(CASE WHEN "currency" = 'GHS' THEN "amountGhs" ELSE 0 END), 0)::text AS ghs,
+               COUNT(*) FILTER (WHERE "currency" = 'GHS') AS ghs_count,
+               COALESCE(SUM(CASE WHEN ("currency" IS NULL OR "currency" = 'USDC') THEN "amountUsdc" ELSE 0 END), 0)::text AS usdc,
+               COUNT(*) FILTER (WHERE "currency" IS NULL OR "currency" = 'USDC') AS usdc_count,
+               COUNT(*) FILTER (
+                   WHERE ("currency" = 'GHS'  AND ("amountGhs" IS NULL OR "amountUsdc" IS NOT NULL))
+                      OR ("currency" = 'USDC' AND "amountUsdc" IS NULL)
+                      OR ("currency" IS NOT NULL AND "currency" NOT IN ('GHS', 'USDC'))
+               ) AS corrupt
         FROM "BusinessOrder"
         WHERE "businessProfileId" = ${businessProfileId}
           AND status = 'COMPLETED'
@@ -70,8 +106,19 @@ const _getRevenueByDay = async (prisma, businessProfileId) => {
 
     const byDate = new Map();
     for (const row of rows) {
-        const key = new Date(row.date).toISOString().slice(0, 10);
-        byDate.set(key, Number(row.revenue) || 0);
+        byDate.set(new Date(row.date).toISOString().slice(0, 10), row);
+    }
+
+    const corruptDays = rows.filter((row) => Number(row.corrupt) > 0);
+    if (corruptDays.length > 0) {
+        // Same refusal as sumOrdersByCurrency / readOrderAmount. A row that
+        // cannot be read must never be guessed at, silently counted, or quietly
+        // left out of the money the merchant sees.
+        throw new OrderCurrencyError(
+            CURRENCY_CODES.CORRUPT,
+            `Revenue series contains ${corruptDays.length} day(s) with unreadable order amounts.`,
+            { days: corruptDays.map((r) => new Date(r.date).toISOString().slice(0, 10)) }
+        );
     }
 
     const result = [];
@@ -82,7 +129,28 @@ const _getRevenueByDay = async (prisma, businessProfileId) => {
             day: 'numeric',
             timeZone: 'UTC',
         }).format(cursor);
-        result.push({ date: key, label, revenue: byDate.get(key) || 0 });
+
+        const row = byDate.get(key);
+        const ghsCount = row ? Number(row.ghs_count) : 0;
+        const usdcCount = row ? Number(row.usdc_count) : 0;
+        // A caller-supplied row is read defensively: the legacy series contract
+        // was {date, revenue}, and a double that still returns exactly that must
+        // not crash the endpoint. Missing partitions simply mean no reading.
+        const ghs = row ? new Prisma.Decimal(row.ghs ?? '0') : null;
+        const usdc = row ? new Prisma.Decimal(row.usdc ?? '0') : null;
+
+        result.push({
+            date: key,
+            label,
+            // Legacy USDC scalar, unchanged meaning, kept for existing clients.
+            revenue: row && row.revenue !== undefined
+                ? Number(row.revenue)
+                : (usdc ? Number(usdc) : 0),
+            byCurrency: {
+                GHS: ghsCount > 0 ? ghs.toFixed(2) : null,
+                USDC: usdcCount > 0 ? usdc.toFixed(8) : null,
+            },
+        });
     }
     return result;
 };
@@ -117,6 +185,70 @@ const createOrder = async (prisma, { businessProfileId, customerId, productId, e
         data: { businessProfileId, customerId, productId: productId || null, escrowId: escrowId || null, ticketId: ticketId || null, status: 'AWAITING_PAYMENT', orderRef, title: cleanTitle, description: description ? String(description).slice(0, 500) : null, amountUsdc: amount, customerNotes: customerNotes ? String(customerNotes).slice(0, 500) : null }
     });
     emitWebhookEvent(businessProfileId, 'order.created', { orderId: order.id, orderRef: order.orderRef, customerId, amount: order.amountUsdc, status: order.status });
+    return order;
+};
+
+// ── Native-GHS order creation ────────────────────────────────────────────────
+// A Ghanaian merchant prices in cedis (BusinessPrice.amountExact, 2dp, currency
+// GHS, confirmed). This is the writer that turns that price into an order: the
+// total is computed server-side from the merchant's own confirmed price, never
+// from a client-supplied number, and the order carries NO USDC amount at all.
+//
+// There is deliberately NO USDC fallback. If a product has no confirmed GHS
+// price, the call is refused rather than quietly priced in another currency: a
+// merchant who has only ever quoted cedis must never discover that a sale was
+// recorded against a USDC column. Creating a GHS order requires no conversion
+// rate, no USDC balance and no external price feed.
+const createGhsOrder = async (prisma, {
+    businessProfileId, customerId, productId, quantity, title, description, customerNotes,
+}) => {
+    if (!businessProfileId) throw new Error('businessProfileId is required.');
+    if (!customerId) throw new Error('customerId is required.');
+    if (!productId) throw new Error('productId is required for a GHS order (the price comes from the product).');
+    const cleanTitle = String(title || '').trim();
+    if (cleanTitle.length < 1 || cleanTitle.length > 200) throw new Error('title must be 1–200 chars.');
+
+    const qty = quantity === undefined || quantity === null ? 1 : Number(quantity);
+    if (!Number.isInteger(qty) || qty < 1 || qty > 999) throw new Error('quantity must be an integer between 1 and 999.');
+
+    const business = await prisma.businessProfile.findUnique({ where: { id: businessProfileId }, select: { id: true, userId: true } });
+    if (!business) throw new Error('Business profile not found.');
+
+    const product = await prisma.businessProduct.findUnique({ where: { id: productId }, select: { id: true, businessProfileId: true, isActive: true, isAvailable: true } });
+    if (!product || product.businessProfileId !== businessProfileId) throw new Error('Product not found.');
+    if (!product.isActive) throw new Error('Product is not available.');
+    if (product.isAvailable === false) throw new Error('Product is not available.');
+
+    // The merchant's confirmed cedi price is the ONLY authority for the amount.
+    const price = await resolveEffectiveGhsPrice(prisma, productId);
+    if (!price) {
+        throw new BusinessPriceError('GHS_PRICE_UNAVAILABLE',
+            `product ${productId} has no confirmed current GHS price — refusing to create an order rather than pricing it in another currency`);
+    }
+
+    // Exact: 2dp cedi price times an integer count stays a Decimal end to end.
+    const unitGhs = new Prisma.Decimal(price.amountExact);
+    if (!unitGhs.gt(0)) throw new BusinessPriceError('GHS_PRICE_NOT_POSITIVE', `product ${productId} has a non-positive GHS price`);
+
+    const orderRef = await _generateOrderRef(prisma);
+    const order = await prisma.businessOrder.create({
+        data: {
+            businessProfileId,
+            customerId,
+            productId,
+            status: 'AWAITING_PAYMENT',
+            orderRef,
+            title: cleanTitle,
+            description: description ? String(description).slice(0, 500) : null,
+            customerNotes: customerNotes ? String(customerNotes).slice(0, 500) : null,
+            currency: 'GHS',
+            amountGhs: unitGhs.times(qty),
+            amountUsdc: null,
+        },
+    });
+    emitWebhookEvent(businessProfileId, 'order.created', {
+        orderId: order.id, orderRef: order.orderRef, customerId, currency: 'GHS', amountGhs: String(order.amountGhs), status: order.status,
+    });
     return order;
 };
 
@@ -203,19 +335,41 @@ const updateOrderStatusFromEscrow = async (prisma, escrowId, escrowStatus) => {
 };
 
 const getBusinessStats = async (prisma, { businessProfileId }) => {
-    const [totalOrders, completedOrders, pendingOrders, disputedOrders, cancelledOrders, revenueAgg, recentOrders, revenueByDay, invoiceSent, invoicePaid, invoiceRevenue] = await Promise.all([
+    const [totalOrders, completedOrders, pendingOrders, disputedOrders, cancelledOrders, revenueAgg, revenueRows, recentOrders, revenueByDay, invoiceSent, invoicePaid, invoiceRevenue] = await Promise.all([
         prisma.businessOrder.count({ where: { businessProfileId } }),
         prisma.businessOrder.count({ where: { businessProfileId, status: 'COMPLETED' } }),
         prisma.businessOrder.count({ where: { businessProfileId, status: { in: ['AWAITING_PAYMENT', 'PAID', 'DELIVERED'] } } }),
         prisma.businessOrder.count({ where: { businessProfileId, status: 'DISPUTED' } }),
         prisma.businessOrder.count({ where: { businessProfileId, status: { in: ['REFUNDED', 'CANCELLED'] } } }),
+        // Legacy USDC scalar. SQL SUM ignores NULLs, so this counts only orders
+        // that actually carry a USDC amount — which is what it has always meant.
         prisma.businessOrder.aggregate({ where: { businessProfileId, status: 'COMPLETED' }, _sum: { amountUsdc: true } }),
+        // Currency-partitioned totals, added alongside it (never merged).
+        // See src/lib/businessRevenueAggregate.js.
+        prisma.businessOrder.findMany({
+            where: { businessProfileId, status: 'COMPLETED' },
+            select: { currency: true, amountUsdc: true, amountGhs: true },
+        }),
         prisma.businessOrder.findMany({ where: { businessProfileId }, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take: 5, include: ORDER_INCLUDE }),
         _getRevenueByDay(prisma, businessProfileId),
         prisma.businessInvoice.count({ where: { businessProfileId, status: 'SENT' } }),
         prisma.businessInvoice.count({ where: { businessProfileId, status: 'PAID' } }),
         prisma.businessInvoice.aggregate({ where: { businessProfileId, status: 'PAID' }, _sum: { billTotalUsdc: true } }),
     ]);
+    const revenue = sumOrdersByCurrency(revenueRows);
+
+    // The single figure a dashboard can show without lying. Native GHS wins
+    // whenever the merchant has taken cedis, because GHS is the primary rail and
+    // for many merchants the only one. USDC appears only when it is the sole
+    // activity. This is a CHOICE BETWEEN the two, never a sum of them, and it is
+    // null when there is no revenue at all rather than 0.00 of some assumed
+    // currency.
+    const headline = revenue.counts.GHS > 0
+        ? { currency: 'GHS', amount: revenue.GHS }
+        : (revenue.counts.USDC > 0 ? { currency: 'USDC', amount: revenue.USDC } : null);
+    // `totalRevenue` is kept for existing clients and means USDC revenue ONLY
+    // (the SUM above ignores NULL USDC amounts, so GHS orders never enter it).
+    // It must never become a merged GHS+USDC figure.
     const totalRevenue = Number(revenueAgg._sum.amountUsdc || 0);
     return {
         totalOrders,
@@ -224,9 +378,14 @@ const getBusinessStats = async (prisma, { businessProfileId }) => {
         disputedOrders,
         cancelledOrders,
         totalRevenue,
+        revenue,
+        headline,
+        revenueBasis: 'PER_CURRENCY',
+        avgOrderValueByCurrency: averageOrderValue(revenue),
         avgOrderValue: completedOrders > 0 ? totalRevenue / completedOrders : 0,
         recentOrders,
         revenueByDay,
+        revenueByDayBasis: 'PER_CURRENCY',
         invoiceStats: {
             sent: invoiceSent,
             paid: invoicePaid,
@@ -235,4 +394,4 @@ const getBusinessStats = async (prisma, { businessProfileId }) => {
     };
 };
 
-module.exports = { createOrder, getOrder, listOrdersForBusiness, listOrdersForCustomer, markDelivered, updateOrderStatusFromEscrow, getBusinessStats };
+module.exports = { createOrder, createGhsOrder, getOrder, listOrdersForBusiness, listOrdersForCustomer, markDelivered, updateOrderStatusFromEscrow, getBusinessStats };

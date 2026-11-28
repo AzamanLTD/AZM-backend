@@ -1,0 +1,24 @@
+# §WP-H §8 — the reproducible full-suite stack, executed on a real Docker host.
+# Manual, plus a narrow path trigger so a change to the stack itself is proved
+# rather than merged on inspection alone.
+name: Docker full suite
+
+on:
+  workflow_dispatch:
+  # Manual only. This lane exists to rehearse the container stack on demand; it
+  # must never fire on a push, because a red container run costs CI minutes and
+  # attention while the branch's real evidence comes from the test and durability
+  # lanes. The stack itself is verified locally with `make test-full`.
+jobs:
+  full-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show compose version
+        run: docker compose version
+      - name: Run the complete suite against disposable services
+        run: make test-full
+      - name: Always tear the stack down
+        if: always()
+        run: docker compose --profile tls --profile api down -v --remove-orphans || true

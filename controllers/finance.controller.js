@@ -19,7 +19,7 @@
 // Routes wired in routes/financeRoutes.js:
 //   POST /api/finance/withdraw/fiat                   → (r42 WAVE-2: canonical alias → withdrawalController.fiatWithdrawal, full authority)
 //   POST /api/finance/admin/liquidate-profits         → liquidateProfits        (admin only)
-//   POST /api/finance/webhook/deposit                 → cryptoDepositWebhook    (public, idempotent)
+//   POST /api/finance/webhook/deposit                 → retiredCryptoDepositWebhook (410, no state access)
 
 /**
  * Phase N helper: retrieve the singleton NotificationService from app context.
@@ -41,6 +41,7 @@ const fiatLiquidity                = require('../src/services/fiatLiquidityServi
 const { canonicalProviderName, persistPayoutOwnership } = require('../services/payoutProviderOwnership'); // r20 P0
 const { recordReconciliationExceptionLoud } = require('../services/reconciliationExceptionService');
 const { FIAT_POOL_ALERT_THRESH }   = financeService;
+const fiatLiquidityActivation     = require('../src/services/fiatLiquidityActivationService');
 const crypto                       = require('crypto');
 const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client'); // r39 exact decimals
@@ -49,9 +50,13 @@ const ledger = require('../services/ledgerService'); // r39 exact-decimal parser
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 /** Tier the fiat pool balance for the public status endpoint. */
-const _classifyFiatPool = (balance) => {
-    if (balance >= FIAT_POOL_ALERT_THRESH)        return 'HEALTHY';
-    if (balance >= FIAT_POOL_ALERT_THRESH / 2)    return 'LIMITED';
+const _classifyFiatPool = (balance) => _classifyFiatPoolValue(balance, FIAT_POOL_ALERT_THRESH);
+
+/** Tier a pool value against the floor expressed in ITS OWN unit. */
+const _classifyFiatPoolValue = (balance, threshold) => {
+    const value = Number(balance);
+    if (value >= threshold)        return 'HEALTHY';
+    if (value >= threshold / 2)    return 'LIMITED';
     return 'CRITICAL';
 };
 
@@ -92,6 +97,12 @@ exports.liquidateProfits = async (req, res) => {
                 amountLiquidated: data.amountLiquidated,
                 newProfitFees:    data.newProfitFees,
                 newFiatPool:      data.newFiatPool,
+                // A pool figure is meaningless without its unit: under the
+                // authority this is the GHS projection, not a USDC pool.
+                newFiatPoolUnit:   data.newFiatPoolUnit,
+                newFiatPoolRegime: data.newFiatPoolRegime,
+                fiatPoolCredited:  data.fiatPoolCredited,
+                treasuryOpeningRecorded: data.treasuryOpeningRecorded,
                 timestamp:        new Date().toISOString()
             });
         } catch (socketErr) {
@@ -100,7 +111,9 @@ exports.liquidateProfits = async (req, res) => {
 
         return res.status(200).json({
             success: true,
-            message: `Liquidated ${data.amountLiquidated} USDC from SystemProfitFees to SystemFiatPool.`,
+            message: data.treasuryOpeningRecorded
+                ? `Liquidated ${data.amountLiquidated} USDC from SystemProfitFees and recorded a NON-AVAILABLE AZM treasury opening. No spendable GHS entered the fiat pool.`
+                : `Liquidated ${data.amountLiquidated} USDC from SystemProfitFees to SystemFiatPool.`,
             data
         });
     } catch (error) {
@@ -110,72 +123,29 @@ exports.liquidateProfits = async (req, res) => {
 };
 
 // =============================================================================
-// POST /api/finance/webhook/deposit  — crypto deposit listener (Tatum/Alchemy)
+// POST /api/finance/webhook/deposit — RETIRED. Refuses before any read or write.
+//
+// This route was mounted with no authentication and no signature check. It
+// took `userId`, `amount` and `txHash` from the request body and credited that
+// user's spendable USDC balance, so anyone who could reach the API could mint
+// balance for any account with a made-up hash. No client calls it, and no
+// provider is configured to: crypto deposits arrive through the verified
+// Tatum webhook (POST /api/finance/webhook/tatum), which resolves the owner
+// from the WalletAddress registry rather than from the payload.
+//
+// The handler deliberately touches nothing — no prisma, no socket, no
+// notification — so a request can never mutate state, whatever its body.
 // =============================================================================
-exports.cryptoDepositWebhook = async (req, res) => {
-    const prisma            = req.app.get('prisma');
-    const io                = req.app.get('socketio');
-    const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
-
-    try {
-        const { amount, txHash, address, userId } = req.body;
-        if (!amount || !txHash) {
-            return res.status(400).json({ success: false, message: 'Missing required fields: amount, txHash.' });
-        }
-        const amountUsdc   = parseFloat(amount);
-        const targetUserId = parseInt(userId, 10);
-        if (isNaN(amountUsdc) || amountUsdc <= 0) {
-            return res.status(400).json({ success: false, message: 'Invalid USDC amount.' });
-        }
-        if (!targetUserId || isNaN(targetUserId)) {
-            return res.status(400).json({ success: false, message: 'userId is required in the webhook payload.' });
-        }
-
-        const result = await financeService.processCryptoDeposit(prisma, {
-            userId:     targetUserId,
-            amountUsdc,
-            txHash,
-            address
-        });
-
-        if (result.alreadyProcessed) {
-            return res.status(200).json({
-                success: true,
-                message: 'Transaction already processed.',
-                data:    { txHash, alreadyProcessed: true }
-            });
-        }
-
-        await emitBalanceUpdate(targetUserId);
-        io.to(`user_${targetUserId}`).emit('deposit_success', {
-            type:       'DEPOSIT_CRYPTO',
-            amount:     amountUsdc,
-            txHash,
-            newBalance: result.data.newBalance,
-            timestamp:  new Date().toISOString()
-        });
-
-        try {
-            await _getNotificationService(req).sendNotification({
-                userId:        targetUserId,
-                title:         '💰 Deposit Confirmed',
-                body:          `${amountUsdc} USDC has been credited to your account.`,
-                category:      'GENERAL',
-                actionPayload: { action: 'OPEN_WALLET', reference: txHash }
-            });
-        } catch (notifErr) {
-            logger.error({ err: notifErr }, '[cryptoDepositWebhook] Notification write failed');
-        }
-
-        return res.status(200).json({
-            success: true,
-            message: `Crypto deposit of ${amountUsdc} USDC confirmed for user ${targetUserId}.`,
-            data:    result.data
-        });
-    } catch (error) {
-        logger.error({ err: error }, '[finance.cryptoDepositWebhook] error');
-        return res.status(500).json({ success: false, message: error.message });
-    }
+exports.retiredCryptoDepositWebhook = (req, res) => {
+    logger.warn(
+        { ip: req.ip, path: req.originalUrl },
+        '[finance] refused call to the retired unauthenticated deposit webhook'
+    );
+    return res.status(410).json({
+        success: false,
+        code: 'DEPOSIT_WEBHOOK_RETIRED',
+        message: 'This endpoint has been retired. Nothing was credited.',
+    });
 };
 
 // =============================================================================
@@ -558,9 +528,35 @@ exports.moolreDisbursementWebhook = async (req, res) => {
 exports.getFiatPoolStatus = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const pool = await prisma.systemFiatPool.findUnique({ where: { id: 1 } });
-        const balance = pool?.balance ?? 0;
-        const status  = _classifyFiatPool(balance);
+        // §P.5-D UNIT CONTRACT: SystemFiatPool.balance is a USDC pool only while
+        // the GHS liquidity authority has never been activated. Once the
+        // authority is (latched, see fiatLiquidityActivationService) the same
+        // column holds a GHS projection of FiatLiquidityState.availableGhs and
+        // MUST be classified against a GHS floor — comparing 600 GHS against a
+        // 100 USDC threshold would report the pool as healthy on a wide margin
+        // while it is actually 8x short. Existing response keys are preserved
+        // for current consumers; `currency`/`regime` state which unit
+        // `balance`/`threshold` are expressed in.
+        // ONE statement = ONE snapshot: the mode and the balance cannot straddle
+        // an activation, and the authoritative GHS figure is used while active.
+        const mode = await fiatLiquidityActivation.readModeAndPool(prisma);
+        const pool = await prisma.systemFiatPool.findUnique({ where: { id: 1 }, select: { updatedAt: true } });
+        const balance = mode.balance;
+
+        let threshold = FIAT_POOL_ALERT_THRESH;
+        if (mode.active) {
+            const settings = await prisma.globalSettings.findUnique({
+                where: { id: 1 }, select: { liveRetailRate: true },
+            }).catch(() => null);
+            const rate = new Prisma.Decimal(Number(settings?.liveRetailRate) || 12.5);
+            // Exact pesewa conversion of the configured USDC floor — the same
+            // arithmetic the auto-payout worker's operational floor uses.
+            threshold = parseFloat(
+                fiatLiquidity.toExactGhsDecimal(new Prisma.Decimal(FIAT_POOL_ALERT_THRESH).times(rate).toFixed(2))
+                    .toString()
+            );
+        }
+        const status = _classifyFiatPoolValue(balance, threshold);
 
         const bannerTexts = {
             HEALTHY: 'Withdrawals are operating normally.',
@@ -571,11 +567,22 @@ exports.getFiatPoolStatus = async (req, res) => {
         return res.status(200).json({
             success: true,
             data: {
-                balance:    parseFloat(balance.toFixed(6)),
-                threshold:  FIAT_POOL_ALERT_THRESH,
+                balance:    parseFloat(Number(balance.toString()).toFixed(6)),
+                threshold,
                 status,                                    // 'HEALTHY' | 'LIMITED' | 'CRITICAL'
                 bannerText: bannerTexts[status],
-                lastUpdate: pool?.updatedAt || null
+                lastUpdate: pool?.updatedAt || null,
+                // Unit of `balance` and `threshold` (they always share one).
+                currency:          mode.authorityUnit,     // 'GHS' | 'USDC'
+                thresholdCurrency: mode.authorityUnit,
+                regime:            mode.active ? 'GHS_AUTHORITY' : 'LEGACY_USDC_POOL',
+                authorityMode:     mode.active,
+                authorityActivatedAt: mode.activatedAt,
+                // While the authority has NEVER been activated, SystemFiatPool
+                // really is the legacy USDC pool, so this is an authoritative
+                // USDC figure. After activation no authoritative USDC pool
+                // exists: null rather than a relabelled GHS number.
+                legacyUsdcPoolBalance: mode.active ? null : parseFloat(Number(balance.toString()).toFixed(6)),
             }
         });
     } catch (error) {

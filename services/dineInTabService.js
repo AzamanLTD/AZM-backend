@@ -57,7 +57,7 @@ const notifyRecoveredPayment = async (prisma, tab, io) => {
 };
 
 exports.openTab = async (prisma, opts) => {
-    const result = await service(prisma, opts).openTab({ businessProfileId: opts.businessProfileId, azamanId: opts.azamanId || opts.customerAzamanId, locationId: opts.locationId, tableId: opts.tableId });
+    const result = await service(prisma, opts).openTab({ businessProfileId: opts.businessProfileId, azamanId: opts.azamanId || opts.customerAzamanId, locationId: opts.locationId, tableId: opts.tableId, currency: opts.currency });
     await notify(prisma, opts, result, 'DINE_IN_TAB_OPENED');
     return result;
 };
@@ -68,6 +68,7 @@ exports.addItem = async (prisma, opts) => addItemAtomically(prisma, {
     productId: opts.productId,
     name: opts.name,
     price: opts.price ?? opts.unitPriceUsdc,
+    priceGhs: opts.priceGhs,
     quantity: normalizeQuantity(opts.quantity),
     notes: opts.notes,
     addedBy: opts.addedBy ?? opts.userId,

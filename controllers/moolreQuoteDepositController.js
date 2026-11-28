@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const { verifyMoolreCallback } = require('../src/services/moolreWebhookAuth');
 const { audit } = require('../utils/audit');
 const logger = require('../src/config/logger');
 const ledger = require('../services/ledgerService'); // §P.4 authoritative ledger (shadow journalIntegration no longer used on this path)
@@ -18,6 +19,7 @@ const {
   getPersistedTransactionQuoteExact,
 } = require('../src/services/transactionQuoteService');
 const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
+const { trustedCollectionWallet } = require('../src/services/moolreTrustedWallet');
 const modelBSettlement = require('../services/modelBSettlementService'); // §P.5-E
 const routePolicy = require('../src/services/routePolicyService');
 const { Prisma } = require('@prisma/client');
@@ -224,6 +226,7 @@ exports.initiate = async (req, res) => {
             dedupKey: `event:moolre-initiation:${pending.txHash}`,
             amountGhs: amountGhsCanonical,
             relatedReference: pending.txHash,
+            walletAccount: trustedCollectionWallet(),
             raw: { stage: 'INITIATE', ...attempt },
           });
         } catch (evidenceErr) {
@@ -332,17 +335,22 @@ exports.webhook = async (req, res) => {
   let quoteId;
   let settlementProviderRef;
   try {
-    const expectedSecret = process.env.MOOLRE_WEBHOOK_SECRET;
-    if (!expectedSecret) return res.status(503).json({ success: false, message: 'Webhook endpoint not configured.' });
-
-    const rawBody = req.rawBody || JSON.stringify(req.body);
-    const signature = req.headers['x-moolre-signature'];
-    let authenticated = signature && safeEqual(
-      signature,
-      crypto.createHmac('sha256', expectedSecret).update(rawBody).digest('hex'),
-    );
-    if (!authenticated) authenticated = safeEqual(req.headers['x-moolre-webhook-secret'], expectedSecret);
-    if (!authenticated) return res.status(401).json({ success: false, message: 'Unauthorized.' });
+    // ONE verifier for every Moolre callback (src/services/moolreWebhookAuth):
+    // the documented X-Moolre-Signature (t=,v1= over "<t>.<raw body>", 5-minute
+    // window), or the legacy documented data.secret until Moolre's sunset. A
+    // body that asserts a secret must assert the right one (WP-I case 4). The
+    // undocumented static header / bare HMAC are accepted outside production
+    // only.
+    const auth = verifyMoolreCallback({
+      headers: req.headers,
+      rawBody: req.rawBody,
+      body: req.body,
+      secret: process.env.MOOLRE_WEBHOOK_SECRET,
+    });
+    if (!auth.ok) {
+      if (auth.status === 503) return res.status(503).json({ success: false, message: 'Webhook endpoint not configured.' });
+      return res.status(401).json({ success: false, message: 'Unauthorized.' });
+    }
 
     const { status, code, data } = req.body || {};
     if (Number(status) !== 1 || code !== 'P01') return res.status(200).json({ success: true, message: 'Event acknowledged.' });
@@ -357,8 +365,34 @@ exports.webhook = async (req, res) => {
     // and accepted input is never altered on its way to evidence/settlement
     // comparison.
 
+    // ── WP-I §9: gross vs net ───────────────────────────────────────────────
+    // Moolre's documented payload carries `amount` (what the payer sent) and
+    // `value` ("Transaction value after applicable fees"). Crediting `amount`
+    // when the provider deducted a fee overstates the money we actually hold.
+    //
+    // So: when the provider reports `value`, that is the settled figure and the
+    // difference is recorded as the fee. When `value` is ABSENT the provider has
+    // not told us the net, so we keep the pre-WP-I gross behaviour unchanged
+    // (existing money paths must not shift on an absence) and mark the evidence
+    // `netValueUnavailable`, which the treasury witness refuses to accept.
+    let providerFeeGhs = null;
+    let netValueUnavailable = false;
     try {
-        settledGhs = fiatLiquidity.toExactGhsDecimal(data?.amount, { field: 'amount' });
+        const grossGhs = fiatLiquidity.toExactGhsDecimal(data?.amount, { field: 'amount' });
+        const hasNet = data?.value !== undefined && data?.value !== null && String(data.value).trim() !== '';
+        if (hasNet) {
+            settledGhs = fiatLiquidity.toExactGhsDecimal(data.value, { field: 'value' });
+            const fee = grossGhs.minus(settledGhs);
+            // A fee can only be zero or positive; a negative one means the
+            // fields are not the pair we documented, so we do not invent a rule.
+            if (fee.isNegative()) {
+                return res.status(409).json({ success: false, message: 'Callback net value exceeds the gross amount — the payload does not match the documented contract, so it cannot be settled automatically.' });
+            }
+            providerFeeGhs = fee;
+        } else {
+            settledGhs = grossGhs;
+            netValueUnavailable = true;
+        }
     } catch (e) {
         return res.status(400).json({ success: false, message: 'Invalid settlement amount — must be a positive decimal exact to the pesewa (2 decimal places).' });
     }
@@ -448,6 +482,9 @@ exports.webhook = async (req, res) => {
             dedupKey: moolreEventDedupKey(externalRef),
             amountGhs: settledGhs,
             relatedReference: externalRef,
+            // §WP-I: the wallet is the one WE are configured to collect into. The
+            // callback body's accountnumber is never used to establish identity.
+            walletAccount: trustedCollectionWallet(),
             raw: req.body || null,
         });
         providerEvent = recorded.event;
@@ -547,6 +584,8 @@ exports.webhook = async (req, res) => {
         settlementProviderRef,
         payerMsisdn: data?.payer || null,
         providerData: data,
+        providerFeeGhs,
+        netValueUnavailable,
         evidenceSource: 'moolre_webhook',
     });
 

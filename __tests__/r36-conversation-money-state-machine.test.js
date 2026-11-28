@@ -40,7 +40,7 @@ jest.mock('../middleware/banGuardMiddleware', () => {
 
 const { PrismaClient } = require('@prisma/client');
 const conversationRoutes = require('../routes/conversationRoutes');
-const { seedUser } = require('./helpers/factories');
+const { seedUser, TEST_PASSWORD } = require('./helpers/factories');
 
 const url = process.env.TEST_DATABASE_URL;
 const run = url ? describe : describe.skip;
@@ -58,11 +58,14 @@ run('r36/P0 — conversation money state machine', () => {
 
     const asUser = (user) => { global.__R36_MONEY_USER__ = user ? { id: user.id } : null; };
 
-    const post = (convId, body) => request(app).post(`/api/conversations/${convId}/messages`).send(body);
-    const accept = (convId, messageId) => request(app).post(`/api/conversations/${convId}/messages/${messageId}/accept-money`);
+    // Money that leaves the caller carries a second factor; seeded users have
+    // no TOTP, so the second factor is their password, as a real client sends.
+    const withSecondFactor = (body) => (body && body.type === 'MONEY_SEND' ? { ...body, password: TEST_PASSWORD } : body);
+    const post = (convId, body) => request(app).post(`/api/conversations/${convId}/messages`).send(withSecondFactor(body));
+    const accept = (convId, messageId) => request(app).post(`/api/conversations/${convId}/messages/${messageId}/accept-money`).send({ password: TEST_PASSWORD });
     const decline = (convId, messageId) => request(app).post(`/api/conversations/${convId}/messages/${messageId}/decline-money`);
-    const fund = (convId, messageId) => request(app).post(`/api/conversations/${convId}/messages/${messageId}/fund-escrow`);
-    const release = (convId, messageId) => request(app).post(`/api/conversations/${convId}/messages/${messageId}/release-escrow`);
+    const fund = (convId, messageId) => request(app).post(`/api/conversations/${convId}/messages/${messageId}/fund-escrow`).send({ password: TEST_PASSWORD });
+    const release = (convId, messageId) => request(app).post(`/api/conversations/${convId}/messages/${messageId}/release-escrow`).send({ password: TEST_PASSWORD });
     const dispute = (convId, messageId, reason) => request(app).post(`/api/conversations/${convId}/messages/${messageId}/dispute-escrow`).send({ reason });
     const history = (convId) => request(app).get(`/api/conversations/${convId}/messages`);
 
@@ -75,13 +78,23 @@ run('r36/P0 — conversation money state machine', () => {
         return conv;
     };
 
-    beforeAll(() => {
+    beforeAll(async () => {
         process.env.DATABASE_URL = url;
         db = new PrismaClient();
         app = express();
         app.use(express.json());
         app.set('prisma', db);
         app.use('/api/conversations', conversationRoutes);
+        // Universal USDC transaction gate: accept-money authorizations
+        // demand a FRESH canonical USDC/GHS rate observation. A fresh
+        // CI database carries a GlobalSettings row with a null/stale
+        // lastExternalSync → the gate correctly fails closed with 503.
+        // Seed the execution contract the same way as the r19 snapshots.
+        await db.globalSettings.upsert({
+            where: { id: 1 },
+            update: { liveRetailRate: 15, liveUsdToGhs: 15, lastExternalSync: new Date(), lastRateSync: new Date(), liveRateSource: 'KOTANI_PAY' },
+            create: { id: 1, liveRetailRate: 15, liveUsdToGhs: 15, lastExternalSync: new Date(), lastRateSync: new Date(), liveRateSource: 'KOTANI_PAY' },
+        });
     });
     afterAll(async () => { await db.$disconnect(); });
     afterEach(async () => {

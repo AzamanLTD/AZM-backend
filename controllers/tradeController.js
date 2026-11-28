@@ -13,6 +13,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const { requireConsumedStepUp, isStepUpRejection, respondStepUpRejected } = require('../middleware/requireActionStepUp');
 const { Prisma } = require('@prisma/client');
 const ledger = require('../services/ledgerService');
 const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
@@ -219,6 +220,9 @@ exports.initiateTrade = async (req, res) => {
         // single atomic transaction to prevent race conditions where two requests
         // both pass the capacity check simultaneously.
         const tradeResult = await prisma.$transaction(async (tx) => {
+            // §WP-H G — the grant (when enforced) is spent first: the queue entry
+            // or the trade it authorises commits with it, or neither does.
+            await requireConsumedStepUp(tx, req);
             // Count active trades INSIDE the transaction (prevents race condition)
             const activeTradeCount = await tx.trade.count({
                 where: {
@@ -365,10 +369,22 @@ exports.initiateTrade = async (req, res) => {
         
         const earningsSettings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
         const tierThreshold = Number(earningsSettings?.tierThreshold ?? 1000);
-        const platformFeePct = feeProfile.platformFeePct || Number(earningsSettings?.p2pFeePct ?? 0.02);
-        const vendorSplit = Number(newTrade.amountCrypto) >= tierThreshold
-            ? (feeProfile.vendorSplitPct || Number(earningsSettings?.vendorShareOver1k ?? 0.50))
-            : (feeProfile.vendorSplitPct || Number(earningsSettings?.vendorShareUnder1k ?? 0.40));
+        // Must agree with settlement: a matched profile's values apply exactly,
+        // including a legitimate 0; otherwise the GlobalSettings tier defaults.
+        // Same resolver as settlement: a matched profile applies exactly
+        // (including 0), and the fallback path honours the payment-method
+        // override, so the advertised estimate cannot drift from what the
+        // completed trade actually pays.
+        const { resolveP2pFeePolicy } = require('../services/p2p/feePolicy');
+        const feePolicy = resolveP2pFeePolicy({
+            settings: earningsSettings,
+            feeProfile,
+            paymentMethod: newTrade.paymentMethod,
+            amountCrypto: newTrade.amountCrypto,
+            defaults: { p2pFeePct: 0.02, tierThreshold: 1000, adminOver1k: 0.50, adminUnder1k: 0.60 },
+        });
+        const platformFeePct = feePolicy.feePct;
+        const vendorSplit = feePolicy.vendorPct;
         const expectedVendorEarningsUsdc = parseFloat((Number(newTrade.amountCrypto) * platformFeePct * vendorSplit).toFixed(6));
 
         res.status(201).json({
@@ -384,6 +400,8 @@ exports.initiateTrade = async (req, res) => {
         });
 
     } catch (error) {
+        // The throw rolled the whole transaction back: nothing was created.
+        if (isStepUpRejection(error)) return respondStepUpRejected(res, error);
         logger.error('Initiate Trade Error:', error);
         res.status(400).json({ success: false, message: error.message });
     }
@@ -418,6 +436,8 @@ exports.acceptTrade = async (req, res) => {
         }
 
         const updatedTrade = await prisma.$transaction(async (tx) => {
+            // §WP-H G — spend the grant (when enforced) before the escrow lock.
+            await requireConsumedStepUp(tx, req);
             const trade = await tx.trade.findUnique({
                 where: { id: tradeIdInt },
                 include: {
@@ -564,6 +584,7 @@ exports.acceptTrade = async (req, res) => {
         res.status(200).json({ success: true, trade: updatedTrade });
 
     } catch (error) {
+        if (isStepUpRejection(error)) return respondStepUpRejected(res, error);
         logger.error({ err: error }, 'acceptTrade error');
         const status = error.message.includes('not found') ? 404
             : error.message.includes('Only') || error.message.includes('Cannot') ? 403

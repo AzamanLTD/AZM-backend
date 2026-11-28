@@ -47,6 +47,19 @@ if (!process.env.DATABASE_URL) {
     logger.fatal('DATABASE_URL is not set. Server cannot start.');
     process.exit(1);
 }
+// QR check-in signs with its OWN key, never JWT_SECRET. In production a
+// missing or short key would mean every scan silently fails (or, worse, that a
+// rotation of the auth secret silently mints valid roving passes), so the boot
+// refuses instead. Non-production keeps running with the feature failing
+// closed per request, which is what a developer without the key needs.
+if (process.env.NODE_ENV === 'production') {
+    const qrKey = require('./services/qrCheckInService').validateSigningKey(process.env.QR_CHECKIN_SIGNING_KEY);
+    if (!qrKey.ok) {
+        // Never log the value; the validator message names the variable only.
+        logger.fatal(qrKey.message + ' Server cannot start.');
+        process.exit(1);
+    }
+}
 
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -124,8 +137,12 @@ if (process.env.REDIS_URL) {
     try {
         const { createAdapter } = require('@socket.io/redis-adapter');
         const { Redis } = require('ioredis');
-        const isTLS = process.env.REDIS_URL.startsWith('rediss://');
-        const pubClient = new Redis(process.env.REDIS_URL, isTLS ? { tls: {} } : {});
+        // Validate through the shared layer so an Upstash REST URL, a malformed
+        // URL, or a plaintext-in-production URL cannot reach ioredis here.
+        const { normalizeRedisUrl } = require('./src/lib/redisConnection');
+        const redisUrl = normalizeRedisUrl(process.env.REDIS_URL);
+        const isTLS = redisUrl.startsWith('rediss://');
+        const pubClient = new Redis(redisUrl, isTLS ? { tls: {} } : {});
         const subClient = pubClient.duplicate();
         pubClient.on('connect', () => { redisStatus = 'connected'; });
         pubClient.on('error', (e) => {

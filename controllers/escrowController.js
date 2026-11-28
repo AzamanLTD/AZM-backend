@@ -16,6 +16,7 @@
 
 const logger = require('../src/config/logger');
 const escrowService = require('../services/escrowService');
+const { requireConsumedStepUp, isStepUpRejection, respondStepUpRejected } = require('../middleware/requireActionStepUp');
 const bizNotificationService = require('../services/bizNotificationService');
 const { audit } = require('../utils/audit');
 
@@ -124,6 +125,7 @@ exports.fundEscrow = async (req, res) => {
         const result = await escrowService.fundEscrow(prisma, {
             escrowId, payerId: userId,
             financialOperation: res.locals?.financialOperation || null,
+            authorize: (tx) => requireConsumedStepUp(tx, req),
         });
         const escrow = result.escrow;
 
@@ -151,6 +153,7 @@ exports.fundEscrow = async (req, res) => {
         // committed replay and the live response are byte-identical.
         return res.status(200).json(result.body);
     } catch (err) {
+        if (isStepUpRejection(err)) return respondStepUpRejected(res, err);
         logger.error({ err: err }, '[fundEscrow] error');
         // §r42.1 failure semantics: a lost funding CAS (state changed /
         // already funded) or an insufficient-balance loss provably committed
@@ -181,7 +184,10 @@ exports.markSatisfied = async (req, res) => {
         const loaded = await _loadEscrowForParticipant(prisma, escrowId, userId);
         if (!loaded.ok) return res.status(loaded.code).json({ success: false, message: loaded.message });
 
-        const result = await escrowService.markSatisfied(prisma, { escrowId, userId });
+        const result = await escrowService.markSatisfied(prisma, {
+            escrowId, userId,
+            authorize: (tx) => requireConsumedStepUp(tx, req),
+        });
         const escrow = result.escrow;
 
         const actor = await prisma.user.findUnique({
@@ -239,6 +245,14 @@ exports.markSatisfied = async (req, res) => {
 
         return res.status(200).json({ success: true, settled: result.settled, escrow });
     } catch (err) {
+        if (isStepUpRejection(err)) return respondStepUpRejected(res, err);
+        // Satisfaction is one transaction: these refusals provably committed
+        // nothing, so the idempotency claim is released for a corrected retry
+        // instead of poisoning the key behind a 500.
+        if (err && (err.code === 'ESCROW_STATE_CHANGED' || /already marked this escrow/i.test(err.message || ''))) {
+            res.locals.financialClaimRelease = true;
+            return res.status(409).json({ success: false, code: err.code || 'ESCROW_ALREADY_SATISFIED', message: err.message });
+        }
         logger.error({ err: err }, '[markSatisfied] error');
         return res.status(500).json({ success: false, message: err.message });
     }

@@ -25,6 +25,10 @@ describe('DepositReconciliationWorker stale pending scan', () => {
             transactionHistory: {
                 findMany: jest.fn().mockResolvedValue([row]),
             },
+            // 83c6e5e8 gates the provider query behind the durable parking read.
+            // Nothing is parked here, so the tick must still resolve the deposit:
+            // an empty result is the "carry on" answer, not a missing mock.
+            $queryRawUnsafe: jest.fn().mockResolvedValue([]),
         };
         const moolre = {};
         const worker = new DepositReconciliationWorker(prisma, moolre, null);
@@ -48,6 +52,27 @@ describe('DepositReconciliationWorker stale pending scan', () => {
             moolre,
             transactionHistoryId: row.id,
         });
+    });
+
+    test('a parked deposit is not re-asked of the provider on the next tick', async () => {
+        const fixedNow = new Date('2026-10-11T12:00:00.000Z').getTime();
+        jest.spyOn(Date, 'now').mockReturnValue(fixedNow);
+
+        const row = { id: 'tx-2', txHash: 'moolre-ref-2' };
+        const prisma = {
+            transactionHistory: { findMany: jest.fn().mockResolvedValue([row]) },
+            // An OPEN blocking exception is the durable "do not ask again" state.
+            $queryRawUnsafe: jest.fn().mockResolvedValue([
+                { reason: 'DEPOSIT_RECONCILIATION_PARKED', status: 'OPEN', details: {} },
+            ]),
+        };
+        const worker = new DepositReconciliationWorker(prisma, {}, null);
+        resolvePendingDeposit.mockClear();
+
+        await worker._tick();
+
+        expect(prisma.$queryRawUnsafe).toHaveBeenCalledTimes(1);
+        expect(resolvePendingDeposit).not.toHaveBeenCalled();
     });
 
     test('does not overlap concurrent ticks', async () => {

@@ -123,28 +123,28 @@ describe('Scheduler Redis resilience', () => {
     });
 
     // ── 1. Redis-off startup ─────────────────────────────────────────────────
-    test('REDIS_URL unset → fallback mode, every job scheduled exactly once', async () => {
+    test('REDIS_URL unset with no explicit opt-in → schedules NOTHING, every job scheduled exactly once', async () => {
         delete process.env.REDIS_URL;
         const sched = new BullScheduler();
         const ticks = { a: 0, b: 0 };
 
         await sched.init();
-        expect(sched.getMode()).toBe('single_instance_fallback');
+        expect(sched.getMode()).toBe('disabled_no_scheduling');
         expect(sched.useBull).toBe(false);
 
         await sched.register('jobA', '60000', () => { ticks.a++; });
         await sched.register('jobB', '*/5 * * * *', () => { ticks.b++; });
 
         expect(sched.jobs.size).toBe(2);
-        expect(sched.fallbacks.size).toBe(2);
+        expect(sched.fallbacks.size).toBe(0);;
         expect(sched.queues.size).toBe(0);
-        expect(activeMechanisms(sched)).toBe(2);
+        expect(activeMechanisms(sched)).toBe(0);;
         // interval jobs fire once immediately (documented fallback behavior)
-        expect(ticks.a).toBe(1);
+        expect(ticks.a).toBe(0);
         expect(ticks.b).toBe(0);
 
         await sched.closeAll();
-        expect(sched.fallbacks.size).toBe(0);
+        expect(sched.fallbacks.size).toBe(0);;
     });
 
     // ── 2. Redis-on normal startup ───────────────────────────────────────────
@@ -183,13 +183,13 @@ describe('Scheduler Redis resilience', () => {
     });
 
     // ── 3. Boot gate: Redis dead at boot ─────────────────────────────────────
-    test('Redis unreachable at boot → clean wholesale fallback, connection killed', async () => {
+    test('Redis configured but unreachable at boot → schedules NOTHING → clean wholesale fallback, connection killed', async () => {
         process.env.REDIS_URL = 'rediss://default:pw@fake.upstash.io:6379';
         redisMockState.pingShouldFail = true;
         const sched = new BullScheduler();
 
         await sched.init();
-        expect(sched.getMode()).toBe('single_instance_fallback');
+        expect(sched.getMode()).toBe('unavailable_no_scheduling');
         expect(sched.useBull).toBe(false);
         // no partial Bull state, and the failing connection was hard-disconnected
         expect(sched.queues.size).toBe(0);
@@ -197,14 +197,14 @@ describe('Scheduler Redis resilience', () => {
         expect(MockRedis.instances[0].disconnected).toBe(true);
 
         await sched.register('jobA', '60000', async () => {});
-        expect(sched.fallbacks.size).toBe(1);
-        expect(activeMechanisms(sched)).toBe(1);
+        expect(sched.fallbacks.size).toBe(0);;
+        expect(activeMechanisms(sched)).toBe(0);;
 
         await sched.closeAll();
     });
 
     // ── 4. Fatal runtime error trips the breaker ─────────────────────────────
-    test('Upstash quota-exhausted error trips breaker → all jobs on fallback exactly once', async () => {
+    test('Upstash quota-exhausted error trips breaker → NO local scheduling → all jobs on fallback exactly once', async () => {
         process.env.REDIS_URL = 'rediss://default:pw@fake.upstash.io:6379';
         const sched = new BullScheduler();
         await sched.init();
@@ -219,13 +219,13 @@ describe('Scheduler Redis resilience', () => {
         await settle(); // breaker trip is async
 
         expect(sched.breakerTripped).toBe(true);
-        expect(sched.getMode()).toBe('single_instance_fallback');
+        expect(sched.getMode()).toBe('unavailable_no_scheduling');
         expect(sched.useBull).toBe(false);
         // every job re-registered on fallback; no job left in Bull
-        expect(sched.fallbacks.size).toBe(2);
+        expect(sched.fallbacks.size).toBe(0);;
         expect(sched.queues.size).toBe(0);
         expect(sched.workers.size).toBe(0);
-        expect(activeMechanisms(sched)).toBe(2);
+        expect(activeMechanisms(sched)).toBe(0);;
         // recovery probe armed
         expect(sched._probeTimer).toBeTruthy();
 
@@ -253,7 +253,7 @@ describe('Scheduler Redis resilience', () => {
     });
 
     // ── 6. queue.add hang → demote-all (boot registration gap) ───────────────
-    test('hanging queue.add demotes the whole fleet to fallback — no job silently dropped', async () => {
+    test('hanging queue.add → NO local scheduling to fallback — no job silently dropped', async () => {
         process.env.REDIS_URL = 'rediss://default:pw@fake.upstash.io:6379';
         const sched = new BullScheduler();
         sched.addTimeoutMs = 50; // shrink the boot-registration timeout
@@ -268,11 +268,11 @@ describe('Scheduler Redis resilience', () => {
 
         // demote-all: BOTH jobs (incl. the already-Bull-registered one) are on
         // fallback, nothing stays in Bull, nothing is silently dropped
-        expect(sched.getMode()).toBe('single_instance_fallback');
-        expect(sched.fallbacks.size).toBe(2);
+        expect(sched.getMode()).toBe('unavailable_no_scheduling');
+        expect(sched.fallbacks.size).toBe(0);;
         expect(sched.queues.size).toBe(0);
         expect(sched.workers.size).toBe(0);
-        expect(activeMechanisms(sched)).toBe(2);
+        expect(activeMechanisms(sched)).toBe(0);;
 
         await sched.closeAll();
     });
@@ -288,7 +288,10 @@ describe('Scheduler Redis resilience', () => {
         sched.redisConnection.emit('error', new Error('ERR max requests limit exceeded. Limit: 500000, Usage: 500006'));
         await settle();
         expect(sched.breakerTripped).toBe(true);
-        expect(sched.fallbacks.size).toBe(2);
+        // NOTHING scheduled locally while Redis is down: N replicas must not each
+        // become an independent scheduler for the same financial jobs.
+        expect(sched.fallbacks.size).toBe(0);
+        expect(sched.queues.size).toBe(0);
 
         // Redis comes back
         redisMockState.pingShouldFail = false;
@@ -309,6 +312,8 @@ describe('Scheduler Redis resilience', () => {
 
     // ── 8. Neither mode can schedule the job → fail loudly ───────────────────
     test('invalid cron in fallback mode throws (fail startup, never silently omit)', async () => {
+        // Local scheduling is an explicit mode; this test is about that mode.
+        process.env.SCHEDULER_SINGLE_INSTANCE = 'true';
         delete process.env.REDIS_URL;
         const sched = new BullScheduler();
         await sched.init();

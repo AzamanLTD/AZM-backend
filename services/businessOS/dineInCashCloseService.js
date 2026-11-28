@@ -83,13 +83,16 @@ const parseMoney = (value, field, { required = false } = {}) => {
 // Replay fingerprint over the EXACT 8-decimal canonical forms — tip/cash are
 // now Prisma.Decimal, so the fingerprint pins the precise stored value rather
 // than a lossy float rounding.
-const fingerprintOf = ({ businessProfileId, actorId, tabId, tip, cash }) =>
+// The requested currency is material: a same-key retry that switches the
+// till's currency is a different request, not a replay.
+const fingerprintOf = ({ businessProfileId, actorId, tabId, tip, cash, currency = null }) =>
     crypto.createHash('sha256').update(JSON.stringify({
         businessProfileId: String(businessProfileId),
         actorId: Number(actorId),
         tabId: String(tabId),
         tip: tip.toFixed(8),
         cash: cash == null ? null : cash.toFixed(8),
+        ...(currency ? { currency } : {}),
     })).digest('hex');
 
 class DineInCashCloseService {
@@ -145,7 +148,10 @@ class DineInCashCloseService {
         };
     }
 
-    async closeTab({ businessProfileId, actorId, tabId, cashReceived, tipAmount, idempotencyKey }) {
+    // `currency` makes the money's currency explicit at the boundary. 'GHS' takes
+    // the native cedi path (exact 2dp carriers, no USDC amount anywhere); omitted
+    // keeps the legacy untagged-USDC behaviour for callers that have not opted in.
+    async closeTab({ businessProfileId, actorId, tabId, cashReceived, tipAmount, idempotencyKey, currency = null }) {
         if (!businessProfileId) throw fail('INVALID_INPUT', 'Business context required.');
         if (!actorId) throw fail('INVALID_INPUT', 'Authentication required.');
         if (!tabId || typeof tabId !== 'string') throw fail('INVALID_INPUT', 'Tab ID required.');
@@ -153,10 +159,14 @@ class DineInCashCloseService {
             throw fail('INVALID_INPUT', 'Invalid idempotency key.');
         }
         const key = idempotencyKey ? idempotencyKey.trim() : null;
+        const requestedCurrency = currency == null || currency === '' ? null : String(currency).trim().toUpperCase();
+        if (requestedCurrency !== null && !['GHS', 'USDC'].includes(requestedCurrency)) {
+            throw fail('INVALID_INPUT', 'currency must be GHS or USDC.');
+        }
         const tip = parseMoney(tipAmount, 'tipAmount');
         const cash = cashReceived == null || cashReceived === '' ? null : parseMoney(cashReceived, 'cashReceived');
 
-        const fingerprint = key ? fingerprintOf({ businessProfileId, actorId, tabId, tip, cash }) : null;
+        const fingerprint = key ? fingerprintOf({ businessProfileId, actorId, tabId, tip, cash, currency: requestedCurrency }) : null;
 
         // Fast-path replay of a committed close (exact durable result).
         const committed = await this._findIdempotentClose(businessProfileId, key, fingerprint);
@@ -183,10 +193,35 @@ class DineInCashCloseService {
                     // r37: Decimal(20,8) authority end-to-end — no lossy
                     // JS-float rounding anywhere between parse, arithmetic,
                     // storage and the ledger row.
-                    const subtotalDec = tab.items.reduce(
-                        (sum, item) => sum.plus(new Prisma.Decimal(item.lineTotalUsdc)),
-                        new Prisma.Decimal(0)
-                    );
+                    // The currency decides WHICH durable line values are summed. A
+                    // GHS tab's money is in the cedi columns; summing the USDC
+                    // columns there would silently total zero.
+                    // The tab's own currency is the authority. The client may
+                    // state it (a Ghana till closes in cedis) but never switch
+                    // a tab into a currency it was not opened in.
+                    if (requestedCurrency !== null && tab.currency != null && requestedCurrency !== tab.currency) {
+                        throw fail('CURRENCY_MISMATCH', `This tab is in ${tab.currency}; it cannot be closed in ${requestedCurrency}. Nothing was recorded.`);
+                    }
+                    const isGhsTab = requestedCurrency === 'GHS' || (requestedCurrency === null && tab.currency === 'GHS');
+                    // A GHS close is only as true as its cedi prices. A line with
+                    // no exact GHS price would otherwise count as zero and record a
+                    // paid sale for the tip alone.
+                    if (isGhsTab) {
+                        const unpriced = tab.items.filter((item) => item.lineTotalGhs == null && item.unitPriceGhs == null);
+                        if (unpriced.length > 0) {
+                            throw fail('GHS_PRICE_UNAVAILABLE',
+                                `${unpriced.length} item(s) on this tab have no GHS price. Nothing was recorded.`);
+                        }
+                    }
+                    const subtotalDec = tab.items.reduce((sum, item) => {
+                        if (isGhsTab) {
+                            if (item.lineTotalGhs != null) return sum.plus(new Prisma.Decimal(item.lineTotalGhs));
+                            const unit = new Prisma.Decimal(item.unitPriceGhs ?? 0);
+                            return sum.plus(unit.times(new Prisma.Decimal(item.quantity ?? 0)));
+                        }
+                        if (item.lineTotalUsdc != null) return sum.plus(new Prisma.Decimal(item.lineTotalUsdc));
+                        return sum.plus(new Prisma.Decimal(item.unitPriceUsdc).times(new Prisma.Decimal(item.quantity ?? 0)));
+                    }, new Prisma.Decimal(0));
 
                     // Tax via the business's default preset — the same
                     // machinery as the invoice/POS settlement boundary.
@@ -201,8 +236,15 @@ class DineInCashCloseService {
                     // authority directly; no JS Number round-trip (the old
                     // path computed 6dp float tax and re-parsed it).
                     const taxResult = computeTaxLinesExact(preset ? [preset] : [], subtotalDec);
-                    const taxTotalDec = taxResult.taxTotal;
-                    const grandTotalDec = subtotalDec.plus(taxTotalDec).plus(tip);
+                    // A cedi tab settles to the pesewa: every derived figure is
+                    // quantized to 2dp BEFORE it is stored, so the tab, the ledger
+                    // entry and the receipt can never disagree by a fraction.
+                    const isGhs = isGhsTab;
+                    const q = (d) => (isGhs ? new Prisma.Decimal(d).toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP) : d);
+                    const taxTotalDec = q(taxResult.taxTotal);
+                    const subtotalQ = q(subtotalDec);
+                    const tipQ = q(tip);
+                    const grandTotalDec = q(subtotalQ.plus(taxTotalDec).plus(tipQ));
 
                     if (cash != null && cash.lt(grandTotalDec)) {
                         throw fail('INSUFFICIENT_CASH', 'Insufficient cash received.');
@@ -212,12 +254,28 @@ class DineInCashCloseService {
                     // CAS: exactly one OPEN -> PAID transition can win.
                     const claimed = await tx.dineInTab.updateMany({
                         where: { id: tabId, businessProfileId, status: 'OPEN' },
-                        data: {
+                        data: isGhs ? {
+                            // Native GHS: the cedi figures live in the cedi
+                            // columns at 2dp and the USDC columns stay at their
+                            // zero defaults. Cedis are never written into a
+                            // USDC-named column.
                             status: 'PAID',
                             closedAt: new Date(),
-                            subtotalUsdc: subtotalDec,
+                            currency: 'GHS',
+                            subtotalGhs: subtotalQ,
+                            taxTotalGhs: taxTotalDec,
+                            tipGhs: tipQ,
+                            grandTotalGhs: grandTotalDec,
+                            paymentMethod: 'CASH',
+                            idempotencyKey: key,
+                            cashReceived: cash,
+                        } : {
+                            status: 'PAID',
+                            closedAt: new Date(),
+                            currency: requestedCurrency === 'USDC' ? 'USDC' : null,
+                            subtotalUsdc: subtotalQ,
                             taxTotalUsdc: taxTotalDec,
-                            tipUsdc: tip,
+                            tipUsdc: tipQ,
                             grandTotalUsdc: grandTotalDec,
                             paymentMethod: 'CASH',
                             idempotencyKey: key,
@@ -239,8 +297,14 @@ class DineInCashCloseService {
                             type: 'INCOME',
                             category: 'DINE_IN',
                             description: `Dine-in cash close (${tab.id.substring(0, 8)})`,
-                            amount: grandTotalDec, // Decimal — no float round-trip
-                            amountGhs: grandTotalDec,
+                            // Native GHS income carries NO USDC amount: `amount`
+                            // stays NULL and the cedi figure goes to its own column
+                            // at 2dp. Writing the cedi number into `amount` (as the
+                            // legacy path did) reported a 100 GHS sale as 100 USDC
+                            // of merchant income.
+                            currency: isGhs ? 'GHS' : (requestedCurrency === 'USDC' ? 'USDC' : null),
+                            amount: isGhs ? null : grandTotalDec,
+                            amountGhs: isGhs ? grandTotalDec : null,
                             sourceType: 'DINE_IN_CASH',
                             sourceId: tab.id,
                             metadata: {
@@ -259,7 +323,8 @@ class DineInCashCloseService {
                     const closed = await tx.dineInTab.findUnique({ where: { id: tabId } });
                     return {
                         tab: closed, duplicate: false,
-                        subtotal: Number(subtotalDec.toFixed(8)),
+                        currency: isGhs ? 'GHS' : (requestedCurrency === 'USDC' ? 'USDC' : null),
+                        subtotal: Number((isGhs ? subtotalQ : subtotalDec).toFixed(isGhs ? 2 : 8)),
                         taxTotal: Number(taxTotalDec.toFixed(8)),
                         tip: Number(tip.toFixed(8)),
                         grandTotal: Number(grandTotalDec.toFixed(8)),

@@ -97,6 +97,9 @@ exports.sendFunds = async (req, res) => {
         try {
             transferAmount = ledger.toExactDecimal(String(amount), 'amount');
         } catch (e) {
+            transferAmount = null;
+        }
+        if (!transferAmount || !transferAmount.gt(0)) {
             return res.status(400).json({
                 success: false,
                 message: 'Amount must be a positive number.'
@@ -419,8 +422,16 @@ exports.requestFunds = async (req, res) => {
             });
         }
 
-        const requestAmount = parseFloat(amount);
-        if (isNaN(requestAmount) || requestAmount <= 0) {
+        // Exact amount, parsed once with the same canonical parser as sendFunds.
+        // The request row's amount is what fulfil later debits, so it must
+        // never pass through a binary float.
+        let requestAmount;
+        try {
+            requestAmount = ledger.toExactDecimal(String(amount), 'amount');
+        } catch (e) {
+            requestAmount = null;
+        }
+        if (!requestAmount || !requestAmount.gt(0)) {
             return res.status(400).json({
                 success: false,
                 message: 'Amount must be a positive number.'
@@ -807,10 +818,21 @@ exports.fulfillTransferRequest = async (req, res) => {
         // a scary error for what is essentially a "you double-tapped".
         if (error.message === 'ALREADY_FINALIZED') {
             const finalState = await prisma.peerTransfer.findUnique({ where: { id: req.params.id } }).catch(() => null);
-            return res.status(200).json({
-                success: true,
-                message: `Request already ${finalState?.status?.toLowerCase() || 'finalized'} (idempotent replay).`,
-                idempotent: true,
+            // Only a request that was actually paid is an idempotent success.
+            // A declined or cancelled request moved no money, so reporting
+            // success would tell the payer a payment happened when it did not.
+            if (finalState?.status === 'COMPLETED') {
+                return res.status(200).json({
+                    success: true,
+                    message: 'Request already fulfilled (idempotent replay).',
+                    idempotent: true,
+                    transfer: finalState
+                });
+            }
+            return res.status(409).json({
+                success: false,
+                code: 'TRANSFER_REQUEST_NOT_PENDING',
+                message: `This request has already been ${finalState?.status?.toLowerCase() || 'finalized'}. Nothing was sent.`,
                 transfer: finalState
             });
         }

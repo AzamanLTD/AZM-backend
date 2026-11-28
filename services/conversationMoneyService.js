@@ -204,6 +204,18 @@ class ConversationMoneyService {
             return { message, replay: true, ticket: existing };
         }
 
+        // NEW sends only (a committed same-key replay above returns its stored
+        // outcome even if the recipient has since left the conversation).
+        // The recipient must be someone in this conversation. The transfer
+        // message lands here, so paying an arbitrary user id from a thread
+        // they are not part of would move money they never see announced,
+        // and would let a guessed integer id stand in for recipient review.
+        const participants = Array.isArray(conv.participants) ? conv.participants : [];
+        if (!participants.some((p) => p && Number(p.id) === receiverId)) {
+            throw fail(403, 'RECIPIENT_NOT_IN_CONVERSATION',
+                'You can only send money to someone in this conversation. Nothing was sent.');
+        }
+
         // r39/P1 — the concurrent same-key loser converges to the committed
         // winner's exact outcome instead of surfacing a transient 409.
         let result;

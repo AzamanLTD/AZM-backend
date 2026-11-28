@@ -135,8 +135,16 @@ run('r38/P0 — overlay upgrade path + fail-closed installer', () => {
         // real DDL type error. BusinessLedgerEntry is a leaf (no child FKs),
         // so the restore is hermetic — dropping and re-pushing cannot orphan
         // other tables' rows.
+        // Settle the database at the FULL contract first. The comparison below is
+        // "a failed installer changes nothing", which is only meaningful when the
+        // starting point is every overlay applied — a database carrying just the
+        // business-os table would legitimately GAIN the later currency columns on
+        // the restore run and the diff would measure the feature, not the failure.
+        expect(runAllOverlays().status).toBe(0);
+
         const beforeColumns = await columnsOf('BusinessLedgerEntry');
         expect(beforeColumns).toContain('reversalOfId');
+        expect(beforeColumns).toContain('currency');
 
         await db.$executeRawUnsafe('DROP TABLE IF EXISTS "BusinessLedgerEntry" CASCADE');
         await db.$executeRawUnsafe(`CREATE TABLE "BusinessLedgerEntry" (
