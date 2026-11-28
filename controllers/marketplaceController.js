@@ -411,14 +411,19 @@ exports.updateTransitTrip = async (req, res) => {
         if (fareUsdc !== undefined) data.fareUsdc = parseFloat(fareUsdc);
         if (normalizedStatus !== undefined && !cancelling) data.status = normalizedStatus;
 
+        // The trip write and its bookings' reschedule commit together: a
+        // departure in the body always re-syncs the bookings and paid escrows
+        // (idempotent), so a failed attempt is simply retried.
+        const { _rescheduleTripBookingsTx } = require('../services/transitBookingService');
         let updated = Object.keys(data).length > 0
-            ? await prisma.transitTrip.update({ where: { id }, data })
+            ? await prisma.$transaction(async (tx) => {
+                const t = await tx.transitTrip.update({ where: { id }, data });
+                if (data.departureAt) {
+                    await _rescheduleTripBookingsTx(tx, { tripId: id, departureAt: data.departureAt });
+                }
+                return t;
+            })
             : trip;
-        // A moved departure moves its bookings and paid escrows with it.
-        if (data.departureAt && new Date(data.departureAt).getTime() !== new Date(trip.departureAt).getTime()) {
-            const { rescheduleTripBookings } = require('../services/transitBookingService');
-            await rescheduleTripBookings(prisma, { tripId: id, departureAt: data.departureAt });
-        }
         if (cancelling) {
             const { cancelTripWithRefunds } = require('../services/transitTripCancellationService');
             const result = await cancelTripWithRefunds(prisma, { tripId: id, businessProfileId: profile.id });
@@ -427,7 +432,7 @@ exports.updateTransitTrip = async (req, res) => {
                 return res.status(409).json({
                     success: false,
                     code: 'TRIP_CANCELLATION_INCOMPLETE',
-                    message: 'Some bookings could not be refunded yet; the trip stays open. Retry is safe.',
+                    message: 'Some bookings could not be refunded yet. Retry is safe: unresolved bookings are reprocessed.',
                     trip: updated,
                     summary: result.summary,
                 });

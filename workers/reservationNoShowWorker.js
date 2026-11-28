@@ -17,7 +17,7 @@ const logger = require('../src/config/logger');
 // must outlast the QR boarding window (departure + 60 min, qrCheckInService
 // TRANSIT_WINDOW_MS): a passenger still holding a valid boarding code is
 // never swept first. 75 min = the window + a margin.
-const GRACE_PERIOD_MINS = 75;
+const GRACE_PERIOD_MINS = require('../services/transitBookingService').NO_SHOW_GRACE_MS / 60000;
 
 // =============================================================================
 // sweepNoShowReservations — finds past-due reservations without check-in.

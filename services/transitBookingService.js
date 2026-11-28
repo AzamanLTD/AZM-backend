@@ -45,8 +45,10 @@ const UNBOOKABLE_TRIP_STATUSES = ['CANCELLED', 'DEPARTED', 'COMPLETED'];
 // with at most 6 decimals, compared as integer micro-units. Anything else
 // (arrays, exponents, hex, 7 decimals) is not an approval.
 const _microsOf = (value) => {
+    // A JSON number counts only if it is already exact at 6 decimals (no
+    // silent rounding of 7.0349996 to 7.035000).
     const text = typeof value === 'number' && Number.isFinite(value)
-        ? value.toFixed(6)
+        ? (Number(value.toFixed(6)) === value ? value.toFixed(6) : null)
         : (typeof value === 'string' ? value.trim() : null);
     if (!text || !/^\d+(\.\d{1,6})?$/.test(text)) return null;
     const [whole, frac = ''] = text.split('.');
@@ -249,6 +251,10 @@ const bookSeats = async (prisma, {
                     id: tripId,
                     status: { notIn: UNBOOKABLE_TRIP_STATUSES },
                     availableSeats: { gte: seatIds.length },
+                    // The departure this booking was priced and scheduled
+                    // against: a trip postponed since the read refuses it
+                    // (the booking would carry the old time and escrow expiry).
+                    departureAt: trip.departureAt,
                 },
                 data: { availableSeats: { decrement: seatIds.length } }
             });
@@ -888,11 +894,15 @@ const assertNoShowWindowClosed = async (db, booking, now = Date.now()) => {
 //    extended to at least the new departure + the completion grace (so a
 //    postponed trip is never refunded by the expiry sweep before it runs).
 // =============================================================================
-const rescheduleTripBookings = async (prisma, { tripId, departureAt }) => {
+// Transaction core: callers that move a trip's departure run this in the SAME
+// transaction as the trip write, so the trip and its bookings can never
+// disagree (and a failed reschedule rolls the trip write back, retryable).
+// Idempotent: running it again with the same departure changes nothing.
+const _rescheduleTripBookingsTx = async (tx, { tripId, departureAt }) => {
     if (!tripId || !departureAt) return { rescheduled: 0, extended: 0 };
     const at = new Date(departureAt);
     const active = ['PENDING', 'CONFIRMED', 'IN_PROGRESS'];
-    return prisma.$transaction(async (tx) => {
+    {
         const moved = await tx.transitBooking.updateMany({
             where: { tripId, status: { in: active } },
             data: { scheduledAt: at },
@@ -915,12 +925,15 @@ const rescheduleTripBookings = async (prisma, { tripId, departureAt }) => {
             extended = res.count;
         }
         return { rescheduled: moved.count, extended };
-    });
+    }
 };
+
+const rescheduleTripBookings = async (prisma, args) =>
+    prisma.$transaction((tx) => _rescheduleTripBookingsTx(tx, args));
 
 module.exports = {
     bookSeats, quoteSeats, getTripSeatAvailability, cancelTransitBooking, completeTransitBooking,
     noShowTransitBookingWithRefund, COMPLETION_GRACE_DAYS,
-    rescheduleTripBookings, assertNoShowWindowClosed, NO_SHOW_GRACE_MS,
+    rescheduleTripBookings, _rescheduleTripBookingsTx, assertNoShowWindowClosed, NO_SHOW_GRACE_MS,
     CANCELLABLE_STATUSES, TransitCancellationError, PAY_WITH,
 };

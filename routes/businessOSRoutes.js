@@ -1524,7 +1524,7 @@ router.delete('/transit/cargo/:id', requirePermission('transit.cargo.manage'), w
 router.post('/transit/irops/reassign', requirePermission('transit.trips.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
-    const { sourceTripId, targetVehicleId, reason } = req.body;
+    const { sourceTripId, targetVehicleId, reason, departureAt } = req.body;
     if (!sourceTripId || !targetVehicleId) {
         return res.status(400).json({ success: false, message: 'sourceTripId and targetVehicleId are required' });
     }
@@ -1547,7 +1547,13 @@ router.post('/transit/irops/reassign', requirePermission('transit.trips.manage')
                 businessProfileId: bpId, vehicleId: targetVehicleId,
                 routeName: `${sourceTrip.routeName} [REPLACEMENT]`,
                 origin: sourceTrip.origin, destination: sourceTrip.destination,
-                departureAt: new Date(), fareUsdc: sourceTrip.fareUsdc,
+                // The replacement leaves when the passengers expect to leave:
+                // the source trip's departure unless the operator sets a new
+                // one. ("now" used to be written here, which put every moved
+                // passenger's boarding window and no-show sweep at the
+                // moment of the swap.)
+                departureAt: departureAt ? new Date(departureAt) : sourceTrip.departureAt,
+                fareUsdc: sourceTrip.fareUsdc,
                 availableSeats: targetVehicle.capacity ?? sourceTrip.availableSeats,
                 status: 'ACTIVE',
             },
@@ -1556,8 +1562,7 @@ router.post('/transit/irops/reassign', requirePermission('transit.trips.manage')
             where: { id: sourceTripId },
             data: { status: 'CANCELLED' },
         });
-        // NOTE: moved bookings take the replacement's departure below
-        // (rescheduleTripBookings), after this transaction commits.
+
         let passengerCount = 0;
         if (sourceTrip.bookings.length > 0) {
             const moved = await tx.transitBooking.updateMany({
@@ -1565,6 +1570,10 @@ router.post('/transit/irops/reassign', requirePermission('transit.trips.manage')
                 data: { tripId: newTrip.id },
             });
             passengerCount = moved.count;
+            // The moved passengers depart with the replacement: bookings and
+            // paid escrows follow its departure, in this same transaction.
+            const { _rescheduleTripBookingsTx } = require('../services/transitBookingService');
+            await _rescheduleTripBookingsTx(tx, { tripId: newTrip.id, departureAt: newTrip.departureAt });
         }
         let cargoCount = 0;
         if (sourceTrip.cargoParcels.length > 0) {
@@ -1576,12 +1585,6 @@ router.post('/transit/irops/reassign', requirePermission('transit.trips.manage')
         }
         return { newTrip, passengerCount, cargoCount };
     });
-    // The moved passengers depart with the replacement: their bookings and
-    // paid escrows follow its departure (no-show sweep, escrow expiry).
-    {
-        const { rescheduleTripBookings } = require('../services/transitBookingService');
-        await rescheduleTripBookings(prisma, { tripId: result.newTrip.id, departureAt: result.newTrip.departureAt });
-    }
 
     res.json({
         success: true,

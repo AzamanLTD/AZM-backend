@@ -592,3 +592,51 @@ describe('re-review: no way around the QR rule', () => {
         expect(user(db, 20).availableBalance).toBe(2);
     });
 });
+
+describe('round three: reschedule stays in step with the trip', () => {
+    test('a trip postponed since the read refuses the booking inside the transaction', async () => {
+        const db = makeDb();
+        // Like Prisma, the read is a snapshot, not the live row.
+        const live = db.transitTrip.findUnique;
+        db.transitTrip.findUnique = jest.fn(async (args) => ({ ...(await live(args)) }));
+        const inner = db.$transaction;
+        db.$transaction = jest.fn(async (cb) => {
+            trip(db).departureAt = new Date(trip(db).departureAt.getTime() + 3 * 60 * 60 * 1000);
+            return inner(cb);
+        });
+        await expect(pay(db, ['1A'])).rejects.toMatchObject({ code: 'TRIP_UNAVAILABLE' });
+        expect(user(db, 10).availableBalance).toBe(100);
+    });
+
+    test('a JSON number total must already be exact at 6 decimals', async () => {
+        const db = makeDb();
+        await expect(bookSeats(db, {
+            tripId: 'trip-1', customerId: 10, seatIds: ['1A', '2A'], payWith: 'WALLET', expectedTotalUsdc: 7.0349996,
+        })).rejects.toMatchObject({ code: 'EXPECTED_TOTAL_INVALID' });
+        const ok = await bookSeats(db, {
+            tripId: 'trip-1', customerId: 10, seatIds: ['1A', '2A'], payWith: 'WALLET', expectedTotalUsdc: 7.035,
+        });
+        expect(ok.payment.totalUsdc).toBe(7.035);
+    });
+
+    test('PATCH moves the departure and its bookings in one transaction', async () => {
+        const db = makeDb();
+        await pay(db, ['1A']);
+        const ctrl = require('../controllers/marketplaceController');
+        // Far enough out to pass the 30-day funded window (escrows only extend).
+        const later = new Date(Date.now() + 40 * DAY);
+        let status = null;
+        await ctrl.updateTransitTrip({
+            app: { get: () => db }, user: { id: 20 }, params: { id: 'trip-1' },
+            body: { departureAt: later.toISOString() },
+        }, {
+            status(c) { status = c; return this; },
+            json() { return this; },
+        });
+        expect(status).toBe(200);
+        expect(db.$transaction).toHaveBeenCalled();
+        expect(new Date(db.transitBooking.rows[0].scheduledAt).getTime()).toBe(later.getTime());
+        expect(new Date(db.smartEscrow.rows[0].expiresAt).getTime())
+            .toBe(later.getTime() + COMPLETION_GRACE_DAYS * DAY);
+    });
+});
