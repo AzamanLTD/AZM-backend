@@ -123,7 +123,7 @@ exports.bookTripSeats = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const transitSvc = require('../services/transitBookingService');
-        const { seatIds, passengerNames, customerNote, payWith } = req.body;
+        const { seatIds, passengerNames, customerNote, payWith, expectedTotalUsdc } = req.body;
 
         const result = await transitSvc.bookSeats(prisma, {
             tripId: req.params.id,
@@ -132,6 +132,7 @@ exports.bookTripSeats = async (req, res) => {
             passengerNames,
             customerNote,
             payWith: payWith || null,
+            expectedTotalUsdc: expectedTotalUsdc ?? null,
             businessProfileId: req.body.businessProfileId,
             // §r42 wired claim (2026-10-01): present only when the caller sent
             // an Idempotency-Key (idempotency authority mounted on the route).
@@ -143,9 +144,11 @@ exports.bookTripSeats = async (req, res) => {
         });
         return res.status(201).json(result);
     } catch (err) {
-        // Every failure here is pre-commit (the booking transaction rolled
-        // back), so a 4xx is honest and lets the RELEASE policy free the key.
-        // A short balance is 402 with its code, so the app can offer a top-up.
+        // Domain refusals (thrown before or inside the booking transaction,
+        // which then rolled back) are 4xx with their code, so the RELEASE
+        // policy frees the key for a corrected retry. A short balance is 402
+        // so the app can offer a top-up. bookSeats swallows its post-commit
+        // work, so a committed booking never reaches this branch.
         const status = err.code === 'INSUFFICIENT_BALANCE' ? 402 : (err.httpStatus || 400);
         return res.status(status).json({
             success: false,
@@ -374,6 +377,10 @@ exports.updateTransitTrip = async (req, res) => {
             return res.status(403).json({ success: false, message: 'This trip does not belong to your business.' });
 
         const { routeName, origin, destination, departureAt, arrivalAt, fareUsdc, status } = req.body;
+        // Cancelling a trip refunds its paid bookings: route it through the
+        // canonical cancellation (never a bare status write, which stranded
+        // every funded escrow on a CANCELLED trip).
+        const cancelling = status !== undefined && String(status).toUpperCase() === 'CANCELLED';
         const data = {};
         if (routeName !== undefined) data.routeName = routeName;
         if (origin !== undefined) data.origin = origin;
@@ -381,9 +388,26 @@ exports.updateTransitTrip = async (req, res) => {
         if (departureAt !== undefined) data.departureAt = new Date(departureAt);
         if (arrivalAt !== undefined) data.arrivalAt = arrivalAt ? new Date(arrivalAt) : null;
         if (fareUsdc !== undefined) data.fareUsdc = parseFloat(fareUsdc);
-        if (status !== undefined) data.status = status;
+        if (status !== undefined && !cancelling) data.status = status;
 
-        const updated = await prisma.transitTrip.update({ where: { id }, data });
+        let updated = Object.keys(data).length > 0
+            ? await prisma.transitTrip.update({ where: { id }, data })
+            : trip;
+        if (cancelling) {
+            const { cancelTripWithRefunds } = require('../services/transitTripCancellationService');
+            const result = await cancelTripWithRefunds(prisma, { tripId: id, businessProfileId: profile.id });
+            updated = await prisma.transitTrip.findUnique({ where: { id } });
+            if (!result.cancelled) {
+                return res.status(409).json({
+                    success: false,
+                    code: 'TRIP_CANCELLATION_INCOMPLETE',
+                    message: 'Some bookings could not be refunded yet; the trip stays open. Retry is safe.',
+                    trip: updated,
+                    summary: result.summary,
+                });
+            }
+            return res.status(200).json({ success: true, trip: updated, summary: result.summary });
+        }
         return res.status(200).json({ success: true, trip: updated });
     } catch (err) {
         return res.status(500).json({ success: false, message: err.message });

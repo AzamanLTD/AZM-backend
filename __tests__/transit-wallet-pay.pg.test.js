@@ -17,6 +17,8 @@
 //       no-op.
 //   W5. The expiry worker's cancel (pinned to PENDING) refuses a booking
 //       that was paid in between: it stays CONFIRMED and FUNDED.
+//   W6. Cancelling the trip refunds a paid booking (fare back, fee kept).
+//   W7. A paid trip cannot be completed before it departs.
 // =============================================================================
 
 const { seedUser, seedBusiness } = require('./helpers/factories');
@@ -70,6 +72,16 @@ run('transit wallet pay (PostgreSQL)', () => {
         return { owner, biz, trip, customer };
     }
 
+    const pay = async (tripId, customerId, seatIds) => {
+        const q = await svc.quoteSeats(prisma, { tripId, customerId, seatIds });
+        return svc.bookSeats(prisma, {
+            tripId, customerId, seatIds, payWith: 'WALLET', expectedTotalUsdc: q.totalUsdc.toFixed(6),
+        });
+    };
+    const depart = (tripId) => prisma.transitTrip.update({
+        where: { id: tripId }, data: { departureAt: new Date(Date.now() - 3600_000) },
+    });
+
     const balances = async (id) => {
         const u = await prisma.user.findUnique({ where: { id }, select: { availableBalance: true, escrowLockedBalance: true } });
         return { available: Number(u.availableBalance), locked: Number(u.escrowLockedBalance) };
@@ -77,9 +89,7 @@ run('transit wallet pay (PostgreSQL)', () => {
 
     test('W1: books, pays and confirms in one commit', async () => {
         const { owner, trip, customer } = await seedTrip();
-        const res = await svc.bookSeats(prisma, {
-            tripId: trip.id, customerId: customer.id, seatIds: ['1A'], payWith: 'WALLET',
-        });
+        const res = await pay(trip.id, customer.id, ['1A']);
         expect(res.booking.status).toBe('CONFIRMED');
         expect(res.payment.amountUsdc).toBe(10);
         const escrow = await prisma.smartEscrow.findUnique({ where: { id: res.payment.escrowId } });
@@ -94,9 +104,8 @@ run('transit wallet pay (PostgreSQL)', () => {
 
     test('W2: a short balance rolls back the seats and the booking too', async () => {
         const { trip, customer } = await seedTrip({ balance: 5 });
-        await expect(svc.bookSeats(prisma, {
-            tripId: trip.id, customerId: customer.id, seatIds: ['1A'], payWith: 'WALLET',
-        })).rejects.toMatchObject({ code: 'INSUFFICIENT_BALANCE' });
+        await expect(pay(trip.id, customer.id, ['1A']))
+            .rejects.toMatchObject({ code: 'INSUFFICIENT_BALANCE' });
         expect(await prisma.transitBooking.count()).toBe(0);
         expect(await prisma.transitBookingSeat.count()).toBe(0);
         expect(await prisma.ticket.count()).toBe(0);
@@ -110,6 +119,8 @@ run('transit wallet pay (PostgreSQL)', () => {
         const ctrl = require('../controllers/marketplaceController');
         const mw = idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true, required: false });
         const { trip, customer } = await seedTrip({ balance: 5 });
+        const total = (await svc.quoteSeats(prisma, { tripId: trip.id, customerId: customer.id, seatIds: ['1A'] }))
+            .totalUsdc.toFixed(6);
 
         const call = () => new Promise((resolve, reject) => {
             const settings = { prisma };
@@ -121,7 +132,7 @@ run('transit wallet pay (PostgreSQL)', () => {
                 params: { id: trip.id }, query: {},
                 headers: { 'idempotency-key': 'key-W3' },
                 get(h) { return this.headers[String(h).toLowerCase()]; },
-                body: { seatIds: ['1A'], payWith: 'WALLET', businessProfileId: null },
+                body: { seatIds: ['1A'], payWith: 'WALLET', expectedTotalUsdc: total, businessProfileId: null },
                 user: { id: customer.id },
                 app: { get: (k) => settings[k] },
             };
@@ -147,7 +158,14 @@ run('transit wallet pay (PostgreSQL)', () => {
         }
         expect(await prisma.financialOperation.findFirst({ where: { userId: customer.id, key: 'key-W3' } })).toBeNull();
 
-        await prisma.user.update({ where: { id: customer.id }, data: { availableBalance: 100 } });
+        // A real top-up: the balance AND its ledger row (runDoubleCheck
+        // recomputes the balance from COMPLETED history before any payment).
+        await prisma.$transaction([
+            prisma.user.update({ where: { id: customer.id }, data: { availableBalance: 100 } }),
+            prisma.transactionHistory.create({
+                data: { userId: customer.id, type: 'DEPOSIT_CRYPTO', amountUsdc: 95, feeUsdc: 0, status: 'COMPLETED' },
+            }),
+        ]);
         const retry = await call();
         expect(retry.status).toBe(201);
         expect(retry.body.booking.status).toBe('CONFIRMED');
@@ -155,10 +173,9 @@ run('transit wallet pay (PostgreSQL)', () => {
 
     test('W4: completion releases the fare to the operator, once', async () => {
         const { owner, customer, trip } = await seedTrip();
-        const res = await svc.bookSeats(prisma, {
-            tripId: trip.id, customerId: customer.id, seatIds: ['1A'], payWith: 'WALLET',
-        });
+        const res = await pay(trip.id, customer.id, ['1A']);
         await prisma.transitBooking.update({ where: { id: res.booking.id }, data: { status: 'IN_PROGRESS' } });
+        await depart(trip.id);
 
         const done = await svc.completeTransitBooking(prisma, { bookingId: res.booking.id });
         expect(done.booking.status).toBe('COMPLETED');
@@ -173,13 +190,39 @@ run('transit wallet pay (PostgreSQL)', () => {
 
     test('W5: the PENDING-pinned expiry cancel refuses a paid booking', async () => {
         const { customer, trip } = await seedTrip();
-        const res = await svc.bookSeats(prisma, {
-            tripId: trip.id, customerId: customer.id, seatIds: ['1A'], payWith: 'WALLET',
-        });
+        const res = await pay(trip.id, customer.id, ['1A']);
         await expect(svc.cancelTransitBooking(prisma, {
             bookingId: res.booking.id, cancelledBy: customer.id, onlyFromStatuses: ['PENDING'],
         })).rejects.toMatchObject({ code: 'NOT_CANCELLABLE' });
         expect((await prisma.transitBooking.findUnique({ where: { id: res.booking.id } })).status).toBe('CONFIRMED');
+        expect((await prisma.smartEscrow.findUnique({ where: { id: res.payment.escrowId } })).status).toBe('FUNDED');
+    });
+
+    test('W6: cancelling the trip refunds a paid booking', async () => {
+        const { biz, customer, trip } = await seedTrip();
+        const res = await pay(trip.id, customer.id, ['1A']);
+        const fee = Number((await prisma.smartEscrow.findUnique({ where: { id: res.payment.escrowId } })).feeUsdc);
+        const { cancelTripWithRefunds } = require('../services/transitTripCancellationService');
+        const out = await cancelTripWithRefunds(prisma, { tripId: trip.id, businessProfileId: biz.id });
+        expect(out.cancelled).toBe(true);
+        expect(out.summary.refunded).toBe(1);
+        expect((await prisma.smartEscrow.findUnique({ where: { id: res.payment.escrowId } })).status).toBe('REFUNDED');
+        const after = await balances(customer.id);
+        expect(after.available).toBeCloseTo(500 - fee, 8);
+        expect(after.locked).toBeCloseTo(0, 8);
+        // And nothing more can be booked on it.
+        const other = await seedUser(prisma, { availableBalance: 50 });
+        await expect(svc.bookSeats(prisma, { tripId: trip.id, customerId: other.id, seatIds: ['1B'] }))
+            .rejects.toThrow();
+    });
+
+    test('W7: a paid trip cannot be completed before it departs', async () => {
+        const { owner, customer, trip } = await seedTrip();
+        const res = await pay(trip.id, customer.id, ['1A']);
+        await prisma.transitBooking.update({ where: { id: res.booking.id }, data: { status: 'IN_PROGRESS' } });
+        await expect(svc.completeTransitBooking(prisma, { bookingId: res.booking.id }))
+            .rejects.toMatchObject({ code: 'TOO_EARLY' });
+        expect((await balances(owner.id)).available).toBe(0);
         expect((await prisma.smartEscrow.findUnique({ where: { id: res.payment.escrowId } })).status).toBe('FUNDED');
     });
 });

@@ -186,6 +186,7 @@ const createBookingEscrow = async (prisma, {
 // pre-flight ledger audit (runDoubleCheck) before opening it.
 const _fundBookingEscrowTx = async (tx, {
     escrowId, payerId, bookingType, bookingId, fundedExpiryDays, reference,
+    fundedExpiresAt = null,
 }) => {
     const escrow = await tx.smartEscrow.findUnique({ where: { id: escrowId }, include: { ticket: true } });
     if (!escrow) throw new Error('Escrow not found.');
@@ -205,7 +206,9 @@ const _fundBookingEscrowTx = async (tx, {
         data: {
             status: 'FUNDED',
             fundedAt: new Date(),
-            expiresAt: new Date(Date.now() + fundedExpiryDays * DAY_MS),
+            // A booking escrow must outlive the trip it pays for: the caller may
+            // pin the funded expiry past departure (transit wallet pay).
+            expiresAt: fundedExpiresAt || new Date(Date.now() + fundedExpiryDays * DAY_MS),
             fundTxHash: reference
         }
     });
@@ -264,7 +267,9 @@ const _fundBookingEscrowTx = async (tx, {
         lines: [
             { account: `user:${payerId}:liability`, debit: _exact(total) },
             { account: `escrow:escrow-${escrowId}:locked`, credit: _exact(amount) },
-            { account: 'revenue:fees', credit: _exact(fee) },
+            // A zero fee (smartEscrowFeePct = 0 is a valid setting) posts
+            // no fee line: the ledger refuses zero-value lines.
+            ...(fee > 0 ? [{ account: 'revenue:fees', credit: _exact(fee) }] : []),
         ],
     });
 

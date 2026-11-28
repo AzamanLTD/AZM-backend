@@ -304,6 +304,29 @@ exports.updateBookingStatus = async (req, res) => {
                     }
                     return res.status(200).json({ success: true, booking: splitUpdated });
                 }
+                // No penalty set: the passenger is refunded in full, with the
+                // NO_SHOW claim, in one transaction (a bare status flip left
+                // the fare locked until the 30-day expiry refund).
+                const { noShowTransitBookingWithRefund } = require('../services/transitBookingService');
+                try {
+                    const result = await noShowTransitBookingWithRefund(prisma, {
+                        bookingId: booking.id,
+                        driverNote: driverNote || null,
+                    });
+                    if (io) {
+                        io.to(`user_${booking.customerId}`).emit('transit_booking_update', result.booking);
+                        if (booking.businessProfile.userId !== booking.customerId) {
+                            io.to(`user_${booking.businessProfile.userId}`).emit('transit_booking_update', result.booking);
+                        }
+                    }
+                    return res.status(200).json({ success: true, booking: result.booking, refund: result.refund });
+                } catch (err) {
+                    if (err.httpStatus) {
+                        return res.status(err.httpStatus).json({ success: false, message: err.message });
+                    }
+                    logger.error({ err: err.message }, '[transit.updateBookingStatus] no-show refund failed');
+                    return res.status(500).json({ success: false, message: 'No-show failed and was fully rolled back; no state changed. Retry is safe.' });
+                }
             }
         }
 
@@ -326,6 +349,7 @@ exports.updateBookingStatus = async (req, res) => {
                     success: true,
                     booking: result.booking,
                     release: result.release,
+                    escrowNotReleased: result.escrowNotReleased,
                     alreadyCompleted: result.alreadyCompleted,
                 });
             } catch (err) {
@@ -340,9 +364,6 @@ exports.updateBookingStatus = async (req, res) => {
         const updateData = { status: nextStatus };
         if (nextStatus === 'CONFIRMED' && !booking.pickupTime) {
             updateData.pickupTime = new Date();
-        }
-        if (nextStatus === 'COMPLETED') {
-            updateData.dropoffTime = new Date();
         }
         if (nextStatus === 'NO_SHOW') {
             updateData.driverNote = driverNote || null;

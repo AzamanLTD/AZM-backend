@@ -12,7 +12,7 @@ const { protect } = require('../middleware/authMiddleware');
 const ctrl = require('../controllers/marketplaceController');
 const hotelCtrl = require('../controllers/hotelMarketplaceController');
 const { require2FA } = require('../middleware/require2FA');
-const { checkBan, establishBusinessRequestContext } = require('../middleware/banGuardMiddleware');
+const { checkBan } = require('../middleware/banGuardMiddleware');
 const { requireKyc } = require('../middleware/requireKyc');
 
 // Wallet pay at booking (payWith: 'WALLET') moves money, so it also needs an
@@ -21,10 +21,21 @@ const { requireKyc } = require('../middleware/requireKyc');
 // passenger's one-time code. A plain reservation (no payWith) is unchanged.
 const whenPayingWithWallet = (mw) => (req, res, next) =>
     (req.body && req.body.payWith === 'WALLET' ? mw(req, res, next) : next());
+// A paid booking must be reconcilable after a lost response, so wallet pay
+// requires an Idempotency-Key (a plain reservation keeps the legacy opt-out).
+const requireIdempotencyKey = (req, res, next) => {
+    const key = req.get('idempotency-key') || req.get('x-idempotency-key');
+    if (key) return next();
+    return res.status(400).json({
+        success: false,
+        code: 'IDEMPOTENCY_KEY_REQUIRED',
+        message: 'Paying requires an Idempotency-Key header.',
+    });
+};
 const walletPayGates = [
-    whenPayingWithWallet(establishBusinessRequestContext),
     whenPayingWithWallet(checkBan),
     whenPayingWithWallet(requireKyc('pay')),
+    whenPayingWithWallet(requireIdempotencyKey),
 ];
 const { idempotency } = require('../middleware/idempotency');
 
