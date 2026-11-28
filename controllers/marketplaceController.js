@@ -123,7 +123,7 @@ exports.bookTripSeats = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const transitSvc = require('../services/transitBookingService');
-        const { seatIds, passengerNames, customerNote } = req.body;
+        const { seatIds, passengerNames, customerNote, payWith } = req.body;
 
         const result = await transitSvc.bookSeats(prisma, {
             tripId: req.params.id,
@@ -131,6 +131,7 @@ exports.bookTripSeats = async (req, res) => {
             seatIds,
             passengerNames,
             customerNote,
+            payWith: payWith || null,
             businessProfileId: req.body.businessProfileId,
             // §r42 wired claim (2026-10-01): present only when the caller sent
             // an Idempotency-Key (idempotency authority mounted on the route).
@@ -142,7 +143,37 @@ exports.bookTripSeats = async (req, res) => {
         });
         return res.status(201).json(result);
     } catch (err) {
-        return res.status(400).json({ success: false, message: err.message });
+        // Every failure here is pre-commit (the booking transaction rolled
+        // back), so a 4xx is honest and lets the RELEASE policy free the key.
+        // A short balance is 402 with its code, so the app can offer a top-up.
+        const status = err.code === 'INSUFFICIENT_BALANCE' ? 402 : (err.httpStatus || 400);
+        return res.status(status).json({
+            success: false,
+            // Our own codes reach the app; Prisma's (P2002 …) stay internal.
+            ...(typeof err.code === 'string' && !/^P\d{4}$/.test(err.code) ? { code: err.code } : {}),
+            message: err.message,
+        });
+    }
+};
+
+// GET /api/marketplace/transit/trips/:id/quote?seats=1A,1B — read-only quote
+// for wallet pay: fare, booking fee, total, the payer's available balance.
+exports.quoteTripSeats = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const transitSvc = require('../services/transitBookingService');
+        const seatIds = String(req.query.seats || '')
+            .split(',')
+            .map(s => s.trim())
+            .filter(Boolean);
+        const result = await transitSvc.quoteSeats(prisma, {
+            tripId: req.params.id,
+            customerId: req.user.id,
+            seatIds,
+        });
+        return res.status(200).json(result);
+    } catch (err) {
+        return res.status(err.httpStatus || 400).json({ success: false, code: err.code, message: err.message });
     }
 };
 

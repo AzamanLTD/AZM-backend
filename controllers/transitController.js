@@ -307,6 +307,36 @@ exports.updateBookingStatus = async (req, res) => {
             }
         }
 
+        // COMPLETED releases a wallet-paid fare to the operator in the same
+        // transaction as the status claim (completeTransitBooking). Without
+        // it the fare stayed locked in escrow and the expiry worker refunded
+        // the passenger 30 days later: a completed trip the operator was
+        // never paid for.
+        if (nextStatus === 'COMPLETED') {
+            const { completeTransitBooking } = require('../services/transitBookingService');
+            try {
+                const result = await completeTransitBooking(prisma, { bookingId: booking.id });
+                if (io) {
+                    io.to(`user_${booking.customerId}`).emit('transit_booking_update', result.booking);
+                    if (booking.businessProfile.userId !== booking.customerId) {
+                        io.to(`user_${booking.businessProfile.userId}`).emit('transit_booking_update', result.booking);
+                    }
+                }
+                return res.status(200).json({
+                    success: true,
+                    booking: result.booking,
+                    release: result.release,
+                    alreadyCompleted: result.alreadyCompleted,
+                });
+            } catch (err) {
+                if (err.httpStatus) {
+                    return res.status(err.httpStatus).json({ success: false, message: err.message });
+                }
+                logger.error({ err: err.message }, '[transit.updateBookingStatus] completion failed');
+                return res.status(500).json({ success: false, message: 'Completion failed and was fully rolled back; no state changed. Retry is safe.' });
+            }
+        }
+
         const updateData = { status: nextStatus };
         if (nextStatus === 'CONFIRMED' && !booking.pickupTime) {
             updateData.pickupTime = new Date();
