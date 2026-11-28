@@ -297,19 +297,45 @@ const listOrdersForCustomer = async (prisma, { customerId, status, limit, cursor
     return { orders, hasMore, nextCursor: hasMore ? orders[orders.length - 1].id : null };
 };
 
+const _handOverError = (code, message) => Object.assign(new Error(message), { code });
+
 const markDelivered = async (prisma, { orderId, businessProfileId, deliveryNotes }) => {
-    const updated = await prisma.businessOrder.updateMany({ where: { id: orderId, businessProfileId, status: 'PAID' }, data: { status: 'DELIVERED', deliveredAt: new Date(), deliveryNotes: deliveryNotes ? String(deliveryNotes).slice(0, 500) : null } });
+    const pre = await prisma.businessOrder.findUnique({ where: { id: orderId }, select: { escrowId: true } });
+    const data = { status: 'DELIVERED', deliveredAt: new Date(), deliveryNotes: deliveryNotes ? String(deliveryNotes).slice(0, 500) : null };
+    // A suspended store cannot hand orders over (the claim fails for it).
+    const claimWhere = { id: orderId, businessProfileId, status: 'PAID', businessProfile: { is: { isSuspended: false } } };
+    let updated;
+    if (pre && pre.escrowId) {
+        // An escrow-backed order is handed over only while its payment is
+        // held: the escrow row is locked first, so the hand-over and a
+        // refund or dispute cannot interleave, and an unpaid order (DRAFT)
+        // never starts the buyer's release window.
+        updated = await prisma.$transaction(async (tx) => {
+            await tx.$executeRaw`SELECT id FROM "SmartEscrow" WHERE "id" = ${pre.escrowId} FOR UPDATE`;
+            const escrow = await tx.smartEscrow.findUnique({ where: { id: pre.escrowId }, select: { status: true } });
+            if (!escrow || !_RELEASABLE_ESCROW.includes(escrow.status)) {
+                throw _handOverError('ORDER_NOT_PAID', 'This order is not paid (or its payment is no longer held), so it cannot be marked handed over.');
+            }
+            return tx.businessOrder.updateMany({ where: { ...claimWhere, escrowId: pre.escrowId }, data });
+        });
+    } else {
+        updated = await prisma.businessOrder.updateMany({ where: claimWhere, data });
+    }
     if (updated.count === 0) {
         const order = await prisma.businessOrder.findUnique({ where: { id: orderId }, select: { businessProfileId: true, status: true } });
         if (!order) throw new Error('Order not found.');
         if (order.businessProfileId !== businessProfileId) throw new Error('You do not own this order.');
-        throw new Error(`Order must be in PAID status to mark as delivered. Current status: ${order.status}.`);
+        if (order.status !== 'PAID') {
+            throw new Error(`Order must be in PAID status to mark as delivered. Current status: ${order.status}.`);
+        }
+        throw _handOverError('STORE_SUSPENDED', 'This store is suspended and cannot hand orders over.');
     }
     const order = await prisma.businessOrder.findUnique({ where: { id: orderId }, include: ORDER_INCLUDE });
     // Handing the order over is the store's side of the escrow: it marks the
-    // store satisfied, so the buyer's "Got it" releases the payment (and the
-    // release sweep pays the store if the buyer never answers). Best effort:
-    // the delivery stands either way, and the sweep does not need the flag.
+    // store satisfied, so the buyer's "Got it" releases the payment. Best
+    // effort: if it fails, the escrow stays FUNDED and the release sweep
+    // still pays the store 72h after hand-over (it releases FUNDED too, and
+    // the 30-day expiry refund skips handed-over orders).
     if (order && order.escrowId) {
         try {
             const escrow = await prisma.smartEscrow.findUnique({
@@ -343,14 +369,9 @@ const updateOrderStatusFromEscrow = async (prisma, escrowId, escrowStatus) => {
     });
     if (!order) return null;
     if (!_ESCROW_ALLOWED_ORDER_STATES[escrowStatus]?.includes(order.status)) return order;
-    // An escrow that expired before it was ever funded refunded nothing:
-    // the order was never paid, so it is cancelled, not "refunded".
-    const mapped = escrowStatus === 'EXPIRED' && order.status === 'AWAITING_PAYMENT'
-        ? 'CANCELLED'
-        : _ESCROW_TO_ORDER[escrowStatus];
+    const mapped = _ESCROW_TO_ORDER[escrowStatus];
     const data = { status: mapped };
     if (mapped === 'COMPLETED') data.completedAt = new Date();
-    if (mapped === 'CANCELLED') data.cancelledAt = new Date();
     const transitioned = await prisma.businessOrder.updateMany({ where: { id: order.id, status: order.status }, data });
     if (transitioned.count === 0) return prisma.businessOrder.findUnique({ where: { id: order.id }, select: { id: true, status: true, completedAt: true, cancelledAt: true } });
     const updated = await prisma.businessOrder.findUnique({ where: { id: order.id }, select: { id: true, status: true, completedAt: true, cancelledAt: true, orderRef: true, amountUsdc: true } });
@@ -375,7 +396,6 @@ const updateOrderStatusFromEscrow = async (prisma, escrowId, escrowStatus) => {
 // =============================================================================
 const _releaseDeliveredOrder = async (prisma, { orderId, now }) => {
     const escrowService = require('./escrowService');
-    const cutoff = new Date(now - ORDER_RELEASE_AFTER_DELIVERY_MS);
     const pre = await prisma.businessOrder.findUnique({ where: { id: orderId }, select: { escrowId: true } });
     if (!pre || !pre.escrowId) return { released: false, reason: 'NO_ESCROW' };
     const escrowId = pre.escrowId;
@@ -383,28 +403,52 @@ const _releaseDeliveredOrder = async (prisma, { orderId, now }) => {
         await tx.$executeRaw`SELECT id FROM "SmartEscrow" WHERE "id" = ${escrowId} FOR UPDATE`;
         const order = await tx.businessOrder.findUnique({
             where: { id: orderId },
-            select: { id: true, status: true, deliveredAt: true, escrowId: true },
+            select: { id: true, status: true, deliveredAt: true, escrowId: true, businessProfileId: true, orderRef: true, amountUsdc: true },
         });
         if (!order || order.status !== 'DELIVERED' || order.escrowId !== escrowId) {
             return { released: false, reason: 'NOT_DELIVERED' };
-        }
-        if (!order.deliveredAt || new Date(order.deliveredAt) > cutoff) {
-            return { released: false, reason: 'HELD' };
         }
         const escrow = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
         if (!escrow || !_RELEASABLE_ESCROW.includes(escrow.status)) {
             return { released: false, reason: `ESCROW_${escrow ? escrow.status : 'MISSING'}` };
         }
+        // The buyer's window runs from the later of hand-over and payment:
+        // a hand-over recorded before the money was held cannot shorten it.
+        const startedAt = Math.max(
+            order.deliveredAt ? new Date(order.deliveredAt).getTime() : Infinity,
+            escrow.fundedAt ? new Date(escrow.fundedAt).getTime() : 0,
+        );
+        if (!Number.isFinite(startedAt) || now < startedAt + ORDER_RELEASE_AFTER_DELIVERY_MS) {
+            return { released: false, reason: 'HELD' };
+        }
+        // Never paid out automatically to a suspended store or a banned payee:
+        // held for review.
+        const store = await tx.businessProfile.findUnique({ where: { id: order.businessProfileId }, select: { isSuspended: true } });
+        const payee = await tx.user.findUnique({ where: { id: escrow.payeeId }, select: { banStatus: true } });
+        if ((store && store.isSuspended) || (payee && payee.banStatus && payee.banStatus !== 'ACTIVE')) {
+            return { released: false, reason: 'PAYEE_HELD' };
+        }
         const settled = await escrowService._releaseEscrowTx(tx, escrow, 'SETTLED');
-        await tx.businessOrder.updateMany({
+        const done = await tx.businessOrder.updateMany({
             where: { id: orderId, status: 'DELIVERED' },
             data: { status: 'COMPLETED', completedAt: new Date(now) },
         });
-        return { released: true, escrow: settled };
+        if (done.count !== 1) throw new Error('ORDER_STATE_CHANGED: the order moved while its payment was released.');
+        return { released: true, escrow: settled, order };
     });
-    if (out.released && typeof escrowService._afterReleaseCommitted === 'function') {
+    if (out.released) {
         try {
-            escrowService._afterReleaseCommitted(prisma, out.escrow, escrowId, 'SETTLED');
+            if (typeof escrowService._afterReleaseCommitted === 'function') {
+                escrowService._afterReleaseCommitted(prisma, out.escrow, escrowId, 'SETTLED');
+            }
+            // The order completed inside the release (so the post-commit sync
+            // finds nothing to move): say so to the store's integrations here.
+            emitWebhookEvent(out.order.businessProfileId, 'order.completed', {
+                orderId: out.order.id,
+                orderRef: out.order.orderRef,
+                amount: Number(out.order.amountUsdc),
+                status: 'COMPLETED',
+            });
         } catch (err) {
             logger.warn({ err: err && err.message, orderId }, '[businessOrder.release] post-commit fan-out failed');
         }
@@ -415,19 +459,20 @@ const _releaseDeliveredOrder = async (prisma, { orderId, now }) => {
 const releaseDeliveredOrders = async (prisma, { now = Date.now(), limit = 100, maxPages = 10 } = {}) => {
     const out = { checked: 0, released: 0, held: 0, failed: 0, releasedOrders: [] };
     const seen = new Set();
-    let cursor = null;
     for (let page = 0; page < maxPages; page += 1) {
+        // Rows already handled this run are excluded by id (a released row
+        // leaves the filter, so a cursor on it would skip the next one).
         const due = await prisma.businessOrder.findMany({
             where: {
                 status: 'DELIVERED',
                 escrowId: { not: null },
                 deliveredAt: { lte: new Date(now - ORDER_RELEASE_AFTER_DELIVERY_MS) },
                 escrow: { is: { status: { in: _RELEASABLE_ESCROW } } },
+                ...(seen.size > 0 ? { id: { notIn: [...seen] } } : {}),
             },
             select: { id: true },
             orderBy: [{ deliveredAt: 'asc' }, { id: 'asc' }],
             take: limit,
-            ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
         });
         const fresh = due.filter((o) => !seen.has(o.id));
         for (const o of fresh) {
@@ -447,7 +492,6 @@ const releaseDeliveredOrders = async (prisma, { now = Date.now(), limit = 100, m
             }
         }
         if (due.length < limit || fresh.length === 0) break;
-        cursor = due[due.length - 1].id;
     }
     return out;
 };

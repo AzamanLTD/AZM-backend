@@ -206,6 +206,22 @@ class EscrowExpiryWorker {
                     }
                 }
 
+                // A store order that was handed over is paid out by the
+                // release after delivery (72h), never refunded here: if the
+                // store-side flag was not recorded at hand-over, the escrow
+                // is still FUNDED and would otherwise land in this sweep.
+                if (this.prisma.businessOrder) {
+                    const handedOver = await this.prisma.businessOrder.findFirst({
+                        where: { escrowId: escrow.id, status: 'DELIVERED' },
+                        select: { id: true },
+                    });
+                    if (handedOver) {
+                        logger.info({ escrowId: escrow.id, orderId: handedOver.id },
+                            '[EscrowExpiryWorker] skip refund: the order was handed over (released after delivery)');
+                        continue;
+                    }
+                }
+
                 // Refund the payer and stamp EXPIRED (transactional inside service).
                 const refunded = await escrowService._refundEscrow(this.prisma, escrow.id, 'EXPIRED');
 

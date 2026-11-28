@@ -164,7 +164,14 @@ exports.fundEscrow = async (req, res) => {
             return res.status(409).json({ success: false, code: err.code, message: err.message });
         }
         const code = /insufficient/i.test(err.message) ? 400 : 500;
-        return res.status(code).json({ success: false, message: err.message });
+        // The app offers "Add money" on a short balance: say so by code
+        // (the status stays 400, which releases the idempotency key).
+        const shortBalance = code === 400 && err.code === 'INSUFFICIENT_BALANCE';
+        return res.status(code).json({
+            success: false,
+            ...(shortBalance ? { code: 'INSUFFICIENT_BALANCE' } : {}),
+            message: err.message,
+        });
     }
 };
 
@@ -423,10 +430,21 @@ exports.cancelEscrow = async (req, res) => {
         }
 
         const result = await prisma.$transaction(async (tx) => {
-            const escrow = await tx.smartEscrow.update({
-                where: { id: escrowId },
+            // Conditional claim: a funding that committed after the check
+            // above wins, and this cancel changes nothing (an unconditional
+            // write here stranded the locked principal under EXPIRED).
+            const claimed = await tx.smartEscrow.updateMany({
+                where: { id: escrowId, status: 'DRAFT' },
                 data: { status: 'EXPIRED' }
             });
+            if (claimed.count !== 1) {
+                const current = await tx.smartEscrow.findUnique({ where: { id: escrowId }, select: { status: true } });
+                throw Object.assign(
+                    new Error(`Only a DRAFT escrow can be cancelled (current: ${current ? current.status : 'UNKNOWN'}).`),
+                    { code: 'ESCROW_STATE_CHANGED' }
+                );
+            }
+            const escrow = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
             // Close the parent ticket (CANCELLED) — standard ticket status flow.
             await tx.ticket.update({
                 where: { id: loaded.escrow.ticketId },
@@ -438,8 +456,8 @@ exports.cancelEscrow = async (req, res) => {
             // only correct for the worker's funded-escrow sweep. updateMany is a no-op for
             // peer-to-peer escrows with no order.
             await tx.businessOrder.updateMany({
-                where: { escrowId },
-                data: { status: 'CANCELLED' }
+                where: { escrowId, status: 'AWAITING_PAYMENT' },
+                data: { status: 'CANCELLED', cancelledAt: new Date() }
             });
             return escrow;
         });
@@ -468,6 +486,9 @@ exports.cancelEscrow = async (req, res) => {
 
         return res.status(200).json({ success: true, escrow: result });
     } catch (err) {
+        if (err && err.code === 'ESCROW_STATE_CHANGED') {
+            return res.status(409).json({ success: false, code: err.code, message: err.message });
+        }
         logger.error({ err: err }, '[cancelEscrow] error');
         return res.status(500).json({ success: false, message: err.message });
     }

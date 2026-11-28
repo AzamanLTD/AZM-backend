@@ -13,6 +13,8 @@
 //       escrow row lock, in real SQL) pays the store only after 72h, once.
 //   S3. A reported problem (the real dispute) is never released.
 //   S4. An unpaid order whose payment hold lapses is cancelled with it.
+//   S5. An owner cannot buy from their own store (SELF_PAYMENT).
+//   S6. An unpaid order cannot be handed over (ORDER_NOT_PAID).
 // =============================================================================
 
 jest.mock('uuid', () => ({
@@ -166,9 +168,9 @@ run('store orders paid from the wallet (PostgreSQL)', () => {
         expect((await balances(buyer.id)).locked).toBeCloseTo(0, 6);
         expect((await prisma.businessOrder.findUnique({ where: { id: order.id } })).status).toBe('COMPLETED');
 
-        const again = await orders.releaseDeliveredOrders(prisma, { now: Date.now() + 200 * HOUR });
-        expect(again.checked).toBe(0);
+        await orders.releaseDeliveredOrders(prisma, { now: Date.now() + 200 * HOUR });
         expect((await balances(owner.id)).available).toBeCloseTo(10, 6);
+        expect((await prisma.smartEscrow.findUnique({ where: { id: order.escrow.id } })).status).toBe('SETTLED');
     });
 
     test('S3: a reported problem is never released', async () => {
@@ -181,6 +183,28 @@ run('store orders paid from the wallet (PostgreSQL)', () => {
         expect(out.released).toBe(0);
         expect((await balances(owner.id)).available).toBe(0);
         expect((await prisma.smartEscrow.findUnique({ where: { id: order.escrow.id } })).status).toBe('DISPUTED');
+    });
+
+    test('S5: an owner cannot buy from their own store', async () => {
+        const out = await checkout({
+            userId: owner.id,
+            body: { items: [{ productId: product.id, quantity: 1 }], paymentMode: 'ESCROW', idempotencyKey: `sp5-${Date.now()}` },
+        });
+        expect(out.status).toBe(409);
+        expect(out.body.code).toBe('SELF_PAYMENT');
+    });
+
+    test('S6: an unpaid order cannot be handed over', async () => {
+        const buyer = await seedUser(prisma, { availableBalance: 100 });
+        const out = await checkout({
+            userId: buyer.id,
+            body: { items: [{ productId: product.id, quantity: 1 }], paymentMode: 'ESCROW', idempotencyKey: `sp6-${Date.now()}` },
+        });
+        const order = out.body.data.order;
+        await prisma.businessOrder.update({ where: { id: order.id }, data: { status: 'PAID' } });
+        await expect(orders.markDelivered(prisma, { orderId: order.id, businessProfileId: biz.id }))
+            .rejects.toMatchObject({ code: 'ORDER_NOT_PAID' });
+        expect((await prisma.businessOrder.findUnique({ where: { id: order.id } })).deliveredAt).toBeNull();
     });
 
     test('S4: an unpaid order whose payment hold lapses is cancelled', async () => {

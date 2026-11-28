@@ -132,6 +132,14 @@ exports.markDelivered = async (req, res) => {
             io.to(`user_${order.customerId}`).emit('business_order_delivered', { order });
         }
 
+        // Did the hand-over settle it (the buyer had already confirmed)?
+        let settledNow = false;
+        if (order.escrowId) {
+            try {
+                const e = await prisma.smartEscrow.findUnique({ where: { id: order.escrowId }, select: { status: true } });
+                settledNow = !!e && e.status === 'SETTLED';
+            } catch (_) { /* the notice falls back to the window wording */ }
+        }
         const notificationService = req.app.get('notificationService');
         if (notificationService) {
             setImmediate(() => {
@@ -141,9 +149,11 @@ exports.markDelivered = async (req, res) => {
                 notificationService.sendNotification({
                     userId:   order.customerId,
                     title:    'Order handed over',
-                    body:     order.escrowId
-                        ? `${profile.businessName} says "${order.title}" was handed over. Tap Got it, or report a problem within ${Math.round(hours / 24)} days. After that the store is paid.`
-                        : `${profile.businessName} has marked your order "${order.title}" as delivered.`,
+                    body:     !order.escrowId
+                        ? `${profile.businessName} has marked your order "${order.title}" as delivered.`
+                        : (settledNow
+                            ? `${profile.businessName} handed over "${order.title}". You had already confirmed, so the store has been paid.`
+                            : `${profile.businessName} says "${order.title}" was handed over. Tap Got it, or report a problem within ${Math.round(hours / 24)} days. After that the store is paid.`),
                     category: 'GENERAL',
                     actionPayload: {
                         route:   '/my-orders',
@@ -155,7 +165,9 @@ exports.markDelivered = async (req, res) => {
 
         return res.status(200).json({ success: true, order });
     } catch (err) {
-        return res.status(400).json({ success: false, message: err.message });
+        const status = err && err.code === 'STORE_SUSPENDED' ? 403
+            : (err && err.code === 'ORDER_NOT_PAID' ? 409 : 400);
+        return res.status(status).json({ success: false, code: err && err.code, message: err.message });
     }
 };
 

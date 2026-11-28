@@ -32,10 +32,10 @@ const flush = async () => { for (let i = 0; i < 4; i++) await new Promise((r) =>
 function makeDb() {
     const db = {
         user: table([
-            { id: 10, availableBalance: 100, escrowLockedBalance: 0, disputeEscrowBalance: 0 },
-            { id: 20, availableBalance: 0, escrowLockedBalance: 0, disputeEscrowBalance: 0 },
+            { id: 10, availableBalance: 100, escrowLockedBalance: 0, disputeEscrowBalance: 0, banStatus: 'ACTIVE' },
+            { id: 20, availableBalance: 0, escrowLockedBalance: 0, disputeEscrowBalance: 0, banStatus: 'ACTIVE' },
         ]),
-        businessProfile: table([{ id: 'bp-1', userId: 20, businessName: 'Kofi Bakery' }]),
+        businessProfile: table([{ id: 'bp-1', userId: 20, businessName: 'Kofi Bakery', isSuspended: false }]),
         ticket: table([{ id: 't-1', status: 'OPEN', creatorId: 10, counterpartyId: 20 }]),
         smartEscrow: table([{
             id: 'esc-1', ticketId: 't-1', payerId: 10, payeeId: 20, amountUsdc: 5, feeUsdc: 0.05,
@@ -45,9 +45,11 @@ function makeDb() {
         businessOrder: table([{
             id: 'ord-1', businessProfileId: 'bp-1', customerId: 10, status: 'AWAITING_PAYMENT',
             orderRef: 'ORD-1', title: 'Bread', escrowId: 'esc-1', ticketId: 't-1', amountUsdc: 5,
-        }], (row, key) => (key === 'escrow'
-            ? db.smartEscrow.rows.find((e) => e.id === row.escrowId) || null
-            : row[key])),
+        }], (row, key) => {
+            if (key === 'escrow') return db.smartEscrow.rows.find((e) => e.id === row.escrowId) || null;
+            if (key === 'businessProfile') return db.businessProfile.rows.find((b) => b.id === row.businessProfileId) || null;
+            return row[key];
+        }),
         globalSettings: table([{ id: 1, escrowFundedExpiryDays: 30 }]),
         systemProfitFees: table([{ id: 1, balance: 0 }]),
         transactionHistory: table([]),
@@ -194,15 +196,89 @@ describe('an unpaid order', () => {
         expect(user(db, 10).availableBalance).toBe(100);
     });
 
-    test('an expired escrow cancels an unpaid order but refunds a paid one', async () => {
-        const db = makeDb();
-        escrow(db).status = 'EXPIRED';
-        await orders.updateOrderStatusFromEscrow(db, 'esc-1', 'EXPIRED');
-        expect(order(db).status).toBe('CANCELLED');
-
+    test('a funded escrow refunded at expiry still marks its order refunded', async () => {
         const paidDb = makeDb();
         order(paidDb).status = 'PAID';
         await orders.updateOrderStatusFromEscrow(paidDb, 'esc-1', 'EXPIRED');
         expect(order(paidDb).status).toBe('REFUNDED');
+    });
+});
+
+describe('review fixes: who starts the clock, and when', () => {
+    test('an unpaid order cannot be handed over', async () => {
+        const db = makeDb();
+        order(db).status = 'PAID'; // e.g. written by an old bulk update; escrow still DRAFT
+        await expect(orders.markDelivered(db, { orderId: 'ord-1', businessProfileId: 'bp-1' }))
+            .rejects.toMatchObject({ code: 'ORDER_NOT_PAID' });
+        expect(order(db).status).toBe('PAID');
+        expect(order(db).deliveredAt).toBeUndefined();
+    });
+
+    test('a suspended store cannot hand over, and is never paid out automatically', async () => {
+        const db = await paid();
+        db.businessProfile.rows[0].isSuspended = true;
+        await expect(orders.markDelivered(db, { orderId: 'ord-1', businessProfileId: 'bp-1' }))
+            .rejects.toMatchObject({ code: 'STORE_SUSPENDED' });
+
+        const db2 = await handedOver();
+        db2.businessProfile.rows[0].isSuspended = true;
+        const out = await orders.releaseDeliveredOrders(db2, { now: Date.now() + 10 * HOLD });
+        expect(out.released).toBe(0);
+        expect(user(db2, 20).availableBalance).toBe(0);
+        user(db2, 20).banStatus = 'BANNED_1W';
+        db2.businessProfile.rows[0].isSuspended = false;
+        expect((await orders.releaseDeliveredOrders(db2, { now: Date.now() + 10 * HOLD })).released).toBe(0);
+    });
+
+    test('the window runs from the later of hand-over and payment', async () => {
+        const db = await handedOver();
+        const delivered = order(db).deliveredAt.getTime();
+        escrow(db).fundedAt = new Date(delivered + 10 * HOUR); // paid after the recorded hand-over
+        expect((await orders.releaseDeliveredOrders(db, { now: delivered + HOLD + HOUR })).released).toBe(0);
+        expect((await orders.releaseDeliveredOrders(db, { now: delivered + 10 * HOUR + HOLD })).released).toBe(1);
+    });
+
+    test('a report that lands while the sweep waits for the lock wins', async () => {
+        const db = await handedOver();
+        db.$executeRaw.mockImplementation(async () => { escrow(db).status = 'DISPUTED'; return 1; });
+        const out = await orders.releaseDeliveredOrders(db, { now: Date.now() + 10 * HOLD });
+        expect(out.released).toBe(0);
+        expect(user(db, 20).availableBalance).toBe(0);
+    });
+
+    test("the release tells the store's integrations the order completed", async () => {
+        const { emitWebhookEvent } = require('../services/webhookEmitter');
+        emitWebhookEvent.mockClear();
+        const db = await handedOver();
+        await orders.releaseDeliveredOrders(db, { now: Date.now() + HOLD + HOUR });
+        expect(emitWebhookEvent).toHaveBeenCalledWith('bp-1', 'order.completed', expect.objectContaining({ orderId: 'ord-1', status: 'COMPLETED' }));
+    });
+
+    test('the 30-day refund leaves a handed-over order to the release', async () => {
+        const db = await handedOver();
+        escrow(db).status = 'FUNDED'; // the store-side flag was not recorded
+        escrow(db).expiresAt = new Date(Date.now() - 1000);
+        const EscrowExpiryWorker = require('../workers/escrowExpiryWorker');
+        const Worker = EscrowExpiryWorker.EscrowExpiryWorker || EscrowExpiryWorker;
+        await new Worker(db, null, null, {})._expireInactiveFunded(new Date());
+        expect(escrow(db).status).toBe('FUNDED');
+        expect(order(db).status).toBe('DELIVERED');
+        expect(user(db, 10).escrowLockedBalance).toBeCloseTo(5, 9);
+    });
+
+    test('a cancel racing a payment changes nothing', async () => {
+        const db = makeDb();
+        const ctrl = require('../controllers/escrowController');
+        const inner = db.$transaction;
+        db.$transaction = jest.fn(async (cb) => { escrow(db).status = 'FUNDED'; return inner(cb); });
+        let status = null; let payload = null;
+        await ctrl.cancelEscrow({
+            app: { get: (k) => (k === 'prisma' ? db : null) }, user: { id: 10, username: 'ama' },
+            body: { escrowId: 'esc-1' }, ip: '127.0.0.1',
+        }, { status(c) { status = c; return this; }, json(p) { payload = p; return this; } });
+        expect(status).toBe(409);
+        expect(payload.code).toBe('ESCROW_STATE_CHANGED');
+        expect(escrow(db).status).toBe('FUNDED');
+        expect(order(db).status).toBe('AWAITING_PAYMENT');
     });
 });

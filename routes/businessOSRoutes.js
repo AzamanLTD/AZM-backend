@@ -2530,12 +2530,13 @@ router.post('/orders/bulk-status', requirePermission('orders.manage'), wrap(asyn
         businessProfileId: bpId,
         status: { in: allowedFrom },
     };
-    if (status === 'CANCELLED') {
-        // Escrow-backed orders must go through the canonical refund path
-        // (POST /orders/:id/refund — escrow dispute + refund economics).
-        // A bulk cancel that skipped the escrow would strand locked funds.
-        bulkWhere.escrowId = null;
-    }
+    // Escrow-backed orders move only through the escrow: paid by the buyer's
+    // funding, handed over by markDelivered (which checks the payment is
+    // held and starts the buyer's window), completed by release, cancelled
+    // through the canonical refund path (POST /orders/:id/refund). A bulk
+    // write would mark an unpaid order PAID, start the release clock with
+    // no notice to the buyer, or say COMPLETED over an unreleased escrow.
+    bulkWhere.escrowId = null;
 
     const updateData = { status };
     if (status === 'DELIVERED') updateData.deliveredAt = new Date();
