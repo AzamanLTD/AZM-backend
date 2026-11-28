@@ -12,6 +12,33 @@ const { protect } = require('../middleware/authMiddleware');
 const ctrl = require('../controllers/marketplaceController');
 const hotelCtrl = require('../controllers/hotelMarketplaceController');
 const { require2FA } = require('../middleware/require2FA');
+const { checkBan } = require('../middleware/banGuardMiddleware');
+const { requireKyc } = require('../middleware/requireKyc');
+
+// Wallet pay at booking (payWith: 'WALLET') moves money, so it also needs an
+// active (unbanned) account and the KYC 'pay' gate — the same gates as escrow
+// funding. They run BEFORE require2FA so a refused request never spends the
+// passenger's one-time code. A plain reservation (no payWith) is unchanged.
+const whenPayingWithWallet = (mw) => (req, res, next) =>
+    (req.body && req.body.payWith === 'WALLET' ? mw(req, res, next) : next());
+// A paid booking must be reconcilable after a lost response, so wallet pay
+// requires an Idempotency-Key (a plain reservation keeps the legacy opt-out).
+const requireIdempotencyKey = (req, res, next) => {
+    // Exactly the header the idempotency middleware claims on: an
+    // X-Idempotency-Key alone would pass a looser check and run unclaimed.
+    const key = req.get('idempotency-key');
+    if (key) return next();
+    return res.status(400).json({
+        success: false,
+        code: 'IDEMPOTENCY_KEY_REQUIRED',
+        message: 'Paying requires an Idempotency-Key header.',
+    });
+};
+const walletPayGates = [
+    whenPayingWithWallet(checkBan),
+    whenPayingWithWallet(requireKyc('pay')),
+    whenPayingWithWallet(requireIdempotencyKey),
+];
 const { idempotency } = require('../middleware/idempotency');
 
 // ── QR Check-in ──────────────────────────────────────────────────────────────
@@ -22,7 +49,14 @@ router.post('/business/checkin', protect, ctrl.businessCheckIn);
 // Backwards-compatible marketplace contract consumed by the Flutter vertical
 // experiences. Hotel detail includes the authoritative HotelRoom inventory.
 router.get('/business/:bizId', hotelCtrl.getBusinessDetail);
-router.post('/business/:bizId/reservations', protect, hotelCtrl.createHotelReservation);
+// A stay paid from the wallet (payWith WALLET) passes the same gates as a
+// paid transit booking, the second factor and the wired idempotency claim;
+// a plain stay request is unchanged.
+router.post('/business/:bizId/reservations', protect, ...walletPayGates, whenPayingWithWallet(require2FA()),
+    whenPayingWithWallet(idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true, required: false })),
+    hotelCtrl.createHotelReservation);
+// Read-only: each room's exact total and availability for dates + guests.
+router.get('/business/:bizId/stay-quote', hotelCtrl.getStayQuote);
 
 // ── Transit Trips + Seat Booking ─────────────────────────────────────────────
 router.get('/transit/trips', protect, ctrl.listTransitTrips);
@@ -45,7 +79,13 @@ router.get('/transit/trips/:id/seats', protect, ctrl.getTripSeats);
 //     @@unique([tripId, seatId]) already prevents duplicate seat claims
 //     structurally, so a keyless request keeps today's behavior (the
 //     exposure is reconciliation UX only, not duplicate economics).
-router.post('/transit/trips/:id/book', protect, require2FA(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true, required: false }), ctrl.bookTripSeats);
+// payWith: 'WALLET' books AND pays in the one booking transaction (seats,
+// booking escrow, wallet debit, ledger, CONFIRMED) — one second factor for
+// the whole action. A refused payment (insufficient balance, KYC) rolls the
+// seats back too, and the 4xx releases the key for a corrected retry.
+router.post('/transit/trips/:id/book', protect, ...walletPayGates, require2FA(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true, required: false }), ctrl.bookTripSeats);
+// Read-only: what booking these seats with wallet pay would charge.
+router.get('/transit/trips/:id/quote', protect, ctrl.quoteTripSeats);
 router.post('/transit/bookings/:id/checkin', protect, ctrl.transitCheckIn);
 router.delete('/transit/bookings/:id', protect, ctrl.cancelTransitBooking);
 
@@ -104,10 +144,11 @@ router.get('/checkin/search', protect, async (req, res) => {
         const { azamanId } = req.query;
         if (!azamanId) return res.status(400).json({ success: false, message: 'azamanId required' });
 
-        const result = await qrSvc.searchByAzamanId(prisma, {
-            azamanId, businessUserId: req.user.id,
+        const boarding = require('../services/transitBoardingService');
+        const found = await qrSvc.searchByAzamanId(prisma, {
+            azamanId: boarding.normalizeAzamanId(String(azamanId)), businessUserId: req.user.id,
         });
-        res.json(result);
+        res.json(await boarding.enrichAzamanIdSearch(prisma, { businessUserId: req.user.id, result: found }));
     } catch (e) { res.status(400).json({ success: false, message: e.message }); }
 });
 

@@ -83,8 +83,12 @@ const _generateBizId = () =>
  * schema migration. Only the explicit boolean at this namespaced location is
  * authoritative; all other businessMeta content is preserved.
  */
+// Escrow-protected wallet checkout is on for every store unless the owner
+// turned it off: it is the only way an order can be paid in the app (a
+// DIRECT order has no payment step). The buyer's money is held until the
+// order is handed over, then released to the store.
 const _escrowProtectionAvailable = (profile) =>
-    profile?.businessMeta?.escrowProtection?.enabled === true;
+    profile?.businessMeta?.escrowProtection?.enabled !== false;
 
 const _withEscrowProtectionCapability = (profile) => {
     if (!profile) return profile;

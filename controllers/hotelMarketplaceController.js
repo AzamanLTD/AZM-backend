@@ -9,21 +9,13 @@
  * canonical reservationController after authoritative room/rate validation.
  */
 
+const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client');
 const reservationController = require('./reservationController');
+// One pricing for the quote, the reservation and the paid stay.
+const { startOfUtcDay, findNightlyRates } = require('../services/hotelPricingService');
+const { bookingEscrowFee } = require('../services/bookingEscrowService');
 const priceService = require('../services/businessPriceService');
-
-function startOfUtcDay(value) {
-    const d = new Date(value);
-    if (Number.isNaN(d.getTime())) return null;
-    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-}
-
-function addUtcDays(value, days) {
-    const d = new Date(value);
-    d.setUTCDate(d.getUTCDate() + days);
-    return d;
-}
 
 function toPublicRoom(room) {
     return {
@@ -62,50 +54,6 @@ function toPublicBusinessMeta(meta) {
     return Object.keys(publicMeta).length ? publicMeta : null;
 }
 
-async function findNightlyRates(prisma, room, checkInDay, checkOutDay) {
-    const nights = [];
-    for (let cursor = new Date(checkInDay); cursor < checkOutDay; cursor = addUtcDays(cursor, 1)) {
-        nights.push(new Date(cursor));
-    }
-
-    const overrides = await prisma.hotelRateOverride.findMany({
-        where: {
-            businessProfileId: room.businessProfileId,
-            date: { gte: checkInDay, lt: checkOutDay },
-            OR: [
-                { roomId: room.id },
-                { roomId: null, roomType: room.roomType },
-                { roomId: null, roomType: null },
-            ],
-        },
-        orderBy: [{ date: 'asc' }],
-    });
-
-    const overrideMap = new Map();
-    for (const override of overrides) {
-        const dateKey = new Date(override.date).toISOString().slice(0, 10);
-        const priority = override.roomId === room.id ? 3 : override.roomType === room.roomType ? 2 : 1;
-        const existing = overrideMap.get(dateKey);
-        if (!existing || priority > existing.priority) {
-            overrideMap.set(dateKey, { override, priority });
-        }
-    }
-
-    return nights.map((date) => {
-        const dateKey = date.toISOString().slice(0, 10);
-        const override = overrideMap.get(dateKey)?.override;
-        const day = date.getUTCDay();
-        const weekend = day === 0 || day === 6;
-        const base = weekend && room.weekendPriceUsdc != null
-            ? room.weekendPriceUsdc
-            : room.basePriceUsdc;
-        return {
-            date: dateKey,
-            priceUsdc: override ? override.priceUsdc : base,
-            source: override ? 'OVERRIDE' : weekend && room.weekendPriceUsdc != null ? 'WEEKEND' : 'BASE',
-        };
-    });
-}
 
 exports.getBusinessDetail = async (req, res) => {
     const prisma = req.app.get('prisma');
@@ -202,11 +150,190 @@ exports.getBusinessDetail = async (req, res) => {
     });
 };
 
+// =============================================================================
+// GET /api/marketplace/business/:bizId/stay-quote?checkIn&checkOut&guests
+//
+// Read-only. For the chosen dates and guests, every room's exact total (the
+// same per-night pricing the reservation charges: overrides, weekend rate,
+// base rate) and whether it can be booked, with the reason when not. The app
+// showed nights x base rate, which differed from the server total whenever a
+// weekend or an override fell inside the stay, and offered rooms that the
+// reservation then refused (too small, blocked, already booked).
+// Mirrors createHotelReservation's checks and reservationController's
+// double-booking rule (active reservation on the same room overlapping).
+// =============================================================================
+const MAX_QUOTE_NIGHTS = 60;
+const ACTIVE_RESERVATION_STATUSES = ['PENDING', 'CONFIRMED', 'CHECKED_IN'];
+
+exports.getStayQuote = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const { bizId } = req.params;
+        const checkInDay = startOfUtcDay(req.query.checkIn);
+        const checkOutDay = startOfUtcDay(req.query.checkOut);
+        if (!checkInDay || !checkOutDay || checkOutDay <= checkInDay) {
+            return res.status(400).json({ success: false, code: 'DATES_INVALID', message: 'Check-out must be after check-in.' });
+        }
+        if (checkInDay < startOfUtcDay(Date.now())) {
+            return res.status(400).json({ success: false, code: 'DATES_PAST', message: 'Check-in cannot be in the past.' });
+        }
+        const nightsCount = Math.round((checkOutDay - checkInDay) / 86400000);
+        if (nightsCount > MAX_QUOTE_NIGHTS) {
+            return res.status(400).json({ success: false, code: 'STAY_TOO_LONG', message: `A stay can be at most ${MAX_QUOTE_NIGHTS} nights.` });
+        }
+        const guests = Math.min(Math.max(parseInt(req.query.guests, 10) || 1, 1), 50);
+
+        const business = await prisma.businessProfile.findUnique({
+            where: { bizId },
+            select: { id: true, category: true, isSuspended: true, isPausedByOwner: true },
+        });
+        if (!business || business.isSuspended) {
+            return res.status(404).json({ success: false, message: 'Business not found.' });
+        }
+        if (business.category !== 'HOSPITALITY') {
+            return res.status(409).json({ success: false, message: 'This business is not configured as a hotel.' });
+        }
+
+        const rooms = await prisma.hotelRoom.findMany({
+            where: { businessProfileId: business.id },
+            orderBy: [{ floor: 'asc' }, { roomNumber: 'asc' }],
+        });
+        const ids = rooms.map((r) => r.id);
+        const [blocks, booked] = ids.length === 0 ? [[], []] : await Promise.all([
+            prisma.hotelRoomBlock.findMany({
+                where: { roomId: { in: ids }, startDate: { lt: checkOutDay }, endDate: { gt: checkInDay } },
+                select: { roomId: true },
+            }),
+            prisma.reservation.findMany({
+                where: {
+                    businessProfileId: business.id,
+                    serviceItemId: { in: ids },
+                    status: { in: ACTIVE_RESERVATION_STATUSES },
+                    startDatetime: { lt: checkOutDay },
+                    endDatetime: { gt: checkInDay },
+                },
+                select: { serviceItemId: true },
+            }),
+        ]);
+        const blocked = new Set(blocks.map((b) => b.roomId));
+        const taken = new Set(booked.map((b) => b.serviceItemId));
+        // The Azaman fee on a stay paid in the app, from the same function
+        // the payment charges with.
+        const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
+        const round6 = (n) => parseFloat(Number(n).toFixed(6));
+
+        const quoted = [];
+        for (const room of rooms) {
+            const nightly = await findNightlyRates(prisma, room, checkInDay, checkOutDay);
+            const total = nightly.reduce((sum, n) => sum.add(n.priceUsdc), new Prisma.Decimal(0));
+            const reason = room.status !== 'AVAILABLE' ? 'ROOM_UNAVAILABLE'
+                : guests > room.capacity ? 'TOO_SMALL'
+                    : blocked.has(room.id) ? 'BLOCKED'
+                        : taken.has(room.id) ? 'BOOKED'
+                            : total.lte(0) ? 'NO_PRICE'
+                                : null;
+            quoted.push({
+                roomId: room.id,
+                bookable: reason === null,
+                reason,
+                capacity: room.capacity,
+                totalUsdc: Number(total.toFixed(8)),
+                // Paying in the app: the price plus the Azaman fee, held
+                // until check-in. payTotalUsdc is what the guest approves.
+                feeUsdc: bookingEscrowFee(settings, round6(Number(total))).feeUsdc,
+                payTotalUsdc: round6(round6(Number(total)) + bookingEscrowFee(settings, round6(Number(total))).feeUsdc),
+                nightly: nightly.map((n) => ({ date: n.date, priceUsdc: Number(n.priceUsdc), source: n.source })),
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            checkIn: checkInDay.toISOString().slice(0, 10),
+            checkOut: checkOutDay.toISOString().slice(0, 10),
+            nights: nightsCount,
+            guests,
+            // Paid in the app from the wallet and held until the guest checks
+            // in with their QR (POST .../reservations with payWith WALLET).
+            payAt: 'APP',
+            heldUntil: 'CHECK_IN',
+            rooms: quoted,
+        });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: 'Could not price this stay. Try again.' });
+    }
+};
+
 exports.createHotelReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     const { bizId } = req.params;
-    const { checkInDate, checkOutDate, roomId, productId, partySize, customerNotes } = req.body || {};
+    const { checkInDate, checkOutDate, roomId, productId, partySize, customerNotes, payWith, expectedTotalUsdc } = req.body || {};
     const selectedRoomId = roomId || productId;
+
+    // Paid from the wallet, held until check-in (stayPaymentService): one
+    // transaction books, pays and confirms. The route's gates (active
+    // account, KYC pay, Idempotency-Key, second factor) ran before this.
+    if (payWith != null) {
+        if (payWith !== 'WALLET') {
+            return res.status(400).json({ success: false, code: 'UNSUPPORTED_PAYMENT_METHOD', message: `Unsupported payment method: ${payWith}.` });
+        }
+        try {
+            const { bookPaidStay } = require('../services/stayPaymentService');
+            const result = await bookPaidStay(prisma, {
+                bizId,
+                roomId: selectedRoomId,
+                customerId: req.user.id,
+                checkInDate,
+                checkOutDate,
+                partySize,
+                customerNotes,
+                expectedTotalUsdc: expectedTotalUsdc ?? null,
+                clientRequestKey: req.get('idempotency-key'),
+                financialOperation: res.locals?.financialOperation || null,
+            });
+            // The hotel hears of the new stay (best effort, post-commit).
+            if (!result.replayed) {
+                try {
+                    const notifier = req.app.get('notificationService');
+                    const owner = await prisma.businessProfile.findUnique({ where: { bizId }, select: { userId: true } });
+                    if (notifier && owner && typeof notifier.sendNotification === 'function') {
+                        await notifier.sendNotification({
+                            userId: owner.userId,
+                            title: 'New paid stay',
+                            body: `${result.reservation.reservationRef}: paid in Azaman and held until the guest checks in with their QR.`,
+                            category: 'MONEY',
+                            actionPayload: { route: '/marketplace/business/checkin', reservationId: result.reservation.id },
+                        });
+                    }
+                } catch (_) { /* the stay stands either way */ }
+            }
+            return res.status(result.replayed ? 200 : 201).json(result);
+        } catch (err) {
+            const code = err && typeof err.code === 'string' ? err.code : null;
+            if (code === 'INSUFFICIENT_BALANCE') {
+                return res.status(402).json({ success: false, code, message: 'Not enough in your wallet for this stay. Nothing was charged.' });
+            }
+            // The capacity trigger (P2004) or a unique index (P2002) refused
+            // the insert: the transaction rolled back, so nothing was charged.
+            if (code === 'P2002' || (code === 'P2004' && String(err.message).includes('reservation_'))) {
+                return res.status(409).json({ success: false, code: 'BOOKED', message: 'This room was just booked for those dates. Nothing was charged.' });
+            }
+            // Our own refusals carry a code and an HTTP status.
+            if (code && !/^P\d{4}$/.test(code) && Number.isInteger(err.httpStatus) && err.httpStatus >= 400 && err.httpStatus < 500) {
+                return res.status(err.httpStatus).json({ success: false, code, message: err.message });
+            }
+            // Anything else: never a raw database message, and no claim that
+            // nothing was charged (the outcome is not proven). A retry with
+            // the same Idempotency-Key cannot pay twice: if the stay was
+            // paid, its reservation carries that key and the retry replays it
+            // (stayPaymentService), whatever the claim's disposition.
+            logger.error({ err: err && err.message, code, bizId }, '[createHotelReservation] paid stay failed');
+            return res.status(500).json({
+                success: false,
+                code: 'PAYMENT_UNCONFIRMED',
+                message: 'We could not confirm the payment. Check Orders & bookings before trying again; retrying the same stay never charges twice.',
+            });
+        }
+    }
 
     if (!selectedRoomId) {
         return res.status(400).json({ success: false, message: 'roomId is required.' });

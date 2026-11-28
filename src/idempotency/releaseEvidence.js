@@ -104,6 +104,20 @@ const RELEASE_EVIDENCE = [
         ),
     },
 
+    // ── hotel stay paid from the wallet ─────────────────────────────────────
+    {
+        file: 'routes/marketplaceRoutes.js',
+        key: 'POST /business/:bizId/reservations',
+        policy: 'RELEASE_5XX',
+        ...IN_TX(
+            'services/stayPaymentService.js',
+            'The wired idempotency claim commits with the stay',
+            "const committed = await tx.financialOperation.updateMany({ where: { id: financialOperation.id, status: 'IN_PROGRESS' },",
+            { file: '__tests__/stay-wallet-pay.pg.test.js', name: 'H5: through the real idempotency middleware: a retry replays, a different stay under the key is refused, a short balance frees the key' },
+            'Only payWith WALLET mounts the claim; a plain stay request is unchanged.',
+        ),
+    },
+
     // ── multi-currency conversion ───────────────────────────────────────────
     {
         file: 'routes/multiCurrencyRoutes.js',

@@ -1524,9 +1524,17 @@ router.delete('/transit/cargo/:id', requirePermission('transit.cargo.manage'), w
 router.post('/transit/irops/reassign', requirePermission('transit.trips.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
-    const { sourceTripId, targetVehicleId, reason } = req.body;
+    const { sourceTripId, targetVehicleId, reason, departureAt } = req.body;
     if (!sourceTripId || !targetVehicleId) {
         return res.status(400).json({ success: false, message: 'sourceTripId and targetVehicleId are required' });
+    }
+    // The moved passengers' boarding windows and payout holds follow this
+    // departure: it may not be in the past.
+    if (departureAt !== undefined && departureAt !== null) {
+        const at = new Date(departureAt);
+        if (Number.isNaN(at.getTime()) || at.getTime() < Date.now() - 5 * 60 * 1000) {
+            return res.status(400).json({ success: false, code: 'DEPARTURE_IN_PAST', message: 'departureAt must be a valid time that has not passed.' });
+        }
     }
     const sourceTrip = await prisma.transitTrip.findFirst({
         where: { id: sourceTripId, businessProfileId: bpId },
@@ -1547,7 +1555,13 @@ router.post('/transit/irops/reassign', requirePermission('transit.trips.manage')
                 businessProfileId: bpId, vehicleId: targetVehicleId,
                 routeName: `${sourceTrip.routeName} [REPLACEMENT]`,
                 origin: sourceTrip.origin, destination: sourceTrip.destination,
-                departureAt: new Date(), fareUsdc: sourceTrip.fareUsdc,
+                // The replacement leaves when the passengers expect to leave:
+                // the source trip's departure unless the operator sets a new
+                // one. ("now" used to be written here, which put every moved
+                // passenger's boarding window and no-show sweep at the
+                // moment of the swap.)
+                departureAt: departureAt ? new Date(departureAt) : sourceTrip.departureAt,
+                fareUsdc: sourceTrip.fareUsdc,
                 availableSeats: targetVehicle.capacity ?? sourceTrip.availableSeats,
                 status: 'ACTIVE',
             },
@@ -1556,6 +1570,7 @@ router.post('/transit/irops/reassign', requirePermission('transit.trips.manage')
             where: { id: sourceTripId },
             data: { status: 'CANCELLED' },
         });
+
         let passengerCount = 0;
         if (sourceTrip.bookings.length > 0) {
             const moved = await tx.transitBooking.updateMany({
@@ -1563,6 +1578,10 @@ router.post('/transit/irops/reassign', requirePermission('transit.trips.manage')
                 data: { tripId: newTrip.id },
             });
             passengerCount = moved.count;
+            // The moved passengers depart with the replacement: bookings and
+            // paid escrows follow its departure, in this same transaction.
+            const { _rescheduleTripBookingsTx } = require('../services/transitBookingService');
+            await _rescheduleTripBookingsTx(tx, { tripId: newTrip.id, departureAt: newTrip.departureAt });
         }
         let cargoCount = 0;
         if (sourceTrip.cargoParcels.length > 0) {
@@ -1684,8 +1703,10 @@ router.post('/transit/trips/:id/cancel', requirePermission('transit.trips.manage
     const result = await cancelTripWithRefunds(prisma, { tripId: req.params.id, businessProfileId: bpId });
     if (result.notFound) return res.status(404).json({ success: false, message: 'Trip not found' });
     if (result.summary.failed > 0) {
-        // Explicit partial failure: the trip stays active, failed bookings
-        // remain in their prior state, and nothing was silently stranded.
+        // Explicit partial failure: failed bookings remain in their prior
+        // state (the trip may already be CANCELLED if a late booking failed
+        // in the second sweep), nothing was silently stranded, and retrying
+        // reprocesses them.
         return res.status(502).json({
             success: false,
             message: 'Trip cancellation partially failed — retry to resolve the remaining bookings. No booking was cancelled without its escrow being resolved.',
@@ -2363,15 +2384,27 @@ router.post('/reservations/:id/propose-reschedule', requirePermission('reservati
     if (reservation.status !== 'PENDING' && reservation.status !== 'CONFIRMED') {
         return res.status(400).json({ success: false, message: 'Can only reschedule PENDING or CONFIRMED reservations.' });
     }
-    const updated = await prisma.reservation.update({
-        where: { id: req.params.id },
-        data: {
-            proposedStartDatetime: new Date(proposedStartDatetime),
-            proposedEndDatetime: proposedEndDatetime ? new Date(proposedEndDatetime) : null,
-            counterProposeMessage: message || null,
-            counterProposedAt: new Date(),
-        },
-    });
+    // A booking paid in Azaman keeps its dates: its price, its escrow's expiry
+    // and its no-show timing were fixed for them. Checked under the row lock.
+    const { assertDatesMovableTx } = require('../services/stayPaymentService');
+    let updated;
+    try {
+        updated = await prisma.$transaction(async (tx) => {
+            await assertDatesMovableTx(tx, reservation.id);
+            return tx.reservation.update({
+                where: { id: reservation.id },
+                data: {
+                    proposedStartDatetime: new Date(proposedStartDatetime),
+                    proposedEndDatetime: proposedEndDatetime ? new Date(proposedEndDatetime) : null,
+                    counterProposeMessage: message || null,
+                    counterProposedAt: new Date(),
+                },
+            });
+        });
+    } catch (err) {
+        if (err && err.code === 'PAID_DATES_FIXED') return res.status(409).json({ success: false, code: err.code, message: err.message });
+        throw err;
+    }
     res.json({ success: true, reservation: updated });
 }));
 
@@ -2388,18 +2421,29 @@ router.post('/reservations/:id/respond-reschedule', requirePermission('reservati
         return res.status(400).json({ success: false, message: 'No pending reschedule proposal.' });
     }
     if (accept) {
-        // Apply the proposed times
-        const updated = await prisma.reservation.update({
-            where: { id: req.params.id },
-            data: {
-                startDatetime: reservation.proposedStartDatetime,
-                endDatetime: reservation.proposedEndDatetime || reservation.endDatetime,
-                proposedStartDatetime: null,
-                proposedEndDatetime: null,
-                counterProposeMessage: null,
-                counterProposedAt: null,
-            },
-        });
+        // Apply the proposed times. A booking paid in Azaman keeps its dates
+        // (PAID_DATES_FIXED), checked under the reservation's row lock.
+        const { assertDatesMovableTx } = require('../services/stayPaymentService');
+        let updated;
+        try {
+            updated = await prisma.$transaction(async (tx) => {
+                await assertDatesMovableTx(tx, reservation.id);
+                return tx.reservation.update({
+                    where: { id: reservation.id },
+                    data: {
+                        startDatetime: reservation.proposedStartDatetime,
+                        endDatetime: reservation.proposedEndDatetime || reservation.endDatetime,
+                        proposedStartDatetime: null,
+                        proposedEndDatetime: null,
+                        counterProposeMessage: null,
+                        counterProposedAt: null,
+                    },
+                });
+            });
+        } catch (err) {
+            if (err && err.code === 'PAID_DATES_FIXED') return res.status(409).json({ success: false, code: err.code, message: err.message });
+            throw err;
+        }
         res.json({ success: true, reservation: updated, action: 'accepted' });
     } else {
         // Reject the proposal
@@ -2509,12 +2553,13 @@ router.post('/orders/bulk-status', requirePermission('orders.manage'), wrap(asyn
         businessProfileId: bpId,
         status: { in: allowedFrom },
     };
-    if (status === 'CANCELLED') {
-        // Escrow-backed orders must go through the canonical refund path
-        // (POST /orders/:id/refund — escrow dispute + refund economics).
-        // A bulk cancel that skipped the escrow would strand locked funds.
-        bulkWhere.escrowId = null;
-    }
+    // Escrow-backed orders move only through the escrow: paid by the buyer's
+    // funding, handed over by markDelivered (which checks the payment is
+    // held and starts the buyer's window), completed by release, cancelled
+    // through the canonical refund path (POST /orders/:id/refund). A bulk
+    // write would mark an unpaid order PAID, start the release clock with
+    // no notice to the buyer, or say COMPLETED over an unreleased escrow.
+    bulkWhere.escrowId = null;
 
     const updateData = { status };
     if (status === 'DELIVERED') updateData.deliveredAt = new Date();

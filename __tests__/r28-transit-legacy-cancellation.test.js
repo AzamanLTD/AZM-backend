@@ -228,7 +228,7 @@ describeOrSkip('r28 P0-C: legacy transit booking cancellation is canonical, tran
     });
 
     // ── C3 ──────────────────────────────────────────────────────────────────
-    test('C3. owner cancellation with funded escrow => same canonical economics', async () => {
+    test('C3. owner cancellation with funded escrow => same canonical economics, fee refunded too', async () => {
         const ctx = await seedBusinessWithTrip();
         const { customer, booking, escrowId } = await seedBooking(ctx, { amountUsdc: 25, seats: 1 });
 
@@ -239,11 +239,20 @@ describeOrSkip('r28 P0-C: legacy transit booking cancellation is canonical, tran
         expect(res.payload.refund.outcome).toBe('REFUNDED');
         const escrow = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
         expect(escrow.status).toBe('REFUNDED');
+        // The business cancelled, so the customer gets the price AND the
+        // 0.5% fee back (feeRefundPolicy: BUSINESS_CANCELLED refunds the fee
+        // by default): 500 -> 474.875 on funding, back to 500. The fee leaves
+        // the fee pool, and its profit entry is reversed exactly once.
         const payer = await snap(customer.id);
         expect(payer.locked).toBeCloseTo(0, 6);
-        expect(payer.available).toBeCloseTo(500 - 25.125 + 25, 6);
+        expect(payer.available).toBeCloseTo(500, 6);
         expect(await refundLedgerCount(escrowId)).toBe(1);
         expect(await tripCapacity(ctx.trip.id)).toBe(30);
+        const pool = await prisma.systemProfitFees.findUnique({ where: { id: 1 } });
+        expect(Number(pool ? pool.balance : 0)).toBeCloseTo(0, 6);
+        const reversals = await prisma.adminProfitLog.findMany({ where: { relatedTxId: `booking_fee_refund_${escrowId}` } });
+        expect(reversals).toHaveLength(1);
+        expect(Number(reversals[0].amountUsdc)).toBeCloseTo(-0.125, 6);
     });
 
     // ── C4 ──────────────────────────────────────────────────────────────────

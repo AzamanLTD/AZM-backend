@@ -177,6 +177,9 @@ exports.listMyReservations = async (req, res) => {
                 businessProfile: {
                     select: { bizId: true, businessName: true, logoUrl: true, category: true },
                 },
+                // A stay paid in the app: where its money is (held until
+                // check-in, paid to the hotel, refunded) and what was paid.
+                escrow: { select: { status: true, amountUsdc: true, feeUsdc: true } },
             },
             ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
         });
@@ -279,10 +282,83 @@ exports.confirmReservation = async (req, res) => {
     }
 };
 
+// ── PATCH /api/reservations/:reservationId/decline ───────────────────────────
+// The hotel declines a request or cancels a stay it cannot honour. A stay
+// paid in the app is refunded in the same transaction, the Azaman fee
+// included (feeRefundPolicy: the business cancelled).
+exports.declineReservation = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const profile = await prisma.businessProfile.findFirst({ where: { userId: req.user.id } });
+        if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
+        const reason = req.body && typeof req.body.reason === 'string' ? req.body.reason : null;
+        const reservation = await reservationLifecycle.businessCancelReservation(prisma, {
+            reservationId: req.params.reservationId,
+            businessProfileId: profile.id,
+            reason,
+        });
+        try {
+            const notifier = req.app.get('notificationService');
+            if (notifier && typeof notifier.sendNotification === 'function') {
+                const escrow = reservation.escrowId
+                    ? await prisma.smartEscrow.findUnique({ where: { id: reservation.escrowId }, select: { status: true, amountUsdc: true, feeUsdc: true, refundTxHash: true } })
+                    : null;
+                // What came back, as the refund recorded it.
+                const refundRow = escrow && escrow.status === 'REFUNDED' && escrow.refundTxHash
+                    ? await prisma.transactionHistory.findUnique({ where: { txHash: escrow.refundTxHash }, select: { amountUsdc: true, metadata: true } })
+                    : null;
+                const meta = refundRow && refundRow.metadata && typeof refundRow.metadata === 'object' ? refundRow.metadata : {};
+                // 2 to 6 decimals: a sub-cent fee is shown, not rounded away.
+                const usdc = (n) => {
+                    const t = Number(n).toFixed(6).replace(/0+$/, '');
+                    const [w, f = ''] = t.split('.');
+                    return `${w}.${f.padEnd(2, '0')} USDC`;
+                };
+                let refunded = 'Nothing was charged.';
+                if (escrow && escrow.status === 'REFUNDED') {
+                    if (Number(meta.feeRefundOwedUsdc) > 0) {
+                        refunded = `The price you paid (${usdc(escrow.amountUsdc)}) is back in your wallet. `
+                            + `Our team will refund the Azaman fee (${usdc(meta.feeRefundOwedUsdc)}) to you separately.`;
+                    } else if (Number(meta.feeRefundedUsdc) > 0) {
+                        refunded = `Everything you paid (${usdc(refundRow.amountUsdc)}, the Azaman fee included) is back in your wallet.`;
+                    } else if (Number(escrow.feeUsdc) > 0) {
+                        refunded = `The price you paid (${usdc(escrow.amountUsdc)}) is back in your wallet; the Azaman fee (${usdc(escrow.feeUsdc)}) is kept.`;
+                    } else {
+                        refunded = `The ${usdc(escrow.amountUsdc)} you paid is back in your wallet.`;
+                    }
+                }
+                await notifier.sendNotification({
+                    userId: reservation.customerId,
+                    title: 'Your stay was cancelled',
+                    body: `${profile.businessName} cancelled ${reservation.reservationRef}. ${refunded}`
+                        + (reason ? ` Reason: ${String(reason).slice(0, 140)}` : ''),
+                    category: 'MONEY',
+                    actionPayload: { route: '/bookings?tab=reservations' },
+                });
+            }
+        } catch (_) { /* the cancellation stands either way */ }
+        return res.status(200).json({ success: true, reservation });
+    } catch (err) {
+        if (err.code === 'RESERVATION_NOT_FOUND') return res.status(404).json({ success: false, message: err.message });
+        if (['RESERVATION_NOT_CANCELLABLE', 'RESERVATION_STATE_CONFLICT', 'ESCROW_IN_DISPUTE', 'ESCROW_ECONOMIC_CONFLICT', 'ESCROW_ALREADY_FINALIZED'].includes(err.code)) {
+            return res.status(409).json({ success: false, code: err.code, message: err.message });
+        }
+        logger.error({ err }, '[reservation.decline] atomic lifecycle failure');
+        return res.status(500).json({ success: false, message: 'The cancellation failed and nothing changed. Try again.' });
+    }
+};
+
 // ── PATCH /api/reservations/:reservationId/checkin ───────────────────────────
+// A stay paid in the app checks in only by the guest's QR (that is what
+// releases the money to the hotel); staff cannot check it in by hand.
 exports.checkInReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
+        const { isPaidReservation, qrCheckInRequiredError } = require('../services/stayPaymentService');
+        if (await isPaidReservation(prisma, req.params.reservationId)) {
+            const e = qrCheckInRequiredError();
+            return res.status(e.httpStatus).json({ success: false, code: e.code, message: e.message });
+        }
         const reservation = await reservationLifecycle.checkInReservation(prisma, {
             reservationId: req.params.reservationId,
             businessUserId: req.user.id,
@@ -422,17 +498,23 @@ exports.counterProposeReservation = async (req, res) => {
             return res.status(400).json({ success: false, message: `Cannot counter-propose on a ${reservation.status} reservation.` });
         }
 
-        // Update the reservation with the proposed alternative
-        const updated = await req.prisma.reservation.update({
-            where: { id: reservationId },
-            data: {
-                // Keep status as PENDING but store the counter-proposal
-                // The customer will see the proposed alternative and can accept or decline
-                proposedStartDatetime: new Date(proposedStartDatetime),
-                proposedEndDatetime: proposedEndDatetime ? new Date(proposedEndDatetime) : null,
-                counterProposeMessage: message || null,
-                counterProposedAt: new Date(),
-            }
+        // Update the reservation with the proposed alternative. A booking
+        // paid in Azaman keeps its dates (PAID_DATES_FIXED), checked under
+        // the reservation's row lock.
+        const { assertDatesMovableTx } = require('../services/stayPaymentService');
+        const updated = await req.prisma.$transaction(async (tx) => {
+            await assertDatesMovableTx(tx, reservation.id);
+            return tx.reservation.update({
+                where: { id: reservation.id },
+                data: {
+                    // Keep status as PENDING but store the counter-proposal
+                    // The customer will see the proposed alternative and can accept or decline
+                    proposedStartDatetime: new Date(proposedStartDatetime),
+                    proposedEndDatetime: proposedEndDatetime ? new Date(proposedEndDatetime) : null,
+                    counterProposeMessage: message || null,
+                    counterProposedAt: new Date(),
+                }
+            });
         });
 
         // Notify the customer
@@ -461,6 +543,7 @@ exports.counterProposeReservation = async (req, res) => {
 
         res.json({ success: true, reservation: updated });
     } catch (err) {
+        if (err && err.code === 'PAID_DATES_FIXED') return res.status(409).json({ success: false, code: err.code, message: err.message });
         logger.error({ err: err }, '[counterProposeReservation]');
         res.status(500).json({ success: false, message: err.message });
     }
@@ -483,16 +566,21 @@ exports.acceptCounterProposal = async (req, res) => {
             return res.status(400).json({ success: false, message: 'No counter-proposal to accept.' });
         }
 
-        // Apply the proposed times
-        const updated = await req.prisma.reservation.update({
-            where: { id: reservationId },
-            data: {
-                startDatetime: reservation.proposedStartDatetime,
-                endDatetime: reservation.proposedEndDatetime || reservation.endDatetime,
-                proposedStartDatetime: null,
-                proposedEndDatetime: null,
-                counterProposeMessage: null,
-            }
+        // Apply the proposed times. A booking paid in Azaman keeps its dates
+        // (PAID_DATES_FIXED), checked under the reservation's row lock.
+        const { assertDatesMovableTx } = require('../services/stayPaymentService');
+        const updated = await req.prisma.$transaction(async (tx) => {
+            await assertDatesMovableTx(tx, reservation.id);
+            return tx.reservation.update({
+                where: { id: reservation.id },
+                data: {
+                    startDatetime: reservation.proposedStartDatetime,
+                    endDatetime: reservation.proposedEndDatetime || reservation.endDatetime,
+                    proposedStartDatetime: null,
+                    proposedEndDatetime: null,
+                    counterProposeMessage: null,
+                }
+            });
         });
 
         // Notify the business
@@ -510,6 +598,7 @@ exports.acceptCounterProposal = async (req, res) => {
 
         res.json({ success: true, reservation: updated });
     } catch (err) {
+        if (err && err.code === 'PAID_DATES_FIXED') return res.status(409).json({ success: false, code: err.code, message: err.message });
         logger.error({ err: err }, '[acceptCounterProposal]');
         if (err.code === 'P2002' && err.meta?.target === null)
             return res.status(409).json({ success: false, message: 'The proposed time is no longer available.' });

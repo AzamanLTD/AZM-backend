@@ -36,6 +36,7 @@
 // The route holds NO refund/ledger logic of its own.
 // =============================================================================
 
+const { REFUND_CAUSE, refundsFee } = require('./feeRefundPolicy');
 const { randomUUID } = require('crypto');
 const {
     _refundBookingEscrowTx,
@@ -63,6 +64,84 @@ const _summary = (outcomes) => {
         alreadyResolved: by('ALREADY_RESOLVED'),
         failed: by('FAILED'),
     };
+};
+
+// Resolves each booking (claim + canonical refund) in its own transaction.
+const _resolveBookings = async (prisma, bookings) => {
+    const outcomes = [];
+
+    for (const booking of bookings) {
+        const entry = {
+            bookingId: booking.id,
+            customerId: booking.customerId,
+            amountUsdc: Number(booking.amountUsdc),
+        };
+        try {
+            const result = await prisma.$transaction(async (tx) => {
+                // 1. Claim the booking (guarded, idempotent). count 0 means a
+                //    racing actor (worker/another cancellation) already moved
+                //    it out of the active set.
+                const claim = await tx.transitBooking.updateMany({
+                    where: { id: booking.id, status: { in: ACTIVE_BOOKING_STATUSES } },
+                    data: { status: 'CANCELLED' },
+                });
+
+                // 2. Resolve the escrow, if any, through the canonical refund.
+                //    Re-read inside the tx: the load above is advisory only.
+                if (booking.escrowId) {
+                    const escrow = await tx.smartEscrow.findUnique({ where: { id: booking.escrowId } });
+                    if (escrow && REFUND_CLAIMABLE.includes(escrow.status)) {
+                        const reference = randomUUID();
+                        // The operator cancelled the trip: the fee comes
+                        // back too (feeRefundPolicy).
+                        const refunded = await _refundBookingEscrowTx(tx, {
+                            escrowId: escrow.id,
+                            reference,
+                            refundFee: refundsFee(REFUND_CAUSE.BUSINESS_CANCELLED),
+                        });
+                        return {
+                            outcome: 'REFUNDED', escrowStatus: 'REFUNDED', refundReference: reference,
+                            feeRefundedUsdc: refunded ? refunded.feeRefundedUsdc : 0,
+                            feeRefundOwedUsdc: refunded ? refunded.feeRefundOwedUsdc : 0,
+                        };
+                    }
+                    if (escrow && escrow.status === 'DISPUTED') {
+                        // Dispute resolution owns the money; never mutate it
+                        // here. Booking cancellation still removes the
+                        // booking from the no-show worker's CONFIRMED set.
+                        return { outcome: 'ESCROW_DISPUTED', escrowStatus: 'DISPUTED' };
+                    }
+                    if (escrow && ALREADY_FINALIZED.includes(escrow.status)) {
+                        // Already resolved by the canonical contract (prior
+                        // refund/release/expiry). No second economic mutation.
+                        return {
+                            outcome: claim.count === 1 ? 'ESCROW_ALREADY_FINALIZED' : 'ALREADY_RESOLVED',
+                            escrowStatus: escrow.status,
+                        };
+                    }
+                    if (escrow) {
+                        // DRAFT (never funded) or any unexpected state: no
+                        // money is locked, so cancellation is safe, but the
+                        // state is surfaced rather than silently dropped.
+                        return { outcome: 'CANCELLED_NO_ESCROW', escrowStatus: escrow.status };
+                    }
+                    return { outcome: 'CANCELLED_NO_ESCROW', escrowStatus: null };
+                }
+                return claim.count === 1
+                    ? { outcome: 'CANCELLED_NO_ESCROW', escrowStatus: null }
+                    : { outcome: 'ALREADY_RESOLVED', escrowStatus: null };
+            });
+            outcomes.push({ ...entry, ...result });
+        } catch (err) {
+            // The whole booking+refund pair rolled back: the booking stays in
+            // its prior active state, recoverable by retrying this same route.
+            logger.error({ err: err.message, bookingId: booking.id },
+                '[transitTripCancellation] booking cancellation rolled back');
+            outcomes.push({ ...entry, outcome: 'FAILED', error: err.message });
+        }
+    }
+
+    return outcomes;
 };
 
 /**
@@ -106,70 +185,9 @@ const cancelTripWithRefunds = async (prisma, { tripId, businessProfileId }) => {
         return { notFound: true };
     }
 
-    const outcomes = [];
+    const outcomes = await _resolveBookings(prisma, trip.bookings);
 
-    for (const booking of trip.bookings) {
-        const entry = {
-            bookingId: booking.id,
-            customerId: booking.customerId,
-            amountUsdc: Number(booking.amountUsdc),
-        };
-        try {
-            const result = await prisma.$transaction(async (tx) => {
-                // 1. Claim the booking (guarded, idempotent). count 0 means a
-                //    racing actor (worker/another cancellation) already moved
-                //    it out of the active set.
-                const claim = await tx.transitBooking.updateMany({
-                    where: { id: booking.id, status: { in: ACTIVE_BOOKING_STATUSES } },
-                    data: { status: 'CANCELLED' },
-                });
-
-                // 2. Resolve the escrow, if any, through the canonical refund.
-                //    Re-read inside the tx: the load above is advisory only.
-                if (booking.escrowId) {
-                    const escrow = await tx.smartEscrow.findUnique({ where: { id: booking.escrowId } });
-                    if (escrow && REFUND_CLAIMABLE.includes(escrow.status)) {
-                        const reference = randomUUID();
-                        await _refundBookingEscrowTx(tx, { escrowId: escrow.id, reference });
-                        return { outcome: 'REFUNDED', escrowStatus: 'REFUNDED', refundReference: reference };
-                    }
-                    if (escrow && escrow.status === 'DISPUTED') {
-                        // Dispute resolution owns the money; never mutate it
-                        // here. Booking cancellation still removes the
-                        // booking from the no-show worker's CONFIRMED set.
-                        return { outcome: 'ESCROW_DISPUTED', escrowStatus: 'DISPUTED' };
-                    }
-                    if (escrow && ALREADY_FINALIZED.includes(escrow.status)) {
-                        // Already resolved by the canonical contract (prior
-                        // refund/release/expiry). No second economic mutation.
-                        return {
-                            outcome: claim.count === 1 ? 'ESCROW_ALREADY_FINALIZED' : 'ALREADY_RESOLVED',
-                            escrowStatus: escrow.status,
-                        };
-                    }
-                    if (escrow) {
-                        // DRAFT (never funded) or any unexpected state: no
-                        // money is locked, so cancellation is safe, but the
-                        // state is surfaced rather than silently dropped.
-                        return { outcome: 'CANCELLED_NO_ESCROW', escrowStatus: escrow.status };
-                    }
-                    return { outcome: 'CANCELLED_NO_ESCROW', escrowStatus: null };
-                }
-                return claim.count === 1
-                    ? { outcome: 'CANCELLED_NO_ESCROW', escrowStatus: null }
-                    : { outcome: 'ALREADY_RESOLVED', escrowStatus: null };
-            });
-            outcomes.push({ ...entry, ...result });
-        } catch (err) {
-            // The whole booking+refund pair rolled back: the booking stays in
-            // its prior active state, recoverable by retrying this same route.
-            logger.error({ err: err.message, bookingId: booking.id },
-                '[transitTripCancellation] booking cancellation rolled back');
-            outcomes.push({ ...entry, outcome: 'FAILED', error: err.message });
-        }
-    }
-
-    const summary = _summary(outcomes);
+    let summary = _summary(outcomes);
 
     // 3. Flip the trip to CANCELLED only when every eligible booking resolved.
     //    CAS-guarded: a racing cancellation that already flipped the trip is
@@ -180,12 +198,37 @@ const cancelTripWithRefunds = async (prisma, { tripId, businessProfileId }) => {
             where: { id: tripId, status: { not: 'CANCELLED' } },
             data: { status: 'CANCELLED' },
         });
+
+        // 4. A booking that committed between the load above and the flip
+        //    (a wallet payment racing this cancellation) is not in the
+        //    snapshot. Once the trip is CANCELLED no new booking can commit
+        //    (bookSeats' capacity claim requires a bookable trip), so ONE
+        //    fresh sweep resolves every straggler.
+        const late = await prisma.transitBooking.findMany({
+            where: {
+                tripId,
+                OR: [
+                    { status: { in: ACTIVE_BOOKING_STATUSES } },
+                    { status: 'CANCELLED', escrow: { status: { in: REFUND_CLAIMABLE } } },
+                ],
+                id: { notIn: outcomes.map(o => o.bookingId) },
+            },
+            include: { escrow: true },
+        });
+        if (late.length > 0) {
+            outcomes.push(...await _resolveBookings(prisma, late));
+            summary = _summary(outcomes);
+        }
     }
 
     const tripAfter = await prisma.transitTrip.findUnique({ where: { id: tripId }, select: { status: true } });
 
     return {
-        cancelled: tripAfter?.status === 'CANCELLED',
+        // Cancelled means the trip flipped AND every booking resolved. A
+        // failure in the post-flip sweep leaves the trip CANCELLED with an
+        // unresolved booking; that is a partial failure (retry is safe: a
+        // cancelled trip's active bookings are reprocessed), never success.
+        cancelled: tripAfter?.status === 'CANCELLED' && summary.failed === 0,
         tripId,
         tripStatus: tripAfter?.status,
         summary,

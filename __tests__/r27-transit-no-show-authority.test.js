@@ -61,7 +61,11 @@ describeOrSkip('r27 P0-B: transit NO_SHOW is business-authoritative (real Postgr
         return { req, res };
     }
 
-    async function seedContext() {
+    // `departed`: the trip left long enough ago that its boarding window and
+    // the no-show grace have closed (a paid passenger can only then be a
+    // no-show; transitBookingService.assertNoShowWindowClosed).
+    const PAST_NO_SHOW_WINDOW = () => new Date(Date.now() - 3 * 3600_000);
+    async function seedContext({ departed = false } = {}) {
         const { biz, owner } = await seedBusiness(prisma);
         const vehicle = await prisma.transitVehicle.create({
             data: { businessProfileId: biz.id, type: 'VAN', capacity: 12, licensePlate: `GT-B-${Date.now()}` },
@@ -70,7 +74,8 @@ describeOrSkip('r27 P0-B: transit NO_SHOW is business-authoritative (real Postgr
             data: {
                 businessProfileId: biz.id, vehicleId: vehicle.id,
                 routeName: 'Tema Loop', origin: 'Tema', destination: 'Accra',
-                departureAt: new Date(Date.now() + 3600_000), fareUsdc: 15, availableSeats: 12,
+                departureAt: departed ? PAST_NO_SHOW_WINDOW() : new Date(Date.now() + 3600_000),
+                fareUsdc: 15, availableSeats: 12,
             },
         });
         return { biz, owner, vehicle, trip };
@@ -144,8 +149,8 @@ describeOrSkip('r27 P0-B: transit NO_SHOW is business-authoritative (real Postgr
     });
 
     test('B3. business owner NO_SHOW with funded escrow + configured penalty executes the canonical split (never a bare flip)', async () => {
-        const ctx = await seedContext();
-        const { customer, booking } = await seedBooking(ctx, { penaltyPct: 0.25 });
+        const ctx = await seedContext({ departed: true });
+        const { customer, booking } = await seedBooking(ctx, { penaltyPct: 0.25, scheduledAt: PAST_NO_SHOW_WINDOW() });
         const escrowId = await fundEscrow(ctx, booking, customer, 40);
 
         const { req, res } = mockReqRes({ user: { id: ctx.owner.id }, params: { id: booking.id }, body: { status: 'NO_SHOW' } });
@@ -182,9 +187,9 @@ describeOrSkip('r27 P0-B: transit NO_SHOW is business-authoritative (real Postgr
         expect(res.payload.booking.status).toBe('NO_SHOW');
     });
 
-    test('B4b. business owner NO_SHOW with funded escrow but no penalty config mirrors the worker exactly (plain flip, escrow untouched — the worker\'s own no-penalty contract)', async () => {
-        const ctx = await seedContext();
-        const { customer, booking } = await seedBooking(ctx); // no penalty config
+    test('B4b. business owner NO_SHOW with funded escrow but no penalty config refunds in full, like the worker\'s no-penalty branch (never a stranded FUNDED escrow)', async () => {
+        const ctx = await seedContext({ departed: true });
+        const { customer, booking } = await seedBooking(ctx, { scheduledAt: PAST_NO_SHOW_WINDOW() }); // no penalty config
         const escrowId = await fundEscrow(ctx, booking, customer, 40);
 
         const { req, res } = mockReqRes({ user: { id: ctx.owner.id }, params: { id: booking.id }, body: { status: 'NO_SHOW' } });
@@ -192,17 +197,35 @@ describeOrSkip('r27 P0-B: transit NO_SHOW is business-authoritative (real Postgr
 
         expect(res.statusCode).toBe(200);
         expect(res.payload.booking.status).toBe('NO_SHOW');
+        // The worker's no-penalty branch refunds the full fare in the same
+        // transaction; the business path now matches it. (This test used to
+        // assert FUNDED, which left the fare stranded until the 30-day expiry.)
         const escrow = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
-        expect(escrow.status).toBe('FUNDED'); // same as the worker's no-penalty branch
-        expect((await snap(customer.id)).locked).toBeCloseTo(40, 6);
+        expect(escrow.status).toBe('REFUNDED');
+        expect((await snap(customer.id)).locked).toBeCloseTo(0, 6);
+    });
+
+    test('B4c. business owner NO_SHOW of a funded booking before the boarding window closes is refused (409 TOO_EARLY)', async () => {
+        const ctx = await seedContext();
+        const { customer, booking } = await seedBooking(ctx, { penaltyPct: 0.25 });
+        const escrowId = await fundEscrow(ctx, booking, customer, 40);
+
+        const { req, res } = mockReqRes({ user: { id: ctx.owner.id }, params: { id: booking.id }, body: { status: 'NO_SHOW' } });
+        await ctrl.updateBookingStatus(req, res);
+
+        expect(res.statusCode).toBe(409);
+        expect(res.payload.code).toBe('TOO_EARLY');
+        expect((await prisma.transitBooking.findUnique({ where: { id: booking.id } })).status).toBe('CONFIRMED');
+        expect((await prisma.smartEscrow.findUnique({ where: { id: escrowId } })).status).toBe('FUNDED');
     });
 
     test('B5. after a rejected customer NO_SHOW attempt, the worker still finds the booking and executes the penalty economics', async () => {
         const ctx = await seedContext();
-        // Past the 30-minute grace window, still CONFIRMED, escrow funded.
+        // Past the no-show grace window, still CONFIRMED, escrow funded.
+        const { GRACE_PERIOD_MINS } = require('../workers/reservationNoShowWorker');
         const { customer, booking } = await seedBooking(ctx, {
             penaltyPct: 0.25,
-            scheduledAt: new Date(Date.now() - 60 * 60 * 1000),
+            scheduledAt: new Date(Date.now() - (GRACE_PERIOD_MINS + 30) * 60 * 1000),
         });
         await fundEscrow(ctx, booking, customer, 40);
 
