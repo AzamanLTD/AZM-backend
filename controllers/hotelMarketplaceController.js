@@ -11,19 +11,10 @@
 
 const { Prisma } = require('@prisma/client');
 const reservationController = require('./reservationController');
+// One pricing for the quote, the reservation and the paid stay.
+const { startOfUtcDay, findNightlyRates } = require('../services/hotelPricingService');
+const { bookingEscrowFee } = require('../services/bookingEscrowService');
 const priceService = require('../services/businessPriceService');
-
-function startOfUtcDay(value) {
-    const d = new Date(value);
-    if (Number.isNaN(d.getTime())) return null;
-    return new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
-}
-
-function addUtcDays(value, days) {
-    const d = new Date(value);
-    d.setUTCDate(d.getUTCDate() + days);
-    return d;
-}
 
 function toPublicRoom(room) {
     return {
@@ -62,50 +53,6 @@ function toPublicBusinessMeta(meta) {
     return Object.keys(publicMeta).length ? publicMeta : null;
 }
 
-async function findNightlyRates(prisma, room, checkInDay, checkOutDay) {
-    const nights = [];
-    for (let cursor = new Date(checkInDay); cursor < checkOutDay; cursor = addUtcDays(cursor, 1)) {
-        nights.push(new Date(cursor));
-    }
-
-    const overrides = await prisma.hotelRateOverride.findMany({
-        where: {
-            businessProfileId: room.businessProfileId,
-            date: { gte: checkInDay, lt: checkOutDay },
-            OR: [
-                { roomId: room.id },
-                { roomId: null, roomType: room.roomType },
-                { roomId: null, roomType: null },
-            ],
-        },
-        orderBy: [{ date: 'asc' }],
-    });
-
-    const overrideMap = new Map();
-    for (const override of overrides) {
-        const dateKey = new Date(override.date).toISOString().slice(0, 10);
-        const priority = override.roomId === room.id ? 3 : override.roomType === room.roomType ? 2 : 1;
-        const existing = overrideMap.get(dateKey);
-        if (!existing || priority > existing.priority) {
-            overrideMap.set(dateKey, { override, priority });
-        }
-    }
-
-    return nights.map((date) => {
-        const dateKey = date.toISOString().slice(0, 10);
-        const override = overrideMap.get(dateKey)?.override;
-        const day = date.getUTCDay();
-        const weekend = day === 0 || day === 6;
-        const base = weekend && room.weekendPriceUsdc != null
-            ? room.weekendPriceUsdc
-            : room.basePriceUsdc;
-        return {
-            date: dateKey,
-            priceUsdc: override ? override.priceUsdc : base,
-            source: override ? 'OVERRIDE' : weekend && room.weekendPriceUsdc != null ? 'WEEKEND' : 'BASE',
-        };
-    });
-}
 
 exports.getBusinessDetail = async (req, res) => {
     const prisma = req.app.get('prisma');
@@ -269,6 +216,10 @@ exports.getStayQuote = async (req, res) => {
         ]);
         const blocked = new Set(blocks.map((b) => b.roomId));
         const taken = new Set(booked.map((b) => b.serviceItemId));
+        // The Azaman fee on a stay paid in the app, from the same function
+        // the payment charges with.
+        const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
+        const round6 = (n) => parseFloat(Number(n).toFixed(6));
 
         const quoted = [];
         for (const room of rooms) {
@@ -286,6 +237,10 @@ exports.getStayQuote = async (req, res) => {
                 reason,
                 capacity: room.capacity,
                 totalUsdc: Number(total.toFixed(8)),
+                // Paying in the app: the price plus the Azaman fee, held
+                // until check-in. payTotalUsdc is what the guest approves.
+                feeUsdc: bookingEscrowFee(settings, round6(Number(total))).feeUsdc,
+                payTotalUsdc: round6(round6(Number(total)) + bookingEscrowFee(settings, round6(Number(total))).feeUsdc),
                 nightly: nightly.map((n) => ({ date: n.date, priceUsdc: Number(n.priceUsdc), source: n.source })),
             });
         }
@@ -296,9 +251,10 @@ exports.getStayQuote = async (req, res) => {
             checkOut: checkOutDay.toISOString().slice(0, 10),
             nights: nightsCount,
             guests,
-            // A stay is requested here and confirmed by the hotel; it is paid
-            // at the hotel (no in-app payment for stays yet).
-            payAt: 'HOTEL',
+            // Paid in the app from the wallet and held until the guest checks
+            // in with their QR (POST .../reservations with payWith WALLET).
+            payAt: 'APP',
+            heldUntil: 'CHECK_IN',
             rooms: quoted,
         });
     } catch (err) {
@@ -309,8 +265,56 @@ exports.getStayQuote = async (req, res) => {
 exports.createHotelReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     const { bizId } = req.params;
-    const { checkInDate, checkOutDate, roomId, productId, partySize, customerNotes } = req.body || {};
+    const { checkInDate, checkOutDate, roomId, productId, partySize, customerNotes, payWith, expectedTotalUsdc } = req.body || {};
     const selectedRoomId = roomId || productId;
+
+    // Paid from the wallet, held until check-in (stayPaymentService): one
+    // transaction books, pays and confirms. The route's gates (active
+    // account, KYC pay, Idempotency-Key, second factor) ran before this.
+    if (payWith != null) {
+        if (payWith !== 'WALLET') {
+            return res.status(400).json({ success: false, code: 'UNSUPPORTED_PAYMENT_METHOD', message: `Unsupported payment method: ${payWith}.` });
+        }
+        try {
+            const { bookPaidStay } = require('../services/stayPaymentService');
+            const result = await bookPaidStay(prisma, {
+                bizId,
+                roomId: selectedRoomId,
+                customerId: req.user.id,
+                checkInDate,
+                checkOutDate,
+                partySize,
+                customerNotes,
+                expectedTotalUsdc: expectedTotalUsdc ?? null,
+                clientRequestKey: req.get('idempotency-key'),
+                financialOperation: res.locals?.financialOperation || null,
+            });
+            // The hotel hears of the new stay (best effort, post-commit).
+            if (!result.replayed) {
+                try {
+                    const notifier = req.app.get('notificationService');
+                    const owner = await prisma.businessProfile.findUnique({ where: { bizId }, select: { userId: true } });
+                    if (notifier && owner && typeof notifier.sendNotification === 'function') {
+                        await notifier.sendNotification({
+                            userId: owner.userId,
+                            title: 'New paid stay',
+                            body: `${result.reservation.reservationRef}: paid in Azaman and held until the guest checks in with their QR.`,
+                            category: 'MONEY',
+                            actionPayload: { route: '/marketplace/business/checkin', reservationId: result.reservation.id },
+                        });
+                    }
+                } catch (_) { /* the stay stands either way */ }
+            }
+            return res.status(result.replayed ? 200 : 201).json(result);
+        } catch (err) {
+            const status = err.code === 'INSUFFICIENT_BALANCE' ? 402 : (err.httpStatus || 400);
+            return res.status(status).json({
+                success: false,
+                ...(typeof err.code === 'string' && !/^P\d{4}$/.test(err.code) ? { code: err.code } : {}),
+                message: err.message,
+            });
+        }
+    }
 
     if (!selectedRoomId) {
         return res.status(400).json({ success: false, message: 'roomId is required.' });

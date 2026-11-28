@@ -131,6 +131,40 @@ const cancelReservation = async (prisma, { reservationId, customerId }) =>
         });
     });
 
+// The hotel cancels a stay it cannot honour (or declines a request): a paid
+// stay is refunded in full, in the same transaction as the claim.
+const businessCancelReservation = async (prisma, { reservationId, businessProfileId, reason = null }) =>
+    runConvergent(prisma, reservationId, 'CANCELLED_BUSINESS', async (tx) => {
+        const reservation = await loadAggregate(tx, reservationId);
+        if (!reservation || reservation.businessProfileId !== businessProfileId) {
+            throw fail('RESERVATION_NOT_FOUND', 'Reservation not found.');
+        }
+        if (reservation.status === 'CANCELLED_BUSINESS') return reservation;
+        if (!['PENDING', 'CONFIRMED'].includes(reservation.status)) {
+            throw fail('RESERVATION_NOT_CANCELLABLE', `Cannot cancel a reservation with status ${reservation.status}.`);
+        }
+        const escrow = reservation.escrow;
+        if (escrow && CUSTODY_STATES.has(escrow.status)) {
+            throw fail('ESCROW_IN_DISPUTE', 'Reservation funds are in dispute custody.');
+        }
+        if (escrow && REFUND_CLAIMABLE.includes(escrow.status)) {
+            await _refundBookingEscrowTx(tx, { escrowId: escrow.id, reference: randomUUID() });
+        } else if (escrow?.status === 'DRAFT') {
+            await expireDraftEscrow(tx, escrow);
+        } else if (escrow && !['REFUNDED', 'EXPIRED'].includes(escrow.status)) {
+            throw fail('ESCROW_ECONOMIC_CONFLICT', `Escrow is already ${escrow.status}.`);
+        }
+        return claimReservation(tx, {
+            reservationId,
+            from: ['PENDING', 'CONFIRMED'],
+            data: {
+                status: 'CANCELLED_BUSINESS',
+                cancelledAt: new Date(),
+                ...(reason ? { businessNotes: String(reason).slice(0, 500) } : {}),
+            },
+        });
+    });
+
 const checkInReservation = async (prisma, { reservationId, businessUserId, requireFreshClaim = false }) => {
     // A QR token is a ONE-USE credential; a staff retry on the same reservation
     // is not. `requireFreshClaim` keeps the convergent default for the manual
@@ -259,6 +293,7 @@ const checkOutReservation = async (prisma, { reservationId, businessUserId }) =>
 module.exports = {
     confirmReservation,
     cancelReservation,
+    businessCancelReservation,
     checkInReservation,
     checkOutReservation,
     markNoShowReservation,

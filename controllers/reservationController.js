@@ -279,10 +279,56 @@ exports.confirmReservation = async (req, res) => {
     }
 };
 
+// ── PATCH /api/reservations/:reservationId/decline ───────────────────────────
+// The hotel declines a request or cancels a stay it cannot honour. A stay
+// paid in the app is refunded in full, in the same transaction.
+exports.declineReservation = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const profile = await prisma.businessProfile.findFirst({ where: { userId: req.user.id } });
+        if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
+        const reason = req.body && typeof req.body.reason === 'string' ? req.body.reason : null;
+        const reservation = await reservationLifecycle.businessCancelReservation(prisma, {
+            reservationId: req.params.reservationId,
+            businessProfileId: profile.id,
+            reason,
+        });
+        try {
+            const notifier = req.app.get('notificationService');
+            if (notifier && typeof notifier.sendNotification === 'function') {
+                await notifier.sendNotification({
+                    userId: reservation.customerId,
+                    title: 'Your stay was cancelled',
+                    body: `${profile.businessName} cancelled ${reservation.reservationRef}. `
+                        + 'Anything you paid in Azaman is back in your wallet.'
+                        + (reason ? ` Reason: ${String(reason).slice(0, 140)}` : ''),
+                    category: 'MONEY',
+                    actionPayload: { route: '/bookings?tab=reservations' },
+                });
+            }
+        } catch (_) { /* the cancellation stands either way */ }
+        return res.status(200).json({ success: true, reservation });
+    } catch (err) {
+        if (err.code === 'RESERVATION_NOT_FOUND') return res.status(404).json({ success: false, message: err.message });
+        if (['RESERVATION_NOT_CANCELLABLE', 'RESERVATION_STATE_CONFLICT', 'ESCROW_IN_DISPUTE', 'ESCROW_ECONOMIC_CONFLICT', 'ESCROW_ALREADY_FINALIZED'].includes(err.code)) {
+            return res.status(409).json({ success: false, code: err.code, message: err.message });
+        }
+        logger.error({ err }, '[reservation.decline] atomic lifecycle failure');
+        return res.status(500).json({ success: false, message: 'The cancellation failed and nothing changed. Try again.' });
+    }
+};
+
 // ── PATCH /api/reservations/:reservationId/checkin ───────────────────────────
+// A stay paid in the app checks in only by the guest's QR (that is what
+// releases the money to the hotel); staff cannot check it in by hand.
 exports.checkInReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
+        const { isPaidReservation, qrCheckInRequiredError } = require('../services/stayPaymentService');
+        if (await isPaidReservation(prisma, req.params.reservationId)) {
+            const e = qrCheckInRequiredError();
+            return res.status(e.httpStatus).json({ success: false, code: e.code, message: e.message });
+        }
         const reservation = await reservationLifecycle.checkInReservation(prisma, {
             reservationId: req.params.reservationId,
             businessUserId: req.user.id,

@@ -61,6 +61,12 @@ exports.businessCheckIn = async (req, res) => {
             const result = await boarding.enrichAzamanIdSearch(prisma, { businessUserId: req.user.id, result: found });
             return res.status(200).json({ success: true, ...result });
         } else if (reservationId) {
+            // A stay paid in the app checks in only by the guest's QR.
+            const { isPaidReservation, qrCheckInRequiredError } = require('../services/stayPaymentService');
+            if (await isPaidReservation(prisma, reservationId)) {
+                const e = qrCheckInRequiredError();
+                return res.status(e.httpStatus).json({ success: false, code: e.code, message: e.message });
+            }
             // Direct compatibility path delegates to the exact same atomic
             // authority as QR and /api/reservations/:id/checkin.
             const { checkInReservation } = require('../services/reservationLifecycleService');
@@ -272,6 +278,15 @@ exports.setPenaltyPolicy = async (req, res) => {
             const r = await prisma.reservation.findUnique({ where: { id: reservationId } });
             if (!r || r.businessProfileId !== profile.id)
                 return res.status(403).json({ success: false, message: 'Not your reservation.' });
+            // A stay already paid in the app keeps the terms it was paid under.
+            const { isPaidReservation } = require('../services/stayPaymentService');
+            if (await isPaidReservation(prisma, reservationId)) {
+                return res.status(409).json({
+                    success: false,
+                    code: 'PENALTY_LOCKED',
+                    message: 'This stay is already paid; its no-show terms cannot change.',
+                });
+            }
 
             const updated = await prisma.reservation.update({
                 where: { id: reservationId },

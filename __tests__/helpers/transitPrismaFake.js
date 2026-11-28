@@ -27,6 +27,11 @@ function matches(row, where = {}, rel = null) {
         if (k === 'OR' && Array.isArray(cond)) return cond.some((c) => matches(row, c, rel));
         if (k === 'AND' && Array.isArray(cond)) return cond.every((c) => matches(row, c, rel));
         const v = row[k];
+        // A compound unique (a_b_c: { a, b, c }) is a plain match on its fields.
+        if (v === undefined && k.includes('_') && cond && typeof cond === 'object' && !Array.isArray(cond)
+            && !(cond instanceof Date) && Object.keys(cond).every((f) => f in row)) {
+            return matches(row, cond, rel);
+        }
         if (cond === null) return v === null || v === undefined;
         if (cond && typeof cond === 'object' && !Array.isArray(cond) && !(cond instanceof Date)) {
             if ('is' in cond) {

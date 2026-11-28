@@ -49,7 +49,12 @@ router.post('/business/checkin', protect, ctrl.businessCheckIn);
 // Backwards-compatible marketplace contract consumed by the Flutter vertical
 // experiences. Hotel detail includes the authoritative HotelRoom inventory.
 router.get('/business/:bizId', hotelCtrl.getBusinessDetail);
-router.post('/business/:bizId/reservations', protect, hotelCtrl.createHotelReservation);
+// A stay paid from the wallet (payWith WALLET) passes the same gates as a
+// paid transit booking, the second factor and the wired idempotency claim;
+// a plain stay request is unchanged.
+router.post('/business/:bizId/reservations', protect, ...walletPayGates, whenPayingWithWallet(require2FA()),
+    whenPayingWithWallet(idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true, required: false })),
+    hotelCtrl.createHotelReservation);
 // Read-only: each room's exact total and availability for dates + guests.
 router.get('/business/:bizId/stay-quote', hotelCtrl.getStayQuote);
 

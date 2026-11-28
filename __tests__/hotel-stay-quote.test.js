@@ -38,6 +38,8 @@ function makeDb() {
             { id: 'res-1', businessProfileId: 'bp-h', serviceItemId: 'r5', status: 'CONFIRMED', startDatetime: day('2027-12-02'), endDatetime: day('2027-12-04') },
             { id: 'res-2', businessProfileId: 'bp-h', serviceItemId: 'r1', status: 'CANCELLED_CUSTOMER', startDatetime: day(IN), endDatetime: day(OUT) },
         ]),
+        // The quote prices the Azaman fee on a stay paid in the app.
+        globalSettings: table([{ id: 1, smartEscrowFeePct: 0.01 }]),
         hotelRateOverride: table([
             { id: 'o1', businessProfileId: 'bp-h', roomId: null, roomType: 'DELUXE', date: day('2027-12-03'), priceUsdc: 99 },
         ]),
@@ -58,10 +60,11 @@ describe('stay quote', () => {
     test('each room: the exact total and why it can or cannot be booked', async () => {
         const out = await call(makeDb(), { guests: 2 });
         expect(out.status).toBe(200);
-        expect(out.body).toEqual(expect.objectContaining({ nights: 3, guests: 2, payAt: 'HOTEL', checkIn: IN, checkOut: OUT }));
+        // Paid in the app, held until check-in.
+        expect(out.body).toEqual(expect.objectContaining({ nights: 3, guests: 2, payAt: 'APP', heldUntil: 'CHECK_IN', checkIn: IN, checkOut: OUT }));
         const byId = Object.fromEntries(out.body.rooms.map((r) => [r.roomId, r]));
         // r1: override 99 (Fri, type-wide) + weekend 70 (Sat) + weekend 70 (Sun)
-        expect(byId.r1).toEqual(expect.objectContaining({ bookable: true, reason: null, totalUsdc: 239 }));
+        expect(byId.r1).toEqual(expect.objectContaining({ bookable: true, reason: null, totalUsdc: 239, feeUsdc: 2.39, payTotalUsdc: 241.39 }));
         expect(byId.r1.nightly.map((n) => n.source)).toEqual(['OVERRIDE', 'WEEKEND', 'WEEKEND']);
         expect(byId.r2).toEqual(expect.objectContaining({ bookable: false, reason: 'TOO_SMALL' }));
         expect(byId.r3).toEqual(expect.objectContaining({ bookable: false, reason: 'ROOM_UNAVAILABLE' }));
