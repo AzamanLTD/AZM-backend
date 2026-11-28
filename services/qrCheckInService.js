@@ -314,6 +314,7 @@ const verifyAndCheckIn = async (prisma, { token, businessUserId, now = Date.now(
     const { checkInReservation } = require('./reservationLifecycleService');
     try {
         await checkInReservation(prisma, {
+            method: 'QR',
             reservationId: reservation.id,
             businessUserId,
             requireFreshClaim: true,

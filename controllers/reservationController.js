@@ -348,6 +348,111 @@ exports.declineReservation = async (req, res) => {
     }
 };
 
+// ── Check-in by ID check (stayCheckInService) ───────────────────────────────
+const _stayFail = (res, err, tag) => {
+    if (err && err.httpStatus) return res.status(err.httpStatus).json({ success: false, code: err.code, message: err.message });
+    logger.error({ err: err && err.message }, tag);
+    return res.status(500).json({ success: false, message: 'Something went wrong. Try again.' });
+};
+const FRONT_DESK = ['reservations.manage', 'hotel.front_desk.manage'];
+
+// POST /api/reservations/:reservationId/checkin-by-id  { azamanId }
+// The owner, or staff with reservations.manage or hotel.front_desk.manage.
+exports.checkInById = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    let result;
+    try {
+        const { resolveBusinessActor } = require('../services/businessActor');
+        const actor = await resolveBusinessActor(prisma, req.user, { anyOf: FRONT_DESK });
+        if (!actor) return res.status(403).json({ success: false, code: 'NOT_PERMITTED', message: 'You cannot check guests in for this business.' });
+        const { checkInByIdCheck } = require('../services/stayCheckInService');
+        result = await checkInByIdCheck(prisma, {
+            reservationId: req.params.reservationId,
+            businessProfileId: actor.businessProfileId,
+            actorUserId: actor.actorUserId,
+            azamanId: req.body && req.body.azamanId,
+        });
+    } catch (err) {
+        return _stayFail(res, err, '[reservation.checkInById] error');
+    }
+    // The guest hears at once (best effort): a check-in that was not them is
+    // reported before the money is released.
+    try {
+        const notifier = req.app.get('notificationService');
+        if (notifier && typeof notifier.sendNotification === 'function') {
+            await notifier.sendNotification({
+                userId: result.customerId,
+                title: 'You were checked in by ID check',
+                body: (result.businessName || 'Your hotel') + ' checked your ID and checked you in. '
+                    + (result.paymentHeld ? 'Was this you? Confirm it or report it in Orders & bookings.' : 'Enjoy your stay.'),
+                category: 'MARKETPLACE',
+                actionPayload: { route: '/bookings?tab=reservations', reservationId: result.reservation.id },
+            });
+        }
+    } catch (err) {
+        logger.error({ err: err && err.message, reservationId: result.reservation.id }, '[reservation.checkInById] guest notice failed');
+    }
+    return res.status(200).json({
+        success: true,
+        reservation: result.reservation,
+        paymentHeld: result.paymentHeld,
+        holdUntil: result.holdUntil,
+    });
+};
+
+// POST /api/reservations/:reservationId/checkin/confirm — the guest: "That was me".
+exports.confirmIdCheckIn = async (req, res) => {
+    try {
+        const { confirmStayCheckIn } = require('../services/stayCheckInService');
+        const out = await confirmStayCheckIn(req.app.get('prisma'), { reservationId: req.params.reservationId, customerId: req.user.id });
+        return res.status(200).json(out);
+    } catch (err) {
+        return _stayFail(res, err, '[reservation.confirmIdCheckIn] error');
+    }
+};
+
+// POST /api/reservations/:reservationId/checkin/report  { reason } — the guest: "Not me".
+exports.reportIdCheckIn = async (req, res) => {
+    try {
+        const { reportStayCheckIn } = require('../services/stayCheckInService');
+        const out = await reportStayCheckIn(req.app.get('prisma'), {
+            reservationId: req.params.reservationId, customerId: req.user.id, reason: req.body && req.body.reason,
+        });
+        return res.status(200).json(out);
+    } catch (err) {
+        return _stayFail(res, err, '[reservation.reportIdCheckIn] error');
+    }
+};
+
+// GET/PUT /api/reservations/policy/checkin — may staff check guests in by ID?
+// Read: anyone acting for the business. Change: the owner or settings.manage.
+exports.getCheckInPolicy = async (req, res) => {
+    try {
+        const prisma = req.app.get('prisma');
+        const { resolveBusinessActor } = require('../services/businessActor');
+        const actor = await resolveBusinessActor(prisma, req.user);
+        if (!actor) return res.status(404).json({ success: false, message: 'Business profile not found.' });
+        const profile = await prisma.businessProfile.findUnique({ where: { id: actor.businessProfileId } });
+        const { stayCheckInPolicy } = require('../services/stayCheckInService');
+        return res.status(200).json({ success: true, policy: stayCheckInPolicy(profile) });
+    } catch (err) {
+        return _stayFail(res, err, '[reservation.getCheckInPolicy] error');
+    }
+};
+exports.setCheckInPolicy = async (req, res) => {
+    try {
+        const prisma = req.app.get('prisma');
+        const { resolveBusinessActor } = require('../services/businessActor');
+        const actor = await resolveBusinessActor(prisma, req.user, { anyOf: ['settings.manage'] });
+        if (!actor) return res.status(403).json({ success: false, code: 'NOT_PERMITTED', message: 'Only the owner or a manager with settings rights can change this.' });
+        const { setStayCheckInPolicy } = require('../services/stayCheckInService');
+        const policy = await setStayCheckInPolicy(prisma, { businessProfileId: actor.businessProfileId, allowIdCheck: req.body && req.body.allowIdCheck });
+        return res.status(200).json({ success: true, policy });
+    } catch (err) {
+        return _stayFail(res, err, '[reservation.setCheckInPolicy] error');
+    }
+};
+
 // ── PATCH /api/reservations/:reservationId/checkin ───────────────────────────
 // A stay paid in the app checks in only by the guest's QR (that is what
 // releases the money to the hotel); staff cannot check it in by hand.
@@ -366,8 +471,8 @@ exports.checkInReservation = async (req, res) => {
         return res.status(200).json({ success: true, reservation });
     } catch (err) {
         if (err.code === 'RESERVATION_NOT_FOUND') return res.status(404).json({ success: false, message: err.message });
-        if (['RESERVATION_NOT_CHECKIN_READY', 'RESERVATION_STATE_CONFLICT', 'ESCROW_IN_DISPUTE', 'ESCROW_ECONOMIC_CONFLICT', 'ESCROW_ALREADY_FINALIZED'].includes(err.code)) {
-            return res.status(409).json({ success: false, message: err.message });
+        if (['RESERVATION_NOT_CHECKIN_READY', 'RESERVATION_STATE_CONFLICT', 'ESCROW_IN_DISPUTE', 'ESCROW_ECONOMIC_CONFLICT', 'ESCROW_ALREADY_FINALIZED', 'QR_CHECKIN_REQUIRED'].includes(err.code)) {
+            return res.status(409).json({ success: false, code: err.code, message: err.message });
         }
         logger.error({ err }, '[reservation.checkin] atomic lifecycle failure');
         return res.status(500).json({ success: false, message: err.message });

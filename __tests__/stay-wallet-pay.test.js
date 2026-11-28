@@ -201,7 +201,7 @@ describe('after paying', () => {
         const db = makeDb();
         const out = await payStay(db);
         // The QR path (qrCheckInService.verifyAndCheckIn) calls this authority.
-        await lifecycle.checkInReservation(db, { reservationId: out.reservation.id, businessUserId: 20, requireFreshClaim: true });
+        await lifecycle.checkInReservation(db, { method: 'QR', reservationId: out.reservation.id, businessUserId: 20, requireFreshClaim: true });
         expect(reservation(db).status).toBe('CHECKED_IN');
         expect(escrow(db).status).toBe('SETTLED');
         expect(user(db, 20).availableBalance).toBeCloseTo(out.payment.amountUsdc, 9);

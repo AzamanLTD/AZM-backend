@@ -452,15 +452,15 @@ describeOrSkip('QR check-in hardening (real PostgreSQL)', () => {
             expect(after.status).toBe('CHECKED_IN');
         });
 
-        test('D3: the MANUAL check-in path keeps its idempotent, convergent behaviour', async () => {
+        test('D3: the convergent (non-strict) path keeps its idempotent behaviour', async () => {
             const ctx = await seedReservationContext();
             const first = await lifecycle.checkInReservation(prisma, {
-                reservationId: ctx.reservation.id, businessUserId: ctx.owner.id,
+                method: 'QR', reservationId: ctx.reservation.id, businessUserId: ctx.owner.id,
             });
             expect(first.status).toBe('CHECKED_IN');
-            // A staff retry is a retry, not a replay: it must not error.
+            // A retry is a retry, not a replay: it must not error.
             const second = await lifecycle.checkInReservation(prisma, {
-                reservationId: ctx.reservation.id, businessUserId: ctx.owner.id,
+                method: 'QR', reservationId: ctx.reservation.id, businessUserId: ctx.owner.id,
             });
             expect(second.status).toBe('CHECKED_IN');
 
@@ -468,13 +468,24 @@ describeOrSkip('QR check-in hardening (real PostgreSQL)', () => {
             expect(side.releases).toBe(1);
         });
 
-        test('D4: strict mode refuses the convergent path that the manual path accepts', async () => {
+        test('D3b: a paid reservation never checks in by hand, and nothing is paid out', async () => {
+            const ctx = await seedReservationContext();
+            await expect(lifecycle.checkInReservation(prisma, {
+                reservationId: ctx.reservation.id, businessUserId: ctx.owner.id,
+            })).rejects.toMatchObject({ code: 'QR_CHECKIN_REQUIRED' });
+            const side = await releaseSideEffects(ctx.escrowId);
+            expect(side.releases).toBe(0);
+            const after = await prisma.reservation.findUnique({ where: { id: ctx.reservation.id } });
+            expect(after.status).toBe('CONFIRMED');
+        });
+
+        test('D4: strict mode refuses the convergent path that a retry accepts', async () => {
             const ctx = await seedReservationContext();
             await lifecycle.checkInReservation(prisma, {
-                reservationId: ctx.reservation.id, businessUserId: ctx.owner.id,
+                method: 'QR', reservationId: ctx.reservation.id, businessUserId: ctx.owner.id,
             });
             await expect(lifecycle.checkInReservation(prisma, {
-                reservationId: ctx.reservation.id, businessUserId: ctx.owner.id, requireFreshClaim: true,
+                method: 'QR', reservationId: ctx.reservation.id, businessUserId: ctx.owner.id, requireFreshClaim: true,
             })).rejects.toMatchObject({ code: 'RESERVATION_ALREADY_CHECKED_IN' });
         });
     });

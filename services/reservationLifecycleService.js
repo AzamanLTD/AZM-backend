@@ -197,7 +197,13 @@ const businessCancelReservation = async (prisma, { reservationId, businessProfil
         });
     });
 
-const checkInReservation = async (prisma, { reservationId, businessUserId, requireFreshClaim = false }) => {
+// method: 'QR' (the guest's own QR, qrCheckInService) or 'MANUAL' (staff by
+// hand). A reservation whose money is held in Azaman (a paid stay, a funded
+// deposit) never checks in by hand: its check-in is what pays the business,
+// so it takes the guest's QR, or an ID check (stayCheckInService, which holds
+// the money until the guest confirms). The rule lives here so no caller can
+// skip it.
+const checkInReservation = async (prisma, { reservationId, businessUserId, requireFreshClaim = false, method = 'MANUAL' }) => {
     // A QR token is a ONE-USE credential; a staff retry on the same reservation
     // is not. `requireFreshClaim` keeps the convergent default for the manual
     // path and makes the token path refuse any use that did not itself perform
@@ -224,6 +230,9 @@ const checkInReservation = async (prisma, { reservationId, businessUserId, requi
         const escrow = reservation.escrow;
         if (escrow && CUSTODY_STATES.has(escrow.status)) {
             throw fail('ESCROW_IN_DISPUTE', 'Reservation funds are in dispute custody.');
+        }
+        if (method !== 'QR' && escrow && RELEASE_CLAIMABLE.includes(escrow.status)) {
+            throw fail('QR_CHECKIN_REQUIRED', "This stay is paid in Azaman. Scan the guest's check-in QR, or check them in by ID check.");
         }
         if (escrow && RELEASE_CLAIMABLE.includes(escrow.status)) {
             await _releaseBookingEscrowTx(tx, { escrowId: escrow.id, reference: randomUUID() });

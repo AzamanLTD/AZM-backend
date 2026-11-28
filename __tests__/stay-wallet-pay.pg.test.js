@@ -87,11 +87,11 @@ run('hotel stay paid from the wallet (PostgreSQL)', () => {
             locked: expect.closeTo(out.payment.amountUsdc, 6),
         });
 
-        await lifecycle.checkInReservation(prisma, { reservationId: out.reservation.id, businessUserId: ctx.owner.id, requireFreshClaim: true });
+        await lifecycle.checkInReservation(prisma, { method: 'QR', reservationId: out.reservation.id, businessUserId: ctx.owner.id, requireFreshClaim: true });
         expect((await prisma.smartEscrow.findUnique({ where: { id: out.payment.escrowId } })).status).toBe('SETTLED');
         expect((await balances(ctx.owner.id)).available).toBeCloseTo(out.payment.amountUsdc, 6);
         expect((await balances(guest.id)).locked).toBeCloseTo(0, 6);
-        await expect(lifecycle.checkInReservation(prisma, { reservationId: out.reservation.id, businessUserId: ctx.owner.id, requireFreshClaim: true }))
+        await expect(lifecycle.checkInReservation(prisma, { method: 'QR', reservationId: out.reservation.id, businessUserId: ctx.owner.id, requireFreshClaim: true }))
             .rejects.toMatchObject({ code: 'RESERVATION_ALREADY_CHECKED_IN' });
         expect((await balances(ctx.owner.id)).available).toBeCloseTo(out.payment.amountUsdc, 6);
     });

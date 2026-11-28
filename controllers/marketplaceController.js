@@ -116,7 +116,7 @@ exports.businessCheckIn = async (req, res) => {
         }
         // A refused one-use token, or a paid stay scanned before its check-in
         // opens, is a client conflict, not a bad request body.
-        const status = err && (err.code === 'QR_TOKEN_ALREADY_USED' || err.code === 'QR_CHECKIN_NOT_OPEN') ? 409 : 400;
+        const status = err && (err.code === 'QR_TOKEN_ALREADY_USED' || err.code === 'QR_CHECKIN_NOT_OPEN' || err.code === 'QR_CHECKIN_REQUIRED') ? 409 : 400;
         return res.status(status).json({ success: false, code: err.code, message: err.message });
     }
 };

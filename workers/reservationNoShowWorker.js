@@ -432,6 +432,16 @@ const sweepAll = async (prisma, { notify = null } = {}) => {
         logger.error({ err: err.message }, '[NoShowWorker] held payout sweep failed');
         payouts = { error: err.message };
     }
+    // Hotel stays checked in by ID check: pay the hotel once the guest's
+    // report window has passed (a reported one is DISPUTED and stays).
+    let stayPayouts;
+    try {
+        const { sweepHeldStayPayouts } = require('../services/stayCheckInService');
+        stayPayouts = await sweepHeldStayPayouts(prisma);
+    } catch (err) {
+        logger.error({ err: err.message }, '[NoShowWorker] held stay payout sweep failed');
+        stayPayouts = { error: err.message };
+    }
     // Requests the business never answered stop holding rooms and tables.
     let requests;
     try {
@@ -441,7 +451,7 @@ const sweepAll = async (prisma, { notify = null } = {}) => {
         requests = { error: err.message };
     }
     if (sweepError) throw sweepError; // after the payouts ran
-    return { reservations: reservationResults, transit: transitResults, payouts, requests };
+    return { reservations: reservationResults, transit: transitResults, payouts, stayPayouts, requests };
 };
 
 module.exports = {

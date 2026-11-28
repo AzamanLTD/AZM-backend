@@ -110,7 +110,7 @@ describeOrSkip('r25+r29 booking funding/lifecycle integration (real PostgreSQL)'
         const ctx = await seedDraft({ status: 'CONFIRMED' });
         const outcomes = await Promise.allSettled([
             fund(ctx),
-            lifecycle.checkInReservation(prisma, { reservationId: ctx.reservation.id, businessUserId: ctx.owner.id }),
+            lifecycle.checkInReservation(prisma, { method: 'QR', reservationId: ctx.reservation.id, businessUserId: ctx.owner.id }),
         ]);
         expect(outcomes.some(x => x.status === 'fulfilled')).toBe(true);
 
