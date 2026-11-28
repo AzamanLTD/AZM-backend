@@ -52,7 +52,9 @@ describe('release-declaration recovery evidence', () => {
         expect(decls.every((d) => !d.key.includes('?'))).toBe(true);
         const releasing = decls.filter((d) => d.policy === 'RELEASE_5XX');
         const on4xxOnly = decls.filter((d) => d.policy === 'RELEASE_4XX_ONLY');
-        expect(releasing.length).toBe(19);
+        // 20: POST /business/:bizId/reservations (a hotel stay paid from the
+        // wallet) declares a releasing claim, with evidence in releaseEvidence.
+        expect(releasing.length).toBe(20);
         expect(on4xxOnly.length).toBe(7); // AZM conversion retired (was the 8th)
     });
 

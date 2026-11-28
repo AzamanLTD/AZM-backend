@@ -19,6 +19,7 @@ router.patch('/:reservationId/cancel',  protectActive, ctrl.cancelReservation);
 router.get('/business/:bizId',          protect,       ctrl.listBusinessReservations);
 router.patch('/:reservationId/confirm', protect,       ctrl.confirmReservation);
 router.patch('/:reservationId/checkin', protect,       ctrl.checkInReservation);
+router.patch('/:reservationId/decline', protect,       ctrl.declineReservation);
 router.patch('/:reservationId/checkout',protect,       ctrl.checkOutReservation);
 router.patch('/:reservationId/no-show', protect,    ctrl.markNoShowReservation);
 

@@ -132,12 +132,20 @@ async function finalizeConfiguredCheckout(prisma, order, preparedItems, paymentM
       if (!Number.isFinite(feePct)) feePct = 0.01;
       const feeUsdc = Number((authoritativeTotal * feePct).toFixed(6));
       if (order.escrow?.id) {
-        await tx.$executeRaw`
+        // Only while unpaid: a funded escrow's amount is the money locked.
+        // If it was funded in between (a replay handed out the escrow id
+        // first), the whole reconciliation rolls back and the order keeps
+        // the amount that was paid.
+        const repriced = await tx.$executeRaw`
           UPDATE "SmartEscrow"
           SET "amountUsdc" = ${authoritativeTotal},
               "feeUsdc" = ${feeUsdc}
           WHERE id = ${order.escrow.id}
+            AND status = 'DRAFT'
         `;
+        if (repriced !== 1) {
+          throw new Error('ESCROW_NOT_DRAFT: the order was paid before its price was finalized.');
+        }
         order.escrow.amountUsdc = authoritativeTotal;
         order.escrow.feeUsdc = feeUsdc;
       }

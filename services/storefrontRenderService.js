@@ -83,12 +83,15 @@ async function invalidateCache(businessProfileId) {
  * businessMeta JSON. Only the explicit boolean at this namespaced location
  * is authoritative.
  */
+// On unless the store turned it off (businessService._escrowProtectionAvailable
+// explains why): escrow is how a store order is paid from the wallet.
 function _escrowProtectionAvailable(business) {
-  if (!business?.businessMeta) return false;
+  if (!business) return false;
+  if (!business.businessMeta) return true;
   const meta = typeof business.businessMeta === 'string'
     ? (() => { try { return JSON.parse(business.businessMeta); } catch { return {}; } })()
     : business.businessMeta;
-  return meta?.escrowProtection?.enabled === true;
+  return meta?.escrowProtection?.enabled !== false;
 }
 
 /**

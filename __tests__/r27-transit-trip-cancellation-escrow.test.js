@@ -136,7 +136,10 @@ describeOrSkip('r27 P0-A: transit trip cancellation resolves funded escrows (rea
 
         const after = await payerSnapshot(customer.id);
         expect(after.locked).toBeCloseTo(0, 6);
-        expect(after.available).toBeCloseTo(before.available + 40, 6);
+        // The operator cancelled the trip: the fee comes back with the fare
+        // (services/feeRefundPolicy, BUSINESS_CANCELLED).
+        expect(Number(escrowAfter.feeUsdc)).toBeGreaterThan(0);
+        expect(after.available).toBeCloseTo(before.available + 40 + Number(escrowAfter.feeUsdc), 6);
 
         // Canonical economic identity: exactly one ledger posting for this
         // escrow and exactly one COMPLETED refund history row for the payer.
@@ -165,7 +168,8 @@ describeOrSkip('r27 P0-A: transit trip cancellation resolves funded escrows (rea
             const snap = await payerSnapshot(b.customer.id);
             expect(escrow.status).toBe('REFUNDED');
             expect(snap.locked).toBeCloseTo(0, 6);
-            expect(snap.available).toBeCloseTo(500 - (Number(escrow.amountUsdc) + Number(escrow.feeUsdc)) + Number(escrow.amountUsdc), 6);
+            // The operator cancelled the trip: fare and fee both come back.
+            expect(snap.available).toBeCloseTo(500, 6);
             expect(await refundLedgerCount(b.escrowId)).toBe(1);
         }
         const bookings = await prisma.transitBooking.findMany({ where: { tripId: ctx.trip.id } });
@@ -210,7 +214,7 @@ describeOrSkip('r27 P0-A: transit trip cancellation resolves funded escrows (rea
 
         const snap = await payerSnapshot(customer.id);
         expect(snap.locked).toBeCloseTo(0, 6);
-        expect(snap.available).toBeCloseTo(500 - 40.2 + 40, 6); // 500 funded -> principal back exactly once
+        expect(snap.available).toBeCloseTo(500, 6); // fare + fee back exactly once (the operator cancelled)
 
         for (const r of [r1, r2]) {
             expect(r.cancelled).toBe(true);
@@ -367,7 +371,7 @@ describeOrSkip('r27 P0-A: transit trip cancellation resolves funded escrows (rea
         expect(escrow.status).toBe('REFUNDED');
         const snap = await payerSnapshot(customer.id);
         expect(snap.locked).toBeCloseTo(0, 6);
-        expect(snap.available).toBeCloseTo(500 - 40.2 + 40, 6);
+        expect(snap.available).toBeCloseTo(500, 6); // fare + fee (the operator cancelled)
     });
 
     // A9 — tenant isolation.

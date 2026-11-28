@@ -26,13 +26,30 @@ const { audit } = require('../utils/audit');
 async function _loadEscrowForParticipant(prisma, escrowId, userId) {
     const escrow = await prisma.smartEscrow.findUnique({
         where: { id: escrowId },
-        include: { ticket: true }
+        include: { ticket: true, reservation: { select: { id: true } }, transitBooking: { select: { id: true } } }
     });
     if (!escrow) return { ok: false, code: 404, message: 'Escrow not found.' };
     if (escrow.payerId !== userId && escrow.payeeId !== userId) {
         return { ok: false, code: 403, message: 'Not a participant in this escrow.' };
     }
     return { ok: true, escrow };
+}
+
+/**
+ * A stay's or a trip's escrow is settled by the booking itself: the guest's
+ * QR check-in, the passenger's boarding, a cancellation or the no-show sweep.
+ * Marking it complete or disputing it here would pay the hotel before
+ * check-in, or freeze a refund the guest is owed. Store orders still use
+ * these endpoints.
+ */
+function _bookingEscrowRefusal(escrow) {
+    if (escrow && escrow.reservation) {
+        return "This stay's payment is released when the guest checks in with their QR, and refunded if the stay is cancelled. It can't be completed or disputed here.";
+    }
+    if (escrow && escrow.transitBooking) {
+        return "This trip's fare is released when the passenger boards. Report a boarding problem from the trip itself.";
+    }
+    return null;
 }
 
 /** Inject a SYSTEM TicketMessage and fan it out on the ticket room. */
@@ -164,7 +181,14 @@ exports.fundEscrow = async (req, res) => {
             return res.status(409).json({ success: false, code: err.code, message: err.message });
         }
         const code = /insufficient/i.test(err.message) ? 400 : 500;
-        return res.status(code).json({ success: false, message: err.message });
+        // The app offers "Add money" on a short balance: say so by code
+        // (the status stays 400, which releases the idempotency key).
+        const shortBalance = code === 400 && err.code === 'INSUFFICIENT_BALANCE';
+        return res.status(code).json({
+            success: false,
+            ...(shortBalance ? { code: 'INSUFFICIENT_BALANCE' } : {}),
+            message: err.message,
+        });
     }
 };
 
@@ -183,6 +207,11 @@ exports.markSatisfied = async (req, res) => {
 
         const loaded = await _loadEscrowForParticipant(prisma, escrowId, userId);
         if (!loaded.ok) return res.status(loaded.code).json({ success: false, message: loaded.message });
+        const bookingRefusal = _bookingEscrowRefusal(loaded.escrow);
+        if (bookingRefusal) {
+            if (res.locals) res.locals.financialClaimRelease = true; // nothing ran
+            return res.status(409).json({ success: false, code: 'BOOKING_ESCROW', message: bookingRefusal });
+        }
 
         const result = await escrowService.markSatisfied(prisma, {
             escrowId, userId,
@@ -292,6 +321,11 @@ exports.raiseDispute = async (req, res) => {
 
         const loaded = await _loadEscrowForParticipant(prisma, escrowId, userId);
         if (!loaded.ok) return res.status(loaded.code).json({ success: false, message: loaded.message });
+        const bookingRefusal = _bookingEscrowRefusal(loaded.escrow);
+        if (bookingRefusal) {
+            if (res.locals) res.locals.financialClaimRelease = true; // nothing ran
+            return res.status(409).json({ success: false, code: 'BOOKING_ESCROW', message: bookingRefusal });
+        }
 
         const result = await escrowService.raiseDispute(prisma, {
             escrowId, raisedById: userId, reason: cleanReason, evidenceUrls: urls
@@ -423,10 +457,21 @@ exports.cancelEscrow = async (req, res) => {
         }
 
         const result = await prisma.$transaction(async (tx) => {
-            const escrow = await tx.smartEscrow.update({
-                where: { id: escrowId },
+            // Conditional claim: a funding that committed after the check
+            // above wins, and this cancel changes nothing (an unconditional
+            // write here stranded the locked principal under EXPIRED).
+            const claimed = await tx.smartEscrow.updateMany({
+                where: { id: escrowId, status: 'DRAFT' },
                 data: { status: 'EXPIRED' }
             });
+            if (claimed.count !== 1) {
+                const current = await tx.smartEscrow.findUnique({ where: { id: escrowId }, select: { status: true } });
+                throw Object.assign(
+                    new Error(`Only a DRAFT escrow can be cancelled (current: ${current ? current.status : 'UNKNOWN'}).`),
+                    { code: 'ESCROW_STATE_CHANGED' }
+                );
+            }
+            const escrow = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
             // Close the parent ticket (CANCELLED) — standard ticket status flow.
             await tx.ticket.update({
                 where: { id: loaded.escrow.ticketId },
@@ -438,8 +483,8 @@ exports.cancelEscrow = async (req, res) => {
             // only correct for the worker's funded-escrow sweep. updateMany is a no-op for
             // peer-to-peer escrows with no order.
             await tx.businessOrder.updateMany({
-                where: { escrowId },
-                data: { status: 'CANCELLED' }
+                where: { escrowId, status: 'AWAITING_PAYMENT' },
+                data: { status: 'CANCELLED', cancelledAt: new Date() }
             });
             return escrow;
         });
@@ -468,6 +513,9 @@ exports.cancelEscrow = async (req, res) => {
 
         return res.status(200).json({ success: true, escrow: result });
     } catch (err) {
+        if (err && err.code === 'ESCROW_STATE_CHANGED') {
+            return res.status(409).json({ success: false, code: err.code, message: err.message });
+        }
         logger.error({ err: err }, '[cancelEscrow] error');
         return res.status(500).json({ success: false, message: err.message });
     }

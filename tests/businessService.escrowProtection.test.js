@@ -1,7 +1,9 @@
 const businessService = require('../services/businessService');
 
 describe('businessService escrow protection capability', () => {
-  test('public profile reports escrow protection as unavailable by default', async () => {
+  // On by default since the store-checkout change (PR #409); only an explicit
+  // escrowProtection.enabled false switches it off.
+  test('public profile reports escrow protection as available by default', async () => {
     const profile = {
       id: 'biz-1',
       userId: 7,
@@ -16,7 +18,7 @@ describe('businessService escrow protection capability', () => {
 
     const result = await businessService.getBusinessProfile(prisma, { bizId: profile.bizId });
 
-    expect(result.escrowProtectionAvailable).toBe(false);
+    expect(result.escrowProtectionAvailable).toBe(true);
   });
 
   test('owner can enable escrow protection without losing existing business metadata', async () => {

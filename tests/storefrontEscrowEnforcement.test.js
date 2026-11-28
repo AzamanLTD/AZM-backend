@@ -1,16 +1,20 @@
 const { _escrowProtectionAvailable } = require('../services/storefrontRenderService');
 
+// Held payment (escrow protection) is on by default for every store since the
+// store-checkout change (PR #409): a store that never set
+// businessMeta.escrowProtection offers it; only an explicit
+// { enabled: false } switches it off. The opt-out cases below are unchanged.
 describe('Storefront escrow protection — render and checkout enforcement', () => {
 
   // ── _escrowProtectionAvailable helper ──────────────────────────────────────
   
   describe('_escrowProtectionAvailable', () => {
-    test('returns false when businessMeta is null', () => {
-      expect(_escrowProtectionAvailable({ businessMeta: null })).toBe(false);
+    test('returns true when businessMeta is null (on by default)', () => {
+      expect(_escrowProtectionAvailable({ businessMeta: null })).toBe(true);
     });
 
-    test('returns false when businessMeta has no escrowProtection key', () => {
-      expect(_escrowProtectionAvailable({ businessMeta: { other: 'keep' } })).toBe(false);
+    test('returns true when businessMeta has no escrowProtection key (on by default)', () => {
+      expect(_escrowProtectionAvailable({ businessMeta: { other: 'keep' } })).toBe(true);
     });
 
     test('returns false when escrowProtection.enabled is false', () => {
@@ -21,8 +25,13 @@ describe('Storefront escrow protection — render and checkout enforcement', () 
       expect(_escrowProtectionAvailable({ businessMeta: { escrowProtection: { enabled: true } } })).toBe(true);
     });
 
-    test('returns false when businessMeta is a JSON string without escrow', () => {
+    test('returns true when businessMeta is a JSON string without escrow (on by default)', () => {
       const json = JSON.stringify({ other: 'keep' });
+      expect(_escrowProtectionAvailable({ businessMeta: json })).toBe(true);
+    });
+
+    test('returns false when businessMeta is a JSON string with escrow switched off', () => {
+      const json = JSON.stringify({ escrowProtection: { enabled: false } });
       expect(_escrowProtectionAvailable({ businessMeta: json })).toBe(false);
     });
 
@@ -72,10 +81,10 @@ describe('Storefront escrow protection — render and checkout enforcement', () 
       expect(result.message).toContain('does not offer escrow protection');
     });
 
-    test('ESCROW is rejected when businessMeta is null', () => {
+    test('ESCROW proceeds when businessMeta is null (on by default)', () => {
       const business = { businessMeta: null };
       const result = shouldRejectEscrow(business, 'ESCROW');
-      expect(result.reject).toBe(true);
+      expect(result.reject).toBe(false);
     });
 
     test('DIRECT proceeds when business has enabled escrow protection', () => {
@@ -125,10 +134,10 @@ describe('Storefront escrow protection — render and checkout enforcement', () 
       expect(value).toBe(false);
     });
 
-    test('store without businessMeta reports false in render response', () => {
+    test('store without businessMeta reports true in render response (on by default)', () => {
       const sampleBusiness = { businessMeta: null };
       const value = _escrowProtectionAvailable(sampleBusiness);
-      expect(value).toBe(false);
+      expect(value).toBe(true);
     });
   });
 });

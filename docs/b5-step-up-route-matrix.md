@@ -10,7 +10,7 @@ every mutation route (POST/PUT/PATCH/DELETE) in `routes/*.js` whose path
 matches a money term, plus an explicit list of value-moving routes whose paths
 carry no money term (`/ghs`, `/fiat`, `/initiate`, `/satisfy`, `/pay`…).
 
-**Measured population: 135 in-scope routes.**
+**Measured population: 136 in-scope routes.**
 
 | class | count | meaning |
 |---|---|---|
@@ -18,7 +18,7 @@ carry no money term (`/ghs`, `/fiat`, `/initiate`, `/satisfy`, `/pay`…).
 | CUSTOMER_GAP | 30 | moves customer value, no gate — recorded gap, may only shrink |
 | CUSTOMER_EXEMPT | 3 | moves value; step-up not required, economic reason recorded |
 | BUSINESS | 11 | KYB-scoped business operator on their own business |
-| OPERATOR | 20 | admin/operator action — separate operator authorisation, never customer step-up |
+| OPERATOR | 21 | admin/operator action — separate operator authorisation, never customer step-up |
 | NON_VALUE | 60 | matches a money term, moves no value |
 | WEBHOOK | 4 | provider callback; never customer-gated |
 
@@ -109,7 +109,7 @@ are the boundary, not customer step-up.
 | `businessOS POST /retail/purchase-orders` | KYB-scoped business operator acting on their own business; membership + KYB gated |
 | `businessOS PATCH /retail/purchase-orders/:id` | KYB-scoped business operator acting on their own business; membership + KYB gated |
 
-## 5. Operator routes (20)
+## 5. Operator routes (21)
 
 Admin/operator actions. The brief forbids customer step-up here; these need
 separate operator authorisation.
@@ -126,6 +126,7 @@ separate operator authorisation.
 | `admin POST /disputes/:tradeId/resolve` | operator/admin action — needs separate operator authorisation, never customer step-up |
 | `admin POST /escrow-disputes/:id/assign` | operator/admin action — needs separate operator authorisation, never customer step-up |
 | `admin POST /escrow-disputes/:id/resolve` | operator/admin action — needs separate operator authorisation, never customer step-up |
+| `admin POST /fee-lab/publish` | operator/admin action — needs separate operator authorisation, never customer step-up; changes live fee settings: fees.manage + require2FA re-auth + strict audit, one transaction |
 | `admin POST /fee-profiles` | operator/admin action — needs separate operator authorisation, never customer step-up |
 | `admin PUT /fee-profiles/:id` | operator/admin action — needs separate operator authorisation, never customer step-up |
 | `admin DELETE /fee-profiles/:id` | operator/admin action — needs separate operator authorisation, never customer step-up |

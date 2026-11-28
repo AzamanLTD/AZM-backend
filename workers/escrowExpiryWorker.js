@@ -65,6 +65,7 @@ class EscrowExpiryWorker {
             await this._expireUnfunded(now);
             await this._warnInactiveFunded(now);
             await this._expireInactiveFunded(now);
+            await this._releaseDeliveredOrders(now);
         } finally {
             this._running = false;
         }
@@ -96,6 +97,15 @@ class EscrowExpiryWorker {
                         data: { status: 'EXPIRED' }
                     });
                     if (claim.count === 0) return false;
+                    // A store order whose payment hold lapsed unpaid is
+                    // cancelled in the same commit (it was never paid, so
+                    // nothing is refunded; the order no longer offers Pay).
+                    if (tx.businessOrder && typeof tx.businessOrder.updateMany === 'function') {
+                        await tx.businessOrder.updateMany({
+                            where: { escrowId: escrow.id, status: 'AWAITING_PAYMENT' },
+                            data: { status: 'CANCELLED', cancelledAt: now }
+                        });
+                    }
                     if (escrow.ticket && escrow.ticket.status !== 'CANCELLED') {
                         await tx.ticket.update({
                             where: { id: escrow.ticket.id },
@@ -165,6 +175,53 @@ class EscrowExpiryWorker {
 
         for (const escrow of expired) {
             try {
+                // A transit fare whose passenger was boarded (their QR, or an
+                // ID check they never reported) was carried: complete the
+                // booking if the operator forgot to, and release the fare
+                // instead of refunding. Both service calls re-check boarding,
+                // departure and the escrow inside their own transactions; a
+                // reported (DISPUTED) escrow is not FUNDED, so never here.
+                const boarded = await this.prisma.transitBooking.findFirst({
+                    where: { escrowId: escrow.id, status: { in: ['IN_PROGRESS', 'COMPLETED'] } },
+                    select: { id: true, status: true, metadata: true },
+                });
+                const boardedBy = boarded && boarded.metadata && boarded.metadata.boarding
+                    ? boarded.metadata.boarding.method : null;
+                if (boarded && (boardedBy === 'QR_TOKEN' || boardedBy === 'ID_CHECK')) {
+                    const { completeTransitBooking, releaseHeldTransitPayout } = require('../services/transitBookingService');
+                    try {
+                        if (boarded.status === 'IN_PROGRESS') {
+                            await completeTransitBooking(this.prisma, { bookingId: boarded.id, now: now.getTime() });
+                        }
+                        // A completed ID check whose fare was held is released
+                        // here too (no-op when completion already released it).
+                        await releaseHeldTransitPayout(this.prisma, { bookingId: boarded.id, now: now.getTime() });
+                        logger.info({ escrowId: escrow.id, bookingId: boarded.id, boardedBy },
+                            '[EscrowExpiryWorker] completed a boarded transit booking at escrow expiry');
+                        continue;
+                    } catch (err) {
+                        logger.error({ err: err.message, escrowId: escrow.id, bookingId: boarded.id },
+                            '[EscrowExpiryWorker] auto-completion failed; leaving the escrow for the next tick');
+                        continue;
+                    }
+                }
+
+                // A store order that was handed over is paid out by the
+                // release after delivery (72h), never refunded here: if the
+                // store-side flag was not recorded at hand-over, the escrow
+                // is still FUNDED and would otherwise land in this sweep.
+                if (this.prisma.businessOrder) {
+                    const handedOver = await this.prisma.businessOrder.findFirst({
+                        where: { escrowId: escrow.id, status: 'DELIVERED' },
+                        select: { id: true },
+                    });
+                    if (handedOver) {
+                        logger.info({ escrowId: escrow.id, orderId: handedOver.id },
+                            '[EscrowExpiryWorker] skip refund: the order was handed over (released after delivery)');
+                        continue;
+                    }
+                }
+
                 // Refund the payer and stamp EXPIRED (transactional inside service).
                 const refunded = await escrowService._refundEscrow(this.prisma, escrow.id, 'EXPIRED');
 
@@ -192,6 +249,46 @@ class EscrowExpiryWorker {
                 logger.info(`[EscrowExpiryWorker] expired+refunded funded escrow ${escrow.id}`);
             } catch (err) {
                 logger.error(`[EscrowExpiryWorker] expire-funded ${escrow.id} failed:`, err.message);
+            }
+        }
+    }
+
+    // ── 4. Store orders handed over, unanswered past the window → pay store ──
+    async _releaseDeliveredOrders(now) {
+        const bizOrderService = require('../services/businessOrderService');
+        let result;
+        try {
+            result = await bizOrderService.releaseDeliveredOrders(this.prisma, { now: now.getTime() });
+        } catch (err) {
+            logger.error({ err: err && err.message }, '[EscrowExpiryWorker] release after delivery failed');
+            return;
+        }
+        if (!this.notificationService || result.releasedOrders.length === 0) return;
+        for (const orderId of result.releasedOrders) {
+            try {
+                const order = await this.prisma.businessOrder.findUnique({
+                    where: { id: orderId },
+                    select: { id: true, orderRef: true, customerId: true, businessProfile: { select: { userId: true, businessName: true } } },
+                });
+                if (!order) continue;
+                await this.notificationService.sendNotification({
+                    userId: order.customerId,
+                    title: 'Order complete',
+                    body: `No problem was reported for ${order.orderRef}, so ${order.businessProfile ? order.businessProfile.businessName : 'the store'} has been paid.`,
+                    category: 'MONEY',
+                    actionPayload: { route: '/my-orders', orderId: order.id },
+                }).catch(() => {});
+                if (order.businessProfile) {
+                    await this.notificationService.sendNotification({
+                        userId: order.businessProfile.userId,
+                        title: 'Payment released',
+                        body: `${order.orderRef}: the buyer's confirmation window has passed. The payment is in your balance.`,
+                        category: 'MONEY',
+                        actionPayload: { action: 'OPEN_WALLET' },
+                    }).catch(() => {});
+                }
+            } catch (err) {
+                logger.warn({ err: err && err.message, orderId }, '[EscrowExpiryWorker] release notice failed');
             }
         }
     }

@@ -8,6 +8,8 @@
 // through inverted locks and exactly one economic fact can win.
 // =============================================================================
 
+const { REFUND_CAUSE, refundsFeeNow } = require('./feeRefundPolicy');
+const { isPaidStay, noShowCutoff } = require('./paidStayPolicy');
 const { randomUUID } = require('crypto');
 const {
     _refundBookingEscrowTx,
@@ -117,7 +119,11 @@ const cancelReservation = async (prisma, { reservationId, customerId }) =>
             throw fail('ESCROW_IN_DISPUTE', 'Reservation funds are in dispute custody.');
         }
         if (escrow && REFUND_CLAIMABLE.includes(escrow.status)) {
-            await _refundBookingEscrowTx(tx, { escrowId: escrow.id, reference: randomUUID() });
+            await _refundBookingEscrowTx(tx, {
+                escrowId: escrow.id,
+                reference: randomUUID(),
+                refundFee: await refundsFeeNow(tx, REFUND_CAUSE.CUSTOMER_CANCELLED),
+            });
         } else if (escrow?.status === 'DRAFT') {
             await expireDraftEscrow(tx, escrow);
         } else if (escrow && !['REFUNDED', 'EXPIRED'].includes(escrow.status)) {
@@ -128,6 +134,45 @@ const cancelReservation = async (prisma, { reservationId, customerId }) =>
             reservationId,
             from: ['PENDING', 'CONFIRMED'],
             data: { status: 'CANCELLED_CUSTOMER', cancelledAt: new Date() },
+        });
+    });
+
+// The hotel cancels a stay it cannot honour (or declines a request): a paid
+// stay is refunded in the same transaction as the claim, the Azaman fee
+// included (feeRefundPolicy: the business cancelled).
+const businessCancelReservation = async (prisma, { reservationId, businessProfileId, reason = null }) =>
+    runConvergent(prisma, reservationId, 'CANCELLED_BUSINESS', async (tx) => {
+        const reservation = await loadAggregate(tx, reservationId);
+        if (!reservation || reservation.businessProfileId !== businessProfileId) {
+            throw fail('RESERVATION_NOT_FOUND', 'Reservation not found.');
+        }
+        if (reservation.status === 'CANCELLED_BUSINESS') return reservation;
+        if (!['PENDING', 'CONFIRMED'].includes(reservation.status)) {
+            throw fail('RESERVATION_NOT_CANCELLABLE', `Cannot cancel a reservation with status ${reservation.status}.`);
+        }
+        const escrow = reservation.escrow;
+        if (escrow && CUSTODY_STATES.has(escrow.status)) {
+            throw fail('ESCROW_IN_DISPUTE', 'Reservation funds are in dispute custody.');
+        }
+        if (escrow && REFUND_CLAIMABLE.includes(escrow.status)) {
+            await _refundBookingEscrowTx(tx, {
+                escrowId: escrow.id,
+                reference: randomUUID(),
+                refundFee: await refundsFeeNow(tx, REFUND_CAUSE.BUSINESS_CANCELLED),
+            });
+        } else if (escrow?.status === 'DRAFT') {
+            await expireDraftEscrow(tx, escrow);
+        } else if (escrow && !['REFUNDED', 'EXPIRED'].includes(escrow.status)) {
+            throw fail('ESCROW_ECONOMIC_CONFLICT', `Escrow is already ${escrow.status}.`);
+        }
+        return claimReservation(tx, {
+            reservationId,
+            from: ['PENDING', 'CONFIRMED'],
+            data: {
+                status: 'CANCELLED_BUSINESS',
+                cancelledAt: new Date(),
+                ...(reason ? { businessNotes: String(reason).slice(0, 500) } : {}),
+            },
         });
     });
 
@@ -186,8 +231,14 @@ const markNoShowReservation = async (prisma, { reservationId, businessUserId = n
         if (reservation.status !== 'CONFIRMED') {
             throw fail('RESERVATION_NOT_NO_SHOW_READY', `Reservation is ${reservation.status}, cannot mark no-show.`);
         }
-        if (reservation.checkedInAt || reservation.endDatetime >= new Date()) {
-            throw fail('RESERVATION_NOT_NO_SHOW_READY', 'Reservation cannot be marked no-show before its end time.');
+        // A stay paid in the app stays open for a late arrival until noon on
+        // the check-out day (paidStayPolicy); any other reservation is a
+        // no-show from its end.
+        const cutoff = noShowCutoff(reservation);
+        if (reservation.checkedInAt || reservation.endDatetime >= cutoff) {
+            throw fail('RESERVATION_NOT_NO_SHOW_READY', isPaidStay(reservation)
+                ? 'A paid stay can be marked no-show from noon on its check-out day.'
+                : 'Reservation cannot be marked no-show before its end time.');
         }
 
         const escrow = reservation.escrow;
@@ -212,12 +263,16 @@ const markNoShowReservation = async (prisma, { reservationId, businessUserId = n
                     refundRef: randomUUID(),
                     reservationClaimWhere: {
                         checkedInAt: null,
-                        endDatetime: { lt: new Date() },
+                        endDatetime: { lt: cutoff },
                     },
                 });
                 return tx.reservation.findUnique({ where: { id: reservationId } });
             }
-            await _refundBookingEscrowTx(tx, { escrowId: escrow.id, reference: randomUUID() });
+            await _refundBookingEscrowTx(tx, {
+                escrowId: escrow.id,
+                reference: randomUUID(),
+                refundFee: await refundsFeeNow(tx, REFUND_CAUSE.NO_SHOW),
+            });
         } else if (escrow?.status === 'DRAFT') {
             await expireDraftEscrow(tx, escrow);
         } else if (escrow && !['REFUNDED', 'EXPIRED'].includes(escrow.status)) {
@@ -229,7 +284,7 @@ const markNoShowReservation = async (prisma, { reservationId, businessUserId = n
             from: ['CONFIRMED'],
             where: {
                 checkedInAt: null,
-                endDatetime: { lt: new Date() },
+                endDatetime: { lt: cutoff },
             },
             data: {
                 status: 'NO_SHOW',
@@ -259,6 +314,7 @@ const checkOutReservation = async (prisma, { reservationId, businessUserId }) =>
 module.exports = {
     confirmReservation,
     cancelReservation,
+    businessCancelReservation,
     checkInReservation,
     checkOutReservation,
     markNoShowReservation,
