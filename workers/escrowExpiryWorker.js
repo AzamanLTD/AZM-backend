@@ -65,6 +65,7 @@ class EscrowExpiryWorker {
             await this._expireUnfunded(now);
             await this._warnInactiveFunded(now);
             await this._expireInactiveFunded(now);
+            await this._releaseDeliveredOrders(now);
         } finally {
             this._running = false;
         }
@@ -96,6 +97,15 @@ class EscrowExpiryWorker {
                         data: { status: 'EXPIRED' }
                     });
                     if (claim.count === 0) return false;
+                    // A store order whose payment hold lapsed unpaid is
+                    // cancelled in the same commit (it was never paid, so
+                    // nothing is refunded; the order no longer offers Pay).
+                    if (tx.businessOrder && typeof tx.businessOrder.updateMany === 'function') {
+                        await tx.businessOrder.updateMany({
+                            where: { escrowId: escrow.id, status: 'AWAITING_PAYMENT' },
+                            data: { status: 'CANCELLED', cancelledAt: now }
+                        });
+                    }
                     if (escrow.ticket && escrow.ticket.status !== 'CANCELLED') {
                         await tx.ticket.update({
                             where: { id: escrow.ticket.id },
@@ -223,6 +233,46 @@ class EscrowExpiryWorker {
                 logger.info(`[EscrowExpiryWorker] expired+refunded funded escrow ${escrow.id}`);
             } catch (err) {
                 logger.error(`[EscrowExpiryWorker] expire-funded ${escrow.id} failed:`, err.message);
+            }
+        }
+    }
+
+    // ── 4. Store orders handed over, unanswered past the window → pay store ──
+    async _releaseDeliveredOrders(now) {
+        const bizOrderService = require('../services/businessOrderService');
+        let result;
+        try {
+            result = await bizOrderService.releaseDeliveredOrders(this.prisma, { now: now.getTime() });
+        } catch (err) {
+            logger.error({ err: err && err.message }, '[EscrowExpiryWorker] release after delivery failed');
+            return;
+        }
+        if (!this.notificationService || result.releasedOrders.length === 0) return;
+        for (const orderId of result.releasedOrders) {
+            try {
+                const order = await this.prisma.businessOrder.findUnique({
+                    where: { id: orderId },
+                    select: { id: true, orderRef: true, customerId: true, businessProfile: { select: { userId: true, businessName: true } } },
+                });
+                if (!order) continue;
+                await this.notificationService.sendNotification({
+                    userId: order.customerId,
+                    title: 'Order complete',
+                    body: `No problem was reported for ${order.orderRef}, so ${order.businessProfile ? order.businessProfile.businessName : 'the store'} has been paid.`,
+                    category: 'MONEY',
+                    actionPayload: { route: '/my-orders', orderId: order.id },
+                }).catch(() => {});
+                if (order.businessProfile) {
+                    await this.notificationService.sendNotification({
+                        userId: order.businessProfile.userId,
+                        title: 'Payment released',
+                        body: `${order.orderRef}: the buyer's confirmation window has passed. The payment is in your balance.`,
+                        category: 'MONEY',
+                        actionPayload: { action: 'OPEN_WALLET' },
+                    }).catch(() => {});
+                }
+            } catch (err) {
+                logger.warn({ err: err && err.message, orderId }, '[EscrowExpiryWorker] release notice failed');
             }
         }
     }

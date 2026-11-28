@@ -135,14 +135,18 @@ exports.markDelivered = async (req, res) => {
         const notificationService = req.app.get('notificationService');
         if (notificationService) {
             setImmediate(() => {
+                // An escrow-paid order: the buyer has the release window to
+                // confirm or report a problem (businessOrderService).
+                const hours = Math.round(businessOrderService.ORDER_RELEASE_AFTER_DELIVERY_MS / 3600000);
                 notificationService.sendNotification({
                     userId:   order.customerId,
-                    title:    'Order Delivered',
-                    body:     `${profile.businessName} has marked your order "${order.title}" as delivered. Confirm to release payment.`,
+                    title:    'Order handed over',
+                    body:     order.escrowId
+                        ? `${profile.businessName} says "${order.title}" was handed over. Tap Got it, or report a problem within ${Math.round(hours / 24)} days. After that the store is paid.`
+                        : `${profile.businessName} has marked your order "${order.title}" as delivered.`,
                     category: 'GENERAL',
                     actionPayload: {
-                        route:   order.ticketId ? `/tickets/${order.ticketId}` : '/business/my-orders',
-                        action:  'VIEW_TICKET',
+                        route:   '/my-orders',
                         orderId: order.id
                     }
                 }).catch((e) => logger.error({ err: e }, '[markDelivered] notification'));
