@@ -58,11 +58,17 @@ describe('business boarding by ID check', () => {
 
 describe('vehicle seat map save', () => {
     const save = (prisma, body) => new TransitOpsService(prisma).saveSeatMap('veh-a', body, 'business-a');
-    const withVehicle = (booked = []) => ({
-        transitVehicle: { findFirst: jest.fn(async () => ({ id: 'veh-a' })) },
-        transitBookingSeat: { findMany: jest.fn(async () => booked) },
-        transitSeatMap: { upsert: jest.fn(async ({ create }) => create) },
-    });
+    const withVehicle = (booked = []) => {
+        const db = {
+            transitVehicle: { findFirst: jest.fn(async () => ({ id: 'veh-a' })) },
+            transitBookingSeat: { findMany: jest.fn(async () => booked), count: jest.fn(async () => booked.length) },
+            transitSeatMap: { upsert: jest.fn(async ({ create }) => create) },
+            transitTrip: { findMany: jest.fn(async () => [{ id: 'trip-a' }]), update: jest.fn(async () => ({})) },
+            $executeRaw: jest.fn(async () => 1),
+        };
+        db.$transaction = jest.fn(async (cb) => cb(db));
+        return db;
+    };
 
     test("another business's vehicle reads as missing", async () => {
         const prisma = { ...withVehicle(), transitVehicle: { findFirst: jest.fn(async () => null) } };
@@ -88,5 +94,7 @@ describe('vehicle seat map save', () => {
         const prisma = withVehicle([{ seatId: '1A' }]);
         const out = await save(prisma, { layout: [{ seatId: '1A' }, { seatId: '1B', status: 'BLOCKED' }], rows: 1, cols: 2 });
         expect(out).toEqual(expect.objectContaining({ vehicleId: 'veh-a', rows: 1, cols: 2 }));
+        // The open trip's counter follows the new grid: 1 bookable, 1 held.
+        expect(prisma.transitTrip.update).toHaveBeenCalledWith({ where: { id: 'trip-a' }, data: { availableSeats: 0 } });
     });
 });

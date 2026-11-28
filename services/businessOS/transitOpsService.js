@@ -265,20 +265,9 @@ class TransitOpsService {
             select: { id: true },
         });
         if (!vehicle) throw _status(new Error('Vehicle not found.'), 404);
-        const { validateLayout, bookedSeatsLost } = require('../transitSeatLayout');
-        let clean;
-        try { clean = validateLayout({ layout, rows, cols }); } catch (err) {
-            throw _status(err, err.httpStatus || 400);
-        }
-        const lost = await bookedSeatsLost(this.prisma, { vehicleId, layout: clean.layout });
-        if (lost.length) {
-            throw _status(new Error(`Seats ${lost.join(', ')} have active bookings. Move or cancel those bookings before removing or blocking them.`), 409, 'SEAT_MAP_BOOKED_SEATS');
-        }
-        return this.prisma.transitSeatMap.upsert({
-            where: { vehicleId },
-            create: { vehicleId, layout: clean.layout, rows: clean.rows, cols: clean.cols },
-            update: { layout: clean.layout, rows: clean.rows, cols: clean.cols },
-        });
+        const { saveVehicleSeatMap } = require('../transitSeatLayout');
+        const { seatMap } = await _withStatus(() => saveVehicleSeatMap(this.prisma, { vehicleId, layout, rows, cols }));
+        return seatMap;
     }
 
     // ═══ LIVE MANIFESTS ═══════════════════════════════════════════════════════

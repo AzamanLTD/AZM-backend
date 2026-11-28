@@ -127,6 +127,14 @@ function makeDb({ passengerBalance = 100, operatorId = 20, fee = null, departInD
         financialOperation: table([{ id: 'op-1', status: 'IN_PROGRESS' }]),
         businessProfile: table([{ id: 'bp-1', userId: operatorId, businessName: 'Kofi Express' }]),
         reservation: table([]),
+        // The vehicle's seat map, read from the trip's (so a test that edits
+        // trip.vehicle.seatMap is seen by the booking's in-transaction check).
+        transitSeatMap: {
+            findUnique: jest.fn(async ({ where }) => {
+                const t = db.transitTrip.rows.find((r) => r.vehicleId === where.vehicleId);
+                return t && t.vehicle && t.vehicle.seatMap ? { vehicleId: where.vehicleId, ...t.vehicle.seatMap } : null;
+            }),
+        },
         $executeRaw: jest.fn(async () => 1),
     };
     db.$transaction = jest.fn(async (cb) => cb(db));

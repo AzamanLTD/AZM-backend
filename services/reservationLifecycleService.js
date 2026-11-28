@@ -140,13 +140,33 @@ const cancelReservation = async (prisma, { reservationId, customerId }) =>
 // The hotel cancels a stay it cannot honour (or declines a request): a paid
 // stay is refunded in the same transaction as the claim, the Azaman fee
 // included (feeRefundPolicy: the business cancelled).
-const businessCancelReservation = async (prisma, { reservationId, businessProfileId, reason = null }) =>
+//
+// unansweredAsOf (the request-expiry sweep): close it only while it is still
+// an unanswered request at that moment (PENDING, and started or 72h old),
+// re-checked in the claim's own conditional UPDATE, so a business confirming
+// (or a guest's deposit confirming it) at the same instant wins and the
+// refund rolls back with the refused claim.
+const REQUEST_ANSWER_WINDOW_MS = 72 * 60 * 60 * 1000;
+const _unansweredWhere = (asOf) => ({
+    OR: [
+        { startDatetime: { lte: asOf } },
+        { createdAt: { lte: new Date(asOf.getTime() - REQUEST_ANSWER_WINDOW_MS) } },
+    ],
+});
+const _isUnanswered = (r, asOf) => r.status === 'PENDING'
+    && ((r.startDatetime && new Date(r.startDatetime) <= asOf)
+        || (r.createdAt && new Date(r.createdAt).getTime() <= asOf.getTime() - REQUEST_ANSWER_WINDOW_MS));
+
+const businessCancelReservation = async (prisma, { reservationId, businessProfileId, reason = null, unansweredAsOf = null }) =>
     runConvergent(prisma, reservationId, 'CANCELLED_BUSINESS', async (tx) => {
         const reservation = await loadAggregate(tx, reservationId);
         if (!reservation || reservation.businessProfileId !== businessProfileId) {
             throw fail('RESERVATION_NOT_FOUND', 'Reservation not found.');
         }
         if (reservation.status === 'CANCELLED_BUSINESS') return reservation;
+        if (unansweredAsOf && !_isUnanswered(reservation, unansweredAsOf)) {
+            throw fail('RESERVATION_ANSWERED', 'This request was answered or changed; it is not expired.');
+        }
         if (!['PENDING', 'CONFIRMED'].includes(reservation.status)) {
             throw fail('RESERVATION_NOT_CANCELLABLE', `Cannot cancel a reservation with status ${reservation.status}.`);
         }
@@ -167,7 +187,8 @@ const businessCancelReservation = async (prisma, { reservationId, businessProfil
         }
         return claimReservation(tx, {
             reservationId,
-            from: ['PENDING', 'CONFIRMED'],
+            from: unansweredAsOf ? ['PENDING'] : ['PENDING', 'CONFIRMED'],
+            where: unansweredAsOf ? _unansweredWhere(unansweredAsOf) : {},
             data: {
                 status: 'CANCELLED_BUSINESS',
                 cancelledAt: new Date(),
@@ -312,6 +333,7 @@ const checkOutReservation = async (prisma, { reservationId, businessUserId }) =>
     });
 
 module.exports = {
+    REQUEST_ANSWER_WINDOW_MS,
     confirmReservation,
     cancelReservation,
     businessCancelReservation,

@@ -335,49 +335,78 @@ const sweepNoShowTransitBookings = async (prisma) => {
 // sweepUnansweredRequests — a reservation REQUEST the business never confirmed
 // holds its room or table (the capacity trigger counts PENDING). It is closed
 // when its start time arrives unconfirmed, or 72 hours after it was made,
-// whichever comes first, through the lifecycle authority (a held deposit is
-// refunded, a draft one expired) as CANCELLED_BUSINESS with the reason in
-// businessNotes. The guest and the business are told. Bounded per run.
+// whichever comes first, through the lifecycle authority as CANCELLED_BUSINESS
+// with the reason in businessNotes. The claim re-checks "still unanswered"
+// (businessCancelReservation unansweredAsOf), so a confirmation at the same
+// moment wins. A request that cannot be closed (its deposit in dispute, say)
+// is passed over, never retried in front of the rest: each run pages past it,
+// up to maxScan requests. The guest and the business are told, for requests
+// made in the last 30 days (older ones, closed by the first run after this
+// shipped, are closed quietly).
 // =============================================================================
-const REQUEST_ANSWER_WINDOW_MS = 72 * 60 * 60 * 1000;
+const { REQUEST_ANSWER_WINDOW_MS } = require('../services/reservationLifecycleService');
 const UNANSWERED_REASON = 'Not confirmed by the business in time (request expired).';
+const NOTIFY_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
-const sweepUnansweredRequests = async (prisma, { now = new Date(), limit = 100, notify = null } = {}) => {
-    const stale = await prisma.reservation.findMany({
-        where: {
-            status: 'PENDING',
-            OR: [
-                { startDatetime: { lte: now } },
-                { createdAt: { lte: new Date(now.getTime() - REQUEST_ANSWER_WINDOW_MS) } },
-            ],
-        },
-        select: { id: true, businessProfileId: true, customerId: true, reservationRef: true },
-        orderBy: { createdAt: 'asc' },
-        take: limit,
-    });
-    const results = { expired: 0, errors: 0 };
+const sweepUnansweredRequests = async (prisma, { now = new Date(), pageSize = 100, maxScan = 500, notify = null } = {}) => {
+    const cutoff = new Date(now.getTime() - REQUEST_ANSWER_WINDOW_MS);
+    const results = { expired: 0, errors: 0, scanned: 0 };
+    const seen = [];
     const { businessCancelReservation } = require('../services/reservationLifecycleService');
-    for (const r of stale) {
-        try {
-            const done = await businessCancelReservation(prisma, {
-                reservationId: r.id, businessProfileId: r.businessProfileId, reason: UNANSWERED_REASON,
-            });
-            if (done && done.status === 'CANCELLED_BUSINESS') results.expired++;
-            if (typeof notify === 'function') {
-                try {
-                    await notify({
-                        userId: r.customerId,
-                        title: 'Your request was not confirmed',
-                        body: `${r.reservationRef}: the business did not confirm in time, so the request was closed. Nothing was charged.`,
-                        category: 'MARKETPLACE',
-                        actionPayload: { route: '/bookings?tab=reservations' },
-                    });
-                } catch (_) { /* the expiry stands either way */ }
+    while (results.scanned < maxScan) {
+        const page = await prisma.reservation.findMany({
+            where: {
+                status: 'PENDING',
+                OR: [{ startDatetime: { lte: now } }, { createdAt: { lte: cutoff } }],
+                ...(seen.length ? { id: { notIn: seen } } : {}),
+            },
+            select: { id: true, businessProfileId: true, customerId: true, reservationRef: true, createdAt: true },
+            orderBy: { createdAt: 'asc' },
+            take: Math.min(pageSize, maxScan - results.scanned),
+        });
+        if (!page.length) break;
+        for (const r of page) {
+            seen.push(r.id);
+            results.scanned++;
+            let done;
+            try {
+                done = await businessCancelReservation(prisma, {
+                    reservationId: r.id, businessProfileId: r.businessProfileId,
+                    reason: UNANSWERED_REASON, unansweredAsOf: now,
+                });
+            } catch (err) {
+                // Answered meanwhile, or not closable (deposit in dispute):
+                // skip it; the next page goes on past it.
+                results.errors++;
+                logger.warn({ err: err.message, code: err.code, reservationId: r.id }, '[NoShowWorker] request expiry skipped');
+                continue;
             }
-        } catch (err) {
-            // Confirmed or changed meanwhile: the lifecycle refused; skip it.
-            results.errors++;
-            logger.warn({ err: err.message, reservationId: r.id }, '[NoShowWorker] request expiry skipped');
+            if (!done || done.status !== 'CANCELLED_BUSINESS') continue;
+            results.expired++;
+            const recent = r.createdAt && now.getTime() - new Date(r.createdAt).getTime() <= NOTIFY_WINDOW_MS;
+            if (typeof notify !== 'function' || !recent) continue;
+            try {
+                await notify({
+                    userId: r.customerId,
+                    title: 'Your request was not confirmed',
+                    body: `${r.reservationRef}: the business did not confirm in time, so the request was closed. `
+                        + 'Anything you paid for it is back in your wallet.',
+                    category: 'MARKETPLACE',
+                    actionPayload: { route: '/bookings?tab=reservations' },
+                });
+            } catch (_) { /* the expiry stands either way */ }
+            try {
+                const business = await prisma.businessProfile.findUnique({ where: { id: r.businessProfileId }, select: { userId: true } });
+                if (business && business.userId) {
+                    await notify({
+                        userId: business.userId,
+                        title: 'A request expired',
+                        body: `${r.reservationRef} was not confirmed in time, so it was closed and the time is free again.`,
+                        category: 'MARKETPLACE',
+                        actionPayload: { route: '/business/notifications', reservationId: r.id },
+                    });
+                }
+            } catch (_) { /* best effort */ }
         }
     }
     return results;
@@ -417,5 +446,5 @@ const sweepAll = async (prisma, { notify = null } = {}) => {
 
 module.exports = {
     sweepNoShowReservations, sweepNoShowTransitBookings, sweepUnansweredRequests, sweepAll,
-    GRACE_PERIOD_MINS, REQUEST_ANSWER_WINDOW_MS,
+    GRACE_PERIOD_MINS, REQUEST_ANSWER_WINDOW_MS, NOTIFY_WINDOW_MS,
 };

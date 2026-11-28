@@ -295,6 +295,15 @@ const bookSeats = async (prisma, {
             if (capacity.count !== 1) {
                 throw _bookingError('TRIP_UNAVAILABLE', 'This trip is no longer taking bookings, or the seats are gone.', 409);
             }
+            // The trip row is held now, so a seat-map save
+            // (transitSeatLayout.saveVehicleSeatMap) either committed before
+            // this point or waits for this booking: re-check the seats
+            // against the layout as it is now.
+            const mapNow = await tx.transitSeatMap.findUnique({ where: { vehicleId: trip.vehicleId }, select: { layout: true } });
+            const stillValid = bookableSeatIds(mapNow ? mapNow.layout : null);
+            if (seatIds.some((id) => !stillValid.has(id))) {
+                throw _bookingError('SEAT_MAP_CHANGED', 'The operator just changed the seat map. Pick your seats again. Nothing was charged.', 409);
+            }
 
             // Wallet pay, in this same transaction: create the booking
             // escrow, fund it from the customer's wallet (debit fare + fee,

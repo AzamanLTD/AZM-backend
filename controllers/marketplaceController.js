@@ -46,16 +46,25 @@ exports.generateCheckInQR = async (req, res) => {
  * still refused. Without a business or the permission, the caller's own id
  * (the authority then refuses).
  */
-const _checkInActorOwnerId = async (prisma, user) => {
+// { ownerId, transit }: transit — the actor may also see the passenger's
+// transit bookings in an AZM-ID search (owner, or staff with a transit
+// manifest permission); front-desk staff with only reservations.manage see
+// the reservations.
+const _checkInActor = async (prisma, user) => {
     const { resolveBusinessContext, resolvePermissions } = require('../middleware/requirePermission');
     const context = await resolveBusinessContext(prisma, user);
-    if (!context || context.isBusinessOwner) return user.id;
+    if (!context || context.isBusinessOwner) return { ownerId: user.id, transit: true };
     const permissions = await resolvePermissions(prisma, user.id, context.businessProfileId);
-    if (!permissions.includes('*') && !permissions.includes('reservations.manage')) return user.id;
+    const all = permissions.includes('*');
+    if (!all && !permissions.includes('reservations.manage')) return { ownerId: user.id, transit: true };
     const business = await prisma.businessProfile.findUnique({ where: { id: context.businessProfileId }, select: { userId: true } });
-    return business && business.userId ? business.userId : user.id;
+    if (!business || !business.userId) return { ownerId: user.id, transit: true };
+    const transit = all || permissions.includes('transit.manifests.view') || permissions.includes('transit.manifests.manage');
+    return { ownerId: business.userId, transit };
 };
+const _checkInActorOwnerId = async (prisma, user) => (await _checkInActor(prisma, user)).ownerId;
 exports._checkInActorOwnerId = _checkInActorOwnerId;
+exports._checkInActor = _checkInActor;
 
 // POST /api/marketplace/business/checkin — business scans QR or searches by AZM-ID
 exports.businessCheckIn = async (req, res) => {
@@ -75,11 +84,13 @@ exports.businessCheckIn = async (req, res) => {
             // Manual AZM-ID search path: reservations, and the passenger's
             // transit bookings with what staff need for an ID check.
             const boarding = require('../services/transitBoardingService');
-            const actorOwnerId = await _checkInActorOwnerId(prisma, req.user);
+            const actor = await _checkInActor(prisma, req.user);
             const found = await qrSvc.searchByAzamanId(prisma, {
-                azamanId: boarding.normalizeAzamanId(azamanId), businessUserId: actorOwnerId,
+                azamanId: boarding.normalizeAzamanId(azamanId), businessUserId: actor.ownerId,
             });
-            const result = await boarding.enrichAzamanIdSearch(prisma, { businessUserId: actorOwnerId, result: found });
+            const result = actor.transit
+                ? await boarding.enrichAzamanIdSearch(prisma, { businessUserId: actor.ownerId, result: found })
+                : found;
             return res.status(200).json({ success: true, ...result });
         } else if (reservationId) {
             // A stay paid in the app checks in only by the guest's QR.
@@ -561,28 +572,14 @@ exports.setSeatMap = async (req, res) => {
         if (!vehicle || vehicle.businessProfileId !== profile.id)
             return res.status(403).json({ success: false, message: 'Vehicle not found for this business.' });
 
-        // Same checks as PUT /api/marketplace-seat-map/:tripId.
-        const seatLayout = require('../services/transitSeatLayout');
-        let clean;
-        try { clean = seatLayout.validateLayout({ layout, rows, cols }); } catch (e) {
-            return res.status(e.httpStatus || 400).json({ success: false, code: e.code, message: e.message });
-        }
-        const lost = await seatLayout.bookedSeatsLost(prisma, { vehicleId, layout: clean.layout });
-        if (lost.length) {
-            return res.status(409).json({
-                success: false, code: 'SEAT_MAP_BOOKED_SEATS', seats: lost,
-                message: `Seats ${lost.join(', ')} have active bookings. Move or cancel those bookings before removing or blocking them.`,
-            });
-        }
-
-        const seatMap = await prisma.transitSeatMap.upsert({
-            where: { vehicleId },
-            update: { layout: clean.layout, rows: clean.rows, cols: clean.cols },
-            create: { vehicleId, layout: clean.layout, rows: clean.rows, cols: clean.cols },
-        });
-
+        // Same save as PUT /api/marketplace-seat-map/:tripId.
+        const { saveVehicleSeatMap } = require('../services/transitSeatLayout');
+        const { seatMap } = await saveVehicleSeatMap(prisma, { vehicleId, layout, rows, cols });
         return res.status(200).json({ success: true, seatMap });
     } catch (err) {
+        if (err && (err.code === 'SEAT_MAP_INVALID' || err.code === 'SEAT_MAP_BOOKED_SEATS')) {
+            return res.status(err.httpStatus).json({ success: false, code: err.code, message: err.message, ...(err.detail || {}) });
+        }
         return res.status(500).json({ success: false, message: err.message });
     }
 };

@@ -705,7 +705,47 @@ describe('a request the hotel never answers stops holding the room', () => {
         expect(old.businessNotes).toMatch(/request expired/);
         expect(started.status).toBe('CANCELLED_BUSINESS');
         expect(confirmed.status).toBe('CONFIRMED');
-        expect(notify).toHaveBeenCalledTimes(2);
+        // The guest and the business, for each closed request.
+        expect(notify).toHaveBeenCalledTimes(4);
         expect(notify.mock.calls[0][0]).toEqual(expect.objectContaining({ userId: 10, title: 'Your request was not confirmed' }));
+        expect(notify.mock.calls[1][0]).toEqual(expect.objectContaining({ userId: 20, title: 'A request expired' }));
+    });
+
+    test('a request confirmed after the sweep picked it is left alone', async () => {
+        const db = makeDb();
+        const r = request(db, { createdAt: new Date(Date.now() - REQUEST_ANSWER_WINDOW_MS - 1000) });
+        // The business confirms between the sweep's read and its cancel.
+        const read = db.reservation.findMany;
+        db.reservation.findMany = jest.fn(async (args) => {
+            const rows = await read(args);
+            rows.forEach((row) => { row.status = 'CONFIRMED'; });
+            return rows.map((row) => ({ ...row, status: 'PENDING' }));
+        });
+        const notify = jest.fn();
+        const out = await sweepUnansweredRequests(db, { notify });
+        expect(r.status).toBe('CONFIRMED');
+        expect(out).toEqual(expect.objectContaining({ expired: 0, errors: 1 }));
+        expect(notify).not.toHaveBeenCalled();
+    });
+
+    test('a request it cannot close is passed over, not retried in front of the rest', async () => {
+        const db = makeDb();
+        // Its deposit is in dispute custody: the lifecycle refuses to close it.
+        db.smartEscrow.rows.push({ id: 'esc-disputed', status: 'DISPUTED', payerId: 10, amount: 5, fee: 0 });
+        const stuck = request(db, { createdAt: new Date(Date.now() - REQUEST_ANSWER_WINDOW_MS - 5000), escrowId: 'esc-disputed' });
+        const next = request(db, { createdAt: new Date(Date.now() - REQUEST_ANSWER_WINDOW_MS - 1000) });
+        const out = await sweepUnansweredRequests(db, { pageSize: 1 });
+        expect(stuck.status).toBe('PENDING');
+        expect(next.status).toBe('CANCELLED_BUSINESS');
+        expect(out).toEqual(expect.objectContaining({ expired: 1, errors: 1, scanned: 2 }));
+    });
+
+    test('a very old request is closed quietly', async () => {
+        const db = makeDb();
+        const ancient = request(db, { createdAt: new Date(Date.now() - 60 * 24 * 3600 * 1000) });
+        const notify = jest.fn();
+        await sweepUnansweredRequests(db, { notify });
+        expect(ancient.status).toBe('CANCELLED_BUSINESS');
+        expect(notify).not.toHaveBeenCalled();
     });
 });

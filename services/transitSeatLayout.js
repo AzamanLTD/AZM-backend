@@ -13,6 +13,10 @@
 //
 // validateLayout checks what an operator saves; bookedSeatsLost finds booked
 // seats a new layout would remove or block (the save is then refused).
+// saveVehicleSeatMap is the one save every endpoint uses: checked and written
+// in one transaction that holds the vehicle's trip rows, so a booking cannot
+// commit between the check and the write, and each open trip's seat counter
+// is set from the new layout.
 // =============================================================================
 
 const NON_SEAT_TYPES = new Set(['NONE', 'EMPTY']);
@@ -21,6 +25,8 @@ const MAX_CELLS = 400;
 const MAX_GRID = 40;
 const MAX_TIER_FARE_USDC = 10000;
 const ACTIVE_BOOKING_STATUSES = ['PENDING', 'CONFIRMED', 'IN_PROGRESS'];
+// Trips whose seat counter no longer matters (transitBookingService).
+const CLOSED_TRIP_STATUSES = ['CANCELLED', 'DEPARTED', 'COMPLETED'];
 
 const isSeatCell = (cell) => Boolean(cell && cell.seatId != null
     && !NON_SEAT_TYPES.has(String(cell.type || '').toUpperCase()));
@@ -91,7 +97,59 @@ const bookedSeatsLost = async (db, { vehicleId, layout }) => {
     return [...new Set(rows.map((s) => s.seatId).filter((id) => !keep.has(id)))].sort();
 };
 
+/**
+ * Save a vehicle's seat map. Throws SEAT_MAP_INVALID (400) or
+ * SEAT_MAP_BOOKED_SEATS (409, detail.seats). tierFares, when given, are
+ * merged into tripId's metadata in the same transaction.
+ * Returns { seatMap, tierFares } (tierFares: the trip's, after the save).
+ */
+const saveVehicleSeatMap = async (prisma, { vehicleId, layout, rows, cols, tierFares = undefined, tripId = null }) => {
+    const clean = validateLayout({ layout, rows, cols, tierFares });
+    return prisma.$transaction(async (tx) => {
+        // Bookings insert seat rows that reference these trips and decrement
+        // their counters; holding the rows serializes the two. Locked in id
+        // order so two saves cannot deadlock.
+        await tx.$executeRaw`SELECT id FROM "TransitTrip" WHERE "vehicleId" = ${vehicleId} ORDER BY id FOR UPDATE`;
+        const lost = await bookedSeatsLost(tx, { vehicleId, layout: clean.layout });
+        if (lost.length) {
+            throw _err('SEAT_MAP_BOOKED_SEATS',
+                `Seats ${lost.join(', ')} have active bookings. Move or cancel those bookings before removing or blocking them.`,
+                409, { seats: lost });
+        }
+        const seatMap = await tx.transitSeatMap.upsert({
+            where: { vehicleId },
+            create: { vehicleId, layout: clean.layout, rows: clean.rows, cols: clean.cols },
+            update: { layout: clean.layout, rows: clean.rows, cols: clean.cols },
+        });
+        // Each open trip's counter: the new layout's bookable seats less the
+        // seats its live bookings hold.
+        const bookable = bookableSeatIds(clean.layout).size;
+        const trips = await tx.transitTrip.findMany({
+            where: { vehicleId, status: { notIn: CLOSED_TRIP_STATUSES } },
+            select: { id: true },
+        });
+        for (const t of trips) {
+            const held = await tx.transitBookingSeat.count({
+                where: { tripId: t.id, booking: { status: { in: ACTIVE_BOOKING_STATUSES } } },
+            });
+            await tx.transitTrip.update({ where: { id: t.id }, data: { availableSeats: Math.max(0, bookable - held) } });
+        }
+        let fares = null;
+        if (tripId) {
+            const trip = await tx.transitTrip.findUnique({ where: { id: tripId }, select: { metadata: true } });
+            const metadata = (trip && trip.metadata && typeof trip.metadata === 'object') ? trip.metadata : {};
+            if (clean.tierFares) {
+                await tx.transitTrip.update({ where: { id: tripId }, data: { metadata: { ...metadata, tierFares: clean.tierFares } } });
+                fares = clean.tierFares;
+            } else {
+                fares = metadata.tierFares || {};
+            }
+        }
+        return { seatMap, tierFares: fares };
+    });
+};
+
 module.exports = {
     NON_SEAT_TYPES, SEAT_TIERS, isSeatCell, isBlocked, isBookableSeat, bookableSeats, bookableSeatIds,
-    validateLayout, bookedSeatsLost,
+    validateLayout, bookedSeatsLost, saveVehicleSeatMap,
 };
