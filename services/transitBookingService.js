@@ -710,6 +710,7 @@ const cancelTransitBooking = async (prisma, { bookingId, cancelledBy, note, only
                 refund = {
                     outcome: 'REFUNDED', reference, amountUsdc: Number(escrow.amountUsdc),
                     feeRefundedUsdc: refunded ? refunded.feeRefundedUsdc : 0,
+                    feeRefundOwedUsdc: refunded ? refunded.feeRefundOwedUsdc : 0,
                 };
             } else if (escrow && escrow.status === 'DISPUTED') {
                 // The dispute channel owns the money — never mutate it here.

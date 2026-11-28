@@ -244,6 +244,9 @@ describe('after paying', () => {
         expect(user(db, 10).escrowLockedBalance).toBeCloseTo(0, 9);
         // The fee's revenue is reversed everywhere it was booked.
         expect(db.systemProfitFees.rows[0].balance).toBeCloseTo(0, 9);
+        // Lock order as at funding: the payer's row before the profit bucket.
+        const lastOrder = (fn) => fn.mock.invocationCallOrder[fn.mock.invocationCallOrder.length - 1];
+        expect(lastOrder(db.user.updateMany)).toBeLessThan(lastOrder(db.systemProfitFees.updateMany));
         expect(db.adminProfitLog.rows.map((r) => r.amountUsdc)).toEqual([out.payment.feeUsdc, -out.payment.feeUsdc]);
         const ledger = require('../services/ledgerService');
         const refundPost = ledger.post.mock.calls.map((c) => c[1]).find((e) => e.entryType === 'ESCROW_REFUND');
@@ -261,6 +264,8 @@ describe('after paying', () => {
         const db = makeDb();
         const out = await payStay(db);
         db.systemProfitFees.rows[0].balance = 0; // the fees were withdrawn
+        db.$executeRawUnsafe = jest.fn(async () => 0); // savepoints
+        db.$queryRawUnsafe = jest.fn(async () => [{ id: 'rx-1' }]);
         const sendNotification = jest.fn().mockResolvedValue(undefined);
         let status = null;
         await require('../controllers/reservationController').declineReservation({
@@ -273,8 +278,12 @@ describe('after paying', () => {
         expect(db.systemProfitFees.rows[0].balance).toBe(0);
         const history = db.transactionHistory.rows.find((h) => h.type === 'TICKET_ESCROW_REFUND');
         expect(history.metadata).toEqual({ priceUsdc: out.payment.amountUsdc, feeRefundedUsdc: 0, feeRefundOwedUsdc: out.payment.feeUsdc });
+        // ...and it is on the team's reconciliation queue until paid.
+        const insert = db.$queryRawUnsafe.mock.calls.find((c) => String(c[0]).includes('INSERT INTO "ReconciliationException"'));
+        expect(insert.slice(1, 5)).toEqual(['BOOKING_FEE_REFUND', escrow(db).id, escrow(db).refundTxHash, 'FEE_REFUND_OWED']);
+        expect(JSON.parse(insert[5])).toEqual(expect.objectContaining({ payerId: 10, feeUsdc: out.payment.feeUsdc.toFixed(8) }));
         expect(sendNotification.mock.calls[0][0].body).toContain(
-            `The Azaman fee (${out.payment.feeUsdc.toFixed(2)} USDC) will be refunded to you separately.`,
+            `Our team will refund the Azaman fee (${out.payment.feeUsdc.toFixed(2)} USDC) to you separately.`,
         );
     });
 
