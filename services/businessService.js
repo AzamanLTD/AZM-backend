@@ -158,10 +158,10 @@ const registerBusiness = async (prisma, {
 // =============================================================================
 // 2. GET BUSINESS PROFILE — by bizId OR userId.
 // =============================================================================
-const getBusinessProfile = async (prisma, { bizId, userId }) => {
-    if (!bizId && !userId) throw new Error('Either bizId or userId is required.');
+const getBusinessProfile = async (prisma, { bizId, userId, businessProfileId }) => {
+    if (!bizId && !userId && !businessProfileId) throw new Error('Either bizId, userId or businessProfileId is required.');
     const profile = await prisma.businessProfile.findFirst({
-        where: bizId ? { bizId } : { userId },
+        where: businessProfileId ? { id: businessProfileId } : (bizId ? { bizId } : { userId }),
         include: {
             user: {
                 select: {

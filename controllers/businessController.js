@@ -156,15 +156,31 @@ exports.updateBusinessProfile = async (req, res) => {
 // =============================================================================
 // 5. GET /api/business/me — calling user's own business profile.
 // =============================================================================
+// The business the caller works for: their own, or — for staff — their
+// employer's (ACTIVE employment; services/businessActor). Staff used to get
+// 404 here, so the business portal sent every employee to sign-up. `access`
+// says who the caller is to the business; staff do not receive the owner's
+// personal account details.
 exports.getMyBusiness = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const userId = req.user.id;
-        const business = await businessService.getBusinessProfile(prisma, { userId });
+        const { resolveBusinessActor } = require('../services/businessActor');
+        const actor = await resolveBusinessActor(prisma, req.user);
+        if (!actor) {
+            return res.status(404).json({ success: false, message: 'You have no business profile.' });
+        }
+        const business = await businessService.getBusinessProfile(prisma, { businessProfileId: actor.businessProfileId });
         if (!business) {
             return res.status(404).json({ success: false, message: 'You have no business profile.' });
         }
-        return res.status(200).json({ success: true, business });
+        if (!actor.isOwner && business.user) {
+            business.user = { username: business.user.username || null };
+        }
+        return res.status(200).json({
+            success: true,
+            business,
+            access: { isOwner: actor.isOwner, permissions: actor.permissions },
+        });
     } catch (err) {
         logger.error({ err: err }, '[getMyBusiness] error');
         return res.status(500).json({ success: false, message: err.message });
