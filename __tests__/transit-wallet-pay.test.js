@@ -12,8 +12,11 @@
 //   • the escrow outlives the trip (departure + the completion grace)
 //   • a zero fee posts no fee ledger line
 //   • a post-commit notice failure never turns a paid booking into an error
-//   • completion releases the fare to the operator once, never before the
-//     trip departs, and reports an escrow it cannot release
+//   • completion releases the fare to the operator once, only for a
+//     passenger boarded by their QR, never before the trip departs, and
+//     reports an escrow it cannot release
+//   • a paid booking boards only by the passenger's QR: manual check-in and
+//     the operator's status write are refused; the QR records the method
 //   • a business no-show without a penalty refunds the passenger
 //   • the expiry worker's cancel is pinned to PENDING
 // The real-PostgreSQL atomicity (rollback on failure) is covered by
@@ -259,7 +262,8 @@ describe('completeTransitBooking', () => {
     async function paidAndBoarded({ departed = true } = {}) {
         const db = makeDb();
         const res = await pay(db, ['1A']);
-        db.transitBooking.rows[0].status = 'IN_PROGRESS'; // boarded
+        db.transitBooking.rows[0].status = 'IN_PROGRESS'; // boarded by QR
+        db.transitBooking.rows[0].metadata = { boarding: { method: 'QR_TOKEN' } };
         if (departed) trip(db).departureAt = new Date(Date.now() - 60 * 60 * 1000);
         return { db, bookingId: res.booking.id };
     }
@@ -279,6 +283,16 @@ describe('completeTransitBooking', () => {
         const { db, bookingId } = await paidAndBoarded({ departed: false });
         await expect(completeTransitBooking(db, { bookingId }))
             .rejects.toMatchObject({ code: 'TOO_EARLY', httpStatus: 409 });
+        expect(db.smartEscrow.rows[0].status).toBe('FUNDED');
+        expect(user(db, 20).availableBalance).toBe(0);
+        expect(db.transitBooking.rows[0].status).toBe('IN_PROGRESS');
+    });
+
+    test('a paid trip not boarded by QR is never released', async () => {
+        const { db, bookingId } = await paidAndBoarded();
+        db.transitBooking.rows[0].metadata = { boarding: { method: 'MANUAL' } };
+        await expect(completeTransitBooking(db, { bookingId }))
+            .rejects.toMatchObject({ code: 'QR_BOARDING_REQUIRED', httpStatus: 409 });
         expect(db.smartEscrow.rows[0].status).toBe('FUNDED');
         expect(user(db, 20).availableBalance).toBe(0);
         expect(db.transitBooking.rows[0].status).toBe('IN_PROGRESS');
@@ -305,8 +319,9 @@ describe('completeTransitBooking', () => {
         const db = makeDb();
         const res = await pay(db, ['1A']);
         trip(db).departureAt = new Date(Date.now() - 60 * 60 * 1000);
+        // A paid booking that never boarded (by QR) is refused, and paid nothing.
         await expect(completeTransitBooking(db, { bookingId: res.booking.id }))
-            .rejects.toMatchObject({ code: 'NOT_COMPLETABLE', httpStatus: 409 });
+            .rejects.toMatchObject({ code: 'QR_BOARDING_REQUIRED', httpStatus: 409 });
         expect(user(db, 20).availableBalance).toBe(0);
     });
 });
@@ -392,5 +407,74 @@ describe('route wiring', () => {
 
     test('the quote route is read-only (GET)', () => {
         expect(src).toContain("router.get('/transit/trips/:id/quote', protect, ctrl.quoteTripSeats)");
+    });
+});
+
+describe('a paid booking boards only by the passenger QR', () => {
+    const qr = require('../services/qrCheckInService');
+    const TEST_ONLY_KEY = 'test-only-qr-signing-key-not-a-secret-0123456789';
+    let savedKey;
+    beforeAll(() => { savedKey = process.env.QR_CHECKIN_SIGNING_KEY; process.env.QR_CHECKIN_SIGNING_KEY = TEST_ONLY_KEY; });
+    afterAll(() => { process.env.QR_CHECKIN_SIGNING_KEY = savedKey; });
+
+    // A paid booking, decorated with the relations the check-in paths read.
+    async function paidBooking() {
+        const db = makeDb();
+        const res = await pay(db, ['1A']);
+        const row = db.transitBooking.rows[0];
+        row.businessProfile = { userId: 20 };
+        row.seats = [{ seatId: '1A', passengerName: null }];
+        return { db, row, bookingId: res.booking.id };
+    }
+
+    test('manual check-in by booking id is refused', async () => {
+        const { db, bookingId, row } = await paidBooking();
+        await expect(qr.transitCheckIn(db, { bookingId, businessUserId: 20 }))
+            .rejects.toMatchObject({ code: 'QR_BOARDING_REQUIRED' });
+        expect(row.status).toBe('CONFIRMED');
+    });
+
+    test('an unpaid booking still checks in manually, recorded as MANUAL', async () => {
+        const db = makeDb();
+        const res = await bookSeats(db, { tripId: 'trip-1', customerId: 10, seatIds: ['1A'] });
+        const row = db.transitBooking.rows[0];
+        row.status = 'CONFIRMED';
+        row.businessProfile = { userId: 20 };
+        await qr.transitCheckIn(db, { bookingId: res.booking.id, businessUserId: 20 });
+        expect(row.status).toBe('IN_PROGRESS');
+        expect(row.metadata.boarding.method).toBe('MANUAL');
+    });
+
+    test('the operator cannot board a paid booking with a status write', async () => {
+        const { db, bookingId } = await paidBooking();
+        const ctrl = require('../controllers/transitController');
+        let status = null; let payload = null;
+        await ctrl.updateBookingStatus({
+            app: { get: (k) => (k === 'prisma' ? db : null) },
+            params: { id: bookingId }, user: { id: 20 }, body: { status: 'IN_PROGRESS' },
+        }, {
+            status(c) { status = c; return this; },
+            json(p) { payload = p; return this; },
+        });
+        expect(status).toBe(409);
+        expect(payload.code).toBe('QR_BOARDING_REQUIRED');
+        expect(db.transitBooking.rows[0].status).toBe('CONFIRMED');
+    });
+
+    test('scan, board, depart, complete: the fare reaches the operator', async () => {
+        const { db, row, bookingId } = await paidBooking();
+        // The boarding window opens an hour before departure.
+        trip(db).departureAt = new Date(Date.now() + 30 * 60 * 1000);
+        row.trip = { id: 'trip-1', departureAt: trip(db).departureAt };
+        const { token } = await qr.generateTransitCheckInToken(db, { bookingId, customerId: 10 });
+        await qr.verifyTransitTokenAndBoard(db, { token, businessUserId: 20 });
+        expect(row.status).toBe('IN_PROGRESS');
+        expect(row.metadata.boarding.method).toBe('QR_TOKEN');
+
+        // Departed: completion releases the fare.
+        trip(db).departureAt = new Date(Date.now() - 60 * 1000);
+        const out = await completeTransitBooking(db, { bookingId });
+        expect(out.release).toEqual(expect.objectContaining({ amountUsdc: 2 }));
+        expect(user(db, 20).availableBalance).toBe(2);
     });
 });

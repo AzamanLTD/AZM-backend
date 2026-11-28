@@ -353,9 +353,33 @@ const searchByAzamanId = async (prisma, { azamanId, businessUserId }) => {
     return { customer, reservations };
 };
 
+// How a transit booking was boarded, recorded on TransitBooking.metadata.
+// A paid fare is released to the operator only after QR_TOKEN boarding:
+// the passenger's own signed code is the evidence they were carried.
+const BOARDING_METHOD = Object.freeze({ QR_TOKEN: 'QR_TOKEN', MANUAL: 'MANUAL' });
+const PAID_ESCROW_STATUSES = ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'];
+const _withBoarding = (metadata, boarding) => ({
+    ...(metadata && typeof metadata === 'object' && !Array.isArray(metadata) ? metadata : {}),
+    boarding,
+});
+const _boardingRequiredError = () => Object.assign(
+    new Error('This booking is paid. Board it by scanning the passenger\'s boarding QR.'),
+    { code: 'QR_BOARDING_REQUIRED', httpStatus: 409 }
+);
+/** True when the booking carries a fare held in escrow (wallet-paid). */
+const isPaidTransitBooking = async (prisma, booking) => {
+    if (!booking || !booking.escrowId) return false;
+    const escrow = await prisma.smartEscrow.findUnique({
+        where: { id: booking.escrowId },
+        select: { status: true },
+    });
+    return !!escrow && PAID_ESCROW_STATUSES.includes(escrow.status);
+};
+
 // =============================================================================
 // 4. TRANSIT — manual check-in by booking id (staff fallback, no token).
 //    Business-scoped and conditionally claimed; never trusts a QR string.
+//    Refused for a paid booking: that boards only by the passenger's QR.
 // =============================================================================
 const transitCheckIn = async (prisma, { bookingId, businessUserId }) => {
     if (!bookingId) throw new Error('bookingId is required.');
@@ -377,10 +401,15 @@ const transitCheckIn = async (prisma, { bookingId, businessUserId }) => {
     if (booking.status !== 'CONFIRMED') {
         throw new Error(`Booking is ${booking.status}, cannot check in.`);
     }
+    if (await isPaidTransitBooking(prisma, booking)) throw _boardingRequiredError();
 
     const claimed = await prisma.transitBooking.updateMany({
-        where: { id: bookingId, status: 'CONFIRMED' },
-        data: { status: 'IN_PROGRESS', checkedInAt: new Date() },
+        where: { id: bookingId, status: 'CONFIRMED', escrowId: booking.escrowId ?? null },
+        data: {
+            status: 'IN_PROGRESS',
+            checkedInAt: new Date(),
+            metadata: _withBoarding(booking.metadata, { method: BOARDING_METHOD.MANUAL, at: new Date().toISOString() }),
+        },
     });
     if (claimed.count !== 1) {
         const current = await prisma.transitBooking.findUnique({ where: { id: bookingId }, select: { status: true } });
@@ -503,7 +532,18 @@ const verifyTransitTokenAndBoard = async (prisma, { token, businessUserId, now =
     // Conditional claim: PostgreSQL's row lock arbitrates two concurrent scans.
     const claimed = await prisma.transitBooking.updateMany({
         where: { id: booking.id, status: 'CONFIRMED' },
-        data: { status: 'IN_PROGRESS', checkedInAt: new Date(now), pickupTime: new Date(now) },
+        data: {
+            status: 'IN_PROGRESS',
+            checkedInAt: new Date(now),
+            pickupTime: new Date(now),
+            // The passenger's signed code: the evidence that releases a paid
+            // fare when the trip completes.
+            metadata: _withBoarding(booking.metadata, {
+                method: BOARDING_METHOD.QR_TOKEN,
+                at: new Date(now).toISOString(),
+                jti: payload.jti,
+            }),
+        },
     });
     if (claimed.count !== 1) {
         const current = await prisma.transitBooking.findUnique({
@@ -524,6 +564,8 @@ const verifyTransitTokenAndBoard = async (prisma, { token, businessUserId, now =
 };
 
 module.exports = {
+    BOARDING_METHOD,
+    isPaidTransitBooking,
     generateCheckInToken,
     generateTransitCheckInToken,
     verifyAndCheckIn,

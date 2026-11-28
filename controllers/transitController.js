@@ -230,6 +230,19 @@ exports.updateBookingStatus = async (req, res) => {
             });
         }
 
+        // A paid booking boards only by the passenger's QR (that boarding is
+        // what releases the fare at completion), never by a status write.
+        if (nextStatus === 'IN_PROGRESS') {
+            const { isPaidTransitBooking } = require('../services/qrCheckInService');
+            if (await isPaidTransitBooking(prisma, booking)) {
+                return res.status(409).json({
+                    success: false,
+                    code: 'QR_BOARDING_REQUIRED',
+                    message: 'This booking is paid. Board it by scanning the passenger\'s boarding QR.',
+                });
+            }
+        }
+
         // r28 / P0-C: CANCELLED is delegated to the canonical transactional
         // cancellation service — booking claim, seat release, capacity
         // restore, escrow refund, ledger and TransactionHistory all commit

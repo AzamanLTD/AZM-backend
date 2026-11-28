@@ -19,6 +19,8 @@
 //       that was paid in between: it stays CONFIRMED and FUNDED.
 //   W6. Cancelling the trip refunds a paid booking (fare back, fee kept).
 //   W7. A paid trip cannot be completed before it departs.
+//   W8. A paid booking cannot be boarded manually or completed without
+//       QR boarding; nothing reaches the operator.
 // =============================================================================
 
 const { seedUser, seedBusiness } = require('./helpers/factories');
@@ -174,7 +176,11 @@ run('transit wallet pay (PostgreSQL)', () => {
     test('W4: completion releases the fare to the operator, once', async () => {
         const { owner, customer, trip } = await seedTrip();
         const res = await pay(trip.id, customer.id, ['1A']);
-        await prisma.transitBooking.update({ where: { id: res.booking.id }, data: { status: 'IN_PROGRESS' } });
+        await prisma.transitBooking.update({
+            where: { id: res.booking.id },
+            // Boarded by the passenger's QR (the only boarding that releases a paid fare).
+            data: { status: 'IN_PROGRESS', metadata: { boarding: { method: 'QR_TOKEN' } } },
+        });
         await depart(trip.id);
 
         const done = await svc.completeTransitBooking(prisma, { bookingId: res.booking.id });
@@ -219,10 +225,28 @@ run('transit wallet pay (PostgreSQL)', () => {
     test('W7: a paid trip cannot be completed before it departs', async () => {
         const { owner, customer, trip } = await seedTrip();
         const res = await pay(trip.id, customer.id, ['1A']);
-        await prisma.transitBooking.update({ where: { id: res.booking.id }, data: { status: 'IN_PROGRESS' } });
+        await prisma.transitBooking.update({
+            where: { id: res.booking.id },
+            // Boarded by the passenger's QR (the only boarding that releases a paid fare).
+            data: { status: 'IN_PROGRESS', metadata: { boarding: { method: 'QR_TOKEN' } } },
+        });
         await expect(svc.completeTransitBooking(prisma, { bookingId: res.booking.id }))
             .rejects.toMatchObject({ code: 'TOO_EARLY' });
         expect((await balances(owner.id)).available).toBe(0);
         expect((await prisma.smartEscrow.findUnique({ where: { id: res.payment.escrowId } })).status).toBe('FUNDED');
+    });
+
+    test('W8: a paid booking boards only by the passenger QR', async () => {
+        const { owner, customer, trip } = await seedTrip();
+        const res = await pay(trip.id, customer.id, ['1A']);
+        const qr = require('../services/qrCheckInService');
+        await expect(qr.transitCheckIn(prisma, { bookingId: res.booking.id, businessUserId: owner.id }))
+            .rejects.toMatchObject({ code: 'QR_BOARDING_REQUIRED' });
+        // Forced into IN_PROGRESS without the QR, it still never releases.
+        await prisma.transitBooking.update({ where: { id: res.booking.id }, data: { status: 'IN_PROGRESS' } });
+        await depart(trip.id);
+        await expect(svc.completeTransitBooking(prisma, { bookingId: res.booking.id }))
+            .rejects.toMatchObject({ code: 'QR_BOARDING_REQUIRED' });
+        expect((await balances(owner.id)).available).toBe(0);
     });
 });

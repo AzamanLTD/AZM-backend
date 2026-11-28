@@ -699,7 +699,7 @@ const completeTransitBooking = async (prisma, { bookingId } = {}) => {
     return prisma.$transaction(async (tx) => {
         const link = await tx.transitBooking.findUnique({
             where: { id: bookingId },
-            select: { escrowId: true, scheduledAt: true, tripId: true, status: true },
+            select: { escrowId: true, scheduledAt: true, tripId: true, status: true, metadata: true },
         });
         if (!link) throw new TransitCancellationError('NOT_FOUND', 'Booking not found.', 404);
         const escrowId = link.escrowId ?? null;
@@ -707,10 +707,24 @@ const completeTransitBooking = async (prisma, { bookingId } = {}) => {
             await tx.$executeRaw`SELECT id FROM "SmartEscrow" WHERE "id" = ${escrowId} FOR UPDATE`;
         }
 
-        // A paid fare is released only once the trip has actually left.
-        // Completing earlier (IN_PROGRESS can be set by the operator) would
-        // let an operator pay themselves for a trip that never ran.
-        if (escrowId && link.status !== 'COMPLETED') {
+        // A paid fare is released only to a passenger boarded by their own QR
+        // (the owner's decision: the signed code is the evidence of
+        // carriage), and only once the trip has actually left. Manual
+        // boarding of a paid booking is refused upstream; this is the last
+        // guard, before anything changes.
+        const held = escrowId
+            ? await tx.smartEscrow.findUnique({ where: { id: escrowId }, select: { status: true } })
+            : null;
+        const paid = !!held && RELEASE_CLAIMABLE.includes(held.status);
+        if (paid && link.status !== 'COMPLETED') {
+            const boarding = link.metadata && link.metadata.boarding;
+            if (!boarding || boarding.method !== 'QR_TOKEN') {
+                throw new TransitCancellationError(
+                    'QR_BOARDING_REQUIRED',
+                    'A paid trip completes only for a passenger boarded by their QR code.',
+                    409
+                );
+            }
             const trip = link.tripId
                 ? await tx.transitTrip.findUnique({ where: { id: link.tripId }, select: { departureAt: true } })
                 : null;
